@@ -9,6 +9,8 @@ mod scrape;
 pub mod subtitles;
 mod tracks;
 mod watch;
+mod work_control;
+pub use work_control::WorkControl;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,7 +36,7 @@ pub use subtitles::{
 };
 pub use tracks::{
     AudioTrack, SubtitleTrack, Tracks, VideoTrack, classify_resolution, external_subtitle_tracks,
-    probe_tracks, probe_tracks_and_duration,
+    probe_tracks, probe_tracks_and_duration, probe_tracks_and_duration_controlled,
 };
 pub use watch::{
     FileError, TransferredFile, Unidentified, WatchJob, WatchKind, WatchOutcome, scan_watch,
@@ -48,6 +50,8 @@ pub enum TransferMode {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LibraryError {
+    #[error("Library work cancelled")]
+    Cancelled,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("ffprobe failed: {0}")]

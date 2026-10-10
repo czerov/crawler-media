@@ -4,6 +4,8 @@ pub mod fingerprint;
 pub mod matcher;
 pub mod target;
 pub mod types;
+mod work_control;
+pub use work_control::WorkControl;
 
 pub use adaptive::{
     EpisodeDescriptor, EpisodeEvidence, SamplingMode, SamplingPolicy, SegmentKind,

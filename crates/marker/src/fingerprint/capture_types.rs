@@ -99,6 +99,7 @@ pub enum CaptureFailureKind {
     EmptyAudio,
     InvalidWindow,
     Decode,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +111,22 @@ pub struct CaptureFailure {
 }
 
 pub trait FingerprintCaptureEngine: Send + Sync {
+    fn capture_window_controlled(
+        &self,
+        request: &CaptureRequest,
+        control: &crate::WorkControl,
+    ) -> Result<CapturedFingerprint, CaptureFailure> {
+        if control.is_cancelled() {
+            return Err(CaptureFailure { kind: CaptureFailureKind::Cancelled,
+                message: "Library work cancelled".into(), metrics: CaptureMetrics::default() });
+        }
+        let result = self.capture_window(request);
+        if control.is_cancelled() {
+            return Err(CaptureFailure { kind: CaptureFailureKind::Cancelled,
+                message: "Library work cancelled".into(), metrics: CaptureMetrics::default() });
+        }
+        result
+    }
     fn capture_window(
         &self,
         request: &CaptureRequest,

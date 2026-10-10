@@ -32,6 +32,7 @@ mod dynamic_downloader;
 pub mod fingerprint_job;
 pub mod http;
 pub mod management;
+pub mod library_lifecycle;
 pub mod marker_resolver;
 pub mod media_posters;
 pub mod media_server_provider;

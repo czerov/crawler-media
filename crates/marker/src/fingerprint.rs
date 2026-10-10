@@ -58,6 +58,13 @@ pub trait FingerprintEngine: Send + Sync {
 pub struct ChromaprintEngine;
 
 impl FingerprintCaptureEngine for ChromaprintEngine {
+    fn capture_window_controlled(
+        &self,
+        request: &CaptureRequest,
+        control: &crate::WorkControl,
+    ) -> Result<CapturedFingerprint, CaptureFailure> {
+        capture::capture_window_controlled(request, control)
+    }
     fn capture_window(
         &self,
         request: &CaptureRequest,

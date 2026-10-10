@@ -16,7 +16,18 @@ use crate::target::ProbeTarget;
 pub fn capture_window_chromaprint(
     request: &CaptureRequest,
 ) -> Result<CapturedFingerprint, CaptureFailure> {
+    capture_window_controlled(request, &crate::WorkControl::default())
+}
+
+pub fn capture_window_controlled(
+    request: &CaptureRequest,
+    control: &crate::WorkControl,
+) -> Result<CapturedFingerprint, CaptureFailure> {
     let started = Instant::now();
+    if control.is_cancelled() {
+        return Err(CaptureFailure { kind: CaptureFailureKind::Cancelled,
+            message: "Library work cancelled".into(), metrics: CaptureMetrics::default() });
+    }
     request.window.validate()?;
 
     let mut timings = ExtractionTimings::default();
@@ -58,6 +69,7 @@ pub fn capture_window_chromaprint(
         &mut fingerprinter,
         &mut timings,
         request.process_deadline_ms,
+        control,
     );
 
     let finish_started = Instant::now();
@@ -176,6 +188,7 @@ fn run_ffmpeg_with_deadline(
     fingerprinter: &mut Fingerprinter,
     timings: &mut ExtractionTimings,
     deadline_ms: u64,
+    control: &crate::WorkControl,
 ) -> Result<(), CaptureFailure> {
     let process_started = Instant::now();
     let stdout = child.stdout.take().ok_or_else(|| CaptureFailure {
@@ -223,6 +236,7 @@ fn run_ffmpeg_with_deadline(
     let mut timed_out = false;
 
     loop {
+        if control.is_cancelled() { break; }
         let elapsed = process_started.elapsed();
         if deadline_ms > 0 && elapsed >= deadline {
             timed_out = true;
@@ -265,14 +279,16 @@ fn run_ffmpeg_with_deadline(
 
     timings.pcm_stream_elapsed_ms = process_started.elapsed().as_millis();
 
-    if timed_out {
+    if timed_out || control.is_cancelled() {
+        let cancelled = control.is_cancelled();
         let _ = child.kill();
         let _ = child.wait();
         let _ = stdout_join.join();
         let _ = collect_stderr_to_timings(stderr_reader, timings);
         return Err(CaptureFailure {
-            kind: CaptureFailureKind::Timeout,
-            message: format!("FFmpeg process exceeded deadline of {deadline_ms}ms"),
+            kind: if cancelled { CaptureFailureKind::Cancelled } else { CaptureFailureKind::Timeout },
+            message: if cancelled { "Library work cancelled".into() }
+                else { format!("FFmpeg process exceeded deadline of {deadline_ms}ms") },
             metrics: build_metrics(timings, process_started, None),
         });
     }

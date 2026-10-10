@@ -213,6 +213,7 @@ fn capture_error_kind(kind: &CaptureFailureKind) -> &'static str {
         CaptureFailureKind::EmptyAudio => "empty_audio",
         CaptureFailureKind::InvalidWindow => "invalid_window",
         CaptureFailureKind::Decode => "decode",
+        CaptureFailureKind::Cancelled => "cancelled",
     }
 }
 

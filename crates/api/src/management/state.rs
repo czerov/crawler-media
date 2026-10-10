@@ -17,6 +17,7 @@ use domain::{SubscribeId, UserId};
 #[derive(Clone)]
 pub struct ApiState {
     pub(crate) store: Arc<Mutex<Store>>,
+    pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
     pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
     /// Job attempts still executing in this process; protects them from timeout recovery.
     pub(crate) active_job_attempts: Arc<Mutex<HashMap<domain::JobId, jobs::Job>>>,
@@ -176,6 +177,7 @@ impl ApiState {
         probe.try_start_workers();
         Ok(Self {
             store: store.clone(),
+            library_work: Arc::new(crate::library_lifecycle::LibraryWorkRegistry::default()),
             jobs: Arc::new(Mutex::new(jobs)),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
             subscribe_guards: Arc::new(Mutex::new(HashMap::new())),

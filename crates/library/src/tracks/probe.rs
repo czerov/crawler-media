@@ -81,6 +81,21 @@ fn probe_tracks_and_duration_with_program(
     path: &Path,
     program: impl AsRef<std::ffi::OsStr>,
 ) -> Result<(Tracks, Option<i64>), LibraryError> {
+    probe_tracks_controlled_program(path, program, &crate::WorkControl::default())
+}
+
+pub fn probe_tracks_and_duration_controlled(
+    path: &Path,
+    control: &crate::WorkControl,
+) -> Result<(Tracks, Option<i64>), LibraryError> {
+    probe_tracks_controlled_program(path, "ffprobe", control)
+}
+
+fn probe_tracks_controlled_program(
+    path: &Path,
+    program: impl AsRef<std::ffi::OsStr>,
+    control: &crate::WorkControl,
+) -> Result<(Tracks, Option<i64>), LibraryError> {
     let target = crate::ProbeTarget::from_path(path);
     let mut command = Command::new(program);
     command.args([
@@ -92,7 +107,7 @@ fn probe_tracks_and_duration_with_program(
         "json",
     ]);
     target.apply_input(&mut command);
-    let output = command.output()?;
+    let output = control.output(&mut command)?;
     if !output.status.success() {
         return Err(LibraryError::Probe(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
