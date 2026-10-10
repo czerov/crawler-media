@@ -274,7 +274,7 @@ pub(crate) async fn refresh_item_metadata(
                 let nfo = crate::scrape_metadata::nfo_from_tmdb(&media, &meta);
                 if media.kind == domain::MediaKind::Tv {
                     crate::scrape_metadata::write_series_nfos(
-                        state.catalog.as_ref(),
+                        &state,
                         &media,
                         tmdb_id,
                         &show_root,

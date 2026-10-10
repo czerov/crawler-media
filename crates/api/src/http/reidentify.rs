@@ -160,7 +160,7 @@ pub(crate) async fn reidentify(State(state): State<ApiState>, Json(body): Json<V
                             let nfo = crate::scrape_metadata::nfo_from_tmdb(&target, &meta);
                             if target.kind == MediaKind::Tv {
                                 crate::scrape_metadata::write_series_nfos(
-                                    state.catalog.as_ref(),
+                                    &state,
                                     &target,
                                     &tmdb_id,
                                     &crate::scrape_metadata::show_root(&path, row),

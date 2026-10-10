@@ -37,6 +37,12 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
     if path.as_os_str().is_empty() || !path.is_dir() {
         return Ok(());
     }
+    let owner = {
+        let store = state.store.lock();
+        store.list_libraries().map_err(|e| e.to_string())?.into_iter()
+            .find(|library| library.root_paths.iter().any(|root| root == &path))
+    };
+    let lease = owner.map(|owner| state.acquire_library_work(&owner.id)).transpose()?;
     tracing::debug!(dir = %path.display(), "扫描目录，刮削并生成 NFO");
     let probe = Media {
         id: MediaId::new(),
@@ -68,8 +74,11 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
             "已记录目录中新增刮削的媒体路径"
         );
     }
-    let inserted =
-        crate::watch_ledger::record_paths(&state.store.lock(), outcome.transferred.clone())?;
+    let inserted = {
+        let store = state.store.lock();
+        if let Some(lease) = &lease { lease.control().check().map_err(|e| e.to_string())?; }
+        crate::watch_ledger::record_paths(&store, outcome.transferred.clone())?
+    };
 
     // MovieClaw / MoviePilot 模式：扫描入库后，为没有 TMDB ID 的影视条目自动匹配 TMDB 元数据与海报
     let unresolved_media = {

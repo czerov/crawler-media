@@ -14,6 +14,7 @@ pub fn auto_resolve_media(
     media: &Media,
     sample_path: &std::path::Path,
 ) -> Option<Media> {
+    let lease = state.acquire_path_work(sample_path, media.kind).ok()?;
     if media.tmdb_id.is_some() || media.douban_id.is_some() {
         return Some(media.clone());
     }
@@ -43,6 +44,7 @@ pub fn auto_resolve_media(
             break;
         }
     }
+    if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { return None; }
     let Some(best_hit) = best_hit else {
         tracing::debug!(title = %title, year = ?media.year, "扫描时未找到可靠的 TMDB 匹配");
         if media.kind == MediaKind::Tv {
@@ -149,7 +151,7 @@ fn write_auto_resolved_nfo(state: &ApiState, media: &Media, sample_path: &std::p
             rows
         };
         crate::scrape_metadata::write_series_nfos(
-            state.catalog.as_ref(),
+            state,
             media,
             tmdb_id,
             &show_root,

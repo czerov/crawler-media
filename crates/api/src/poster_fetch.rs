@@ -29,6 +29,7 @@ impl PosterFetch for HttpPoster {
 /// 2. else extract a video frame locally (network-independent fallback).
 /// Writes `poster.jpg` beside the video. Any failure keeps sidecars intact.
 pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Vec<u8>> {
+    let lease = state.acquire_path_work(video, media.kind).ok()?;
     // 刮削与整理设置：写入图片总开关（mirror_images）。
     let mirror_images = state
         .store
@@ -130,6 +131,7 @@ pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Ve
             }
         };
         if let Some(bytes) = picked {
+            if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { return None; }
             return write_artwork(media, &target, "海报", &bytes);
         }
     }
@@ -165,7 +167,8 @@ pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Ve
         if generate_allowed {
             match frame_poster(video) {
                 Ok(bytes) if !bytes.is_empty() => {
-                    return write_artwork(media, &target, "海报", &bytes);
+                    if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { return None; }
+            return write_artwork(media, &target, "海报", &bytes);
                 }
                 Ok(_) => {
                     tracing::warn!(media = %media.title, video = %video.display(), "视频截帧海报为空");
@@ -306,6 +309,7 @@ fn attach_backdrop_opts(
     video: &Path,
     force: bool,
 ) -> Option<Vec<u8>> {
+    let lease = state.acquire_path_work(video, media.kind).ok()?;
     let Some(config) = state.store.lock().get_scrape_config().ok() else {
         tracing::warn!(media = %media.title, "读取刮削配置失败，跳过背景图");
         return None;
@@ -372,6 +376,7 @@ fn attach_backdrop_opts(
     let Some(bytes) = fetch_artwork(state, media, "背景图", &url) else {
         return None;
     };
+    if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { return None; }
     write_artwork(media, &target, "背景图", &bytes)
 }
 

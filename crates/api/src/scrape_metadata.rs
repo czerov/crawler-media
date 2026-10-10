@@ -86,7 +86,7 @@ pub(crate) fn write_nfo(path: &Path, media: &Media, metadata: &library::NfoMeta)
 }
 
 pub(crate) fn write_series_nfos(
-    catalog: &dyn Catalog,
+    state: &crate::management::ApiState,
     media: &Media,
     tmdb_id: &str,
     show_root: &Path,
@@ -94,6 +94,11 @@ pub(crate) fn write_series_nfos(
     show_metadata: &library::NfoMeta,
     language: &str,
 ) {
+    let Some(sample) = rows.first() else { return; };
+    let lease = match state.acquire_path_work(Path::new(&sample.path), media.kind) {
+        Ok(lease) => lease, Err(_) => return,
+    };
+    let catalog = state.catalog.as_ref();
     write_nfo(&show_root.join("tvshow.nfo"), media, show_metadata);
     let seasons = rows
         .iter()
@@ -115,6 +120,7 @@ pub(crate) fn write_series_nfos(
             }
         };
         for row in rows.iter().filter(|row| row.season == Some(season)) {
+            if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { return; }
             let Some(episode_number) = row.episode else {
                 continue;
             };

@@ -37,6 +37,10 @@ async fn run_metadata_worker(manager: Arc<ProbeManager>) {
         };
         let Some(unit) = unit else { break };
         let pending = MetadataStageGuard(manager.clone());
+        let _lease = match work_lease(&manager, &unit) {
+            Ok(lease) => lease,
+            Err(reason) => { manager.cancel_unit(&unit, &reason); continue; }
+        };
         if !source_ready(&manager, &unit) || !start_persisted_unit(&manager, &unit) {
             continue;
         }
@@ -85,6 +89,10 @@ async fn run_fingerprint_worker(manager: Arc<ProbeManager>) {
             rx.recv().await
         };
         let Some(work) = work else { break };
+        let _lease = match work_lease(&manager, &work.unit) {
+            Ok(lease) => lease,
+            Err(reason) => { manager.cancel_unit(&work.unit, &reason); continue; }
+        };
         wait_for_metadata_idle(&manager).await;
 
         if !source_ready(&manager, &work.unit) {
@@ -112,6 +120,19 @@ async fn run_fingerprint_worker(manager: Arc<ProbeManager>) {
             }
         }
     }
+}
+
+fn work_lease(manager: &ProbeManager, unit: &ProbeUnit)
+    -> Result<Option<crate::library_lifecycle::LibraryWorkLease>, String>
+{
+    let registry = manager.library_work.lock().clone();
+    let Some(registry) = registry else { return Ok(None) };
+    let library_id = {
+        let store = manager.store.lock();
+        store.library_for_path_strict(std::path::Path::new(&unit.row.path), unit.kind)
+            .map_err(|e| e.to_string())?.map(|library| library.id)
+    }.ok_or("Library no longer owns probe source")?;
+    registry.acquire(&manager.store, &library_id).map(Some)
 }
 
 fn source_ready(manager: &ProbeManager, unit: &ProbeUnit) -> bool {

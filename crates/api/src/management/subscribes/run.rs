@@ -265,6 +265,11 @@ fn execute(
             .map(|id| id.to_string())
             .as_deref(),
     )?;
+    let library_lease = state.acquire_path_work(&library_root, context.media.kind)
+        .map_err(ApiError::internal)?;
+    if let Some(lease) = &library_lease {
+        lease.control().check().map_err(|e| ApiError::internal(e.to_string()))?;
+    }
     let naming = state.store.lock().naming_pattern(context.media.kind)?;
     let nfo = {
         let store = state.store.lock();
@@ -294,6 +299,9 @@ fn execute(
         &library::Ffprobe::default(),
         &destinations,
     )?;
+    if let Some(lease) = &library_lease {
+        lease.control().check().map_err(|e| ApiError::internal(e.to_string()))?;
+    }
     outcome.facts.retain_owned();
     outcome.completed = subscribe::is_complete(&context.subscribe, &outcome.facts);
     Ok((outcome, scrape))

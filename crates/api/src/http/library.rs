@@ -73,6 +73,7 @@ pub(crate) fn library_visible(
     library: &Library,
     user_id: Option<domain::UserId>,
 ) -> bool {
+    if !store.library_accepts_work(&library.id).unwrap_or(false) { return false; }
     let Some(user_id) = user_id else {
         return true;
     };

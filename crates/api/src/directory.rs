@@ -177,13 +177,16 @@ pub fn transfer_plan_for_library(
 ) -> Result<(std::path::PathBuf, Option<library::TransferMode>, bool), crate::store::StoreError> {
     let root = if let Some(id) = library_id {
         if let Some(lib) = store.get_library(id)? {
+            if !store.library_accepts_work(id)? {
+                return Err(crate::store::StoreError::Protected("目标 Library 正在删除".into()));
+            }
             if let Some(r) = lib.root_paths.first() {
                 r.clone()
             } else {
                 store.library_root(kind)?
             }
         } else {
-            store.library_root(kind)?
+            return Err(crate::store::StoreError::Missing("目标 Library 已删除，请重新选择".into()));
         }
     } else {
         store.library_root(kind)?

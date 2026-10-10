@@ -13,6 +13,22 @@ impl ProbeManager {
             }
         };
         for (job, units) in jobs {
+            let deleting = {
+                let store = self.store.lock();
+                units.iter().any(|unit| {
+                    let row = store.get_ledger(&unit.ledger_id).ok().flatten();
+                    row.and_then(|row| {
+                        let media = store.get_media(row.media_id).ok().flatten()?;
+                        store.library_for_path_strict(std::path::Path::new(&row.path), media.kind).ok().flatten()
+                    }).is_some_and(|owner| !store.library_accepts_work(&owner.id).unwrap_or(false))
+                })
+            };
+            if deleting {
+                if let Err(error) = self.store.lock().cancel_probe_job(&job.id, "Library removed") {
+                    tracing::error!(%error, job_id=%job.id, "恢复时取消删除库任务失败");
+                }
+                continue;
+            }
             tracing::info!(
                 job_id = %job.id,
                 media_id = %job.media_id,

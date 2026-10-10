@@ -63,6 +63,7 @@ pub(crate) fn scan_library_subdir(
             .mirror_nfo;
         (library.id, library.kind, scrape)
     };
+    let lease = state.acquire_library_work(&library_id)?;
     if !target_dir.is_dir() {
         return Ok(());
     }
@@ -105,6 +106,10 @@ pub(crate) fn scan_library_subdir(
     let outcome = library::scan_watch(&job, &probe).map_err(|error| error.to_string())?;
     let (scan_media, inserted) = {
         let store = state.store.lock();
+        lease.control().check().map_err(|e| e.to_string())?;
+        if !store.library_accepts_work(&library_id).map_err(|e| e.to_string())? {
+            return Err("Library 正在删除".into());
+        }
         let inserted = crate::watch_ledger::record_paths(&store, outcome.transferred.clone())?;
         let mut scan_media = HashMap::new();
         for file in &outcome.transferred {
@@ -120,6 +125,7 @@ pub(crate) fn scan_library_subdir(
         (scan_media, inserted)
     };
     for (_, (media, path)) in scan_media {
+        lease.control().check().map_err(|e| e.to_string())?;
         let resolved = if media.tmdb_id.is_some() || media.douban_id.is_some() {
             Some(media.clone())
         } else {
@@ -169,6 +175,14 @@ pub(crate) fn scan_library_subdir(
 }
 
 fn scan_library_sync(state: ApiState, id: String) -> Response {
+    let lease = match state.acquire_library_work(&id) {
+        Ok(lease) => lease,
+        Err(error) => return err(StatusCode::CONFLICT, "library.deleting", &error),
+    };
+    scan_library_leased(&state, &id, &lease)
+}
+
+fn scan_library_leased(state: &ApiState, id: &str, lease: &crate::library_lifecycle::LibraryWorkLease) -> Response {
     let (kind, roots, scrape) = {
         let store = state.store.lock();
         let Some(library) = store.get_library(&id).ok().flatten() else {
@@ -217,6 +231,9 @@ fn scan_library_sync(state: ApiState, id: String) -> Response {
         }
     }
     let store = state.store.lock();
+    if lease.control().is_cancelled() || !store.library_accepts_work(id).unwrap_or(false) {
+        return err(StatusCode::CONFLICT, "library.deleting", "Library 正在删除");
+    }
     let inserted = match crate::watch_ledger::record_paths(&store, transferred.clone()) {
         Ok(inserted) => inserted,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &error),
@@ -246,6 +263,9 @@ fn scan_library_sync(state: ApiState, id: String) -> Response {
     drop(store);
 
     for (_, (media, row)) in scan_media {
+        if lease.control().is_cancelled() {
+            return err(StatusCode::CONFLICT, "library.deleting", "Library 正在删除");
+        }
         let media = crate::auto_resolve::auto_resolve_media(
             &state,
             &media,
@@ -423,11 +443,16 @@ fn scrape_library_metadata(
     path: &std::path::Path,
     owned_rows: &[domain::LedgerRow],
 ) {
+    let lease = match state.acquire_path_work(path, media.kind) {
+        Ok(lease) => lease,
+        Err(_) => return,
+    };
     let Some(tmdb_id) = media.tmdb_id.as_deref() else {
         return;
     };
     match crate::scrape_metadata::fetch_tmdb_metadata(state, media.kind, tmdb_id) {
         Ok(Some(metadata)) => {
+            if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { return; }
             let nfo = crate::scrape_metadata::nfo_from_tmdb(media, &metadata);
             if media.kind == domain::MediaKind::Tv {
                 let show_root = crate::scrape_metadata::show_root(path, row);
@@ -437,7 +462,7 @@ fn scrape_library_metadata(
                     .cloned()
                     .collect::<Vec<_>>();
                 crate::scrape_metadata::write_series_nfos(
-                    state.catalog.as_ref(),
+                    state,
                     media,
                     tmdb_id,
                     &show_root,

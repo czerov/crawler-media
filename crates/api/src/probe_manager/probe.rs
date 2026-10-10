@@ -365,8 +365,9 @@ async fn probe_tracks_and_store(
         }
     }
     let probe_unit = unit.clone();
+    let control = probe_control(mgr, unit);
     let tracks_result =
-        tokio::task::spawn_blocking(move || read_tracks_with_nfo(&probe_unit, started_at)).await;
+        tokio::task::spawn_blocking(move || read_tracks_with_nfo(&probe_unit, started_at, &control)).await;
     let tracks = match tracks_result {
         Ok(Some(tracks_and_duration)) => tracks_and_duration,
         Ok(None) => {
@@ -397,12 +398,14 @@ async fn probe_tracks_and_store(
         }
     };
     let (tracks, duration_ms) = tracks;
-    if let Err(error) = mgr.store.lock().put_file_meta_versioned(
-        &ledger_id,
-        &tracks,
-        Some(source_version),
-        duration_ms,
-    ) {
+    let published = {
+        let store = mgr.store.lock();
+        if crate::fingerprint_job::source::ensure_source_available(&store, &unit.row).is_err() {
+            return Err(());
+        }
+        store.put_file_meta_versioned(&ledger_id, &tracks, Some(source_version), duration_ms)
+    };
+    if let Err(error) = published {
         tracing::error!(
             %error,
             media_id = %unit.row.media_id,
@@ -437,9 +440,17 @@ async fn probe_tracks_and_store(
     Ok(duration_ms)
 }
 
+pub(super) fn probe_control(mgr: &ProbeManager, unit: &ProbeUnit) -> library::WorkControl {
+    let owner = mgr.store.lock().library_for_path_strict(std::path::Path::new(&unit.row.path), unit.kind)
+        .ok().flatten().map(|library| library.id);
+    let registry = mgr.library_work.lock().clone();
+    owner.and_then(|id| registry.and_then(|registry| registry.active_control(&id))).unwrap_or_default()
+}
+
 fn read_tracks_with_nfo(
     unit: &ProbeUnit,
     probe_started_at: Instant,
+    control: &library::WorkControl,
 ) -> Option<(library::Tracks, Option<i64>)> {
     let tracks_path = PathBuf::from(&unit.row.path);
     let nfo_path = tracks_path.with_extension("nfo");
@@ -447,10 +458,11 @@ fn read_tracks_with_nfo(
     let season = unit.row.season.unwrap_or(1);
     let episode = unit.row.episode.unwrap_or(1);
     let probe_ledger_id = unit.row.id.to_string();
-    match library::probe_tracks_and_duration(&tracks_path) {
+    match library::probe_tracks_and_duration_controlled(&tracks_path, control) {
         Ok((tracks, duration_ms)) => {
             let has_streams =
                 tracks.video.is_some() || !tracks.audio.is_empty() || !tracks.subtitles.is_empty();
+            if control.is_cancelled() { return None; }
             if has_streams {
                 if let Err(error) = library::write_streamdetails_into_nfo(
                     &nfo_path,

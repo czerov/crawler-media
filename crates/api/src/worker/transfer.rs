@@ -212,6 +212,8 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
         .collect();
 
     let plan = resolve_transfer_plan(state, &media, &subscribe)?;
+    let library_lease = state.acquire_path_work(&plan.root, media.kind)?;
+    if let Some(lease) = &library_lease { lease.control().check().map_err(|e| e.to_string())?; }
     tracing::info!(%subscribe_id, pending_count = chosen.len(), "Transfer 开始");
 
     let added = build_added_input(
@@ -247,6 +249,7 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
         attach_metadata_and_chapters(state, &media, &outcome.ledger);
     }
 
+    if let Some(lease) = &library_lease { lease.control().check().map_err(|e| e.to_string())?; }
     let ledger_count = outcome.ledger.len();
     commit_transfer_outcome(state, &subscribe, &outcome)?;
 
