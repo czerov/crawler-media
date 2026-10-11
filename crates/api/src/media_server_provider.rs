@@ -224,7 +224,19 @@ impl MediaServerProvider for ApiServerProvider {
         user_id: UserId,
         id: &str,
     ) -> Result<Option<media_server::provider::UserItemData>, String> {
-        if let Some(snapshot) = self.resolve_single_item(user_id, id).await? {
+        let compact_id = id.replace('-', "");
+        let items = self.list_visible_items(user_id, None).await?;
+        for it in items {
+            let target = if it.is_series {
+                it.media.id.to_string().replace('-', "")
+            } else {
+                it.row.id.to_string().replace('-', "")
+            };
+            if compact_id == target || id == target || id == it.media.id.to_string() {
+                return Ok(Some(it.user_item_data()));
+            }
+        }
+        if let Some(snapshot) = resolve_fallback_item(&self.state, user_id, id, &compact_id) {
             return Ok(Some(snapshot.user_item_data()));
         }
         let season_target = {
