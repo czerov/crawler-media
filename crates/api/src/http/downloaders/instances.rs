@@ -1,7 +1,6 @@
 //! Downloaders: qBittorrent / Transmission instances, live tasks, submit.
 
 use std::str::FromStr;
-use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -13,6 +12,8 @@ use serde_json::{Value, json};
 
 use crate::http::{err, ok, ok_list};
 use crate::management::ApiState;
+
+use super::tasks::{run_downloader_action, run_downloader_read};
 
 #[derive(Deserialize)]
 pub(crate) struct DownloaderInput {
@@ -453,23 +454,20 @@ fn parse_limit_val(val: Option<&Value>) -> Result<u64, &'static str> {
     }
 }
 
-fn resolve_target_downloader(
-    state: &ApiState,
+/// 只解析 query 里的下载器 id；client 解析必须留到 blocking 闭包内（同步建连）。
+fn parse_downloader_id(
     id: Option<&str>,
-) -> Result<Arc<dyn downloader::Downloader>, (StatusCode, &'static str, String)> {
-    let dl_id = if let Some(id_str) = id.filter(|s| !s.is_empty()) {
-        Some(DownloaderId::from_str(id_str).map_err(|_| {
+) -> Result<Option<DownloaderId>, (StatusCode, &'static str, String)> {
+    match id.filter(|s| !s.is_empty()) {
+        Some(raw) => Ok(Some(DownloaderId::from_str(raw).map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
                 "downloader.invalid_id",
                 "下载器 ID 不是合法 UUID".to_string(),
             )
-        })?)
-    } else {
-        None
-    };
-    crate::delivery::client_for_id(state, dl_id)
-        .map_err(|e| (StatusCode::BAD_GATEWAY, "downloader.error", e.to_string()))
+        })?)),
+        None => Ok(None),
+    }
 }
 
 /// GET /downloaders/limits
@@ -477,28 +475,17 @@ pub(crate) async fn get_limits(
     State(state): State<ApiState>,
     Query(query): Query<LimitsQuery>,
 ) -> Response {
-    let downloader = match resolve_target_downloader(&state, query.id.as_deref()) {
-        Ok(d) => d,
+    let downloader_id = match parse_downloader_id(query.id.as_deref()) {
+        Ok(id) => id,
         Err((status, code, msg)) => return err(status, code, &msg),
     };
-    let res: Result<Result<(u64, u64), downloader::DownloaderError>, _> =
-        tokio::task::spawn_blocking(move || downloader.get_speed_limits()).await;
-    match res {
-        Ok(Ok((dl, ul))) => ok(json!({
+    match run_downloader_read(&state, downloader_id, |client| client.get_speed_limits()).await {
+        Ok((dl, ul)) => ok(json!({
             "download_limit_bytes": if dl == 0 { Value::Null } else { json!(dl) },
             "upload_limit_bytes": if ul == 0 { Value::Null } else { json!(ul) },
         }))
         .into_response(),
-        Ok(Err(e)) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "downloader.error",
-            &e.to_string(),
-        ),
-        Err(e) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "downloader.error",
-            &e.to_string(),
-        ),
+        Err(error) => error.response(),
     }
 }
 
@@ -516,27 +503,21 @@ pub(crate) async fn set_limits(
         Ok(v) => v,
         Err(msg) => return err(StatusCode::BAD_REQUEST, "downloader.invalid_limit", msg),
     };
-    let downloader = match resolve_target_downloader(&state, query.id.as_deref()) {
-        Ok(d) => d,
+    let downloader_id = match parse_downloader_id(query.id.as_deref()) {
+        Ok(id) => id,
         Err((status, code, msg)) => return err(status, code, &msg),
     };
-    let res: Result<Result<(), downloader::DownloaderError>, _> =
-        tokio::task::spawn_blocking(move || downloader.set_speed_limits(dl, ul)).await;
-    match res {
-        Ok(Ok(())) => ok(json!({
+    // 有副作用：run_to_completion 保证返回时动作已真正结束。
+    match run_downloader_action(&state, downloader_id, move |client| {
+        client.set_speed_limits(dl, ul)
+    })
+    .await
+    {
+        Ok(()) => ok(json!({
             "download_limit_bytes": if dl == 0 { Value::Null } else { json!(dl) },
             "upload_limit_bytes": if ul == 0 { Value::Null } else { json!(ul) },
         }))
         .into_response(),
-        Ok(Err(e)) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "downloader.error",
-            &e.to_string(),
-        ),
-        Err(e) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "downloader.error",
-            &e.to_string(),
-        ),
+        Err(error) => error.response(),
     }
 }

@@ -21,6 +21,8 @@ pub struct ApiState {
     pub(crate) password_login: Arc<crate::password_login::PasswordLogin>,
     /// 有界 blocking 预算：owned 快照上的 stat/catalog 计算准入（生产默认 8）。
     pub(crate) http_work: Arc<crate::blocking_budget::BlockingBudget>,
+    /// notify 发送 seam（生产为显式超时的 HTTP 实现；测试可注入阻塞实现）。
+    pub(crate) notify_transport: Arc<dyn crate::NotifyTransport>,
     pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
     pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
     /// Job attempts still executing in this process; protects them from timeout recovery.
@@ -187,6 +189,7 @@ impl ApiState {
                 2,
             )),
             http_work: Arc::new(crate::blocking_budget::BlockingBudget::new(8)),
+            notify_transport: Arc::new(crate::http::notify::notify_transport::HttpNotifyTransport),
             library_work,
             jobs: Arc::new(Mutex::new(jobs)),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -231,6 +234,12 @@ impl ApiState {
     /// 替换 blocking 预算（测试注入小并发以观察准入/超时行为）。
     pub fn with_http_work(mut self, budget: Arc<crate::blocking_budget::BlockingBudget>) -> Self {
         self.http_work = budget;
+        self
+    }
+
+    /// 替换 notify 发送实现（测试注入阻塞实现以验证预算准入）。
+    pub fn with_notify_transport(mut self, transport: Arc<dyn crate::NotifyTransport>) -> Self {
+        self.notify_transport = transport;
         self
     }
 

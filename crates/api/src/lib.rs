@@ -67,6 +67,7 @@ pub mod user_agent;
 pub use config::ServerConfig;
 pub use dynamic_downloader::DynamicDownloader;
 pub use fs_watcher::spawn_fs_watcher;
+pub use http::notify::notify_transport::NotifyTransport;
 pub use job_loop::{spawn_job_loop, spawn_job_loop_with};
 pub use management::{ApiState, router};
 pub use runtime_downloader::{ChosenDownloader, DownloaderEnv, choose_downloader};

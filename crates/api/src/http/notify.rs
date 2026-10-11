@@ -6,8 +6,16 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
+use crate::blocking_budget::BlockingError;
 use crate::http::{err, ok};
 use crate::management::ApiState;
+
+// 从 notify.rs 注册兄弟文件模块，避免改动本任务写范围之外的 `http/mod.rs`；
+// trait 通过 lib.rs 公开 re-export 供集成测试注入 fake。
+#[path = "notify_transport.rs"]
+pub(crate) mod notify_transport;
+
+use notify_transport::{HttpNotifyTransport, NotifyTransport};
 
 const NOTIFY_URL_KEY: &str = "notify_url";
 const NOTIFY_TOKEN_KEY: &str = "notify_token";
@@ -79,26 +87,10 @@ pub fn send(store: &crate::Store, title: &str, content: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// Send with explicit credentials (no store lock needed).
+/// Send with explicit credentials (no store lock needed). 保持同步 API：后台
+/// worker 本身不在 async worker 上；HTTP handler 必须走 `http_work` 预算。
 pub fn send_configured(base: &str, token: &str, title: &str, content: &str) -> Result<(), String> {
-    let app_id = base
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("system_alerts")
-        .to_string();
-    let root = base.trim_end_matches(&format!("/{}", app_id));
-    let url = format!("{root}/api/v1/notify/{app_id}");
-    let payload = json!({
-        "title": title,
-        "content": content,
-    });
-    let _ = ureq::post(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/json")
-        .send(payload.to_string())
-        .map_err(|err| err.to_string())?;
-    Ok(())
+    HttpNotifyTransport.send(base, token, title, content)
 }
 
 pub(crate) async fn get_config(
@@ -130,16 +122,19 @@ pub(crate) async fn put_config(State(state): State<ApiState>, Json(body): Json<V
 pub(crate) async fn test(State(state): State<ApiState>, Json(body): Json<Value>) -> Response {
     let url = body["notify_url"].as_str().unwrap_or_default();
     let token = body["notify_token"].as_str().unwrap_or_default();
-    let store = state.store.lock();
-    let base = if url.is_empty() {
-        notify_url(&store).unwrap_or_default()
-    } else {
-        url.to_string()
-    };
-    let token = if token.is_empty() {
-        notify_token(&store).unwrap_or_default()
-    } else {
-        token.to_string()
+    let (base, token) = {
+        let store = state.store.lock();
+        let base = if url.is_empty() {
+            notify_url(&store).unwrap_or_default()
+        } else {
+            url.to_string()
+        };
+        let token = if token.is_empty() {
+            notify_token(&store).unwrap_or_default()
+        } else {
+            token.to_string()
+        };
+        (base, token)
     };
     if base.is_empty() || token.is_empty() {
         return err(
@@ -148,10 +143,34 @@ pub(crate) async fn test(State(state): State<ApiState>, Json(body): Json<Value>)
             "请先配置 notify_url 和 notify_token",
         );
     }
-    drop(store);
-    // Direct sync send (ureq is fast; config errors already handled).
-    match send_configured(&base, &token, "crawler-media 测试通知", "通知配置已生效") {
-        Ok(_) => ok(json!({ "ok": true, "sent": true })).into_response(),
-        Err(error) => ok(json!({ "ok": false, "sent": false, "error": error })).into_response(),
+    // 诊断发送必须在 blocking 预算内：不得占用 async worker，也不得日志 url/token。
+    let transport = state.notify_transport.clone();
+    let outcome = state
+        .http_work
+        .run(std::time::Duration::from_secs(10), move || {
+            transport.send(&base, &token, "crawler-media 测试通知", "通知配置已生效")
+        })
+        .await;
+    match outcome {
+        Ok(Ok(())) => ok(json!({ "ok": true, "sent": true })).into_response(),
+        Ok(Err(error)) => ok(json!({ "ok": false, "sent": false, "error": error })).into_response(),
+        Err(BlockingError::Busy) => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime.busy",
+            "服务繁忙，请重试",
+        ),
+        Err(BlockingError::Timeout) => err(
+            StatusCode::GATEWAY_TIMEOUT,
+            "notify.timeout",
+            "通知发送超时",
+        ),
+        Err(error) => {
+            tracing::error!(error = %error, "notify 测试发送 worker 异常");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "notify.worker",
+                "通知发送任务异常",
+            )
+        }
     }
 }

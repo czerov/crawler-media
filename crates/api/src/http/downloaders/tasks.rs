@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -10,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::blocking_budget::BlockingError;
 use crate::http::{err, ok};
 use crate::management::ApiState;
 
@@ -47,27 +49,119 @@ pub(crate) struct SubmitInput {
     pub(super) auto_route: bool,
 }
 
-fn routed_task_client(
+/// 下载器工作失败的两层结果：解析失败 vs 调用失败 vs 预算失败。
+pub(super) enum DownloaderWorkError {
+    /// `client_for_id` 失败（配置不存在/建连失败）。
+    Resolve(String),
+    /// 已连上的 client 返回的 DownloaderError。
+    Operation(String),
+    /// 只读路径的等待预算耗尽（有副作用动作不会出现）。
+    Timeout,
+    Busy,
+    Worker(String),
+}
+
+impl DownloaderWorkError {
+    /// Resolve→502、Operation/Worker→500、Timeout→504、Busy→503
+    /// （remove_task 另行映射 Resolve）。
+    pub(super) fn response(self) -> Response {
+        match self {
+            Self::Resolve(message) => err(StatusCode::BAD_GATEWAY, "downloader.error", &message),
+            Self::Operation(message) | Self::Worker(message) => err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "downloader.error",
+                &message,
+            ),
+            Self::Timeout => err(
+                StatusCode::GATEWAY_TIMEOUT,
+                "downloader.timeout",
+                "下载器响应超时",
+            ),
+            Self::Busy => err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime.busy",
+                "服务繁忙，请重试",
+            ),
+        }
+    }
+}
+
+/// 解析 client 与随后的 trait 调用必须一起放进同一个 owned blocking 闭包：
+/// 非默认下载器的 `client_for_id` 会同步建连，提前 resolve 会阻塞 async worker。
+async fn run_downloader<T, F>(
     state: &ApiState,
+    downloader_id: Option<domain::DownloaderId>,
+    deadline: Option<Duration>,
+    work: F,
+) -> Result<T, DownloaderWorkError>
+where
+    T: Send + 'static,
+    F: FnOnce(&dyn downloader::Downloader) -> Result<T, downloader::DownloaderError>
+        + Send
+        + 'static,
+{
+    let state_for_work = state.clone();
+    let job = move || -> Result<T, DownloaderWorkError> {
+        let client = crate::delivery::client_for_id(&state_for_work, downloader_id)
+            .map_err(|error| DownloaderWorkError::Resolve(error.to_string()))?;
+        work(client.as_ref()).map_err(|error| DownloaderWorkError::Operation(error.to_string()))
+    };
+    let outcome = match deadline {
+        Some(deadline) => state.http_work.run(deadline, job).await,
+        None => state.http_work.run_to_completion(job).await,
+    };
+    outcome.unwrap_or_else(|error| match error {
+        BlockingError::Busy => Err(DownloaderWorkError::Busy),
+        BlockingError::Timeout => Err(DownloaderWorkError::Timeout),
+        other => Err(DownloaderWorkError::Worker(other.to_string())),
+    })
+}
+
+/// 只读查询（telemetry / snapshots）：12s 等待预算。
+pub(super) async fn run_downloader_read<T, F>(
+    state: &ApiState,
+    downloader_id: Option<domain::DownloaderId>,
+    work: F,
+) -> Result<T, DownloaderWorkError>
+where
+    T: Send + 'static,
+    F: FnOnce(&dyn downloader::Downloader) -> Result<T, downloader::DownloaderError>
+        + Send
+        + 'static,
+{
+    run_downloader(state, downloader_id, Some(Duration::from_secs(12)), work).await
+}
+
+/// 有副作用动作（remove / delete / pause / resume / set_limits）：必须等到
+/// worker 真正结束，绝不"超时返回但后台继续删"。
+pub(super) async fn run_downloader_action<T, F>(
+    state: &ApiState,
+    downloader_id: Option<domain::DownloaderId>,
+    work: F,
+) -> Result<T, DownloaderWorkError>
+where
+    T: Send + 'static,
+    F: FnOnce(&dyn downloader::Downloader) -> Result<T, downloader::DownloaderError>
+        + Send
+        + 'static,
+{
+    run_downloader(state, downloader_id, None, work).await
+}
+
+/// 只解析 query 里的 downloader_id（纯字符串处理，不触碰 Store/网络）。
+fn routed_task_downloader_id(
     query: &HashMap<String, String>,
-) -> Result<std::sync::Arc<dyn downloader::Downloader>, Response> {
-    let id = match query.get("downloader_id").filter(|id| !id.is_empty()) {
-        Some(raw) => Some(domain::DownloaderId::from_str(raw).map_err(|_| {
+) -> Result<Option<domain::DownloaderId>, Response> {
+    match query.get("downloader_id").filter(|id| !id.is_empty()) {
+        Some(raw) => Ok(Some(domain::DownloaderId::from_str(raw).map_err(|_| {
             err(
                 StatusCode::BAD_REQUEST,
                 "downloader.invalid_id",
                 "下载器 ID 不是合法 UUID",
             )
-        })?),
-        None => None,
-    };
-    crate::delivery::client_for_id(state, id).map_err(|error| {
-        err(
-            StatusCode::BAD_GATEWAY,
-            "downloader.error",
-            &error.to_string(),
-        )
-    })
+        })?)),
+        None => Ok(None),
+    }
 }
 
 pub(super) fn task_state(raw: &str, progress: f64) -> &'static str {
@@ -93,22 +187,17 @@ pub(crate) async fn delete_task(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let delete_files = query.get("delete_files").is_some_and(|v| v == "true");
-    let downloader = match routed_task_client(&state, &query) {
-        Ok(client) => client,
+    let downloader_id = match routed_task_downloader_id(&query) {
+        Ok(id) => id,
         Err(response) => return response,
     };
-    match tokio::task::spawn_blocking(move || downloader.delete_task(&hash, delete_files)).await {
-        Ok(Ok(())) => ok(json!({"ok": true})).into_response(),
-        Ok(Err(e)) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "downloader.error",
-            &e.to_string(),
-        ),
-        Err(e) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "downloader.error",
-            &e.to_string(),
-        ),
+    match run_downloader_action(&state, downloader_id, move |client| {
+        client.delete_task(&hash, delete_files)
+    })
+    .await
+    {
+        Ok(()) => ok(json!({"ok": true})).into_response(),
+        Err(error) => error.response(),
     }
 }
 
@@ -118,22 +207,17 @@ pub(crate) async fn pause_task(
     Path(hash): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let downloader = match routed_task_client(&state, &query) {
-        Ok(client) => client,
+    let downloader_id = match routed_task_downloader_id(&query) {
+        Ok(id) => id,
         Err(response) => return response,
     };
-    match tokio::task::spawn_blocking(move || downloader.pause_task(&hash)).await {
-        Ok(Ok(())) => ok(json!({"ok": true})).into_response(),
-        Ok(Err(e)) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "downloader.error",
-            &e.to_string(),
-        ),
-        Err(e) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "downloader.error",
-            &e.to_string(),
-        ),
+    match run_downloader_action(&state, downloader_id, move |client| {
+        client.pause_task(&hash)
+    })
+    .await
+    {
+        Ok(()) => ok(json!({"ok": true})).into_response(),
+        Err(error) => error.response(),
     }
 }
 
@@ -143,22 +227,17 @@ pub(crate) async fn resume_task(
     Path(hash): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let downloader = match routed_task_client(&state, &query) {
-        Ok(client) => client,
+    let downloader_id = match routed_task_downloader_id(&query) {
+        Ok(id) => id,
         Err(response) => return response,
     };
-    match tokio::task::spawn_blocking(move || downloader.resume_task(&hash)).await {
-        Ok(Ok(())) => ok(json!({"ok": true})).into_response(),
-        Ok(Err(e)) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "downloader.error",
-            &e.to_string(),
-        ),
-        Err(e) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "downloader.error",
-            &e.to_string(),
-        ),
+    match run_downloader_action(&state, downloader_id, move |client| {
+        client.resume_task(&hash)
+    })
+    .await
+    {
+        Ok(()) => ok(json!({"ok": true})).into_response(),
+        Err(error) => error.response(),
     }
 }
 
@@ -225,30 +304,24 @@ pub(crate) async fn remove_task(
             Err(message) => return err(StatusCode::NOT_FOUND, "task.missing", &message),
         }
     };
-    let downloader = match crate::delivery::client_for_id(&state, pending.downloader_id) {
-        Ok(client) => client,
-        Err(error) => {
+    let delete_files = body.delete_files;
+    let torrent_for_remove = pending.torrent.clone();
+    // 有副作用：等到 remove_owned 真正结束；解析与调用同在一个 owned 闭包内。
+    match run_downloader_action(&state, pending.downloader_id, move |client| {
+        client.remove_owned(&torrent_for_remove, delete_files)
+    })
+    .await
+    {
+        Ok(()) => {}
+        Err(DownloaderWorkError::Resolve(message)) => {
+            // 保留既有 remove_task 的解析失败状态码（500，而非 routed 路径的 502）。
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "downloader.error",
-                &error.to_string(),
+                &message,
             );
         }
-    };
-    let delete_files = body.delete_files;
-    let torrent_for_remove = pending.torrent.clone();
-    let remove_res = tokio::task::spawn_blocking(move || {
-        downloader.remove_owned(&torrent_for_remove, delete_files)
-    })
-    .await
-    .map_err(|e| e.to_string())
-    .and_then(|res| res.map_err(|e| e.to_string()));
-    if let Err(error) = remove_res {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "downloader.error",
-            &error,
-        );
+        Err(error) => return error.response(),
     }
     if let Err(error) = state
         .store
