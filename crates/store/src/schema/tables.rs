@@ -266,6 +266,7 @@ pub(super) const SUBSCRIBE_TABLES: &str = r#"
             admin_ended INTEGER NOT NULL DEFAULT 0,
             started_at INTEGER NOT NULL,
             last_report_at INTEGER NOT NULL,
+            ledger_id TEXT,
             PRIMARY KEY (user_id, device_id)
         );
         CREATE TABLE IF NOT EXISTS playback_logs (

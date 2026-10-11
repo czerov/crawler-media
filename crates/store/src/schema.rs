@@ -227,6 +227,7 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     migrate_playback_session_key(conn)?;
     // Old logs have no trustworthy device identity and remain nonrevocable.
     ensure_column(conn, "playback_logs", "device_id", "TEXT")?;
+    ensure_column(conn, "playback_sessions", "ledger_id", "TEXT")?;
     ensure_column(
         conn,
         "subscribes",

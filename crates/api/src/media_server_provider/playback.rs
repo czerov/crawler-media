@@ -7,6 +7,7 @@ use super::ApiServerProvider;
 
 struct PlaybackTarget {
     media: Media,
+    ledger_id: String,
     season: i32,
     episode: i32,
     duration_ms: Option<i64>,
@@ -42,6 +43,7 @@ fn resolve_target(
             });
     Ok(Some(PlaybackTarget {
         media,
+        ledger_id: row.id.to_string(),
         season,
         episode,
         duration_ms,
@@ -151,6 +153,17 @@ fn persist_event(
     if current.as_ref().is_some_and(|s| s.admin_ended) {
         return Ok(());
     }
+    // 验证目标所属媒体库未处于删除冻结中且台账未被清理，防止已删除文件在心跳中复活
+    if let Some(row) = store.get_ledger(&target.ledger_id)? {
+        if let Some(owner) = store.library_for_path_strict(std::path::Path::new(&row.path), target.media.kind)? {
+            if !store.library_accepts_work(&owner.id).unwrap_or(true) {
+                return Ok(());
+            }
+        }
+    } else {
+        return Ok(());
+    }
+
     persist_event_position(
         store,
         user_id,
@@ -332,5 +345,6 @@ fn session_row(
         admin_ended: existing.map(|session| session.admin_ended).unwrap_or(false),
         started_at: existing.map(|session| session.started_at).unwrap_or(now),
         last_report_at: now,
+        ledger_id: Some(target.ledger_id.clone()),
     }
 }

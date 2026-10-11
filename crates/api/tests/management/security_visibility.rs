@@ -133,6 +133,7 @@ async fn nested_hidden_library_does_not_leak_through_visible_parent() {
             admin_ended: false,
             started_at: now,
             last_report_at: now,
+            ledger_id: None,
         })
         .unwrap();
     store

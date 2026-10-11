@@ -23,6 +23,18 @@ test("persisted operation resumes and failed operation reports backend error", a
   }, { intervalMs: 0 }), /cleanup failed/);
 });
 
+test("initial failed operation on retry polls status and can resolve to success", async () => {
+  const states = ["draining", "succeeded"];
+  const seen = [];
+  const result = await waitForLibraryRemoval(
+    { ...operation("failed"), error: "old timeout" },
+    async () => operation(states.shift()),
+    { intervalMs: 0, onProgress: (value) => seen.push(value.state) }
+  );
+  assert.equal(result.state, "succeeded");
+  assert.deepEqual(seen, ["failed", "draining", "succeeded"]);
+});
+
 test("abort cancels pending timer without another status request", async () => {
   const controller = new AbortController();
   let requested = false;

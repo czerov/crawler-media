@@ -126,7 +126,9 @@ fn finish_intake_metadata(
     };
     for (_, (media, dest)) in unresolved_media {
         check_intake_libraries(&state.store.lock(), movie_lease, tv_lease)?;
-        let _ = crate::auto_resolve::auto_resolve_media(state, &media, &dest);
+        if let Some(canonical) = crate::auto_resolve::auto_resolve_media(state, &media, &dest) {
+            crate::auto_resolve::rebind_scan_rows(state, media.id, canonical.id, &inserted)?;
+        }
     }
 
     crate::http::library::enqueue_probes_for_paths(state, inserted);

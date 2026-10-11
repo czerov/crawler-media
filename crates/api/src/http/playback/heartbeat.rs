@@ -19,6 +19,7 @@ struct Heartbeat<'a> {
     body: &'a Value,
     user_id: domain::UserId,
     media_id: domain::MediaId,
+    ledger_id: String,
     season: i32,
     episode: i32,
     duration_ms: Option<i64>,
@@ -61,6 +62,7 @@ pub(crate) async fn progress(
         body: &body,
         user_id,
         media_id: media.id,
+        ledger_id: row.id.to_string(),
         season,
         episode,
         duration_ms,
@@ -174,6 +176,7 @@ fn next_session(
         admin_ended: previous.is_some_and(|s| s.admin_ended),
         started_at: previous.map(|s| s.started_at).unwrap_or(heartbeat.now),
         last_report_at: heartbeat.now,
+        ledger_id: Some(heartbeat.ledger_id.clone()),
     }
 }
 

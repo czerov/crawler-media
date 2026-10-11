@@ -93,4 +93,18 @@ async fn failed_removal_stays_frozen_on_resume_and_is_not_auto_succeeded() {
     assert_eq!(current.state, "failed");
     assert!(!resumed_state.store().lock().library_accepts_work(&library.id).unwrap());
     assert!(resumed_state.store().lock().get_library(&library.id).unwrap().is_some());
+
+    // 显式重试删除：应当同步返回 draining 并最终完成清理
+    let retried = start_library_removal(&resumed_state, &library.id).unwrap();
+    assert_eq!(retried.state, "draining");
+    assert!(retried.error.is_none());
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let op = resumed_state.store().lock().library_removal(&retried.operation_id).unwrap().unwrap();
+            if op.state == "succeeded" { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(resumed_state.store().lock().get_library(&library.id).unwrap().is_none());
 }

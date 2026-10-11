@@ -53,6 +53,7 @@ pub struct SessionRow {
     pub admin_ended: bool,
     pub started_at: i64,
     pub last_report_at: i64,
+    pub ledger_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

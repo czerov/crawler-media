@@ -194,7 +194,7 @@ fn resolve_and_scrape_subdir(
         };
 
         if let Some(resolved_media) = resolved.as_ref()
-            && let Err(error) = rebind_scan_rows(state, media.id, resolved_media.id, inserted)
+            && let Err(error) = crate::auto_resolve::rebind_scan_rows(state, media.id, resolved_media.id, inserted)
         {
             return Err(error);
         }
@@ -214,46 +214,6 @@ fn resolve_and_scrape_subdir(
                 scrape_library_metadata(state, &resolved_media, &row, &path, &all_rows);
             }
         }
-    }
-    Ok(())
-}
-
-fn rebind_scan_rows(
-    state: &ApiState,
-    previous: domain::MediaId,
-    canonical: domain::MediaId,
-    inserted: &[PathBuf],
-) -> Result<(), String> {
-    if previous == canonical {
-        return Ok(());
-    }
-    let store = state.store.lock();
-    for path in inserted {
-        let Some(row) = store
-            .ledger_by_path(&path.display().to_string())
-            .map_err(|e| e.to_string())?
-            .filter(|row| row.media_id == previous)
-        else {
-            continue;
-        };
-        let kind = store
-            .get_media(canonical)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "canonical Media missing".to_string())?
-            .kind;
-        let owner = store
-            .library_for_path_strict(path, kind)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "scanned path no longer owned".to_string())?;
-        if !store
-            .library_accepts_work(&owner.id)
-            .map_err(|e| e.to_string())?
-        {
-            return Err("Library 正在删除".into());
-        }
-        store
-            .rebind_scanned_ledger(row.id, canonical)
-            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -388,7 +348,7 @@ fn resolve_scan_metadata(
         }
         let resolved = crate::auto_resolve::resolve_scanned_media(state, &media, path)
             .unwrap_or_else(|| media.clone());
-        if let Err(error) = rebind_scan_rows(state, media.id, resolved.id, &inserted) {
+        if let Err(error) = crate::auto_resolve::rebind_scan_rows(state, media.id, resolved.id, &inserted) {
             return Err(err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "store.error",

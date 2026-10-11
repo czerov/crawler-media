@@ -118,19 +118,24 @@ fn removal_closes_playback_sessions_for_removed_files_and_preserves_other_librar
     std::fs::create_dir_all(&root_a).unwrap();
     std::fs::create_dir_all(&root_b).unwrap();
     let a = store.create_library(MediaKind::Tv, "A", &[root_a.to_str().unwrap()], "everyone", true, &[]).unwrap();
-    let _b = store.create_library(MediaKind::Tv, "B", &[root_b.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    let b = store.create_library(MediaKind::Tv, "B", &[root_b.to_str().unwrap()], "everyone", true, &[]).unwrap();
     let media = media();
     store.insert_media(&media).unwrap();
 
     let path_a = root_a.join("E01.strm");
+    let path_b = root_b.join("E01.strm");
     let a_row = row(media.id, &path_a);
+    let b_row = row(media.id, &path_b);
     store.insert_ledger(&a_row).unwrap();
+    store.insert_ledger(&b_row).unwrap();
 
-    let user = domain::UserId::new();
+    let user_a = domain::UserId::new();
+    let user_b = domain::UserId::new();
     let device_a = "device-a";
-    let session = store::SessionRow {
+    let device_b = "device-b";
+    let session_a = store::SessionRow {
         device_id: device_a.into(),
-        user_id: user,
+        user_id: user_a,
         media_id: media.id,
         season: Some(1),
         episode: Some(1),
@@ -149,12 +154,43 @@ fn removal_closes_playback_sessions_for_removed_files_and_preserves_other_librar
         admin_ended: false,
         started_at: 100,
         last_report_at: 200,
+        ledger_id: Some(a_row.id.to_string()),
     };
-    store.upsert_session(&session).unwrap();
-    assert!(store.get_session(user, device_a).unwrap().is_some());
+    let session_b = store::SessionRow {
+        device_id: device_b.into(),
+        user_id: user_b,
+        media_id: media.id,
+        season: Some(1),
+        episode: Some(1),
+        client: Some("web".into()),
+        device_name: Some("browser".into()),
+        client_version: Some("1.0".into()),
+        play_method: "direct".into(),
+        position_ms: 50_000,
+        start_position_ms: 0,
+        duration_ms: Some(100_000),
+        paused: false,
+        watched_ms: 50_000,
+        rate_bps: 0,
+        bytes_sent: 0,
+        connections: 1,
+        admin_ended: false,
+        started_at: 100,
+        last_report_at: 200,
+        ledger_id: Some(b_row.id.to_string()),
+    };
+    store.upsert_session(&session_a).unwrap();
+    store.upsert_session(&session_b).unwrap();
+    assert!(store.get_session(user_a, device_a).unwrap().is_some());
+    assert!(store.get_session(user_b, device_b).unwrap().is_some());
 
     let removal = store.begin_library_removal(&a.id).unwrap();
     let closed = store.close_playback_sessions_for_removal(&removal.operation_id).unwrap();
     assert_eq!(closed, 1);
-    assert!(store.get_session(user, device_a).unwrap().is_none());
+
+    // A 库的会话被精确关闭
+    assert!(store.get_session(user_a, device_a).unwrap().is_none());
+    // B 库的会话完好保留
+    assert!(store.get_session(user_b, device_b).unwrap().is_some());
+    assert_eq!(store.get_library(&b.id).unwrap().is_some(), true);
 }

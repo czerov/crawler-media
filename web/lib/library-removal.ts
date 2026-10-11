@@ -27,13 +27,20 @@ export async function waitForLibraryRemoval(
   getStatus: (operationId: string, signal?: AbortSignal) => Promise<LibraryRemoval>,
   options: RemovalWaitOptions = {},
 ): Promise<LibraryRemoval> {
+  let isFirst = true;
   for (;;) {
     options.signal?.throwIfAborted();
     options.onProgress?.(operation);
-    if (operation.state === "failed") throw new Error(operation.error ?? "删除失败，可重新尝试");
     if (operation.state === "succeeded") return operation;
+    if (operation.state === "failed" && !isFirst) {
+      throw new Error(operation.error ?? "删除失败，可重新尝试");
+    }
+    isFirst = false;
     await pause(options.intervalMs ?? 1000, options.signal);
     operation = await getStatus(operation.operation_id, options.signal);
+    if (operation.state === "failed") {
+      throw new Error(operation.error ?? "删除失败，可重新尝试");
+    }
   }
 }
 

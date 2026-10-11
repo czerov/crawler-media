@@ -368,7 +368,7 @@ impl Store {
             snapshot.rows.iter().map(|r| r.ledger_id.as_str()).collect();
 
         let mut session_stmt = self.subscribe.prepare(
-            "SELECT user_id, device_id, media_id, season, episode FROM playback_sessions",
+            "SELECT user_id, device_id, media_id, season, episode, ledger_id FROM playback_sessions",
         )?;
         let sessions = session_stmt
             .query_map([], |row| {
@@ -378,41 +378,51 @@ impl Store {
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<i32>>(3)?,
                     row.get::<_, Option<i32>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut closed = 0;
         let now = crate::unix_now();
-        for (user_id_str, device_id, media_id, season, episode) in sessions {
-            let in_snapshot = snapshot.rows.iter().any(|r| {
-                r.media_id == media_id
-                    && r.season.map(|s| s as i32) == season
-                    && r.episode.map(|e| e as i32) == episode
-            });
-            if !in_snapshot {
-                continue;
-            }
-
-            let mut ledger_stmt = self.library.prepare(
-                "SELECT id FROM ledger WHERE media_id=?1 AND season IS ?2 AND episode IS ?3",
-            )?;
-            let other_exists = ledger_stmt
-                .query_map(params![media_id, season, episode], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .filter_map(Result::ok)
-                .any(|id| !removal_ledger_ids.contains(id.as_str()));
-
-            if other_exists {
-                continue;
-            }
-
-            if let Ok(user_id) = user_id_str.parse::<domain::UserId>() {
-                if self.close_session(user_id, &device_id, now)?.is_some() {
-                    tracing::info!(%device_id, %media_id, "已关闭待删除媒体库相关的活跃播放会话");
-                    closed += 1;
+        for (user_id_str, device_id, media_id, season, episode, session_ledger_id) in sessions {
+            let matches_removal = if let Some(ref lid) = session_ledger_id {
+                removal_ledger_ids.contains(lid.as_str())
+            } else {
+                let in_snapshot = snapshot.rows.iter().any(|r| {
+                    r.media_id == media_id
+                        && r.season.map(|s| s as i32) == season
+                        && r.episode.map(|e| e as i32) == episode
+                });
+                if !in_snapshot {
+                    false
+                } else {
+                    let mut ledger_stmt = self.library.prepare(
+                        "SELECT id FROM ledger WHERE media_id=?1 AND season IS ?2 AND episode IS ?3",
+                    )?;
+                    let mut rows_cursor = ledger_stmt.query(params![media_id, season, episode])?;
+                    let mut other_exists = false;
+                    while let Some(row) = rows_cursor.next()? {
+                        let row_id: String = row.get(0)?;
+                        if !removal_ledger_ids.contains(row_id.as_str()) {
+                            other_exists = true;
+                            break;
+                        }
+                    }
+                    !other_exists
                 }
+            };
+
+            if !matches_removal {
+                continue;
+            }
+
+            let user_id = user_id_str
+                .parse::<domain::UserId>()
+                .map_err(|e| StoreError::Protected(format!("会话用户 ID 无效: {e}")))?;
+            if self.close_session(user_id, &device_id, now)?.is_some() {
+                tracing::info!(%device_id, %media_id, "已关闭待删除媒体库相关的活跃播放会话");
+                closed += 1;
             }
         }
         Ok(closed)

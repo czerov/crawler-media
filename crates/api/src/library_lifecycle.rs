@@ -28,9 +28,15 @@ pub fn start_library_removal(state: &ApiState, library_id: &str)
     launch_library_removal(state, operation, handle)
 }
 
-pub(crate) fn launch_library_removal(state: &ApiState, operation: store::LibraryRemoval,
+pub(crate) fn launch_library_removal(state: &ApiState, mut operation: store::LibraryRemoval,
     handle: tokio::runtime::Handle) -> Result<store::LibraryRemoval, String> {
     if operation.state == "succeeded" { return Ok(operation); }
+    if operation.state == "failed" {
+        state.store.lock().set_removal_state(&operation.operation_id, "draining", None)
+            .map_err(|e| e.to_string())?;
+        operation.state = "draining".into();
+        operation.error = None;
+    }
     if !state.library_work.removals.lock().insert(operation.operation_id.clone()) {
         return Ok(operation);
     }
@@ -63,9 +69,9 @@ async fn drain_removal(state: &ApiState, operation_id: &str) -> Result<(), Strin
 
     {
         let store = state.store.lock();
-        if let Err(error) = store.close_playback_sessions_for_removal(operation_id) {
-            tracing::warn!(%operation_id, %library_id, %error, "关闭待删除库播放会话时出现警告");
-        }
+        store
+            .close_playback_sessions_for_removal(operation_id)
+            .map_err(|e| format!("关闭待删除媒体库播放会话失败: {e}"))?;
     }
 
     if let Err(_) = tokio::time::timeout(std::time::Duration::from_secs(30), state.library_work.wait_idle(&library_id)).await {
