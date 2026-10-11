@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 mod filters;
 mod metadata;
+mod file_stats;
 pub(crate) use filters::LibraryFilter;
 use metadata::BrowseMetadata;
 
@@ -174,33 +175,11 @@ pub(crate) fn watch_state_for<'a>(
 }
 
 fn total_size(rows: &[LedgerRow]) -> Option<u64> {
-    let mut total = 0u64;
-    let mut known = false;
-    for row in rows {
-        match std::fs::metadata(&row.path) {
-            Ok(meta) => {
-                total += meta.len();
-                known = true;
-            }
-            Err(error) => {
-                tracing::warn!(path = %row.path, %error, "Library size unavailable for missing file");
-            }
-        }
-    }
-    known.then_some(total)
+    file_stats::total_size(rows)
 }
 
 fn added_at(rows: &[LedgerRow]) -> Option<SystemTime> {
-    rows.iter().filter_map(|row| match std::fs::metadata(&row.path) {
-        Ok(meta) => meta.created().or_else(|error| {
-            tracing::warn!(path = %row.path, %error, "Library added_at uses modified time: creation time unavailable");
-            meta.modified()
-        }).ok(),
-        Err(error) => {
-            tracing::warn!(path = %row.path, %error, "Library added_at unavailable for missing file");
-            None
-        }
-    }).min()
+    file_stats::added_at(rows)
 }
 
 pub(crate) fn resolution_rank(value: &str) -> u32 {
