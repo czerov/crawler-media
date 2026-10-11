@@ -27,10 +27,37 @@ fn file_metadata(path: &Path) -> Option<Metadata> {
 }
 
 pub(crate) fn total_size(rows: &[LedgerRow]) -> Option<u64> {
+    aggregate_size(rows, file_metadata)
+}
+
+#[cfg(test)]
+pub(crate) fn total_size_with(
+    rows: &[LedgerRow],
+    metadata: impl Fn(&Path) -> Option<Metadata>,
+) -> Option<u64> {
+    aggregate_size(rows, metadata)
+}
+
+pub(crate) fn added_at(rows: &[LedgerRow]) -> Option<SystemTime> {
+    aggregate_added_at(rows, file_metadata)
+}
+
+#[cfg(test)]
+pub(crate) fn added_at_with(
+    rows: &[LedgerRow],
+    metadata: impl Fn(&Path) -> Option<Metadata>,
+) -> Option<SystemTime> {
+    aggregate_added_at(rows, metadata)
+}
+
+fn aggregate_size(
+    rows: &[LedgerRow],
+    metadata: impl Fn(&Path) -> Option<Metadata>,
+) -> Option<u64> {
     let mut total = 0u64;
     let mut known = false;
     for row in rows {
-        if let Some(meta) = file_metadata(Path::new(&row.path)) {
+        if let Some(meta) = metadata(Path::new(&row.path)) {
             total += meta.len();
             known = true;
         }
@@ -38,10 +65,13 @@ pub(crate) fn total_size(rows: &[LedgerRow]) -> Option<u64> {
     known.then_some(total)
 }
 
-pub(crate) fn added_at(rows: &[LedgerRow]) -> Option<SystemTime> {
+fn aggregate_added_at(
+    rows: &[LedgerRow],
+    metadata: impl Fn(&Path) -> Option<Metadata>,
+) -> Option<SystemTime> {
     let mut oldest = None;
     for row in rows {
-        if let Some(meta) = file_metadata(Path::new(&row.path)) {
+        if let Some(meta) = metadata(Path::new(&row.path)) {
             let stamp = meta.created().or_else(|error| {
                 tracing::warn!(
                     path = %row.path,

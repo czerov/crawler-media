@@ -84,11 +84,28 @@ fn stats_warn_on_permission_denied() {
     });
     assert!(logs.contains("WARN"), "permission denied must log warning: {logs}");
     assert!(logs.contains("fixture permission denied"));
+}
 
-    // Also assert directly on the public seam (total_size and added_at)
+#[test]
+fn stats_entry_warns_when_metadata_read_is_denied() {
+    let path = std::path::Path::new("/library/private.strm");
     let media_id = domain::MediaId::new();
-    let row = test_row(media_id, dummy_path);
-    // Path doesn't exist on disk, returns None without crashing
-    assert_eq!(super::total_size(&[row.clone()]), None);
-    assert_eq!(super::added_at(&[row]), None);
+    let row = test_row(media_id, path);
+    let logs = capture(|| {
+        let denied = |candidate: &std::path::Path| {
+            assert_eq!(candidate, path);
+            super::classify_metadata(
+                candidate,
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "fixture permission denied",
+                )),
+            )
+        };
+        assert_eq!(super::total_size_with(&[row.clone()], denied), None);
+        assert_eq!(super::added_at_with(&[row], denied), None);
+    });
+    assert!(logs.contains("WARN"), "stats entry must warn: {logs}");
+    assert!(logs.contains("/library/private.strm"), "{logs}");
+    assert!(logs.contains("fixture permission denied"), "{logs}");
 }

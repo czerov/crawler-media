@@ -360,6 +360,15 @@ fn scrape_tv_stills(
     matched_episodes: Vec<(PathBuf, Option<String>)>,
     still_size: &str,
 ) {
+    scrape_tv_stills_with(state, matched_episodes, still_size, library::extract_frame);
+}
+
+fn scrape_tv_stills_with(
+    state: &crate::management::ApiState,
+    matched_episodes: Vec<(PathBuf, Option<String>)>,
+    still_size: &str,
+    extract: impl Fn(&Path, i64, &Path) -> Result<(), String>,
+) {
     let is_allowed = |path: &Path| -> bool {
         let store = state.store.lock();
         if let Ok(libraries) = store.list_libraries() {
@@ -394,11 +403,66 @@ fn scrape_tv_stills(
         if !ok && targets::video_present(&ep_path) && is_allowed(&ep_path) {
             if crate::episode_still::existing(&ep_path).is_none() {
                 let still_dest = crate::episode_still::path(&ep_path);
-                if let Err(err) = library::extract_frame(&ep_path, 60_000, &still_dest) {
+                if let Err(err) = extract(&ep_path, 60_000, &still_dest) {
                     tracing::warn!(error = %err, path = %ep_path.display(), "ffmpeg 抽取剧照失败");
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod still_fallback_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct EmptyFetcher;
+    impl indexer::Fetcher for EmptyFetcher {
+        fn fetch(&self, _: &indexer::FetchRequest) -> Result<String, indexer::IndexerError> {
+            Err(indexer::IndexerError::Fetch("unused".into()))
+        }
+    }
+
+    struct RenameFetch {
+        video: PathBuf,
+    }
+    impl crate::poster_fetch::PosterFetch for RenameFetch {
+        fn get(&self, _: &str) -> Result<Vec<u8>, String> {
+            let _ = std::fs::remove_file(&self.video);
+            Err("download failed after rename".into())
+        }
+    }
+
+    #[test]
+    fn still_fallback_skips_ffmpeg_when_source_vanishes_during_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let video = tmp.path().join("S01E01.mkv");
+        std::fs::write(&video, b"video").unwrap();
+        let called = AtomicBool::new(false);
+        let state = crate::management::ApiState::new(
+            crate::Store::open(tmp.path().join("data")).unwrap(),
+            "test-token".into(),
+            indexer::ProfileSet::load(None).unwrap(),
+            Arc::new(EmptyFetcher),
+            Arc::new(downloader::MemoryDownloader::new(tmp.path().join("stage"))),
+            tmp.path().join("library"),
+        )
+        .unwrap()
+        .with_poster_fetch(Arc::new(RenameFetch {
+            video: video.clone(),
+        }));
+        scrape_tv_stills_with(
+            &state,
+            vec![(video.clone(), Some("/ep1.jpg".into()))],
+            "w300",
+            |_, _, _| {
+                called.store(true, Ordering::SeqCst);
+                panic!("ffmpeg must not run after the source disappears");
+            },
+        );
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(!video.exists());
     }
 }
 

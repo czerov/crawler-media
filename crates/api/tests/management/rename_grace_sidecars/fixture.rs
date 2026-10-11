@@ -100,12 +100,17 @@ pub struct RenameFixture {
     pub live_root: PathBuf,
 }
 
-fn row(media_id: domain::MediaId, path: &std::path::Path, episode: u32) -> domain::LedgerRow {
+fn row(
+    media_id: domain::MediaId,
+    path: &std::path::Path,
+    season: u32,
+    episode: u32,
+) -> domain::LedgerRow {
     domain::LedgerRow {
         id: domain::LedgerId::new(),
         media_id,
         path: path.display().to_string(),
-        season: Some(1),
+        season: Some(season),
         episode: Some(episode),
         resolution: Some("1080p".into()),
         codec: None,
@@ -113,6 +118,36 @@ fn row(media_id: domain::MediaId, path: &std::path::Path, episode: u32) -> domai
         quality_source: domain::QualitySource::Release,
         confidence: domain::Confidence::High,
         filter_score: None,
+    }
+}
+
+fn seed_layout(store: &api::Store, media_id: domain::MediaId, layout: &str, root: &std::path::Path) {
+    if layout == "two_seasons" {
+        seed_season(store, media_id, &root.join("Season 01"), 1);
+        seed_season(store, media_id, &root.join("Season 02"), 2);
+        return;
+    }
+    let dir = if layout.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(layout)
+    };
+    seed_season(store, media_id, &dir, 1);
+}
+
+fn seed_season(
+    store: &api::Store,
+    media_id: domain::MediaId,
+    dir: &std::path::Path,
+    season: u32,
+) {
+    std::fs::create_dir_all(dir).unwrap();
+    for episode in 1..=2 {
+        let path = dir.join(format!("Spirit.Rangers.S{season:02}E{episode:02}.strm"));
+        std::fs::write(&path, b"https://example.com/stream").unwrap();
+        store
+            .insert_ledger(&row(media_id, &path, season, episode))
+            .unwrap();
     }
 }
 
@@ -160,83 +195,9 @@ impl RenameFixture {
             anilist_id: None,
         };
         store.insert_media(&media).unwrap();
-
-        let (old_episode_dir, live_episode_dir) = if layout == "two_seasons" {
-            let old_s1 = old_root.join("Season 01");
-            let old_s2 = old_root.join("Season 02");
-            std::fs::create_dir_all(&old_s1).unwrap();
-            std::fs::create_dir_all(&old_s2).unwrap();
-            for ep in 1..=2 {
-                let p1 = old_s1.join(format!("Spirit.Rangers.S01E{ep:02}.strm"));
-                let p2 = old_s2.join(format!("Spirit.Rangers.S02E{ep:02}.strm"));
-                std::fs::write(&p1, b"https://example.com/stream").unwrap();
-                std::fs::write(&p2, b"https://example.com/stream").unwrap();
-                store.insert_ledger(&row(media_id, &p1, ep)).unwrap();
-                store.insert_ledger(&domain::LedgerRow {
-                    id: domain::LedgerId::new(),
-                    media_id,
-                    path: p2.display().to_string(),
-                    season: Some(2),
-                    episode: Some(ep),
-                    resolution: Some("1080p".into()),
-                    codec: None,
-                    hdr: None,
-                    quality_source: domain::QualitySource::Release,
-                    confidence: domain::Confidence::High,
-                    filter_score: None,
-                }).unwrap();
-            }
-            std::fs::rename(&old_root, &live_root).unwrap();
-            let live_s1 = live_root.join("Season 01");
-            let live_s2 = live_root.join("Season 02");
-            for ep in 1..=2 {
-                let p1 = live_s1.join(format!("Spirit.Rangers.S01E{ep:02}.strm"));
-                let p2 = live_s2.join(format!("Spirit.Rangers.S02E{ep:02}.strm"));
-                store.insert_ledger(&row(media_id, &p1, ep)).unwrap();
-                store.insert_ledger(&domain::LedgerRow {
-                    id: domain::LedgerId::new(),
-                    media_id,
-                    path: p2.display().to_string(),
-                    season: Some(2),
-                    episode: Some(ep),
-                    resolution: Some("1080p".into()),
-                    codec: None,
-                    hdr: None,
-                    quality_source: domain::QualitySource::Release,
-                    confidence: domain::Confidence::High,
-                    filter_score: None,
-                }).unwrap();
-            }
-            (old_s1, live_s1)
-        } else {
-            let old_dir = if layout.is_empty() {
-                old_root.clone()
-            } else {
-                old_root.join(layout)
-            };
-            std::fs::create_dir_all(&old_dir).unwrap();
-            for ep in 1..=2 {
-                let p = old_dir.join(format!("Spirit.Rangers.S01E{ep:02}.strm"));
-                std::fs::write(&p, b"https://example.com/stream").unwrap();
-                store.insert_ledger(&row(media_id, &p, ep)).unwrap();
-            }
-
-            // Rename old_root -> live_root on disk
-            std::fs::rename(&old_root, &live_root).unwrap();
-
-            let live_dir = if layout.is_empty() {
-                live_root.clone()
-            } else {
-                live_root.join(layout)
-            };
-            for ep in 1..=2 {
-                let p = live_dir.join(format!("Spirit.Rangers.S01E{ep:02}.strm"));
-                store.insert_ledger(&row(media_id, &p, ep)).unwrap();
-            }
-            (old_dir, live_dir)
-        };
-        let _ = (old_episode_dir, live_episode_dir);
-
+        seed_layout(&store, media_id, layout, &old_root);
+        std::fs::rename(&old_root, &live_root).unwrap();
+        seed_layout(&store, media_id, layout, &live_root);
         let media_clone = media.clone();
 
         drop(store);

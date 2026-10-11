@@ -29,6 +29,15 @@ impl PosterFetch for HttpPoster {
 /// 2. else extract a video frame locally (network-independent fallback).
 /// Writes `poster.jpg` beside the video. Any failure keeps sidecars intact.
 pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Vec<u8>> {
+    attach_poster_with(state, media, video, frame_poster)
+}
+
+fn attach_poster_with(
+    state: &ApiState,
+    media: &Media,
+    video: &Path,
+    frame: impl Fn(&Path) -> Result<Vec<u8>, String>,
+) -> Option<Vec<u8>> {
     if !crate::scrape_metadata::targets::video_present(video) {
         return None;
     }
@@ -90,36 +99,7 @@ pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Ve
             .map(|c| c.effective.poster_mode.as_str())
             .unwrap_or("default");
         let picked: Option<Vec<u8>> = if mode == "language" {
-            match state.catalog.image_candidates(media.kind, tmdb_id) {
-                Ok(candidates) => {
-                    let effective = config.as_ref().map(|c| &c.effective);
-                    let meta = effective.map(|e| e.primary_language()).unwrap_or("zh-CN");
-                    let priority = effective
-                        .map(|e| e.poster_language_priority.as_slice())
-                        .unwrap_or_default();
-                    let min = effective.map(|e| e.poster_min_width).unwrap_or(500);
-                    let size = effective.map(|e| e.poster_size.as_str()).unwrap_or("w780");
-                    match pick_candidate(&candidates.posters, priority, meta, min) {
-                        Some(candidate) => {
-                            fetch_artwork(state, media, "海报", &candidate.url(size))
-                        }
-                        None => {
-                            tracing::warn!(
-                                media = %media.title,
-                                tmdb_id,
-                                posters = candidates.posters.len(),
-                                min_width = min,
-                                "没有符合语言和宽度的海报候选"
-                            );
-                            None
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, media = %media.title, tmdb_id, "拉取海报候选失败");
-                    None
-                }
-            }
+            language_poster(state, media, tmdb_id, config.as_ref())
         } else {
             match state.catalog.poster_url(media.kind, tmdb_id) {
                 Ok(Some(url)) => {
@@ -146,44 +126,8 @@ pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Ve
     // Channel 2: local video frame → 2:3 poster (no network needed).
     // 对于 STRM 虚拟流媒体文件，跳过本地强制抓帧（避免 ffmpeg 读纯文本报错），
     // 且避免对远程挂载发起大流量视频流拉取
-    let is_strm = video
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("strm"));
-    if !is_strm {
-        let generate_allowed = {
-            let store = state.store.lock();
-            if let Ok(libraries) = store.list_libraries() {
-                libraries
-                    .into_iter()
-                    .filter(|lib| lib.root_paths.iter().any(|r| video.starts_with(r)))
-                    .max_by_key(|lib| {
-                        lib.root_paths
-                            .iter()
-                            .filter(|r| video.starts_with(r))
-                            .map(|r| r.components().count())
-                            .max()
-                            .unwrap_or(0)
-                    })
-                    .map(|lib| lib.generate_thumbnails)
-                    .unwrap_or(true)
-            } else {
-                true
-            }
-        };
-        if generate_allowed {
-            match frame_poster(video) {
-                Ok(bytes) if !bytes.is_empty() => {
-                    return write_artwork(media, &target, "海报", &bytes);
-                }
-                Ok(_) => {
-                    tracing::warn!(media = %media.title, video = %video.display(), "视频截帧海报为空");
-                }
-                Err(error) => {
-                    tracing::warn!(%error, media = %media.title, video = %video.display(), "视频截帧海报失败");
-                }
-            }
-        }
+    if write_frame_poster(state, media, video, &target, frame) {
+        return None;
     }
     tracing::warn!(
         media = %media.title,
@@ -192,6 +136,106 @@ pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Ve
         "海报未写入"
     );
     None
+}
+
+fn language_poster(
+    state: &ApiState,
+    media: &Media,
+    tmdb_id: &str,
+    config: Option<&crate::scrape_config::ScrapeConfig>,
+) -> Option<Vec<u8>> {
+    match state.catalog.image_candidates(media.kind, tmdb_id) {
+        Ok(candidates) => {
+            let effective = config.map(|c| &c.effective);
+            let meta = effective.map(|e| e.primary_language()).unwrap_or("zh-CN");
+            let priority = effective
+                .map(|e| e.poster_language_priority.as_slice())
+                .unwrap_or_default();
+            let min = effective.map(|e| e.poster_min_width).unwrap_or(500);
+            let size = effective.map(|e| e.poster_size.as_str()).unwrap_or("w780");
+            match pick_candidate(&candidates.posters, priority, meta, min) {
+                Some(candidate) => fetch_artwork(state, media, "海报", &candidate.url(size)),
+                None => {
+                    tracing::warn!(
+                        media = %media.title,
+                        tmdb_id,
+                        posters = candidates.posters.len(),
+                        min_width = min,
+                        "没有符合语言和宽度的海报候选"
+                    );
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, media = %media.title, tmdb_id, "拉取海报候选失败");
+            None
+        }
+    }
+}
+
+fn write_frame_poster(
+    state: &ApiState,
+    media: &Media,
+    video: &Path,
+    target: &Path,
+    frame: impl Fn(&Path) -> Result<Vec<u8>, String>,
+) -> bool {
+    let is_strm = video
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("strm"));
+    if is_strm || !thumbnails_allowed(state, video) || !crate::scrape_metadata::targets::video_present(video) {
+        return false;
+    }
+    match frame_poster_with(video, frame) {
+        Ok(bytes) if !bytes.is_empty() => {
+            if !crate::scrape_metadata::targets::video_present(video) {
+                tracing::debug!(video = %video.display(), "源视频已不存在，跳过截帧海报写入");
+                return true;
+            }
+            write_artwork(media, target, "海报", &bytes);
+            true
+        }
+        Ok(_) => {
+            tracing::warn!(media = %media.title, video = %video.display(), "视频截帧海报为空");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(%error, media = %media.title, video = %video.display(), "视频截帧海报失败");
+            false
+        }
+    }
+}
+
+fn thumbnails_allowed(state: &ApiState, video: &Path) -> bool {
+    let store = state.store.lock();
+    let Ok(libraries) = store.list_libraries() else {
+        return true;
+    };
+    libraries
+        .into_iter()
+        .filter(|lib| lib.root_paths.iter().any(|root| video.starts_with(root)))
+        .max_by_key(|lib| {
+            lib.root_paths
+                .iter()
+                .filter(|root| video.starts_with(root))
+                .map(|root| root.components().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .map(|lib| lib.generate_thumbnails)
+        .unwrap_or(true)
+}
+
+fn frame_poster_with(
+    video: &Path,
+    frame: impl Fn(&Path) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    if !crate::scrape_metadata::targets::video_present(video) {
+        return Err("source missing".into());
+    }
+    frame(video)
 }
 
 fn fetch_artwork(state: &ApiState, media: &Media, kind: &str, url: &str) -> Option<Vec<u8>> {
@@ -407,5 +451,92 @@ fn lang_matches(candidate: &Option<String>, want: &Option<String>) -> bool {
         (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
         (None, None) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct PosterCatalog;
+    impl crate::catalog::Catalog for PosterCatalog {
+        fn search_movie(&self, _: &str) -> Result<Vec<media::CatalogHit>, String> {
+            Ok(Vec::new())
+        }
+        fn search_tv(&self, _: &str) -> Result<Vec<media::CatalogHit>, String> {
+            Ok(Vec::new())
+        }
+        fn popular_movie(&self) -> Result<Vec<media::CatalogHit>, String> {
+            Ok(Vec::new())
+        }
+        fn popular_tv(&self) -> Result<Vec<media::CatalogHit>, String> {
+            Ok(Vec::new())
+        }
+        fn details(&self, _: domain::MediaKind, _: &str) -> Result<Option<domain::Media>, String> {
+            Ok(None)
+        }
+        fn poster_url(&self, _: domain::MediaKind, _: &str) -> Result<Option<String>, String> {
+            Ok(Some("https://example.test/poster.jpg".into()))
+        }
+    }
+
+    struct RenameFetch {
+        video: std::path::PathBuf,
+    }
+    impl PosterFetch for RenameFetch {
+        fn get(&self, _: &str) -> Result<Vec<u8>, String> {
+            let _ = std::fs::remove_file(&self.video);
+            Err("poster download failed after rename".into())
+        }
+    }
+
+    struct EmptyFetcher;
+    impl indexer::Fetcher for EmptyFetcher {
+        fn fetch(&self, _: &indexer::FetchRequest) -> Result<String, indexer::IndexerError> {
+            Err(indexer::IndexerError::Fetch("unused".into()))
+        }
+    }
+
+    #[test]
+    fn failed_poster_download_does_not_frame_a_vanished_video() {
+        let tmp = tempfile::tempdir().unwrap();
+        let video = tmp.path().join("Movie.mkv");
+        std::fs::write(&video, b"video").unwrap();
+        let called = AtomicBool::new(false);
+        let state = ApiState::new(
+            crate::Store::open(tmp.path().join("data")).unwrap(),
+            "test-token".into(),
+            indexer::ProfileSet::load(None).unwrap(),
+            Arc::new(EmptyFetcher),
+            Arc::new(downloader::MemoryDownloader::new(tmp.path().join("stage"))),
+            tmp.path().join("library"),
+        )
+        .unwrap()
+        .with_catalog(Arc::new(PosterCatalog))
+        .with_poster_fetch(Arc::new(RenameFetch {
+            video: video.clone(),
+        }));
+        let media = domain::Media {
+            id: domain::MediaId::new(),
+            kind: domain::MediaKind::Movie,
+            title: "Movie".into(),
+            year: Some(2023),
+            original_title: None,
+            tmdb_id: Some("1".into()),
+            douban_id: None,
+            tvdb_id: None,
+            bangumi_id: None,
+            anilist_id: None,
+        };
+        let written = attach_poster_with(&state, &media, &video, |_| {
+            called.store(true, Ordering::SeqCst);
+            panic!("ffmpeg must not run after the poster source disappears");
+        });
+        assert!(written.is_none());
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(!video.exists());
+        assert!(!tmp.path().join("poster.jpg").exists());
     }
 }
