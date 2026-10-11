@@ -57,7 +57,12 @@ pub(crate) fn write_season_nfos(
     rows: &[LedgerRow],
     seasons: &[SeasonArtwork],
 ) {
-    let owned_seasons: HashSet<u32> = rows
+    let live_rows: Vec<&LedgerRow> = rows
+        .iter()
+        .filter(|r| crate::scrape_metadata::targets::video_present(Path::new(&r.path)))
+        .collect();
+
+    let owned_seasons: HashSet<u32> = live_rows
         .iter()
         .filter_map(|r| r.season)
         .collect();
@@ -79,8 +84,21 @@ pub(crate) fn write_season_nfos(
             show_root.join(format!("season{:02}.nfo", artwork.number))
         };
 
-        if let Err(error) = library::write_season_nfo(&path, &meta) {
-            warn!(%error, path = %path.display(), "写入 season.nfo 失败");
+        // Re-check before write that this season still has live files
+        let season_still_live = rows
+            .iter()
+            .filter(|r| r.season == Some(artwork.number))
+            .any(|r| crate::scrape_metadata::targets::video_present(Path::new(&r.path)));
+        if !season_still_live {
+            continue;
+        }
+
+        if let Err(error) = library::write_season_nfo_in_existing_dir(&path, &meta) {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                tracing::debug!(path = %path.display(), "目标目录不存在，跳过 season.nfo 保存");
+            } else {
+                warn!(%error, path = %path.display(), "写入 season.nfo 失败");
+            }
         }
     }
 }
@@ -146,9 +164,14 @@ fn write_destination_if_missing(
     if dest.is_file() {
         return;
     }
-    let live_source = source_rows.iter().any(|row| {
-        crate::scrape_metadata::targets::video_present(Path::new(&row.path))
-    });
+    let live_source = if source_rows.is_empty() {
+        // Movie 场景没有分集 rows，检查目标父目录是否存在且为目录
+        dest.parent().is_some_and(|p| p.is_dir())
+    } else {
+        source_rows.iter().any(|row| {
+            crate::scrape_metadata::targets::video_present(Path::new(&row.path))
+        })
+    };
     if !live_source {
         return;
     }
@@ -169,9 +192,13 @@ fn write_destination_if_missing(
         }
     }
 
-    let live_source_after = source_rows.iter().any(|row| {
-        crate::scrape_metadata::targets::video_present(Path::new(&row.path))
-    });
+    let live_source_after = if source_rows.is_empty() {
+        dest.parent().is_some_and(|p| p.is_dir())
+    } else {
+        source_rows.iter().any(|row| {
+            crate::scrape_metadata::targets::video_present(Path::new(&row.path))
+        })
+    };
     if !live_source_after {
         return;
     }
@@ -236,11 +263,12 @@ pub(crate) fn save_fanart_files(
     for sp in &set.season_posters {
         let Some(s_num) = sp.season else { continue };
         if !owned_seasons.contains(&s_num) { continue };
+        let season_rows: Vec<LedgerRow> = rows.iter().filter(|r| r.season == Some(s_num)).cloned().collect();
         let prefix = season_prefix(s_num);
         let mut bytes = None;
-        write_destination_if_missing(fetch, &sp.url, &mut bytes, &show_root.join(format!("{prefix}poster.jpg")), &mut written, rows);
+        write_destination_if_missing(fetch, &sp.url, &mut bytes, &show_root.join(format!("{prefix}poster.jpg")), &mut written, &season_rows);
         if let Some(s_dir) = season_dir(show_root, rows, s_num) {
-            write_destination_if_missing(fetch, &sp.url, &mut bytes, &s_dir.join("poster.jpg"), &mut written, rows);
+            write_destination_if_missing(fetch, &sp.url, &mut bytes, &s_dir.join("poster.jpg"), &mut written, &season_rows);
         }
     }
 
@@ -248,12 +276,13 @@ pub(crate) fn save_fanart_files(
     for st in &set.season_thumbs {
         let Some(s_num) = st.season else { continue };
         if !owned_seasons.contains(&s_num) { continue };
+        let season_rows: Vec<LedgerRow> = rows.iter().filter(|r| r.season == Some(s_num)).cloned().collect();
         let prefix = season_prefix(s_num);
         let mut bytes = None;
-        write_destination_if_missing(fetch, &st.url, &mut bytes, &show_root.join(format!("{prefix}thumb.jpg")), &mut written, rows);
+        write_destination_if_missing(fetch, &st.url, &mut bytes, &show_root.join(format!("{prefix}thumb.jpg")), &mut written, &season_rows);
         if let Some(s_dir) = season_dir(show_root, rows, s_num) {
-            write_destination_if_missing(fetch, &st.url, &mut bytes, &s_dir.join("thumb.jpg"), &mut written, rows);
-            write_destination_if_missing(fetch, &st.url, &mut bytes, &s_dir.join("landscape.jpg"), &mut written, rows);
+            write_destination_if_missing(fetch, &st.url, &mut bytes, &s_dir.join("thumb.jpg"), &mut written, &season_rows);
+            write_destination_if_missing(fetch, &st.url, &mut bytes, &s_dir.join("landscape.jpg"), &mut written, &season_rows);
         }
     }
 
@@ -261,11 +290,12 @@ pub(crate) fn save_fanart_files(
     for sb in &set.season_banners {
         let Some(s_num) = sb.season else { continue };
         if !owned_seasons.contains(&s_num) { continue };
+        let season_rows: Vec<LedgerRow> = rows.iter().filter(|r| r.season == Some(s_num)).cloned().collect();
         let prefix = season_prefix(s_num);
         let mut bytes = None;
-        write_destination_if_missing(fetch, &sb.url, &mut bytes, &show_root.join(format!("{prefix}banner.jpg")), &mut written, rows);
+        write_destination_if_missing(fetch, &sb.url, &mut bytes, &show_root.join(format!("{prefix}banner.jpg")), &mut written, &season_rows);
         if let Some(s_dir) = season_dir(show_root, rows, s_num) {
-            write_destination_if_missing(fetch, &sb.url, &mut bytes, &s_dir.join("banner.jpg"), &mut written, rows);
+            write_destination_if_missing(fetch, &sb.url, &mut bytes, &s_dir.join("banner.jpg"), &mut written, &season_rows);
         }
     }
 

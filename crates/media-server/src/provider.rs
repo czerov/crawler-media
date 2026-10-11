@@ -197,6 +197,23 @@ pub trait MediaServerProvider: Send + Sync + 'static {
         parent_id: Option<&str>,
     ) -> Result<Vec<MediaItemSnapshot>, String>;
 
+    async fn list_resumable_items(
+        &self,
+        user_id: UserId,
+        limit: usize,
+    ) -> Result<Vec<MediaItemSnapshot>, String> {
+        let items = self.list_visible_items(user_id, None).await?;
+        let mut resumable = Vec::new();
+        for item in items {
+            if item.ticks > 0 && !item.played {
+                resumable.push(item);
+                if resumable.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(resumable)
+    }
     async fn resolve_single_item(
         &self,
         user_id: UserId,

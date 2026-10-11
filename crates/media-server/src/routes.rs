@@ -530,45 +530,28 @@ async fn resume_items(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let root_rows = state
-        .provider
-        .list_visible_items(user.id, query.parent_id.as_deref())
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut rows = Vec::new();
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    for item in root_rows {
-        if rows.len() >= limit {
-            break;
-        }
-        if item.media.kind == domain::MediaKind::Tv && item.is_series {
-            if item.played {
-                continue;
+    let mut rows = if query.parent_id.is_none() {
+        state.provider.list_resumable_items(user.id, limit).await.unwrap_or_default()
+    } else {
+        let root_rows = state
+            .provider
+            .list_visible_items(user.id, query.parent_id.as_deref())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut filtered = Vec::new();
+        for item in root_rows {
+            if item.ticks > 0 && !item.played {
+                filtered.push(item);
+                if filtered.len() >= limit {
+                    break;
+                }
             }
-            let series_id = item.media.id.to_string().replace('-', "");
-            let episodes = state
-                .provider
-                .list_visible_items(user.id, Some(&series_id))
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            let mut in_progress: Vec<_> = episodes.into_iter().filter(|ep| ep.ticks > 0 && !ep.played).collect();
-            in_progress.sort_by_key(|episode| {
-                (
-                    episode.metadata.resume_updated_at,
-                    episode.row.season.unwrap_or_default(),
-                    episode.row.episode.unwrap_or_default(),
-                )
-            });
-            if let Some(episode) = in_progress.pop() {
-                rows.push(episode);
-            }
-        } else if item.ticks > 0 && !item.played {
-            rows.push(item);
         }
-    }
+        filtered
+    };
     let total = rows.len();
     let start_index = query.start_index.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).clamp(1, 200);
     let listed: Vec<Value> = rows
         .drain(..)
         .skip(start_index)

@@ -29,6 +29,9 @@ impl PosterFetch for HttpPoster {
 /// 2. else extract a video frame locally (network-independent fallback).
 /// Writes `poster.jpg` beside the video. Any failure keeps sidecars intact.
 pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Vec<u8>> {
+    if !crate::scrape_metadata::targets::video_present(video) {
+        return None;
+    }
     // 刮削与整理设置：写入图片总开关（mirror_images）。
     let mirror_images = state
         .store
@@ -39,6 +42,9 @@ pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Ve
         .unwrap_or(true);
     if !mirror_images {
         tracing::info!(media = %media.title, "镜像图片已关闭，跳过海报");
+        return None;
+    }
+    if !crate::scrape_metadata::targets::video_present(video) {
         return None;
     }
     let Some(dir) = video.parent() else {
@@ -130,6 +136,9 @@ pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Ve
             }
         };
         if let Some(bytes) = picked {
+            if !crate::scrape_metadata::targets::video_present(video) {
+                return None;
+            }
             return write_artwork(media, &target, "海报", &bytes);
         }
     }
@@ -211,7 +220,11 @@ fn write_artwork(media: &Media, target: &Path, kind: &str, bytes: &[u8]) -> Opti
             Some(bytes.to_vec())
         }
         Err(error) => {
-            tracing::warn!(%error, media = %media.title, path = %target.display(), "{kind}写入失败");
+            if error.kind() == std::io::ErrorKind::NotFound {
+                tracing::debug!(path = %target.display(), "目标目录不存在，跳过{kind}写入");
+            } else {
+                tracing::warn!(%error, media = %media.title, path = %target.display(), "{kind}写入失败");
+            }
             None
         }
     }
@@ -314,6 +327,9 @@ fn attach_backdrop_opts(
         tracing::info!(media = %media.title, "镜像图片已关闭，跳过背景图");
         return None;
     }
+    if !crate::scrape_metadata::targets::video_present(video) {
+        return None;
+    }
     let Some(dir) = video.parent() else {
         tracing::warn!(media = %media.title, video = %video.display(), "背景图落盘失败：视频没有父目录");
         return None;
@@ -372,6 +388,9 @@ fn attach_backdrop_opts(
     let Some(bytes) = fetch_artwork(state, media, "背景图", &url) else {
         return None;
     };
+    if !crate::scrape_metadata::targets::video_present(video) {
+        return None;
+    }
     write_artwork(media, &target, "背景图", &bytes)
 }
 

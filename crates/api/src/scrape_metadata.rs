@@ -463,6 +463,9 @@ pub(crate) fn scrape_movie_fanart(
     media: &Media,
     movie_root: &Path,
 ) {
+    if !movie_root.is_dir() {
+        return;
+    }
     let Some(tmdb_id) = media.tmdb_id.as_deref() else {
         return;
     };

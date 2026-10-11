@@ -203,6 +203,15 @@ impl Store {
         let rows = stmt.query_map(rusqlite::params![media_id.to_string()], map_ledger)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+    pub fn get_ledger_by_unit(
+        &self,
+        media_id: domain::MediaId,
+        season: Option<u32>,
+        episode: Option<u32>,
+    ) -> Result<Option<LedgerRow>, StoreError> {
+        let rows = self.ledger_for_media(media_id)?;
+        Ok(rows.into_iter().find(|r| r.season == season && r.episode == episode))
+    }
 
     pub fn delete_ledger_for_media(&self, media_id: domain::MediaId) -> Result<usize, StoreError> {
         let tx = rusqlite::Transaction::new_unchecked(

@@ -149,6 +149,36 @@ impl Store {
         Ok(result)
     }
 
+    /// User's in-progress (resume) units, ordered by most recently updated first.
+    pub fn user_resumable_units(
+        &self,
+        user_id: UserId,
+        limit: usize,
+    ) -> Result<Vec<(MediaId, i32, i32, i64, i64)>, StoreError> {
+        let mut stmt = self.subscribe.prepare(
+            "SELECT media_id, season, episode, position_ms, updated_at
+             FROM playback_units
+             WHERE user_id = ?1 AND position_ms > 0 AND played = 0
+             ORDER BY updated_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![user_id.to_string(), limit as i64], |row| {
+            let media_str: String = row.get(0)?;
+            let season: i32 = row.get(1)?;
+            let episode: i32 = row.get(2)?;
+            let pos: i64 = row.get(3)?;
+            let updated: i64 = row.get(4)?;
+            Ok((media_str, season, episode, pos, updated))
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            let (m_str, season, episode, pos, updated) = r?;
+            if let Ok(m_id) = MediaId::from_str(&m_str) {
+                list.push((m_id, season, episode, pos, updated));
+            }
+        }
+        Ok(list)
+    }
     /// All unit rows of a media (for marks aggregation / cascade).
     pub fn unit_rows(
         &self,

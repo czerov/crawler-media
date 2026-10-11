@@ -73,3 +73,13 @@ async fn rename_grace_stale_preferred_row_does_not_poison_target() {
     let store = store_guard.lock();
     assert_eq!(store.ledger_for_media(f.media.id).unwrap().len(), 5);
 }
+
+#[tokio::test]
+async fn rename_grace_two_seasons() {
+    let f = RenameFixture::new("two_seasons");
+    f.refresh().await;
+    assert!(f.live_root.join("tvshow.nfo").is_file());
+    assert!(f.live_root.join("Season 01/season.nfo").is_file());
+    assert!(f.live_root.join("Season 02/season.nfo").is_file());
+    assert!(!f.old_root.exists());
+}

@@ -194,6 +194,48 @@ impl MediaServerProvider for ApiServerProvider {
         items::list_visible_items(self, user_id, parent_id)
     }
 
+    async fn list_resumable_items(
+        &self,
+        user_id: UserId,
+        limit: usize,
+    ) -> Result<Vec<MediaItemSnapshot>, String> {
+        let targets = {
+            let store = self.state.store.lock();
+            store.user_resumable_units(user_id, limit).unwrap_or_default()
+        };
+        let mut results = Vec::new();
+        let mut seen_media = std::collections::HashSet::new();
+        for (media_id, season, episode, _pos, _updated) in targets {
+            if !seen_media.insert(media_id) {
+                continue;
+            }
+            let s_opt = if season < 0 { None } else { Some(season as u32) };
+            let e_opt = if episode < 0 { None } else { Some(episode as u32) };
+            let snapshot = {
+                let store = self.state.store.lock();
+                if let Ok(Some(row)) = store.get_ledger_by_unit(media_id, s_opt, e_opt) {
+                    if let Ok(Some(media)) = store.get_media(media_id) {
+                        if crate::http::library::row_visible_to_user(&store, &row, &media, Some(user_id)) {
+                            Some(items::fallback_snapshot(&store, user_id, row, media, false))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(sn) = snapshot {
+                results.push(sn);
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(results)
+    }
     async fn resolve_single_item(
         &self,
         user_id: UserId,

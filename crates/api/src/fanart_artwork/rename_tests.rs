@@ -64,3 +64,78 @@ fn rename_grace_fanart_download_does_not_recreate_parent() {
     assert_eq!(written, 0, "no files should be written to renamed away root");
     assert!(!old.exists(), "old root must not be recreated by fanart");
 }
+
+#[test]
+fn movie_fanart_writes_when_movie_root_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let movie_root = tmp.path().join("Movie (2023)");
+    std::fs::create_dir(&movie_root).unwrap();
+
+    struct SimpleFetch;
+    impl crate::poster_fetch::PosterFetch for SimpleFetch {
+        fn get(&self, _: &str) -> Result<Vec<u8>, String> {
+            Ok(b"movie_logo".to_vec())
+        }
+    }
+
+    let set = FanartSet {
+        logo: Some(super::tests::image("https://example.test/logo.png")),
+        banner: None,
+        thumb: None,
+        season_posters: Vec::new(),
+        season_thumbs: Vec::new(),
+        season_banners: Vec::new(),
+    };
+
+    let written = super::save_fanart_files(&SimpleFetch, &movie_root, &[], &set);
+    assert!(written >= 1, "movie fanart must write when movie root exists, got {written}");
+    assert!(movie_root.join("logo.png").is_file());
+    assert_eq!(std::fs::read(movie_root.join("logo.png")).unwrap(), b"movie_logo");
+}
+
+#[test]
+fn season_poster_checks_its_own_season_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let show = tmp.path().join("Show");
+    let season2 = show.join("Season 2");
+    std::fs::create_dir_all(&season2).unwrap();
+    let s2_video = season2.join("S02E01.strm");
+    std::fs::write(&s2_video, b"stream").unwrap();
+
+    // S1 video is missing (old root was deleted)
+    let s1_missing = show.join("Season 1/S01E01.strm");
+
+    let s1_row = super::tests::ledger_row(s1_missing.to_str().unwrap(), 1);
+    let s2_row = super::tests::ledger_row(s2_video.to_str().unwrap(), 2);
+
+    struct SimpleFetch;
+    impl crate::poster_fetch::PosterFetch for SimpleFetch {
+        fn get(&self, _: &str) -> Result<Vec<u8>, String> {
+            Ok(b"poster_data".to_vec())
+        }
+    }
+
+    fn season_image(url: &str, season: u32) -> media::fanart::FanartImage {
+        media::fanart::FanartImage {
+            url: url.to_string(),
+            lang: None,
+            likes: 0,
+            season: Some(season),
+        }
+    }
+
+    let set = FanartSet {
+        logo: None,
+        banner: None,
+        thumb: None,
+        season_posters: vec![season_image("https://example.test/s1.jpg", 1), season_image("https://example.test/s2.jpg", 2)],
+        season_thumbs: Vec::new(),
+        season_banners: Vec::new(),
+    };
+
+    let written = super::save_fanart_files(&SimpleFetch, &show, &[s1_row, s2_row], &set);
+    // Only season 2 should be written
+    assert!(!show.join("season01-poster.jpg").exists(), "season 1 poster should NOT be written");
+    assert!(show.join("season02-poster.jpg").is_file(), "season 2 poster should be written");
+    assert_eq!(written, 2); // show root season02-poster.jpg + season2/poster.jpg
+}
