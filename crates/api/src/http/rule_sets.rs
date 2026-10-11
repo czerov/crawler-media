@@ -286,7 +286,18 @@ pub(crate) async fn patch_rule_set(
             &error.to_string(),
         );
     }
-    ok(rule_set_json(&filter, false)).into_response()
+    let expected = id.to_string();
+    let is_default = match store.get_setting(settings_keys::DEFAULT_FILTER_ID) {
+        Ok(raw) => raw.as_deref() == Some(expected.as_str()),
+        Err(error) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store.error",
+                &error.to_string(),
+            );
+        }
+    };
+    ok(rule_set_json(&filter, is_default)).into_response()
 }
 
 pub(crate) async fn delete_rule_set(
