@@ -55,3 +55,106 @@ fn removal_cleans_only_owned_rows_and_preserves_files_and_media() {
     assert_eq!(std::fs::read(&path).unwrap(), b"https://example.test/one");
     assert_eq!(store.clean_library_removal(&removal.operation_id).unwrap().removed_ledger_count, 1);
 }
+
+#[test]
+fn removal_cleans_fingerprint_attempts_and_preserves_shared_season_comparison() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("data")).unwrap();
+    let root_a = temp.path().join("tv_a");
+    let root_b = temp.path().join("tv_b");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+    let a = store.create_library(MediaKind::Tv, "A", &[root_a.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    let _b = store.create_library(MediaKind::Tv, "B", &[root_b.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    let media = media();
+    store.insert_media(&media).unwrap();
+    let path_a = root_a.join("E01.strm");
+    let path_b = root_b.join("E01.strm");
+    std::fs::write(&path_a, b"a").unwrap();
+    std::fs::write(&path_b, b"b").unwrap();
+    let a_row = row(media.id, &path_a);
+    let b_row = row(media.id, &path_b);
+    store.insert_ledger(&a_row).unwrap();
+    store.insert_ledger(&b_row).unwrap();
+
+    let attempt = store::StoredFingerprintAttempt {
+        attempt_id: "att-1".into(),
+        job_id: "job-1".into(),
+        ledger_id: a_row.id.to_string(),
+        kind: "intro".into(),
+        window_start_ms: 0,
+        window_end_ms: 10_000,
+        phase: "capture".into(),
+        started_at_ms: 1_000,
+        finished_at_ms: None,
+        status: "running".into(),
+        error_kind: None,
+        metrics_json: "{}".into(),
+    };
+    store.begin_fingerprint_attempt(&attempt).unwrap();
+    assert!(store.get_fingerprint_attempt("att-1").unwrap().is_some());
+
+    // 写入季对比历史：同一 Media、Season 1
+    store.save_season_comparison_digest(&media.id.to_string(), 1, "digest-1", 1000).unwrap();
+
+    let removal = store.begin_library_removal(&a.id).unwrap();
+    store.set_removal_state(&removal.operation_id, "cleaning", None).unwrap();
+    let done = store.clean_library_removal(&removal.operation_id).unwrap();
+    assert_eq!(done.state, "succeeded");
+
+    // a 库的 fingerprint_attempts 应被彻底删除
+    assert!(store.get_fingerprint_attempt("att-1").unwrap().is_none());
+
+    // 因为 b 库依然有同一个 Media 的 Season 1 ledger，所以该季的对比历史应该得以保留！
+    assert!(store.season_comparison_digest(&media.id.to_string(), 1).unwrap().is_some());
+}
+
+#[test]
+fn removal_closes_playback_sessions_for_removed_files_and_preserves_other_library() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("data")).unwrap();
+    let root_a = temp.path().join("tv_a");
+    let root_b = temp.path().join("tv_b");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+    let a = store.create_library(MediaKind::Tv, "A", &[root_a.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    let _b = store.create_library(MediaKind::Tv, "B", &[root_b.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    let media = media();
+    store.insert_media(&media).unwrap();
+
+    let path_a = root_a.join("E01.strm");
+    let a_row = row(media.id, &path_a);
+    store.insert_ledger(&a_row).unwrap();
+
+    let user = domain::UserId::new();
+    let device_a = "device-a";
+    let session = store::SessionRow {
+        device_id: device_a.into(),
+        user_id: user,
+        media_id: media.id,
+        season: Some(1),
+        episode: Some(1),
+        client: Some("web".into()),
+        device_name: Some("browser".into()),
+        client_version: Some("1.0".into()),
+        play_method: "direct".into(),
+        position_ms: 10_000,
+        start_position_ms: 0,
+        duration_ms: Some(100_000),
+        paused: false,
+        watched_ms: 10_000,
+        rate_bps: 0,
+        bytes_sent: 0,
+        connections: 1,
+        admin_ended: false,
+        started_at: 100,
+        last_report_at: 200,
+    };
+    store.upsert_session(&session).unwrap();
+    assert!(store.get_session(user, device_a).unwrap().is_some());
+
+    let removal = store.begin_library_removal(&a.id).unwrap();
+    let closed = store.close_playback_sessions_for_removal(&removal.operation_id).unwrap();
+    assert_eq!(closed, 1);
+    assert!(store.get_session(user, device_a).unwrap().is_none());
+}

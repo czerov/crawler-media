@@ -4,7 +4,9 @@ use axum::http::StatusCode;
 use domain::{Media, MediaId, MediaKind};
 use parking_lot::Mutex;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::{collections::HashMap, sync::Arc};
+use store::Store;
 use tower::ServiceExt;
 
 #[derive(Default)]
@@ -134,6 +136,60 @@ async fn public_scan_recovers_existing_media_from_local_work_alias() {
     );
 }
 
+fn setup_rebind_movies(
+    store: &Store,
+    temp_path: &Path,
+) -> (PathBuf, String, Media, Media, domain::LedgerRow) {
+    let library = store
+        .list_libraries()
+        .unwrap()
+        .into_iter()
+        .find(|lib| lib.kind == MediaKind::Movie)
+        .unwrap();
+    let old = Media {
+        id: MediaId::new(),
+        kind: MediaKind::Movie,
+        title: "旧中文标题".into(),
+        year: Some(2022),
+        original_title: None,
+        tmdb_id: Some("207890".into()),
+        douban_id: None,
+        tvdb_id: None,
+        bangumi_id: None,
+        anilist_id: None,
+    };
+    let mut provisional = old.clone();
+    provisional.id = MediaId::new();
+    provisional.title = "English Name".into();
+    provisional.tmdb_id = None;
+    store.insert_media(&old).unwrap();
+    store.insert_media(&provisional).unwrap();
+    let unrelated = domain::LedgerRow {
+        id: domain::LedgerId::new(),
+        media_id: provisional.id,
+        path: temp_path
+            .join("unrelated/English.Name.2022.mkv")
+            .display()
+            .to_string(),
+        season: None,
+        episode: None,
+        resolution: None,
+        codec: None,
+        hdr: None,
+        quality_source: domain::QualitySource::Release,
+        confidence: domain::Confidence::High,
+        filter_score: None,
+    };
+    store.insert_ledger(&unrelated).unwrap();
+    (
+        library.root_paths[0].clone(),
+        library.id,
+        old,
+        provisional,
+        unrelated,
+    )
+}
+
 #[tokio::test]
 async fn incomplete_nfo_online_alias_rebinds_only_new_scanned_rows() {
     let temp = tempfile::tempdir().unwrap();
@@ -146,58 +202,7 @@ async fn incomplete_nfo_online_alias_rebinds_only_new_scanned_rows() {
         Arc::new(downloader::MemoryDownloader::new(temp.path().join("stage"))),
     );
     let shared = state.store();
-    let (root, id, old, provisional, unrelated) = {
-        let store = shared.lock();
-        let library = store
-            .list_libraries()
-            .unwrap()
-            .into_iter()
-            .find(|lib| lib.kind == MediaKind::Movie)
-            .unwrap();
-        let old = Media {
-            id: MediaId::new(),
-            kind: MediaKind::Movie,
-            title: "旧中文标题".into(),
-            year: Some(2022),
-            original_title: None,
-            tmdb_id: Some("207890".into()),
-            douban_id: None,
-            tvdb_id: None,
-            bangumi_id: None,
-            anilist_id: None,
-        };
-        let mut provisional = old.clone();
-        provisional.id = MediaId::new();
-        provisional.title = "English Name".into();
-        provisional.tmdb_id = None;
-        store.insert_media(&old).unwrap();
-        store.insert_media(&provisional).unwrap();
-        let unrelated = domain::LedgerRow {
-            id: domain::LedgerId::new(),
-            media_id: provisional.id,
-            path: temp
-                .path()
-                .join("unrelated/English.Name.2022.mkv")
-                .display()
-                .to_string(),
-            season: None,
-            episode: None,
-            resolution: None,
-            codec: None,
-            hdr: None,
-            quality_source: domain::QualitySource::Release,
-            confidence: domain::Confidence::High,
-            filter_score: None,
-        };
-        store.insert_ledger(&unrelated).unwrap();
-        (
-            library.root_paths[0].clone(),
-            library.id,
-            old,
-            provisional,
-            unrelated,
-        )
-    };
+    let (root, id, old, provisional, unrelated) = setup_rebind_movies(&shared.lock(), temp.path());
     let mut hit = old.clone();
     hit.title = "English Name".into();
     let catalog = Arc::new(ScanCatalog {
@@ -206,7 +211,7 @@ async fn incomplete_nfo_online_alias_rebinds_only_new_scanned_rows() {
     });
     let state = state.with_catalog(catalog.clone());
     std::fs::create_dir_all(&root).unwrap();
-    let paths = [
+    let paths: [PathBuf; 2] = [
         root.join("English.Name.2022.1080p.strm"),
         root.join("English.Name.2022.720p.strm"),
     ];

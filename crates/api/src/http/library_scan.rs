@@ -68,31 +68,7 @@ pub(crate) fn scan_library_subdir(
         return Ok(());
     }
     if kind == domain::MediaKind::Video {
-        let mut files = Vec::new();
-        walk_video_files(target_dir, &mut files);
-        let inserted = {
-            let store = state.store.lock();
-            lease.control().check().map_err(|e| e.to_string())?;
-            if !store
-                .library_accepts_work(&library_id)
-                .map_err(|e| e.to_string())?
-            {
-                return Err("Library 正在删除".into());
-            }
-            crate::watch_ledger::record_video_paths(&store, files)?
-        };
-        tracing::info!(root = %root.display(), target_dir = %target_dir.display(),
-            inserted = inserted.len(), "实时 Video Library 扫描完成，不进行 Movie/TV 识别");
-        crate::http::library::enqueue_probes_for_paths(state, inserted);
-        let store = state.store.lock();
-        if let Some(library) = store
-            .get_library(&library_id)
-            .map_err(|error| error.to_string())?
-        {
-            crate::http::library::clear_library_cover_checked(&store, &library.id);
-            let _ = crate::http::library::library_cover_path(&store, &library);
-        }
-        return Ok(());
+        return scan_video_subdir(state, target_dir, root, &library_id, &lease);
     }
     let probe = domain::Media {
         id: domain::MediaId::new(),
@@ -137,8 +113,68 @@ pub(crate) fn scan_library_subdir(
         }
         (scan_media, inserted)
     };
+    resolve_and_scrape_subdir(state, scan_media, &inserted, scrape, &lease)?;
+    tracing::info!(
+        root = %root.display(),
+        target_dir = %target_dir.display(),
+        scanned = outcome.transferred.len(),
+        inserted = inserted.len(),
+        "实时目录扫描完成，仅新增台账进入探测队列"
+    );
+    crate::http::library::enqueue_probes_for_paths(state, inserted);
+    {
+        let store = state.store.lock();
+        if let Ok(Some(library)) = store.get_library(&library_id) {
+            crate::http::library::clear_library_cover_checked(&store, &library.id);
+            let _ = crate::http::library::library_cover_path(&store, &library);
+        }
+    }
+    Ok(())
+}
+
+fn scan_video_subdir(
+    state: &ApiState,
+    target_dir: &std::path::Path,
+    root: &std::path::Path,
+    library_id: &str,
+    lease: &crate::library_lifecycle::LibraryWorkLease,
+) -> Result<(), String> {
+    let mut files = Vec::new();
+    walk_video_files(target_dir, &mut files);
+    let inserted = {
+        let store = state.store.lock();
+        lease.control().check().map_err(|e: library::LibraryError| e.to_string())?;
+        if !store
+            .library_accepts_work(library_id)
+            .map_err(|e| e.to_string())?
+        {
+            return Err("Library 正在删除".into());
+        }
+        crate::watch_ledger::record_video_paths(&store, files)?
+    };
+    tracing::info!(root = %root.display(), target_dir = %target_dir.display(),
+        inserted = inserted.len(), "实时 Video Library 扫描完成，不进行 Movie/TV 识别");
+    crate::http::library::enqueue_probes_for_paths(state, inserted);
+    let store = state.store.lock();
+    if let Some(library) = store
+        .get_library(library_id)
+        .map_err(|error| error.to_string())?
+    {
+        crate::http::library::clear_library_cover_checked(&store, &library.id);
+        let _ = crate::http::library::library_cover_path(&store, &library);
+    }
+    Ok(())
+}
+
+fn resolve_and_scrape_subdir(
+    state: &ApiState,
+    scan_media: HashMap<domain::MediaId, (domain::Media, PathBuf)>,
+    inserted: &[PathBuf],
+    scrape: bool,
+    lease: &crate::library_lifecycle::LibraryWorkLease,
+) -> Result<(), String> {
     for (_, (media, path)) in scan_media {
-        lease.control().check().map_err(|e| e.to_string())?;
+        lease.control().check().map_err(|e: library::LibraryError| e.to_string())?;
         if crate::auto_resolve::has_local_scan_metadata(state, &media, &path) {
             continue;
         }
@@ -158,7 +194,7 @@ pub(crate) fn scan_library_subdir(
         };
 
         if let Some(resolved_media) = resolved.as_ref()
-            && let Err(error) = rebind_scan_rows(state, media.id, resolved_media.id, &inserted)
+            && let Err(error) = rebind_scan_rows(state, media.id, resolved_media.id, inserted)
         {
             return Err(error);
         }
@@ -177,21 +213,6 @@ pub(crate) fn scan_library_subdir(
             if let Some(row) = target_row {
                 scrape_library_metadata(state, &resolved_media, &row, &path, &all_rows);
             }
-        }
-    }
-    tracing::info!(
-        root = %root.display(),
-        target_dir = %target_dir.display(),
-        scanned = outcome.transferred.len(),
-        inserted = inserted.len(),
-        "实时目录扫描完成，仅新增台账进入探测队列"
-    );
-    crate::http::library::enqueue_probes_for_paths(state, inserted);
-    {
-        let store = state.store.lock();
-        if let Ok(Some(library)) = store.get_library(&library_id) {
-            crate::http::library::clear_library_cover_checked(&store, &library.id);
-            let _ = crate::http::library::library_cover_path(&store, &library);
         }
     }
     Ok(())

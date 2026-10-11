@@ -59,11 +59,6 @@ pub fn capture_window_controlled(
         }
     };
 
-    let pcm_duration_calc = |samples: u64| -> Option<i64> {
-        // 16000 samples per second = 16 samples per millisecond
-        Some((samples / 16) as i64)
-    };
-
     let run_res = run_ffmpeg_with_deadline(
         &mut child,
         &mut fingerprinter,
@@ -76,6 +71,16 @@ pub fn capture_window_controlled(
     fingerprinter.finish();
     timings.chromaprint_finish_ms = finish_started.elapsed().as_millis();
 
+    finish_captured_fingerprint(request, run_res, &mut fingerprinter, timings, started)
+}
+
+fn finish_captured_fingerprint(
+    request: &CaptureRequest,
+    run_res: Result<(), CaptureFailure>,
+    fingerprinter: &mut Fingerprinter,
+    timings: ExtractionTimings,
+    started: Instant,
+) -> Result<CapturedFingerprint, CaptureFailure> {
     let source = match ProbeTarget::from_path(&request.path) {
         ProbeTarget::Local(_) => "local",
         ProbeTarget::Remote(_) => "remote",
@@ -121,7 +126,7 @@ pub fn capture_window_controlled(
             Ok(CapturedFingerprint {
                 window: request.window.clone(),
                 words,
-                pcm_duration_ms: pcm_duration_calc(timings.sample_count),
+                pcm_duration_ms: Some((timings.sample_count / 16) as i64),
                 metrics,
             })
         }

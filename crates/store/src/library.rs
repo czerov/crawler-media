@@ -446,6 +446,10 @@ pub(crate) fn delete_file_meta_for_ledger(
         "DELETE FROM fingerprint_cache WHERE ledger_id = ?1",
         [ledger_id],
     )?;
+    tx.execute(
+        "DELETE FROM fingerprint_attempts WHERE ledger_id = ?1",
+        [ledger_id],
+    )?;
     super::probe_state::delete_probe_stages_for_ledger(tx, ledger_id)?;
     super::fingerprint_samples::delete_samples_for_ledger(tx, ledger_id)
 }

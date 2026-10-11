@@ -213,6 +213,7 @@ impl Store {
                     .any(|(a, b)| a.zip(b).is_some_and(|(a, b)| a == b))
             })
             .collect();
+        let has_incoming_alias = aliases(&incoming).iter().any(Option::is_some);
         let existing = if external.len() > 1 {
             return Err(identity_conflict(&incoming));
         } else if let Some(existing) = external.first() {
@@ -220,12 +221,14 @@ impl Store {
                 return Err(identity_conflict(&incoming));
             }
             Some(*existing)
-        } else {
+        } else if let Some(same_id) = candidates.iter().find(|existing| existing.id == incoming.id) {
+            Some(same_id)
+        } else if !has_incoming_alias {
             let titles: Vec<_> = candidates
                 .iter()
                 .filter(|existing| {
                     existing.title == incoming.title
-                        && incoming.year.is_none_or(|year| existing.year == Some(year))
+                        && incoming.year == existing.year
                         && !aliases_conflict(existing, &incoming)
                 })
                 .collect();
@@ -233,6 +236,8 @@ impl Store {
                 return Err(identity_conflict(&incoming));
             }
             titles.first().copied()
+        } else {
+            None
         };
         if let Some(existing) = existing {
             let mut canonical = existing.clone();

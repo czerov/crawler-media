@@ -57,13 +57,26 @@ async fn drain_removal(state: &ApiState, operation_id: &str) -> Result<(), Strin
         store.set_removal_state(operation_id, "draining", None).map_err(|e| e.to_string())?;
         (operation.library_id, store.removal_ledger_ids(operation_id).map_err(|e| e.to_string())?)
     };
+    tracing::info!(%operation_id, %library_id, total_ledgers = ledger_ids.len(), "开始排空 Library 关联任务与活跃会话");
     state.library_work.cancel(&library_id);
     state.probe.cancel_ledger_work(&ledger_ids, "Library removed").map_err(|e| e.to_string())?;
-    tokio::time::timeout(std::time::Duration::from_secs(30), state.library_work.wait_idle(&library_id))
-        .await.map_err(|_| "Library work did not stop within 30 seconds".to_string())?;
+
+    {
+        let store = state.store.lock();
+        if let Err(error) = store.close_playback_sessions_for_removal(operation_id) {
+            tracing::warn!(%operation_id, %library_id, %error, "关闭待删除库播放会话时出现警告");
+        }
+    }
+
+    if let Err(_) = tokio::time::timeout(std::time::Duration::from_secs(30), state.library_work.wait_idle(&library_id)).await {
+        tracing::error!(%operation_id, %library_id, "等待 Library 工作租约释放超时 (30s)，删除操作失败并保持冻结");
+        return Err("Library work did not stop within 30 seconds".to_string());
+    }
+    tracing::info!(%operation_id, %library_id, "Library 任务已全部排空，进入清理阶段");
     let store = state.store.lock();
     store.set_removal_state(operation_id, "cleaning", None).map_err(|e| e.to_string())?;
     store.clean_library_removal(operation_id).map_err(|e| e.to_string())?;
+    tracing::info!(%operation_id, %library_id, "Library 索引清理完成，删除操作成功");
     Ok(())
 }
 
@@ -71,6 +84,11 @@ pub fn resume_library_removals(state: &ApiState) -> Result<(), String> {
     let operations = state.store.lock().pending_library_removals().map_err(|e| e.to_string())?;
     for operation in operations {
         state.library_work.cancel(&operation.library_id);
+        if operation.state == "failed" {
+            tracing::warn!(operation_id = %operation.operation_id, library_id = %operation.library_id,
+                "Library 删除此前已失败，重启后保持冻结状态，等待手动重试");
+            continue;
+        }
         start_library_removal(state, &operation.library_id)?;
     }
     Ok(())

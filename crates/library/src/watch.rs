@@ -146,7 +146,7 @@ fn identify_local(
 
 fn in_place(job: &WatchJob, kind: MediaKind) -> Result<WatchOutcome, LibraryError> {
     let mut outcome = WatchOutcome::default();
-    walk_in_place(&job.path, &job.path, kind, job.scrape, &mut outcome)?;
+    walk_in_place(&job.path, &job.library_root, kind, job.scrape, &mut outcome)?;
     Ok(outcome)
 }
 

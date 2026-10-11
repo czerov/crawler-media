@@ -340,16 +340,82 @@ impl Store {
             tx.execute("DELETE FROM ledger WHERE id=?1", [&row.ledger_id])?;
         }
         for row in &snapshot.rows {
-            tx.execute("DELETE FROM media_markers WHERE media_id=?1 AND season IS ?2 AND episode IS ?3
-                AND NOT EXISTS (SELECT 1 FROM ledger WHERE media_id=?1 AND season IS ?2 AND episode IS ?3)",
-                params![row.media_id, row.season, row.episode])?;
             tx.execute(
-                "DELETE FROM probe_season_comparison_history WHERE media_id=?1 AND season=?2",
-                params![row.media_id, row.season.unwrap_or(1)],
+                "DELETE FROM media_markers WHERE media_id=?1 AND season IS ?2 AND episode IS ?3
+                 AND NOT EXISTS (SELECT 1 FROM ledger WHERE media_id=?1 AND season IS ?2 AND episode IS ?3)",
+                params![row.media_id, row.season, row.episode],
             )?;
+            if let Some(season) = row.season {
+                tx.execute(
+                    "DELETE FROM probe_season_comparison_history WHERE media_id=?1 AND season=?2
+                     AND NOT EXISTS (SELECT 1 FROM ledger WHERE media_id=?1 AND season=?2)",
+                    params![row.media_id, season],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Close active playback sessions matching files being removed, preserving last progress.
+    /// Sessions for the same Media hosted in another active Library are unaffected.
+    pub fn close_playback_sessions_for_removal(&self, id: &str) -> Result<usize, StoreError> {
+        let snapshot = self.removal_snapshot(id)?;
+        if snapshot.rows.is_empty() {
+            return Ok(0);
+        }
+        let removal_ledger_ids: std::collections::HashSet<&str> =
+            snapshot.rows.iter().map(|r| r.ledger_id.as_str()).collect();
+
+        let mut session_stmt = self.subscribe.prepare(
+            "SELECT user_id, device_id, media_id, season, episode FROM playback_sessions",
+        )?;
+        let sessions = session_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i32>>(3)?,
+                    row.get::<_, Option<i32>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut closed = 0;
+        let now = crate::unix_now();
+        for (user_id_str, device_id, media_id, season, episode) in sessions {
+            let in_snapshot = snapshot.rows.iter().any(|r| {
+                r.media_id == media_id
+                    && r.season.map(|s| s as i32) == season
+                    && r.episode.map(|e| e as i32) == episode
+            });
+            if !in_snapshot {
+                continue;
+            }
+
+            let mut ledger_stmt = self.library.prepare(
+                "SELECT id FROM ledger WHERE media_id=?1 AND season IS ?2 AND episode IS ?3",
+            )?;
+            let other_exists = ledger_stmt
+                .query_map(params![media_id, season, episode], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .filter_map(Result::ok)
+                .any(|id| !removal_ledger_ids.contains(id.as_str()));
+
+            if other_exists {
+                continue;
+            }
+
+            if let Ok(user_id) = user_id_str.parse::<domain::UserId>() {
+                if self.close_session(user_id, &device_id, now)?.is_some() {
+                    tracing::info!(%device_id, %media_id, "已关闭待删除媒体库相关的活跃播放会话");
+                    closed += 1;
+                }
+            }
+        }
+        Ok(closed)
     }
 }
 

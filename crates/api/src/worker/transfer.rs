@@ -113,6 +113,31 @@ struct TransferPlan {
     nfo: bool,
 }
 
+fn filter_matched_pending(
+    subscribe: &Subscribe,
+    media: &Media,
+    pending: Vec<(i32, crate::store::PendingDownload)>,
+) -> Vec<ScoredTorrent> {
+    pending
+        .into_iter()
+        .filter_map(|(score, pending)| {
+            let release = pending
+                .release_override
+                .unwrap_or_else(|| release::parse(&pending.torrent.title));
+            if !subscribe::candidate_matches_subscribe(subscribe, media, &release) {
+                tracing::error!(subscribe_id = %subscribe.id, media = %media.title,
+                    torrent = %pending.torrent.title, "拒绝转存与订阅不匹配的待处理种子");
+                return None;
+            }
+            Some(ScoredTorrent {
+                release,
+                torrent: pending.torrent,
+                score,
+            })
+        })
+        .collect()
+}
+
 fn build_added_input<'a>(
     input: RunInput<'a, crate::delivery::RoutedDownloader<'a>>,
     chosen: Vec<ScoredTorrent>,
@@ -209,24 +234,7 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
 
     let (media, filter, facts, wash_filter) = load_transfer_context(state, &subscribe)?;
     let routed = crate::delivery::RoutedDownloader::with_pending(state, &subscribe, &pending);
-    let chosen: Vec<ScoredTorrent> = pending
-        .into_iter()
-        .filter_map(|(score, pending)| {
-            let release = pending
-                .release_override
-                .unwrap_or_else(|| release::parse(&pending.torrent.title));
-            if !subscribe::candidate_matches_subscribe(&subscribe, &media, &release) {
-                tracing::error!(subscribe_id = %subscribe.id, media = %media.title,
-                    torrent = %pending.torrent.title, "拒绝转存与订阅不匹配的待处理种子");
-                return None;
-            }
-            Some(ScoredTorrent {
-                release,
-                torrent: pending.torrent,
-                score,
-            })
-        })
-        .collect();
+    let chosen = filter_matched_pending(&subscribe, &media, pending);
 
     let plan = resolve_transfer_plan(state, &media, &subscribe)?;
     let library_lease = state.acquire_library_work(&plan.library_id)?;

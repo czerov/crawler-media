@@ -90,3 +90,30 @@ fn title_only_recovery_requires_unique_candidate() {
         Err(StoreError::Protected(_))
     ));
 }
+
+#[test]
+fn missing_year_incoming_does_not_merge_into_existing_with_year() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path()).unwrap();
+    let old = media("Same", Some("1"));
+    store.insert_media(&old).unwrap();
+
+    let mut incoming_no_year = media("Same", None);
+    incoming_no_year.year = None;
+    let resolved = store.resolve_scanned_media(incoming_no_year).unwrap();
+    assert_ne!(resolved.id, old.id);
+}
+
+#[test]
+fn incoming_with_different_alias_provider_does_not_merge_by_title() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path()).unwrap();
+    let mut old = media("Same", None);
+    old.douban_id = Some("douban-123".into());
+    store.insert_media(&old).unwrap();
+
+    let mut incoming = media("Same", None);
+    incoming.tmdb_id = Some("tmdb-456".into());
+    let resolved = store.resolve_scanned_media(incoming).unwrap();
+    assert_ne!(resolved.id, old.id);
+}
