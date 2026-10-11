@@ -55,6 +55,15 @@ impl Catalog for OfflineCatalog {
         self.reject(format!("poster:{id}"))
     }
 }
+struct OnlineCatalog(media::CatalogHit);
+impl Catalog for OnlineCatalog {
+    fn search_movie(&self, _: &str) -> Result<Vec<media::CatalogHit>, String> { Ok(vec![self.0.clone()]) }
+    fn search_tv(&self, _: &str) -> Result<Vec<media::CatalogHit>, String> { Ok(vec![]) }
+    fn popular_movie(&self) -> Result<Vec<media::CatalogHit>, String> { Ok(vec![]) }
+    fn popular_tv(&self) -> Result<Vec<media::CatalogHit>, String> { Ok(vec![]) }
+    fn details(&self, _: MediaKind, _: &str) -> Result<Option<Media>, String> { Ok(None) }
+}
+
 struct NoFetch;
 impl Fetcher for NoFetch {
     fn fetch(&self, _: &FetchRequest) -> Result<String, IndexerError> {
@@ -504,6 +513,46 @@ fn tv_delete_reimport_preserves_two_users_and_independent_same_media() {
 #[test]
 fn movie_delete_reimport_preserves_whole_movie_progress() {
     run_reimport(MediaKind::Movie, "207890", true);
+}
+
+#[test]
+fn online_identity_rebind_succeeds_when_reimported_library_reuses_removed_root() {
+    let mut fixture = Fixture::new(MediaKind::Movie, "207890");
+    let app = api::router(fixture.state.clone());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            remove(&fixture, &app).await;
+            let created = call(
+                &app,
+                "POST",
+                "/api/v1/libraries",
+                json!({"kind":"movie", "name":"Recreated", "root_paths":[fixture.root]}),
+                StatusCode::OK,
+            ).await;
+            let library_id = created["id"].as_str().unwrap();
+            let hit = media::CatalogHit {
+                media: Media {
+                    id: MediaId::new(), kind: MediaKind::Movie, title: "Different filename title".into(),
+                    year: Some(2022), original_title: None, tmdb_id: Some("207890".into()),
+                    douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None,
+                },
+                poster_path: None, backdrop_path: None, rating: None, overview: None,
+            };
+            fixture.state = fixture.state.clone().with_catalog(Arc::new(OnlineCatalog(hit)));
+            let app = api::router(fixture.state.clone());
+            call(&app, "POST", &format!("/api/v1/libraries/{library_id}/scan"), Value::Null, StatusCode::OK).await;
+            let shared = fixture.state.store();
+            let store = shared.lock();
+            let row = store.ledger_by_path(&fixture.old.path).unwrap().unwrap();
+            assert_eq!(row.media_id, fixture.old.media_id);
+            for user in fixture.users {
+                assert_eq!(store.unit_state(user, row.media_id, 0, 0).unwrap().unwrap().position_ms,
+                    if user == fixture.users[0] { 750_000 } else { 120_000 });
+            }
+        });
 }
 #[test]
 fn different_nfo_alias_does_not_restore_old_progress() {

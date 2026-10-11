@@ -86,7 +86,7 @@ pub fn run(state: &ApiState) -> Result<(), String> {
         crate::watch_ledger::record_paths(&store, transferred.clone())?
     };
 
-    finish_intake_metadata(state, &transferred, inserted, &movie_lease, tv_lease.as_ref())?;
+    finish_intake_metadata(state, &transferred, inserted, &movie_lease, tv_lease.as_ref(), nfo)?;
     if !outcome.errors.is_empty() {
         let err_msgs: Vec<String> = outcome
             .errors
@@ -108,6 +108,7 @@ fn finish_intake_metadata(
     inserted: Vec<PathBuf>,
     movie_lease: &crate::library_lifecycle::LibraryWorkLease,
     tv_lease: Option<&crate::library_lifecycle::LibraryWorkLease>,
+    nfo: bool,
 ) -> Result<(), String> {
     // 为没有 TMDB ID 的影视条目自动匹配 TMDB 元数据与海报
     let unresolved_media = {
@@ -133,14 +134,7 @@ fn finish_intake_metadata(
         } else {
             media
         };
-        let nfo_enabled = state
-            .store
-            .lock()
-            .get_scrape_config()
-            .ok()
-            .map(|config| config.effective.mirror_nfo)
-            .unwrap_or(true);
-        if nfo_enabled && active_media.tmdb_id.is_some() {
+        if nfo && active_media.tmdb_id.is_some() {
             let _ = crate::poster_fetch::attach_poster(state, &active_media, &dest);
             let _ = crate::poster_fetch::attach_backdrop(state, &active_media, &dest);
             crate::auto_resolve::write_resolved_nfo(state, &active_media, &dest);

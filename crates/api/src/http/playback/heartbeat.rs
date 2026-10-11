@@ -182,13 +182,29 @@ fn next_session(
     }
 }
 
+fn heartbeat_matches_row(heartbeat: &Heartbeat<'_>, row: &domain::LedgerRow) -> bool {
+    row.media_id == heartbeat.media_id
+        && row.season.map(|value| value as i32) == (heartbeat.season != UNIT_WHOLE).then_some(heartbeat.season)
+        && row.episode.map(|value| value as i32) == (heartbeat.episode != UNIT_WHOLE).then_some(heartbeat.episode)
+}
+
 fn persist_heartbeat(
     store: &crate::Store,
     heartbeat: &Heartbeat<'_>,
     device: &str,
 ) -> Result<(UnitState, bool), StoreError> {
-    // 验证目标所属媒体库未处于删除冻结中且台账未被清理，防止已删除文件在心跳中复活或篡改观看数据
+    // The row may have been canonically rebound after initial selection. Never
+    // persist an event against the stale Media/unit captured by that selection.
     if let Some(row) = store.get_ledger(&heartbeat.ledger_id)? {
+        if !heartbeat_matches_row(heartbeat, &row) {
+            tracing::warn!(ledger_id = %heartbeat.ledger_id, media_id = %heartbeat.media_id,
+                "Ignoring stale Playback heartbeat after ledger identity changed");
+            return Ok((
+                store.unit_state(heartbeat.user_id, heartbeat.media_id, heartbeat.season, heartbeat.episode)?
+                    .unwrap_or_default(),
+                true,
+            ));
+        }
         if let Some(owner) = store.library_for_path_strict(std::path::Path::new(&row.path), heartbeat.kind)? {
             if !store.library_accepts_work(&owner.id)? {
                 return Ok((
@@ -241,5 +257,43 @@ fn apply_heartbeat(store: &crate::Store, heartbeat: &Heartbeat<'_>, device: &str
     match store.playback_write(|store| persist_heartbeat(store, heartbeat, device)) {
         Ok((unit, ended)) => ok(watch_state_json(&unit, ended)).into_response(),
         Err(error) => persistence_error(&error, heartbeat.user_id, device),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_heartbeat_after_canonical_rebind_does_not_write_old_media() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(temp.path()).unwrap();
+        let library = store.list_libraries().unwrap().into_iter()
+            .find(|library| library.kind == domain::MediaKind::Movie).unwrap();
+        let provisional = domain::Media { id: domain::MediaId::new(), kind: domain::MediaKind::Movie,
+            title: "provisional".into(), year: None, original_title: None, tmdb_id: None,
+            douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None };
+        let canonical = domain::Media { id: domain::MediaId::new(), kind: domain::MediaKind::Movie,
+            title: "canonical".into(), year: None, original_title: None, tmdb_id: Some("123".into()),
+            douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None };
+        store.insert_media(&provisional).unwrap();
+        store.insert_media(&canonical).unwrap();
+        let ledger = domain::LedgerRow { id: domain::LedgerId::new(), media_id: provisional.id,
+            path: library.root_paths[0].join("movie.mkv").display().to_string(), season: None, episode: None,
+            resolution: None, codec: None, hdr: None, quality_source: domain::QualitySource::Probe,
+            confidence: domain::Confidence::High, filter_score: None };
+        store.insert_ledger(&ledger).unwrap();
+        store.rebind_scanned_ledger(ledger.id, canonical.id).unwrap();
+        let user_id = domain::UserId::new();
+        let body = serde_json::json!({"event":"start", "position_ms":500, "device_id":"race"});
+        let heartbeat = Heartbeat { body: &body, user_id, media_id: provisional.id,
+            kind: domain::MediaKind::Movie, ledger_id: ledger.id.to_string(),
+            season: UNIT_WHOLE, episode: UNIT_WHOLE, duration_ms: Some(1000), now: 10 };
+
+        let (_, ended) = persist_heartbeat(&store, &heartbeat, "race").unwrap();
+
+        assert!(ended);
+        assert!(store.unit_state(user_id, provisional.id, UNIT_WHOLE, UNIT_WHOLE).unwrap().is_none());
+        assert!(store.get_session(user_id, "race").unwrap().is_none());
     }
 }

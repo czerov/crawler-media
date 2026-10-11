@@ -314,7 +314,7 @@ async fn watch_scrape_job_rebinds_incoming_rows_to_canonical_media_identity() {
     let tmp = tempfile::tempdir().unwrap();
     let old_canonical = domain::Media {
         id: domain::MediaId::new(),
-        kind: domain::MediaKind::Movie,
+        kind: domain::MediaKind::Tv,
         title: "Canonical Orbit".into(),
         year: Some(2022),
         original_title: None,
@@ -326,18 +326,22 @@ async fn watch_scrape_job_rebinds_incoming_rows_to_canonical_media_identity() {
     };
     struct OrbitCatalog(media::CatalogHit);
     impl api::catalog::Catalog for OrbitCatalog {
-        fn search_movie(&self, _query: &str) -> Result<Vec<media::CatalogHit>, String> {
-            Ok(vec![self.0.clone()])
-        }
-        fn search_tv(&self, _query: &str) -> Result<Vec<media::CatalogHit>, String> { Ok(Vec::new()) }
+        fn search_movie(&self, _query: &str) -> Result<Vec<media::CatalogHit>, String> { Ok(Vec::new()) }
+        fn search_tv(&self, _query: &str) -> Result<Vec<media::CatalogHit>, String> { Ok(vec![self.0.clone()]) }
         fn popular_movie(&self) -> Result<Vec<media::CatalogHit>, String> { Ok(Vec::new()) }
         fn popular_tv(&self) -> Result<Vec<media::CatalogHit>, String> { Ok(Vec::new()) }
-        fn details(&self, _kind: domain::MediaKind, _id: &str) -> Result<Option<domain::Media>, String> { Ok(None) }
+        fn details(&self, _kind: domain::MediaKind, _id: &str) -> Result<Option<domain::Media>, String> { Ok(Some(self.0.media.clone())) }
+        fn metadata(&self, _kind: domain::MediaKind, _id: &str) -> Result<Option<media::ItemMeta>, String> {
+            Ok(Some(media::ItemMeta { overview: Some("Show summary".into()), ..Default::default() }))
+        }
+        fn season_details(&self, _id: &str, season: u32) -> Result<Vec<media::EpisodeMeta>, String> {
+            Ok(vec![media::EpisodeMeta { episode_number: 1, name: Some("Pilot Episode".into()), overview: Some("Episode summary".into()), ..Default::default() }])
+        }
     }
     let hit = media::CatalogHit {
         media: domain::Media {
             id: domain::MediaId::new(),
-            kind: domain::MediaKind::Movie,
+            kind: domain::MediaKind::Tv,
             title: "Orbit".into(),
             year: Some(2022),
             original_title: None,
@@ -366,19 +370,30 @@ async fn watch_scrape_job_rebinds_incoming_rows_to_canonical_media_identity() {
     state.store().lock().insert_media(&old_canonical).unwrap();
     let app = router(state.clone());
 
-    let watch = tmp.path().join("inplace");
-    std::fs::create_dir_all(&watch).unwrap();
-    let video = watch.join("Orbit.2022.1080p.mkv");
-    std::fs::write(&video, b"orbit video").unwrap();
-
-    put_inplace(&app, &tmp, &watch).await;
+    let watch = tmp.path().join("extra-tv");
+    let watch_season = watch.join("Orbit").join("Season 1");
+    std::fs::create_dir_all(&watch_season).unwrap();
+    let video = watch_season.join("Orbit.S01E01.1080p.mkv");
+    std::fs::write(&video, b"orbit episode").unwrap();
+    std::fs::write(watch.join("Orbit/tvshow.nfo"), b"<tvshow><title>Orbit</title></tvshow>").unwrap();
+    let directory = app.clone().oneshot(request("PUT", "/api/v1/directory", Some("management-secret"), json!({
+        "movie_root":tmp.path().join("data/library/movies").display().to_string(),
+        "tv_root":tmp.path().join("data/library/tv").display().to_string(),
+        "transfer_mode":"hardlink", "movie_naming":"{title} ({year})/{title}{ext}",
+        "tv_naming":"{title} - {season_episode}{ext}", "scrape":true,
+        "watch_inplace":tmp.path().join("empty-watch").display().to_string()
+    }))).await.unwrap();
+    assert_eq!(directory.status(), StatusCode::OK);
+    let added = app.clone().oneshot(request("POST", "/api/v1/directory/roots", Some("management-secret"), json!({
+        "kind":"tv", "path":watch.display().to_string()
+    }))).await.unwrap();
+    assert_eq!(added.status(), StatusCode::CREATED);
     tick(&app, 1).await;
 
     let store_arc = state.store();
     let store = store_arc.lock();
-    let row = store
-        .ledger_by_path(&video.display().to_string())
-        .unwrap()
-        .expect("scanned ledger should exist via watch inplace job");
-    assert_eq!(row.media_id, old_canonical.id, "通过真实 watch_inplace 任务扫描的文件台账必须重绑到已有 canonical Media");
+    let row = store.ledger_by_path(&video.display().to_string()).unwrap().expect("watch job inserts the new episode");
+    assert_eq!(row.media_id, old_canonical.id, "TV episode ledger should use the retained canonical Media");
+    let episode_nfo = std::fs::read_to_string(video.with_extension("nfo")).expect("new episode NFO is published");
+    assert!(episode_nfo.contains("Pilot Episode"), "episode NFO must use fetched canonical episode metadata: {episode_nfo}");
 }
