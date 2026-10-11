@@ -802,24 +802,9 @@ async fn shows_next_up(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let series = state
-        .provider
-        .list_visible_items(user.id, None)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    let target_series_id = query.series_id.as_deref().map(|s| s.replace('-', ""));
     let mut next_up = Vec::new();
-    for show in series
-        .iter()
-        .filter(|item| item.media.kind == domain::MediaKind::Tv && item.is_series)
-    {
-        let series_id = show.media.id.to_string().replace('-', "");
-        if let Some(target) = &target_series_id {
-            if !series_id.eq_ignore_ascii_case(target) {
-                continue;
-            }
-        }
+    if let Some(series_id) = query.series_id.as_deref().map(|s| s.replace('-', "")) {
         let mut episodes = state
             .provider
             .list_visible_items(user.id, Some(&series_id))
@@ -833,6 +818,32 @@ async fn shows_next_up(
         });
         if let Some(episode) = episodes.into_iter().find(|item| !item.played) {
             next_up.push(item_dto_json(episode));
+        }
+    } else {
+        let series = state
+            .provider
+            .list_visible_items(user.id, None)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        for show in series
+            .iter()
+            .filter(|item| item.media.kind == domain::MediaKind::Tv && item.is_series)
+        {
+            let series_id = show.media.id.to_string().replace('-', "");
+            let mut episodes = state
+                .provider
+                .list_visible_items(user.id, Some(&series_id))
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            episodes.sort_by_key(|item| {
+                (
+                    item.row.season.unwrap_or_default(),
+                    item.row.episode.unwrap_or_default(),
+                )
+            });
+            if let Some(episode) = episodes.into_iter().find(|item| !item.played) {
+                next_up.push(item_dto_json(episode));
+            }
         }
     }
     let total = next_up.len();
@@ -860,7 +871,7 @@ async fn show_seasons(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut season_numbers: std::collections::BTreeSet<u32> = episodes
-        .into_iter()
+        .iter()
         .map(|episode| episode.row.season.unwrap_or(1))
         .collect();
     if season_numbers.is_empty() {
@@ -870,21 +881,18 @@ async fn show_seasons(
     let mut seasons_json: Vec<Value> = Vec::new();
     for season_num in season_numbers {
         let season_id = format!("{compact_id}{season_num:02}");
-        let user_data = state
-            .provider
-            .resolve_user_item_data(user.id, &season_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|data| data.json_value())
-            .unwrap_or_else(|| {
-                json!({
-                    "PlaybackPositionTicks": 0,
-                    "PlayCount": 0,
-                    "IsFavorite": false,
-                    "Played": false,
-                })
-            });
+        let season_episodes: Vec<&crate::provider::MediaItemSnapshot> = episodes.iter().filter(|e| e.row.season == Some(season_num)).collect();
+        let played_count = season_episodes.iter().filter(|e| e.played).count();
+        let season_total = season_episodes.len();
+        let unplayed = season_total.saturating_sub(played_count);
+        let user_data = json!({
+            "PlaybackPositionTicks": 0,
+            "PlayCount": 0,
+            "IsFavorite": false,
+            "Played": season_total > 0 && unplayed == 0,
+            "UnplayedItemCount": unplayed,
+            "PlayedPercentage": if season_total > 0 { played_count as f64 / season_total as f64 * 100.0 } else { 0.0 },
+        });
         let primary_tag = item.metadata.primary_image_tag.clone();
         seasons_json.push(json!({
             "Id": season_id,

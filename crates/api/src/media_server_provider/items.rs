@@ -15,14 +15,15 @@ pub(super) fn resolve_fallback_item(
         return None;
     }
     let media = store.get_media(row.media_id).ok().flatten()?;
-    Some(fallback_snapshot(&store, user_id, row, media))
+    Some(fallback_snapshot(&store, user_id, row, media, false))
 }
 
-fn fallback_snapshot(
+pub(super) fn fallback_snapshot(
     store: &crate::Store,
     user_id: UserId,
     row: domain::LedgerRow,
     media: domain::Media,
+    is_series: bool,
 ) -> MediaItemSnapshot {
     let marker = store
         .get_media_marker(row.media_id, row.season, row.episode)
@@ -56,14 +57,14 @@ fn fallback_snapshot(
         ),
         unplayed_item_count: None,
         metadata: with_date_created(
-            item_metadata(store, user_id, &row, &media, false, None),
+            item_metadata(store, user_id, &row, &media, is_series, None),
             file_date_created(&row.path),
         ),
         row,
         media,
         ticks,
         parent_id,
-        is_series: false,
+        is_series,
         chapters,
         intro_start_ms: marker.as_ref().and_then(|item| item.intro_start_ms),
         intro_end_ms: marker.as_ref().and_then(|item| item.intro_end_ms),

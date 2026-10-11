@@ -199,17 +199,26 @@ impl MediaServerProvider for ApiServerProvider {
         user_id: UserId,
         id: &str,
     ) -> Result<Option<MediaItemSnapshot>, String> {
-        let items = self.list_visible_items(user_id, None).await?;
         let compact_id = id.replace('-', "");
-        for it in items {
-            let target = if it.is_series {
-                it.media.id.to_string().replace('-', "")
+        let direct = {
+            let store = self.state.store.lock();
+            let row = crate::http::media_visibility::resolve_visible_row(&store, id, Some(user_id));
+            if let Some(row) = row {
+                if let Ok(Some(media)) = store.get_media(row.media_id) {
+                    let is_series = media.kind == MediaKind::Tv
+                        && (compact_id == media.id.to_string().replace('-', "")
+                            || id == media.id.to_string());
+                    Some(items::fallback_snapshot(&store, user_id, row, media, is_series))
+                } else {
+                    None
+                }
             } else {
-                it.row.id.to_string().replace('-', "")
-            };
-            if compact_id == target || id == target || id == it.media.id.to_string() {
-                return Ok(Some(self.enrich_single_item(it).await));
+                None
             }
+        };
+
+        if let Some(snapshot) = direct {
+            return Ok(Some(self.enrich_single_item(snapshot).await));
         }
 
         let fallback = resolve_fallback_item(&self.state, user_id, id, &compact_id);
