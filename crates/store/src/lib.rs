@@ -1,6 +1,7 @@
 //! System-of-record store for crawler-media (ADR-0008).
 //! Backed by 4 SQLite files in the data directory.
 
+mod app_write;
 mod catalog;
 mod collections;
 mod downloaders;

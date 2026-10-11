@@ -45,31 +45,43 @@ impl ScrapeStoreExt for Store {
     /// fields. Empty fields stay "follow default".
     fn set_legacy_naming(&self, kind: domain::MediaKind, pattern: &str) -> Result<(), StoreError> {
         let mut setting = self.get_scrape_config()?.setting;
-        let segments: Vec<&str> = pattern.split('/').collect();
-        match kind {
-            domain::MediaKind::Movie | domain::MediaKind::Video => match segments.as_slice() {
-                [entry, file] => {
-                    setting.naming_entry_dir = entry.trim().to_string();
-                    setting.naming_movie_file = file.trim().to_string();
-                }
-                [file] => setting.naming_movie_file = file.trim().to_string(),
-                _ => setting.naming_movie_file = pattern.to_string(),
-            },
-            domain::MediaKind::Tv => match segments.as_slice() {
-                [entry, season, file] => {
-                    setting.naming_entry_dir = entry.trim().to_string();
-                    setting.naming_season_dir = season.trim().to_string();
-                    setting.naming_episode_file = file.trim().to_string();
-                }
-                [entry, file] => {
-                    setting.naming_entry_dir = entry.trim().to_string();
-                    setting.naming_episode_file = file.trim().to_string();
-                }
-                [file] => setting.naming_episode_file = file.trim().to_string(),
-                _ => setting.naming_episode_file = pattern.to_string(),
-            },
-        }
+        apply_legacy_naming(&mut setting, kind, pattern);
         self.save_scrape_config(&setting)?;
         Ok(())
+    }
+}
+
+/// Decompose an old-style composed pattern (may contain `/` hierarchy) back
+/// into the four scrape-config template fields. Pure: no IO. Empty fields stay
+/// "follow default"; the entry segment is shared, so a later TV call overrides
+/// what a Movie call set (kept behavior, not a naming-rule change).
+pub(crate) fn apply_legacy_naming(
+    setting: &mut ScrapeConfigSetting,
+    kind: domain::MediaKind,
+    pattern: &str,
+) {
+    let segments: Vec<&str> = pattern.split('/').collect();
+    match kind {
+        domain::MediaKind::Movie | domain::MediaKind::Video => match segments.as_slice() {
+            [entry, file] => {
+                setting.naming_entry_dir = entry.trim().to_string();
+                setting.naming_movie_file = file.trim().to_string();
+            }
+            [file] => setting.naming_movie_file = file.trim().to_string(),
+            _ => setting.naming_movie_file = pattern.to_string(),
+        },
+        domain::MediaKind::Tv => match segments.as_slice() {
+            [entry, season, file] => {
+                setting.naming_entry_dir = entry.trim().to_string();
+                setting.naming_season_dir = season.trim().to_string();
+                setting.naming_episode_file = file.trim().to_string();
+            }
+            [entry, file] => {
+                setting.naming_entry_dir = entry.trim().to_string();
+                setting.naming_episode_file = file.trim().to_string();
+            }
+            [file] => setting.naming_episode_file = file.trim().to_string(),
+            _ => setting.naming_episode_file = pattern.to_string(),
+        },
     }
 }

@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use crate::http::{err, ok};
 use crate::management::ApiState;
-use crate::scrape_store::ScrapeStoreExt;
+use crate::scrape_store::{ScrapeStoreExt, apply_legacy_naming};
 
 #[derive(Deserialize)]
 pub(crate) struct DirectoryInput {
@@ -84,65 +84,31 @@ pub(crate) async fn put_directory(
         );
     }
     let store = state.store.lock();
-    if let Err(error) = store.set_library_root(MediaKind::Movie, body.movie_root.trim()) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store.error",
-            &error.to_string(),
-        );
-    }
-    if let Err(error) = store.set_library_root(MediaKind::Tv, body.tv_root.trim()) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store.error",
-            &error.to_string(),
-        );
-    }
-    if let Err(error) = store.set_legacy_naming(MediaKind::Movie, body.movie_naming.trim()) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store.error",
-            &error.to_string(),
-        );
-    }
-    if let Err(error) = store.set_legacy_naming(MediaKind::Tv, body.tv_naming.trim()) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store.error",
-            &error.to_string(),
-        );
-    }
-    if let Err(error) = store.set_transfer_mode(&body.transfer_mode) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store.error",
-            &error.to_string(),
-        );
-    }
-    if let Err(error) = store.set_scrape_enabled(body.scrape) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store.error",
-            &error.to_string(),
-        );
-    }
-    if let Some(path) = &body.watch_intake {
-        if let Err(error) = store.set_watch_intake(path) {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "store.error",
-                &error.to_string(),
-            );
+    let applied = store.app_write(|s| {
+        // Compose one final setting: Movie first, then TV — the shared
+        // `naming_entry_dir` follows the existing "TV overrides" rule.
+        let mut setting = s.get_scrape_config()?.setting;
+        apply_legacy_naming(&mut setting, MediaKind::Movie, body.movie_naming.trim());
+        apply_legacy_naming(&mut setting, MediaKind::Tv, body.tv_naming.trim());
+        s.set_library_root(MediaKind::Movie, body.movie_root.trim())?;
+        s.set_library_root(MediaKind::Tv, body.tv_root.trim())?;
+        s.set_transfer_mode(&body.transfer_mode)?;
+        s.set_scrape_enabled(body.scrape)?;
+        if let Some(path) = body.watch_intake.as_deref() {
+            s.set_watch_intake(path)?;
         }
-    }
-    if let Some(path) = &body.watch_inplace {
-        if let Err(error) = store.set_watch_inplace(path) {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "store.error",
-                &error.to_string(),
-            );
+        if let Some(path) = body.watch_inplace.as_deref() {
+            s.set_watch_inplace(path)?;
         }
+        s.save_scrape_config(&setting)?;
+        Ok(())
+    });
+    if let Err(error) = applied {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store.error",
+            &error.to_string(),
+        );
     }
     match directory_json(&store) {
         Ok(value) => ok(value).into_response(),
