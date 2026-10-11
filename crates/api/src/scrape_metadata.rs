@@ -382,13 +382,16 @@ fn scrape_tv_stills(
     };
 
     for (ep_path, still_path) in matched_episodes {
+        if !targets::video_present(&ep_path) {
+            continue;
+        }
         let ok = crate::fanart_artwork::mirror_episode_still(
             state.poster_fetch.as_ref(),
             &ep_path,
             still_path.as_deref(),
             still_size,
         );
-        if !ok && is_allowed(&ep_path) {
+        if !ok && targets::video_present(&ep_path) && is_allowed(&ep_path) {
             if crate::episode_still::existing(&ep_path).is_none() {
                 let still_dest = crate::episode_still::path(&ep_path);
                 if let Err(err) = library::extract_frame(&ep_path, 60_000, &still_dest) {

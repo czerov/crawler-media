@@ -5,7 +5,7 @@ use tracing::info;
 
 use crate::nfo::{NfoMeta, xml_escape};
 
-pub fn write_season_nfo(path: &Path, meta: &NfoMeta) -> io::Result<()> {
+fn season_body(path: &Path, meta: &NfoMeta) -> io::Result<String> {
     if path.is_file() {
         let existing = fs::read_to_string(path)?;
         let doc = roxmltree::Document::parse(&existing)
@@ -54,10 +54,21 @@ pub fn write_season_nfo(path: &Path, meta: &NfoMeta) -> io::Result<()> {
     }
 
     body.push_str("</season>\n");
+    Ok(body)
+}
 
+pub fn write_season_nfo(path: &Path, meta: &NfoMeta) -> io::Result<()> {
+    let body = season_body(path, meta)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    fs::write(path, body)?;
+    info!(path = %path.display(), "已写入 season.nfo");
+    Ok(())
+}
+
+pub fn write_season_nfo_in_existing_dir(path: &Path, meta: &NfoMeta) -> io::Result<()> {
+    let body = season_body(path, meta)?;
     fs::write(path, body)?;
     info!(path = %path.display(), "已写入 season.nfo");
     Ok(())

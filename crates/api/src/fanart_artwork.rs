@@ -91,6 +91,9 @@ pub(crate) fn mirror_episode_still(
     still_file_path: Option<&str>,
     size: &str,
 ) -> bool {
+    if !crate::scrape_metadata::targets::video_present(video) {
+        return false;
+    }
     let still_dest = crate::episode_still::path(video);
     if crate::episode_still::existing(video).is_some() {
         return true;
@@ -105,11 +108,16 @@ pub(crate) fn mirror_episode_still(
     let url = format!("https://image.tmdb.org/t/p/{size}{file_path}");
     match fetch.get(&url) {
         Ok(bytes) if !bytes.is_empty() => {
-            if let Some(parent) = still_dest.parent() {
-                let _ = fs::create_dir_all(parent);
+            // Re-check after fetch in case the directory/file was renamed while downloading
+            if !crate::scrape_metadata::targets::video_present(video) {
+                return false;
             }
             if let Err(error) = fs::write(&still_dest, &bytes) {
-                warn!(%error, path = %still_dest.display(), "保存分集剧照失败");
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    tracing::debug!(path = %still_dest.display(), "目标目录已不存在，跳过分集剧照保存");
+                } else {
+                    warn!(%error, path = %still_dest.display(), "保存分集剧照失败");
+                }
                 false
             } else {
                 info!(path = %still_dest.display(), "已下载分集剧照");
@@ -133,8 +141,15 @@ fn write_destination_if_missing(
     cached_bytes: &mut Option<Vec<u8>>,
     dest: &Path,
     written_count: &mut usize,
+    source_rows: &[LedgerRow],
 ) {
     if dest.is_file() {
+        return;
+    }
+    let live_source = source_rows.iter().any(|row| {
+        crate::scrape_metadata::targets::video_present(Path::new(&row.path))
+    });
+    if !live_source {
         return;
     }
 
@@ -154,12 +169,20 @@ fn write_destination_if_missing(
         }
     }
 
+    let live_source_after = source_rows.iter().any(|row| {
+        crate::scrape_metadata::targets::video_present(Path::new(&row.path))
+    });
+    if !live_source_after {
+        return;
+    }
+
     if let Some(bytes) = cached_bytes.as_deref() {
-        if let Some(parent) = dest.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         if let Err(error) = fs::write(dest, bytes) {
-            warn!(%error, path = %dest.display(), "写入 Fanart 图片失败");
+            if error.kind() == std::io::ErrorKind::NotFound {
+                tracing::debug!(path = %dest.display(), "目标目录不存在，跳过 Fanart 图片保存");
+            } else {
+                warn!(%error, path = %dest.display(), "写入 Fanart 图片失败");
+            }
         } else {
             info!(path = %dest.display(), "已保存 Fanart 图片");
             *written_count += 1;
@@ -186,25 +209,26 @@ pub(crate) fn save_fanart_files(
     // Show-level logo
     if let Some(ref logo) = set.logo {
         let mut bytes = None;
-        write_destination_if_missing(fetch, &logo.url, &mut bytes, &show_root.join("logo.png"), &mut written);
-        write_destination_if_missing(fetch, &logo.url, &mut bytes, &show_root.join("clearlogo.png"), &mut written);
+        write_destination_if_missing(fetch, &logo.url, &mut bytes, &show_root.join("logo.png"), &mut written, rows);
+        write_destination_if_missing(fetch, &logo.url, &mut bytes, &show_root.join("clearlogo.png"), &mut written, rows);
     }
 
     // Show-level thumb
     if let Some(ref thumb) = set.thumb {
         let mut bytes = None;
-        write_destination_if_missing(fetch, &thumb.url, &mut bytes, &show_root.join("thumb.jpg"), &mut written);
-        write_destination_if_missing(fetch, &thumb.url, &mut bytes, &show_root.join("landscape.jpg"), &mut written);
+        write_destination_if_missing(fetch, &thumb.url, &mut bytes, &show_root.join("thumb.jpg"), &mut written, rows);
+        write_destination_if_missing(fetch, &thumb.url, &mut bytes, &show_root.join("landscape.jpg"), &mut written, rows);
     }
 
     // Show-level banner
     if let Some(ref banner) = set.banner {
         let mut bytes = None;
-        write_destination_if_missing(fetch, &banner.url, &mut bytes, &show_root.join("banner.jpg"), &mut written);
+        write_destination_if_missing(fetch, &banner.url, &mut bytes, &show_root.join("banner.jpg"), &mut written, rows);
     }
 
     let owned_seasons: HashSet<u32> = rows
         .iter()
+        .filter(|r| crate::scrape_metadata::targets::video_present(Path::new(&r.path)))
         .filter_map(|r| r.season)
         .collect();
 
@@ -214,9 +238,9 @@ pub(crate) fn save_fanart_files(
         if !owned_seasons.contains(&s_num) { continue };
         let prefix = season_prefix(s_num);
         let mut bytes = None;
-        write_destination_if_missing(fetch, &sp.url, &mut bytes, &show_root.join(format!("{prefix}poster.jpg")), &mut written);
+        write_destination_if_missing(fetch, &sp.url, &mut bytes, &show_root.join(format!("{prefix}poster.jpg")), &mut written, rows);
         if let Some(s_dir) = season_dir(show_root, rows, s_num) {
-            write_destination_if_missing(fetch, &sp.url, &mut bytes, &s_dir.join("poster.jpg"), &mut written);
+            write_destination_if_missing(fetch, &sp.url, &mut bytes, &s_dir.join("poster.jpg"), &mut written, rows);
         }
     }
 
@@ -226,10 +250,10 @@ pub(crate) fn save_fanart_files(
         if !owned_seasons.contains(&s_num) { continue };
         let prefix = season_prefix(s_num);
         let mut bytes = None;
-        write_destination_if_missing(fetch, &st.url, &mut bytes, &show_root.join(format!("{prefix}thumb.jpg")), &mut written);
+        write_destination_if_missing(fetch, &st.url, &mut bytes, &show_root.join(format!("{prefix}thumb.jpg")), &mut written, rows);
         if let Some(s_dir) = season_dir(show_root, rows, s_num) {
-            write_destination_if_missing(fetch, &st.url, &mut bytes, &s_dir.join("thumb.jpg"), &mut written);
-            write_destination_if_missing(fetch, &st.url, &mut bytes, &s_dir.join("landscape.jpg"), &mut written);
+            write_destination_if_missing(fetch, &st.url, &mut bytes, &s_dir.join("thumb.jpg"), &mut written, rows);
+            write_destination_if_missing(fetch, &st.url, &mut bytes, &s_dir.join("landscape.jpg"), &mut written, rows);
         }
     }
 
@@ -239,9 +263,9 @@ pub(crate) fn save_fanart_files(
         if !owned_seasons.contains(&s_num) { continue };
         let prefix = season_prefix(s_num);
         let mut bytes = None;
-        write_destination_if_missing(fetch, &sb.url, &mut bytes, &show_root.join(format!("{prefix}banner.jpg")), &mut written);
+        write_destination_if_missing(fetch, &sb.url, &mut bytes, &show_root.join(format!("{prefix}banner.jpg")), &mut written, rows);
         if let Some(s_dir) = season_dir(show_root, rows, s_num) {
-            write_destination_if_missing(fetch, &sb.url, &mut bytes, &s_dir.join("banner.jpg"), &mut written);
+            write_destination_if_missing(fetch, &sb.url, &mut bytes, &s_dir.join("banner.jpg"), &mut written, rows);
         }
     }
 
@@ -275,7 +299,7 @@ mod tests {
         }
     }
 
-    fn ledger_row(path: &str, season: u32) -> domain::LedgerRow {
+    pub(super) fn ledger_row(path: &str, season: u32) -> domain::LedgerRow {
         domain::LedgerRow {
             id: domain::LedgerId::new(),
             media_id: domain::MediaId::new(),
@@ -291,7 +315,7 @@ mod tests {
         }
     }
 
-    fn image(url: &str) -> FanartImage {
+    pub(super) fn image(url: &str) -> FanartImage {
         FanartImage {
             url: url.to_string(),
             lang: None,
@@ -342,3 +366,6 @@ mod tests {
         assert_eq!(std::fs::read(show.join("fanart.jpg")).unwrap(), b"tmdb-backdrop");
     }
 }
+
+#[cfg(test)]
+mod rename_tests;
