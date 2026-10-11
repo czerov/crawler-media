@@ -25,6 +25,7 @@ mod playback_devices;
 mod probe_tasks;
 mod roots;
 mod schema;
+mod scanned_ledger;
 mod sites;
 mod subscribe_wanted;
 mod subscribe_library;

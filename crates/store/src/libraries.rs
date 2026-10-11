@@ -300,6 +300,7 @@ impl Store {
         match_rules: &[serde_json::Value],
         default_filter_id: Option<&str>,
     ) -> Result<Library, StoreError> {
+        self.ensure_removal_roots_available(root_paths)?;
         let id = uuid::Uuid::new_v4().to_string();
         let sort_order = self.next_sort_order()?;
         let has_default: bool = self
@@ -346,6 +347,7 @@ impl Store {
         exclude_from_home: Option<bool>,
         auto_series_collections: Option<bool>,
     ) -> Result<(), StoreError> {
+        self.ensure_library_mutable(id)?;
         let Some(current) = self.get_library(id)? else {
             return Err(StoreError::Missing(format!("library {id}")));
         };
@@ -382,6 +384,7 @@ impl Store {
         detect_intros: bool,
         enable_fingerprint: bool,
     ) -> Result<(), StoreError> {
+        self.ensure_library_mutable(id)?;
         self.app.execute(
             "UPDATE libraries SET detect_intros = ?1, enable_fingerprint = ?2 WHERE id = ?3",
             params![detect_intros as i64, enable_fingerprint as i64, id],
@@ -394,6 +397,7 @@ impl Store {
         id: &str,
         cover_path: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.ensure_library_mutable(id)?;
         self.app.execute(
             "UPDATE libraries SET cover_path = ?1 WHERE id = ?2",
             params![cover_path, id],
@@ -433,10 +437,12 @@ impl Store {
         match_rules: Option<&[serde_json::Value]>,
         default_filter_id: Option<Option<&str>>,
     ) -> Result<Library, StoreError> {
+        self.ensure_library_mutable(id)?;
         let Some(library) = self.get_library(id)? else {
             return Err(StoreError::Missing(format!("library {id}")));
         };
         if let Some(root_paths) = root_paths {
+            self.ensure_removal_roots_available(root_paths)?;
             let proposed: Vec<PathBuf> = root_paths.iter().map(PathBuf::from).collect();
             for row in self.list_ledger()? {
                 let Some(media) = self.get_media(row.media_id)? else {
@@ -508,56 +514,26 @@ impl Store {
 
     /// Delete a library and its roots. The last library of a kind is protected.
     pub fn delete_library(&self, id: &str) -> Result<(), StoreError> {
-        let Some(library) = self.get_library(id)? else {
-            return Err(StoreError::Missing(format!("library {id}")));
-        };
-        let kind_count: i64 = self.app.query_row(
-            "SELECT COUNT(*) FROM libraries WHERE kind = ?1",
-            params![library.kind.as_str()],
-            |row| row.get(0),
-        )?;
-        if kind_count <= 1 {
-            return Err(StoreError::Protected(format!(
-                "每种类型的媒体库至少保留一个（{} 库不能删除）",
-                if library.kind == MediaKind::Tv {
-                    "剧集"
-                } else {
-                    "电影"
-                }
-            )));
-        }
-        let roots = self.roots_of(id)?;
-        for root in roots {
-            let root_str = root.to_string_lossy().to_string();
-            let count: i64 = self.library.query_row(
-                "SELECT COUNT(*) FROM ledger WHERE path LIKE ?1 || '%'",
-                params![root_str],
-                |row| row.get(0),
-            )?;
-            if count > 0 {
-                return Err(StoreError::Protected(
-                    "该媒体库中仍有台账文件，请先清理或迁移其中的文件后再删除".into(),
-                ));
-            }
-        }
-        self.app.execute(
-            "DELETE FROM library_roots WHERE library_id = ?1",
-            params![id],
-        )?;
-        self.app
-            .execute("DELETE FROM libraries WHERE id = ?1", params![id])?;
-        crate::library_defaults::ensure_library_defaults(&self.app)?;
-        Ok(())
+        Err(StoreError::Protected(format!(
+            "Library {id} 必须通过持久删除协调器删除，不能绕过任务排空"
+        )))
     }
 
     /// Promote a library to default for its kind; the previous default of that
     /// kind is demoted.
     pub fn set_default_library(&self, id: &str) -> Result<Library, StoreError> {
+        self.ensure_library_mutable(id)?;
         let Some(library) = self.get_library(id)? else {
             return Err(StoreError::Missing(format!("library {id}")));
         };
+        for current in self.list_libraries()? {
+            if current.kind == library.kind && current.is_default {
+                self.ensure_library_mutable(&current.id)?;
+            }
+        }
         self.app.execute(
-            "UPDATE libraries SET is_default = 0 WHERE kind = ?1",
+            "UPDATE libraries SET is_default = 0 WHERE kind = ?1 AND id NOT IN
+             (SELECT library_id FROM library_removals WHERE state != 'succeeded')",
             params![library.kind.as_str()],
         )?;
         self.app.execute(
@@ -571,6 +547,9 @@ impl Store {
 
     /// Full-order reorder: `ids` is the desired display order of every library.
     pub fn reorder_libraries(&self, ids: &[&str]) -> Result<(), StoreError> {
+        for id in ids {
+            self.ensure_library_mutable(id)?;
+        }
         for (index, id) in ids.iter().enumerate() {
             self.app.execute(
                 "UPDATE libraries SET sort_order = ?1 WHERE id = ?2",

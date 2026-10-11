@@ -3,6 +3,125 @@ use std::sync::atomic::Ordering;
 
 use super::{ProbeManager, ProbeUnit};
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    #[test]
+    fn ordinary_recovery_keeps_other_library_units_queued() {
+        for kind in ["probe", "marker_refresh"] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(Mutex::new(store::Store::open(temp.path()).unwrap()));
+            let media = domain::Media {
+                id: domain::MediaId::new(),
+                kind: MediaKind::Tv,
+                title: "Fixture".into(),
+                year: None,
+                original_title: None,
+                tmdb_id: None,
+                douban_id: None,
+                tvdb_id: None,
+                bangumi_id: None,
+                anilist_id: None,
+            };
+            store.lock().insert_media(&media).unwrap();
+            let mut libraries = Vec::new();
+            let mut ledger_ids = Vec::new();
+            for name in ["removed", "retained"] {
+                let root = temp.path().join(name);
+                libraries.push(
+                    store
+                        .lock()
+                        .create_library(
+                            media.kind,
+                            name,
+                            &[root.to_str().unwrap()],
+                            "everyone",
+                            true,
+                            &[],
+                        )
+                        .unwrap(),
+                );
+                let row = domain::LedgerRow {
+                    id: domain::LedgerId::new(),
+                    media_id: media.id,
+                    path: root.join("episode.mkv").to_string_lossy().into_owned(),
+                    season: Some(1),
+                    episode: Some(1),
+                    resolution: None,
+                    codec: None,
+                    hdr: None,
+                    quality_source: domain::QualitySource::Release,
+                    confidence: domain::Confidence::High,
+                    filter_score: None,
+                };
+                store.lock().insert_ledger(&row).unwrap();
+                ledger_ids.push(row.id.to_string());
+            }
+            let specs: Vec<_> = ledger_ids
+                .iter()
+                .map(|id| store::ProbeJobUnitSpec {
+                    ledger_id: id,
+                    kind: "tv",
+                    force_fingerprint: false,
+                    reuse_fingerprint_cache: false,
+                    overwrite_markers: false,
+                    reuse_media_info_cache: true,
+                })
+                .collect();
+            store
+                .lock()
+                .create_probe_job(
+                    "mixed",
+                    kind,
+                    &media.id.to_string(),
+                    Some(1),
+                    "mixed",
+                    &specs,
+                )
+                .unwrap();
+            store
+                .lock()
+                .begin_library_removal(&libraries[0].id)
+                .unwrap();
+            let manager = ProbeManager::new(store.clone());
+            let units = store.lock().probe_job_units("mixed").unwrap();
+            assert_eq!(
+                units
+                    .iter()
+                    .find(|u| u.ledger_id == ledger_ids[0])
+                    .unwrap()
+                    .status,
+                "cancelled"
+            );
+            if kind == "marker_refresh" {
+                assert!(units.iter().all(|u| u.status == "cancelled"));
+                assert!(!manager.is_queued(&ledger_ids[1]));
+            } else {
+                assert_eq!(
+                    units
+                        .iter()
+                        .find(|u| u.ledger_id == ledger_ids[1])
+                        .unwrap()
+                        .status,
+                    "queued"
+                );
+                assert!(manager.is_queued(&ledger_ids[1]));
+                assert!(
+                    store
+                        .lock()
+                        .get_probe_job("mixed")
+                        .unwrap()
+                        .unwrap()
+                        .is_active()
+                );
+            }
+        }
+    }
+}
+
 impl ProbeManager {
     pub(crate) fn recover_pending_jobs(&self) {
         let jobs = match self.store.lock().recover_probe_jobs() {
@@ -13,18 +132,13 @@ impl ProbeManager {
             }
         };
         for (job, units) in jobs {
-            let deleting = {
-                let store = self.store.lock();
-                units.iter().any(|unit| {
-                    let row = store.get_ledger(&unit.ledger_id).ok().flatten();
-                    row.and_then(|row| {
-                        let media = store.get_media(row.media_id).ok().flatten()?;
-                        store.library_for_path_strict(std::path::Path::new(&row.path), media.kind).ok().flatten()
-                    }).is_some_and(|owner| !store.library_accepts_work(&owner.id).unwrap_or(false))
-                })
-            };
-            if deleting {
-                if let Err(error) = self.store.lock().cancel_probe_job(&job.id, "Library removed") {
+            let removed_units = self.removed_recovery_units(&units);
+            if !removed_units.is_empty() && job.kind == "marker_refresh" {
+                if let Err(error) = self
+                    .store
+                    .lock()
+                    .cancel_probe_job(&job.id, "Library removed")
+                {
                     tracing::error!(%error, job_id=%job.id, "恢复时取消删除库任务失败");
                 }
                 continue;
@@ -54,7 +168,7 @@ impl ProbeManager {
                 }
                 continue;
             }
-            self.recover_job_units(&job, &units);
+            self.recover_retained_units(&job, units, &removed_units);
             let refreshed = self.store.lock().get_probe_job(&job.id);
             let refreshed = match refreshed {
                 Ok(Some(refreshed)) => refreshed,
@@ -129,6 +243,40 @@ impl ProbeManager {
         }
     }
 
+    fn recover_retained_units(
+        &self,
+        job: &crate::store::ProbeJob,
+        units: Vec<crate::store::ProbeJobUnit>,
+        removed: &[String],
+    ) {
+        for ledger_id in removed {
+            if let Err(error) = self.store.lock().cancel_probe_unit(&job.id, ledger_id, "Library removed") {
+                tracing::error!(%error, job_id = %job.id, %ledger_id, "恢复时取消删除库单元失败");
+            }
+        }
+        let retained: Vec<_> = units.into_iter().filter(|unit| !removed.contains(&unit.ledger_id)).collect();
+        self.recover_job_units(job, &retained);
+    }
+
+    fn removed_recovery_units(&self, units: &[crate::store::ProbeJobUnit]) -> Vec<String> {
+        let store = self.store.lock();
+        units
+            .iter()
+            .filter(|unit| {
+                let row = store.get_ledger(&unit.ledger_id).ok().flatten();
+                row.and_then(|row| {
+                    let media = store.get_media(row.media_id).ok().flatten()?;
+                    store
+                        .library_for_path_strict(std::path::Path::new(&row.path), media.kind)
+                        .ok()
+                        .flatten()
+                })
+                .is_some_and(|owner| !store.library_accepts_work(&owner.id).unwrap_or(false))
+            })
+            .map(|unit| unit.ledger_id.clone())
+            .collect()
+    }
+
     fn recover_job_units(
         &self,
         job: &crate::store::ProbeJob,
@@ -156,8 +304,8 @@ impl ProbeManager {
                         let store = self.store.lock();
                         store
                             .cancel_probe_unit(&job.id, &persisted.ledger_id, "file_deleted")
-                            .and_then(|(_, _, all_done)| {
-                                if job.kind == "marker_refresh" || all_done {
+                            .and_then(|(_, _, _)| {
+                                if job.kind == "marker_refresh" {
                                     store.cancel_probe_job(&job.id, "file_deleted")?;
                                 }
                                 Ok(())

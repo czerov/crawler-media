@@ -464,7 +464,15 @@ impl ProbeManager {
         for ledger_id in ledger_ids {
             let unit = self.store.lock().active_probe_unit_for_ledger(ledger_id)?;
             if let Some(unit) = unit {
-                self.store.lock().cancel_probe_job(&unit.job_id, reason)?;
+                {
+                    let store = self.store.lock();
+                    let job = store.get_probe_job(&unit.job_id)?;
+                    if job.as_ref().is_some_and(|job| job.kind == "marker_refresh") {
+                        store.cancel_probe_job(&unit.job_id, reason)?;
+                    } else {
+                        store.cancel_probe_unit(&unit.job_id, ledger_id, reason)?;
+                    }
+                }
                 let units = self.store.lock().probe_job_units(&unit.job_id)?;
                 let mut seen = self.seen.lock();
                 for unit in units { seen.remove(&unit.ledger_id); }

@@ -5,7 +5,7 @@ use domain::{Confidence, LedgerId, LedgerRow, QualitySource, Release};
 use downloader::Downloader;
 use filter::ScoredTorrent;
 use hooks::{HookEvent, Step};
-use library::{MediaProbe, resolve_mode, scrape_beside, transfer_file};
+use library::{MediaProbe, resolve_mode, scrape_beside, transfer_file_controlled};
 
 use crate::add::Added;
 use crate::choose::{covered_slots, is_complete};
@@ -20,10 +20,20 @@ pub fn collect_completed<D: Downloader + ?Sized>(
 }
 
 pub fn collect_completed_with_destinations<D: Downloader + ?Sized>(
-    mut added: Added<'_, D>,
+    added: Added<'_, D>,
     probe: &dyn MediaProbe,
     existing: &[crate::collection_destinations::DestinationMapping],
 ) -> Result<RunOutcome, SubscribeError> {
+    collect_completed_controlled(added, probe, existing, &library::WorkControl::default())
+}
+
+pub fn collect_completed_controlled<D: Downloader + ?Sized>(
+    mut added: Added<'_, D>,
+    probe: &dyn MediaProbe,
+    existing: &[crate::collection_destinations::DestinationMapping],
+    control: &library::WorkControl,
+) -> Result<RunOutcome, SubscribeError> {
+    control.check()?;
     let mut ledger = Vec::new();
     let mut ledger_sources = Vec::new();
     let mut removed_paths = Vec::new();
@@ -40,6 +50,7 @@ pub fn collect_completed_with_destinations<D: Downloader + ?Sized>(
 
     let chosen = std::mem::take(&mut added.chosen);
     for scored in chosen {
+        control.check()?;
         collect_scored_torrent(
             &mut added,
             probe,
@@ -50,8 +61,10 @@ pub fn collect_completed_with_destinations<D: Downloader + ?Sized>(
             &mut removed_paths,
             &mut transferred_enclosures,
             &mut collection_errors,
+            control,
         );
     }
+    control.check()?;
     Ok(RunOutcome {
         completed: is_complete(added.input.subscribe, &added.input.facts),
         facts: added.input.facts,
@@ -75,6 +88,7 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
     removed_paths: &mut Vec<String>,
     transferred_enclosures: &mut Vec<String>,
     collection_errors: &mut Vec<String>,
+    control: &library::WorkControl,
 ) {
     let errors_before_torrent = collection_errors.len();
     let completed_files = match added.input.downloader.completed_files(&scored.torrent) {
@@ -95,6 +109,9 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
     let reported_any = !videos.is_empty() || !subs.is_empty();
     let mut torrent_destinations = Vec::new();
     for src in videos {
+        if control.is_cancelled() {
+            return;
+        }
         let source_path = src.display().to_string();
         if let Some(mapping) = existing.iter().find(|m| m.source_path == source_path) {
             if mapping.destination_path.is_file() {
@@ -123,6 +140,7 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
             ledger,
             ledger_sources,
             removed_paths,
+            control,
         ) {
             Ok(Some(dest)) => torrent_destinations.push(
                 crate::collection_destinations::DestinationMapping::new(source_path, dest),
@@ -149,10 +167,14 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
     }
     let subs_count = subs.len();
     for src in subs {
-        match crate::sidecars::place_mapped_subtitle(
+        if control.is_cancelled() {
+            return;
+        }
+        match crate::sidecars::place_mapped_subtitle_controlled(
             &src,
             &sidecar_destinations,
             added.input.transfer_mode,
+            control,
         ) {
             Ok(()) => {}
             Err(error) => {
@@ -229,6 +251,7 @@ fn collect_one<D: Downloader + ?Sized>(
     ledger: &mut Vec<LedgerRow>,
     ledger_sources: &mut Vec<LedgerSource>,
     removed_paths: &mut Vec<String>,
+    control: &library::WorkControl,
 ) -> Result<Option<PathBuf>, SubscribeError> {
     let file_release = release::parse(
         src.file_name()
@@ -277,8 +300,9 @@ fn collect_one<D: Downloader + ?Sized>(
     }) {
         return Ok(None);
     }
-    publish_video(added, &src, &dest)?;
-    let (quality, source, confidence) = quality_for(probe, &dest, &scored.release);
+    publish_video(added, &src, &dest, control)?;
+    let (quality, source, confidence) = quality_for(probe, &dest, &scored.release, control);
+    control.check()?;
     // Final deletion approval uses actual quality, not the download title.
     let (approved, actual_score) = replacement_survives_probe(
         added,
@@ -345,18 +369,24 @@ fn publish_video<D: Downloader + ?Sized>(
     added: &Added<'_, D>,
     src: &Path,
     dest: &Path,
+    control: &library::WorkControl,
 ) -> Result<(), SubscribeError> {
     let mode = resolve_mode(src, added.input.library_root, added.input.transfer_mode);
     tracing::info!(src = %src.display(), dest = %dest.display(), ?mode, "将已完成的媒体文件转入媒体库");
     emit(added.input.hooks, Step::Rename)?;
     emit(added.input.hooks, Step::Transfer)?;
-    transfer_file(src, dest, mode).map_err(|e| {
+    transfer_file_controlled(src, dest, mode, control).map_err(|e| {
         tracing::error!(src = %src.display(), dest = %dest.display(), error = %e, "文件转移失败");
         SubscribeError::Library(e)
     })?;
+    control.check()?;
     emit(added.input.hooks, Step::Scrape)?;
-    if let Err(e) = scrape_beside(dest, added.input.media, added.input.scrape, None) {
-        tracing::warn!(dest = %dest.display(), error = %e, "刮削写入元数据失败，但媒体文件已就位，继续入账");
+    control.check()?;
+    if let Err(error) = control.publish(|| {
+        scrape_beside(dest, added.input.media, added.input.scrape, None).map_err(|e| e.to_string())
+    }) {
+        control.check()?;
+        tracing::warn!(dest = %dest.display(), %error, "刮削写入元数据失败，但媒体文件已就位，继续入账");
     }
     Ok(())
 }
@@ -496,8 +526,9 @@ fn quality_for(
     probe: &dyn MediaProbe,
     src: &Path,
     release: &Release,
+    control: &library::WorkControl,
 ) -> (library::FileQuality, QualitySource, Confidence) {
-    if let Ok(quality) = probe.probe(src) {
+    if let Ok(quality) = probe.probe_controlled(src, control) {
         (quality, QualitySource::Probe, Confidence::High)
     } else {
         (

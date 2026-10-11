@@ -8,7 +8,8 @@ pub(crate) fn ensure_source_available(store: &Store, row: &LedgerRow) -> Result<
     })?;
     if current
         .as_ref()
-        .is_none_or(|current| current.path != row.path)
+        .is_none_or(|current| current.path != row.path || current.media_id != row.media_id
+            || current.season != row.season || current.episode != row.episode)
     {
         return Err(format!(
             "file_deleted: ledger {} is no longer available",

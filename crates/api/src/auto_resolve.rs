@@ -14,8 +14,29 @@ pub fn auto_resolve_media(
     media: &Media,
     sample_path: &std::path::Path,
 ) -> Option<Media> {
+    resolve_media(state, media, sample_path, true)
+}
+
+/// Scans publish sidecars only after rebinding their newly inserted ledger rows.
+pub(crate) fn resolve_scanned_media(
+    state: &ApiState,
+    media: &Media,
+    sample_path: &std::path::Path,
+) -> Option<Media> {
+    resolve_media(state, media, sample_path, false)
+}
+
+fn resolve_media(
+    state: &ApiState,
+    media: &Media,
+    sample_path: &std::path::Path,
+    publish_sidecars: bool,
+) -> Option<Media> {
     let lease = state.acquire_path_work(sample_path, media.kind).ok()?;
-    if media.tmdb_id.is_some() || media.douban_id.is_some() {
+    if has_local_scan_metadata(state, media, sample_path)
+        || media.tmdb_id.is_some()
+        || media.douban_id.is_some()
+    {
         return Some(media.clone());
     }
 
@@ -44,7 +65,12 @@ pub fn auto_resolve_media(
             break;
         }
     }
-    if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { return None; }
+    if lease
+        .as_ref()
+        .is_some_and(|lease| lease.control().is_cancelled())
+    {
+        return None;
+    }
     let Some(best_hit) = best_hit else {
         tracing::debug!(title = %title, year = ?media.year, "扫描时未找到可靠的 TMDB 匹配");
         if media.kind == MediaKind::Tv {
@@ -76,12 +102,27 @@ pub fn auto_resolve_media(
         updated.original_title = best_hit.media.original_title.clone();
     }
 
-    // Persist updated TMDB ID / Douban ID to the database
-    {
+    // External IDs are aliases: an online match may already have a canonical
+    // Media with Playback history. The scan caller rebinds only its new rows.
+    let updated = {
         let store = state.store.lock();
-        if let Err(e) = store.update_media(&updated) {
-            tracing::warn!(error = %e, "更新媒体 TMDB/豆瓣 ID 失败");
+        if lease
+            .as_ref()
+            .is_some_and(|lease| lease.control().is_cancelled())
+        {
+            return None;
         }
+        match store.resolve_scanned_media(updated) {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                tracing::error!(%error, media_id = %media.id, "无法汇合扫描媒体身份");
+                return None;
+            }
+        }
+    };
+
+    if !publish_sidecars {
+        return Some(updated);
     }
 
     // Attach official poster & backdrop
@@ -104,6 +145,13 @@ pub fn auto_resolve_media(
 }
 
 fn write_auto_resolved_nfo(state: &ApiState, media: &Media, sample_path: &std::path::Path) {
+    let lease = match state.acquire_path_work(sample_path, media.kind) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(path = %sample_path.display(), %error, "自动 NFO 写入被拒绝");
+            return;
+        }
+    };
     let Some(tmdb_id) = media.tmdb_id.as_deref() else {
         return;
     };
@@ -161,7 +209,17 @@ fn write_auto_resolved_nfo(state: &ApiState, media: &Media, sample_path: &std::p
         );
     } else if let Some(stem) = sample_path.file_stem().and_then(|value| value.to_str()) {
         let target = sample_path.with_file_name(format!("{stem}.nfo"));
-        crate::scrape_metadata::write_nfo(&target, media, &nfo);
+        let write = || {
+            crate::scrape_metadata::write_nfo(&target, media, &nfo);
+            Ok(())
+        };
+        let result = match &lease {
+            Some(lease) => lease.publish(write),
+            None => write(),
+        };
+        if let Err(error) = result {
+            tracing::warn!(path = %target.display(), %error, "自动电影 NFO 写入被取消");
+        }
     }
 }
 
@@ -188,12 +246,23 @@ fn attach_episode_frames(state: &ApiState, media: &Media, sample_path: &std::pat
         paths
     };
     for path in targets {
+        let lease = match state.acquire_path_work(&path, media.kind) {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "分集抓帧被拒绝");
+                continue;
+            }
+        };
+        let control = lease
+            .as_ref()
+            .map(|lease| lease.control().clone())
+            .unwrap_or_default();
         let still = crate::episode_still::path(&path);
         if still.is_file() {
             continue;
         }
-        if library::extract_frame(&path, 60_000, &still).is_err() {
-            tracing::warn!(path = %path.display(), "匹配失败后分集抓帧失败");
+        if let Err(error) = library::extract_frame_controlled(&path, 60_000, &still, &control) {
+            tracing::warn!(path = %path.display(), %error, "匹配失败后分集抓帧失败");
         }
     }
 }
@@ -277,4 +346,46 @@ fn normalize_title(t: &str) -> String {
         })
         .collect::<String>()
         .to_lowercase()
+}
+
+/// Complete local identity and a display title are enough; missing plot/cast
+/// never implicitly turns a normal scan into an explicit metadata refresh.
+pub(crate) fn has_local_scan_metadata(
+    state: &ApiState,
+    media: &domain::Media,
+    path: &std::path::Path,
+) -> bool {
+    let root = {
+        let store = state.store.lock();
+        store
+            .library_for_path_strict(path, media.kind)
+            .ok()
+            .flatten()
+            .and_then(|library| {
+                library
+                    .root_paths
+                    .into_iter()
+                    .find(|root| path.starts_with(root))
+            })
+    };
+    let Some(root) = root else { return false };
+    match library::read_watch_identity(path, &root, media.kind) {
+        Ok(Some(identity)) => {
+            identity.title.is_some()
+                && [
+                    identity.tmdb_id,
+                    identity.douban_id,
+                    identity.tvdb_id,
+                    identity.bangumi_id,
+                    identity.anilist_id,
+                ]
+                .iter()
+                .any(Option::is_some)
+        }
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "无法读取本地 NFO，回退扫描识别");
+            false
+        }
+    }
 }

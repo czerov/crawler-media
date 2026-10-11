@@ -46,6 +46,7 @@ pub(crate) fn library_json(store: &crate::Store, library: &Library) -> Value {
         .any(|root| !FsPath::new(root).is_dir());
     json!({
         "id": library.id,
+        "removal": store.removal_for_library(&library.id).ok().flatten(),
         "kind": library.kind.as_str(),
         "name": library.name,
         "root_paths": library.root_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),

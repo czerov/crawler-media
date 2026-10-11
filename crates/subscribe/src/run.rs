@@ -2,7 +2,6 @@ use downloader::Downloader;
 use library::{Ffprobe, MediaProbe};
 
 use crate::add::admit_and_add;
-use crate::collect::collect_completed_with_destinations;
 use crate::{RunInput, RunOutcome, SubscribeError, collection_destinations};
 
 pub fn run<D: Downloader + ?Sized>(input: RunInput<'_, D>) -> Result<RunOutcome, SubscribeError> {
@@ -25,8 +24,19 @@ pub fn run_with_destinations<D: Downloader + ?Sized>(
     probe: &dyn MediaProbe,
     existing: &[collection_destinations::DestinationMapping],
 ) -> Result<RunOutcome, SubscribeError> {
+    run_with_destinations_controlled(input, probe, existing, &library::WorkControl::default())
+}
+
+pub fn run_with_destinations_controlled<D: Downloader + ?Sized>(
+    input: RunInput<'_, D>,
+    probe: &dyn MediaProbe,
+    existing: &[collection_destinations::DestinationMapping],
+    control: &library::WorkControl,
+) -> Result<RunOutcome, SubscribeError> {
+    control.check()?;
     let added = admit_and_add(input)?;
-    let outcome = collect_completed_with_destinations(added, probe, existing)?;
+    control.check()?;
+    let outcome = crate::collect::collect_completed_controlled(added, probe, existing, control)?;
     if !outcome.submission_errors.is_empty() && outcome.torrents_added.is_empty() {
         return Err(SubscribeError::Downloader(
             downloader::DownloaderError::Message(outcome.submission_errors.join("; ")),

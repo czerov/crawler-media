@@ -205,6 +205,10 @@ pub(crate) async fn select_artwork(
         Ok(id) => id,
         Err(_) => return err(StatusCode::BAD_REQUEST, "library.invalid", "条目 id 无效"),
     };
+    let lease = match state.acquire_library_work(&id) {
+        Ok(lease) => lease,
+        Err(_) => return err(StatusCode::CONFLICT, "library.deleting", "Library 正在删除"),
+    };
     let is_backdrop = body.get("kind").and_then(Value::as_str) == Some("backdrop");
     let file_path = body["file_path"].as_str().map(str::to_string);
     let store = state.store.lock();
@@ -257,11 +261,11 @@ pub(crate) async fn select_artwork(
                     }
                 }
             };
-            if let Err(error) = std::fs::write(&target, &bytes) {
+            if let Err(error) = lease.publish(|| std::fs::write(&target, &bytes).map_err(|e| e.to_string())) {
                 return err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "artwork.write",
-                    &error.to_string(),
+                    StatusCode::CONFLICT,
+                    "library.deleting",
+                    &error,
                 );
             }
             let store = state.store.lock();
@@ -285,6 +289,10 @@ pub(crate) async fn upload_artwork(
     let media_id = match MediaId::from_str(&item_id) {
         Ok(id) => id,
         Err(_) => return err(StatusCode::BAD_REQUEST, "library.invalid", "条目 id 无效"),
+    };
+    let lease = match state.acquire_library_work(&id) {
+        Ok(lease) => lease,
+        Err(_) => return err(StatusCode::CONFLICT, "library.deleting", "Library 正在删除"),
     };
     let is_backdrop = body.get("kind").and_then(Value::as_str) == Some("backdrop");
     let data_url = body["data_url"].as_str().unwrap_or_default();
@@ -313,13 +321,15 @@ pub(crate) async fn upload_artwork(
     let write_target = target.clone();
     let write_bytes = bytes.clone();
     let write =
-        tokio::task::spawn_blocking(move || std::fs::write(write_target, write_bytes)).await;
-    if let Err(error) = write.unwrap_or_else(|error| Err(std::io::Error::other(error.to_string())))
+        tokio::task::spawn_blocking(move || {
+            lease.publish(|| std::fs::write(write_target, write_bytes).map_err(|e| e.to_string()))
+        }).await;
+    if let Err(error) = write.unwrap_or_else(|error| Err(error.to_string()))
     {
         return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "artwork.write",
-            &error.to_string(),
+            StatusCode::CONFLICT,
+            "library.deleting",
+            &error,
         );
     }
     let _ = state.store.lock().put_setting(

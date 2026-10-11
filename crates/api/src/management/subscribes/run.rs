@@ -32,6 +32,11 @@ pub(crate) async fn run_subscribe(
     let admitted = admit_after_search(&state, id, user_id, torrents, search_keywords)?;
     if admitted.scrape {
         for row in &admitted.ledger {
+            admitted
+                .library_lease
+                .control()
+                .check()
+                .map_err(|e| ApiError::internal(e.to_string()))?;
             crate::poster_fetch::attach_poster(
                 &state,
                 &admitted.media,
@@ -149,6 +154,7 @@ struct AdmittedRun {
     ledger_rows: usize,
     ledger: Vec<domain::LedgerRow>,
     run_errors: Vec<String>,
+    library_lease: crate::library_lifecycle::LibraryWorkLease,
 }
 
 fn admit_after_search(
@@ -162,7 +168,8 @@ fn admit_after_search(
     let _guard = guard.lock();
     let context = reload_locked(state, id, user_id)?;
     let routed = RoutedDownloader::new(state, Some(&context.subscribe));
-    let (outcome, scrape) = execute(state, id, &context, &routed, torrents, search_keywords)?;
+    let (outcome, scrape, library_lease) =
+        execute(state, id, &context, &routed, torrents, search_keywords)?;
     let completed = outcome.completed;
     let ledger_rows = outcome.ledger.len();
     let ledger = outcome.ledger.clone();
@@ -172,7 +179,7 @@ fn admit_after_search(
         .chain(outcome.collection_errors.iter())
         .cloned()
         .collect::<Vec<_>>();
-    persist(state, id, outcome, &routed)?;
+    persist(state, id, outcome, &routed, &library_lease)?;
     Ok(AdmittedRun {
         media: context.media,
         scrape,
@@ -180,6 +187,7 @@ fn admit_after_search(
         ledger_rows,
         ledger,
         run_errors,
+        library_lease,
     })
 }
 
@@ -219,10 +227,87 @@ fn execute(
     routed: &RoutedDownloader<'_>,
     mut torrents: Vec<domain::Torrent>,
     search_keywords: Vec<String>,
-) -> Result<(subscribe::RunOutcome, bool), ApiError> {
+) -> Result<
+    (
+        subscribe::RunOutcome,
+        bool,
+        crate::library_lifecycle::LibraryWorkLease,
+    ),
+    ApiError,
+> {
     exclude_pending(state, id, &mut torrents)?;
+    let facts = load_run_facts(state, id, context)?;
+    let (library_id, library_root, transfer_mode, scrape) = {
+        let store = state.store.lock();
+        let library_id = match context.subscribe.library_id {
+            Some(id) => id.to_string(),
+            None => {
+                store
+                    .default_library(context.media.kind)?
+                    .ok_or_else(|| ApiError::internal("目标 Library 不存在".into()))?
+                    .id
+            }
+        };
+        let (root, mode, scrape) = crate::directory::transfer_plan_for_library(
+            &store,
+            context.media.kind,
+            Some(&library_id),
+        )?;
+        (library_id, root, mode, scrape)
+    };
+    let library_lease = state
+        .acquire_library_work(&library_id)
+        .map_err(ApiError::internal)?;
+    library_lease
+        .control()
+        .check()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let naming = state.store.lock().naming_pattern(context.media.kind)?;
+    let nfo = {
+        let store = state.store.lock();
+        let cfg = store.get_scrape_config()?;
+        scrape && cfg.effective.mirror_nfo
+    };
+    let destinations = routed
+        .imported_destinations()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let mut outcome = subscribe::run_with_destinations_controlled(
+        RunInput {
+            subscribe: &context.subscribe,
+            media: &context.media,
+            filter: &context.filter,
+            wash_filter: context.wash_filter.as_ref(),
+            torrents,
+            search_keywords,
+            facts,
+            downloader: routed,
+            library_root: &library_root,
+            transfer_mode,
+            scrape: nfo,
+            hooks: None,
+            naming: Some(&naming),
+            preserve_removed: true,
+        },
+        &library::Ffprobe::default(),
+        &destinations,
+        library_lease.control(),
+    )?;
+    library_lease
+        .control()
+        .check()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    outcome.facts.retain_owned();
+    outcome.completed = subscribe::is_complete(&context.subscribe, &outcome.facts);
+    Ok((outcome, scrape, library_lease))
+}
+
+fn load_run_facts(state: &ApiState, id: SubscribeId, context: &RunContext)
+    -> Result<subscribe::SubscribeFacts, ApiError>
+{
     let existing = state.store.lock().load_pending(id)?;
-    let mut facts = state.store.lock()
+    let mut facts = state
+        .store
+        .lock()
         .load_library_subscribe_facts(&context.subscribe, context.media.kind)?;
     for (_, pending) in &existing {
         let release = pending
@@ -255,56 +340,7 @@ fn execute(
             }
         }
     }
-    let (library_root, transfer_mode, scrape) = crate::directory::transfer_plan_for_library(
-        &state.store.lock(),
-        context.media.kind,
-        context
-            .subscribe
-            .library_id
-            .as_ref()
-            .map(|id| id.to_string())
-            .as_deref(),
-    )?;
-    let library_lease = state.acquire_path_work(&library_root, context.media.kind)
-        .map_err(ApiError::internal)?;
-    if let Some(lease) = &library_lease {
-        lease.control().check().map_err(|e| ApiError::internal(e.to_string()))?;
-    }
-    let naming = state.store.lock().naming_pattern(context.media.kind)?;
-    let nfo = {
-        let store = state.store.lock();
-        let cfg = store.get_scrape_config()?;
-        scrape && cfg.effective.mirror_nfo
-    };
-    let destinations = routed
-        .imported_destinations()
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    let mut outcome = subscribe::run_with_destinations(
-        RunInput {
-            subscribe: &context.subscribe,
-            media: &context.media,
-            filter: &context.filter,
-            wash_filter: context.wash_filter.as_ref(),
-            torrents,
-            search_keywords,
-            facts,
-            downloader: routed,
-            library_root: &library_root,
-            transfer_mode,
-            scrape: nfo,
-            hooks: None,
-            naming: Some(&naming),
-            preserve_removed: true,
-        },
-        &library::Ffprobe::default(),
-        &destinations,
-    )?;
-    if let Some(lease) = &library_lease {
-        lease.control().check().map_err(|e| ApiError::internal(e.to_string()))?;
-    }
-    outcome.facts.retain_owned();
-    outcome.completed = subscribe::is_complete(&context.subscribe, &outcome.facts);
-    Ok((outcome, scrape))
+    Ok(facts)
 }
 
 fn fetch_torrents(
@@ -388,8 +424,19 @@ fn persist(
     id: SubscribeId,
     outcome: subscribe::RunOutcome,
     routed: &RoutedDownloader<'_>,
+    lease: &crate::library_lifecycle::LibraryWorkLease,
 ) -> Result<(), ApiError> {
     let store = state.store.lock();
+    lease
+        .control()
+        .check()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if !store.library_accepts_work(lease.library_id())? {
+        return Err(lifecycle_conflict(
+            "library.deleting",
+            "目标 Library 正在删除或已不存在",
+        ));
+    }
     for row in &outcome.ledger {
         let source_path = outcome
             .ledger_sources

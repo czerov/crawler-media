@@ -5,6 +5,28 @@ use super::maps::map_media;
 use super::schema::MEDIA_COLS;
 use super::{Store, StoreError};
 
+fn aliases(media: &Media) -> [Option<&str>; 5] {
+    [
+        media.tmdb_id.as_deref(),
+        media.douban_id.as_deref(),
+        media.tvdb_id.as_deref(),
+        media.bangumi_id.as_deref(),
+        media.anilist_id.as_deref(),
+    ]
+}
+
+fn aliases_conflict(a: &Media, b: &Media) -> bool {
+    aliases(a)
+        .into_iter()
+        .zip(aliases(b))
+        .any(|(a, b)| a.zip(b).is_some_and(|(a, b)| a != b))
+}
+
+fn identity_conflict(incoming: &Media) -> StoreError {
+    tracing::warn!(media_id = %incoming.id, kind = incoming.kind.as_str(), "Ambiguous scanned Media identity rejected");
+    StoreError::Protected("Ambiguous or conflicting scanned Media identity".into())
+}
+
 impl Store {
     pub fn insert_media(&self, media: &Media) -> Result<(), StoreError> {
         self.app.execute(
@@ -161,6 +183,74 @@ impl Store {
         Ok(())
     }
 
+    /// Recover canonical identity without selecting the first alias or ambiguous title.
+    pub fn resolve_scanned_media(&self, incoming: Media) -> Result<Media, StoreError> {
+        let mut stmt = self.app.prepare(&format!(
+            "SELECT {MEDIA_COLS} FROM media WHERE kind = ?1 AND
+             (title = ?2 OR tmdb_id = ?3 OR douban_id = ?4 OR tvdb_id = ?5
+              OR bangumi_id = ?6 OR anilist_id = ?7)"
+        ))?;
+        let candidates = stmt
+            .query_map(
+                params![
+                    incoming.kind.as_str(),
+                    incoming.title,
+                    incoming.tmdb_id,
+                    incoming.douban_id,
+                    incoming.tvdb_id,
+                    incoming.bangumi_id,
+                    incoming.anilist_id
+                ],
+                map_media,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let external: Vec<_> = candidates
+            .iter()
+            .filter(|existing| {
+                aliases(existing)
+                    .into_iter()
+                    .zip(aliases(&incoming))
+                    .any(|(a, b)| a.zip(b).is_some_and(|(a, b)| a == b))
+            })
+            .collect();
+        let existing = if external.len() > 1 {
+            return Err(identity_conflict(&incoming));
+        } else if let Some(existing) = external.first() {
+            if aliases_conflict(existing, &incoming) {
+                return Err(identity_conflict(&incoming));
+            }
+            Some(*existing)
+        } else {
+            let titles: Vec<_> = candidates
+                .iter()
+                .filter(|existing| {
+                    existing.title == incoming.title
+                        && incoming.year.is_none_or(|year| existing.year == Some(year))
+                        && !aliases_conflict(existing, &incoming)
+                })
+                .collect();
+            if titles.len() > 1 {
+                return Err(identity_conflict(&incoming));
+            }
+            titles.first().copied()
+        };
+        if let Some(existing) = existing {
+            let mut canonical = existing.clone();
+            canonical.year = canonical.year.or(incoming.year);
+            canonical.original_title = canonical.original_title.or(incoming.original_title);
+            canonical.tmdb_id = canonical.tmdb_id.or(incoming.tmdb_id);
+            canonical.douban_id = canonical.douban_id.or(incoming.douban_id);
+            canonical.tvdb_id = canonical.tvdb_id.or(incoming.tvdb_id);
+            canonical.bangumi_id = canonical.bangumi_id.or(incoming.bangumi_id);
+            canonical.anilist_id = canonical.anilist_id.or(incoming.anilist_id);
+            self.update_media(&canonical)?;
+            tracing::debug!(media_id = %canonical.id, "Recovered canonical scanned Media identity");
+            return Ok(canonical);
+        }
+        self.insert_media(&incoming)?;
+        Ok(incoming)
+    }
+
     pub fn ensure_media(&self, incoming: Media) -> Result<Media, StoreError> {
         self.ensure_media_with_previous(incoming)
             .map(|(media, _)| media)
@@ -212,10 +302,8 @@ impl Store {
     }
 
     pub fn delete_media(&self, id: MediaId) -> Result<(), StoreError> {
-        self.app.execute(
-            "DELETE FROM media WHERE id = ?1",
-            params![id.to_string()],
-        )?;
+        self.app
+            .execute("DELETE FROM media WHERE id = ?1", params![id.to_string()])?;
         Ok(())
     }
 }

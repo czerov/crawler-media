@@ -94,6 +94,8 @@ pub(crate) fn render_subscription_snapshot(
         "full_season_pack": subscribe.full_season_pack,
         "downloader_id": subscribe.downloader_id.map(|id| id.to_string()),
         "library_id": subscribe.library_id.map(|id| id.to_string()),
+        "target_library_status": snapshot.target_library_status,
+        "target_library_error": snapshot.target_library_error,
         "tracking_state": subscribe.tracking_state,
         "follow_future": subscribe.follow_future,
         "search_interval_secs": subscribe.search_interval_secs,

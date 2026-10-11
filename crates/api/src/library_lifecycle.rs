@@ -5,7 +5,14 @@ impl ApiState {
     pub(crate) fn acquire_path_work(&self, path: &std::path::Path, kind: domain::MediaKind)
         -> Result<Option<LibraryWorkLease>, String>
     {
-        let owner = self.store.lock().library_for_path_strict(path, kind).map_err(|e| e.to_string())?;
+        let owner = {
+            let store = self.store.lock();
+            let owner = store.library_for_path_strict(path, kind).map_err(|e| e.to_string())?;
+            if owner.is_none() && store.path_in_removal_scope(path).map_err(|e| e.to_string())? {
+                return Err("Library 已删除，拒绝旧目录工作".into());
+            }
+            owner
+        };
         owner.map(|owner| self.acquire_library_work(&owner.id)).transpose()
     }
     pub fn acquire_library_work(&self, library_id: &str) -> Result<LibraryWorkLease, String> {
@@ -18,7 +25,15 @@ pub fn start_library_removal(state: &ApiState, library_id: &str)
 {
     let handle = tokio::runtime::Handle::try_current().map_err(|e| e.to_string())?;
     let operation = state.library_work.freeze(&state.store, library_id).map_err(|e| e.to_string())?;
+    launch_library_removal(state, operation, handle)
+}
+
+pub(crate) fn launch_library_removal(state: &ApiState, operation: store::LibraryRemoval,
+    handle: tokio::runtime::Handle) -> Result<store::LibraryRemoval, String> {
     if operation.state == "succeeded" { return Ok(operation); }
+    if !state.library_work.removals.lock().insert(operation.operation_id.clone()) {
+        return Ok(operation);
+    }
     let state = state.clone();
     let operation_id = operation.operation_id.clone();
     handle.spawn(async move {
@@ -28,6 +43,7 @@ pub fn start_library_removal(state: &ApiState, library_id: &str)
                 tracing::error!(%operation_id, %persist_error, "保存 Library 删除失败状态失败");
             }
         }
+        state.library_work.removals.lock().remove(&operation_id);
     });
     Ok(operation)
 }
@@ -69,6 +85,7 @@ use tokio::sync::Notify;
 pub struct LibraryWorkRegistry {
     entries: Mutex<HashMap<String, Entry>>,
     changed: Notify,
+    removals: Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -86,6 +103,14 @@ pub struct LibraryWorkLease {
 }
 
 impl LibraryWorkLease {
+    pub fn library_id(&self) -> &str { &self.library_id }
+    pub fn publish<T>(&self, publish: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let entries = self.registry.entries.lock();
+        if entries.get(&self.library_id).is_none_or(|entry| entry.cancelled) {
+            return Err("Library work cancelled".into());
+        }
+        self.control.publish(publish)
+    }
     pub fn control(&self) -> &library::WorkControl { &self.control }
 }
 

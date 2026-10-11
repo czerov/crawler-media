@@ -13,6 +13,9 @@ pub struct WorkControl {
 
 impl WorkControl {
     pub fn signal(&self) -> &marker::WorkControl { &self.signal }
+    pub fn publish<T>(&self, publish: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        self.signal.publish(publish)
+    }
     pub fn cancel(&self) { self.signal.cancel(); }
     pub fn is_cancelled(&self) -> bool { self.signal.is_cancelled() }
     pub fn check(&self) -> Result<(), LibraryError> {

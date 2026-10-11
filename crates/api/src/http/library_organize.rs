@@ -100,6 +100,10 @@ pub(crate) async fn organize(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
+    let lease = match state.acquire_library_work(&id) {
+        Ok(lease) => lease,
+        Err(error) => return err(StatusCode::CONFLICT, "library.frozen", &error),
+    };
     let store = state.store.lock();
     let Some(library) = store.get_library(&id).ok().flatten() else {
         return missing_library();
@@ -111,6 +115,17 @@ pub(crate) async fn organize(
             "缺少 renames 列表",
         );
     };
+    match lease
+        .control()
+        .signal()
+        .publish(|| Ok(apply_organize(&store, &library, renames)))
+    {
+        Ok(response) => response,
+        Err(error) => err(StatusCode::CONFLICT, "library.frozen", &error),
+    }
+}
+
+fn apply_organize(store: &crate::Store, library: &store::Library, renames: &[Value]) -> Response {
     let mut applied = 0usize;
     let mut skipped = Vec::new();
     let mut errors = Vec::new();
@@ -228,6 +243,10 @@ pub(crate) async fn refresh_item_metadata(
     State(state): State<ApiState>,
     Path((id, item_id)): Path<(String, String)>,
 ) -> Response {
+    let lease = match state.acquire_library_work(&id) {
+        Ok(lease) => lease,
+        Err(error) => return err(StatusCode::CONFLICT, "library.frozen", &error),
+    };
     let store = state.store.lock();
     let Some(library) = store.get_library(&id).ok().flatten() else {
         return missing_library();
@@ -263,10 +282,14 @@ pub(crate) async fn refresh_item_metadata(
     let mut refreshed = 0;
     if let Some(bytes) = crate::poster_fetch::attach_poster(&state, &media, &path) {
         refreshed += 1;
-        let _ = std::fs::write(show_root.join("poster.jpg"), &bytes);
+        let _ = lease.control().signal().publish(|| {
+            std::fs::write(show_root.join("poster.jpg"), &bytes).map_err(|error| error.to_string())
+        });
     }
     if let Some(bytes) = crate::poster_fetch::force_attach_backdrop(&state, &media, &path) {
-        let _ = std::fs::write(show_root.join("fanart.jpg"), &bytes);
+        let _ = lease.control().signal().publish(|| {
+            std::fs::write(show_root.join("fanart.jpg"), &bytes).map_err(|error| error.to_string())
+        });
     }
     if let Some(tmdb_id) = media.tmdb_id.as_deref() {
         match crate::scrape_metadata::fetch_tmdb_metadata(&state, media.kind, tmdb_id) {
@@ -284,7 +307,10 @@ pub(crate) async fn refresh_item_metadata(
                     );
                 } else if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
                     let target = path.with_file_name(format!("{stem}.nfo"));
-                    crate::scrape_metadata::write_nfo(&target, &media, &nfo);
+                    let _ = lease.control().signal().publish(|| {
+                        crate::scrape_metadata::write_nfo(&target, &media, &nfo);
+                        Ok(())
+                    });
                 }
             }
             Ok(None) => {

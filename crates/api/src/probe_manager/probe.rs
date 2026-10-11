@@ -262,10 +262,15 @@ async fn probe_adaptive_season(
             Ok(replacement) => {
                 let chapter_updates_clone = replacement.chapter_updates.clone();
                 let markers_len = replacement.markers.len();
-                let publication = mgr
-                    .store
-                    .lock()
-                    .replace_marker_results_batch_checked(&[replacement]);
+                let publication = {
+                    let store = mgr.store.lock();
+                    let rows = season_units
+                        .iter()
+                        .map(|unit| unit.row.clone())
+                        .collect::<Vec<_>>();
+                    super::markers::validate_publication_rows(&store, &rows)
+                        .and_then(|()| store.replace_marker_results_batch_checked(&[replacement]))
+                };
                 if let Err(e) = publication {
                     if matches!(&e, crate::store::StoreError::Missing(reason) if crate::fingerprint_job::source::is_file_deleted(reason))
                     {
@@ -274,11 +279,12 @@ async fn probe_adaptive_season(
                     }
                     tracing::error!(error = %e, "自适应整季标记替换失败");
                 } else {
-                    {
-                        let store = mgr.store.lock();
+                    let registry = mgr.library_work.lock().clone();
+                    if let Some(registry) = registry {
                         crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
                             &chapter_updates_clone,
-                            &store,
+                            &mgr.store,
+                            &registry,
                         );
                     }
                     tracing::info!(
@@ -366,8 +372,10 @@ async fn probe_tracks_and_store(
     }
     let probe_unit = unit.clone();
     let control = probe_control(mgr, unit);
-    let tracks_result =
-        tokio::task::spawn_blocking(move || read_tracks_with_nfo(&probe_unit, started_at, &control)).await;
+    let tracks_result = tokio::task::spawn_blocking(move || {
+        read_tracks_with_nfo(&probe_unit, started_at, &control)
+    })
+    .await;
     let tracks = match tracks_result {
         Ok(Some(tracks_and_duration)) => tracks_and_duration,
         Ok(None) => {
@@ -403,7 +411,9 @@ async fn probe_tracks_and_store(
         if crate::fingerprint_job::source::ensure_source_available(&store, &unit.row).is_err() {
             return Err(());
         }
-        store.put_file_meta_versioned(&ledger_id, &tracks, Some(source_version), duration_ms)
+        store
+            .put_file_meta_versioned(&ledger_id, &tracks, Some(source_version), duration_ms)
+            .map(|()| update_ledger_quality(&store, &ledger_id, &tracks))
     };
     if let Err(error) = published {
         tracing::error!(
@@ -417,7 +427,6 @@ async fn probe_tracks_and_store(
         );
         return Err(());
     }
-    update_ledger_quality(mgr, &ledger_id, &tracks);
     tracing::info!(
         media_id = %unit.row.media_id,
         season = unit.row.season.unwrap_or(1),
@@ -441,10 +450,17 @@ async fn probe_tracks_and_store(
 }
 
 pub(super) fn probe_control(mgr: &ProbeManager, unit: &ProbeUnit) -> library::WorkControl {
-    let owner = mgr.store.lock().library_for_path_strict(std::path::Path::new(&unit.row.path), unit.kind)
-        .ok().flatten().map(|library| library.id);
+    let owner = mgr
+        .store
+        .lock()
+        .library_for_path_strict(std::path::Path::new(&unit.row.path), unit.kind)
+        .ok()
+        .flatten()
+        .map(|library| library.id);
     let registry = mgr.library_work.lock().clone();
-    owner.and_then(|id| registry.and_then(|registry| registry.active_control(&id))).unwrap_or_default()
+    owner
+        .and_then(|id| registry.and_then(|registry| registry.active_control(&id)))
+        .unwrap_or_default()
 }
 
 fn read_tracks_with_nfo(
@@ -462,14 +478,19 @@ fn read_tracks_with_nfo(
         Ok((tracks, duration_ms)) => {
             let has_streams =
                 tracks.video.is_some() || !tracks.audio.is_empty() || !tracks.subtitles.is_empty();
-            if control.is_cancelled() { return None; }
+            if control.is_cancelled() {
+                return None;
+            }
             if has_streams {
-                if let Err(error) = library::write_streamdetails_into_nfo(
-                    &nfo_path,
-                    tracks.video.as_ref(),
-                    &tracks.audio,
-                    &tracks.subtitles,
-                ) {
+                if let Err(error) = control.publish(|| {
+                    library::write_streamdetails_into_nfo(
+                        &nfo_path,
+                        tracks.video.as_ref(),
+                        &tracks.audio,
+                        &tracks.subtitles,
+                    )
+                    .map_err(|error| error.to_string())
+                }) {
                     tracing::warn!(
                         media_id = %media_id,
                         season,
@@ -543,101 +564,6 @@ pub(super) fn fingerprint_duration(
     })
 }
 
-async fn probe_fingerprint_and_store(
-    mgr: &ProbeManager,
-    unit: &ProbeUnit,
-    fp_path: PathBuf,
-    duration_secs: u32,
-    media_duration_ms: Option<i64>,
-    source_version: String,
-    fingerprint_engine: Arc<dyn FingerprintEngine>,
-    require_complete_markers: bool,
-    allow_cache_reuse: bool,
-) -> bool {
-    let ledger_id = unit.row.id.to_string();
-    let started = Instant::now();
-    let cached = match mgr.store.lock().get_fingerprint_cache(&ledger_id) {
-        Ok(cache) => cache,
-        Err(error) => {
-            tracing::error!(%error, ledger_id, "【声纹】读取指纹缓存失败，回退到重新采集");
-            None
-        }
-    };
-    let outcome = match crate::fingerprint_job::capture_or_reuse_fingerprints(
-        &fp_path,
-        &source_version,
-        duration_secs,
-        media_duration_ms,
-        cached,
-        allow_cache_reuse,
-        fingerprint_engine,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            tracing::error!(
-                %error,
-                ledger_id,
-                media_id = %unit.row.media_id,
-                season = unit.row.season.unwrap_or(1),
-                episode = unit.row.episode.unwrap_or(1),
-                path = %fp_path.display(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "【声纹】音频指纹采集失败"
-            );
-            return false;
-        }
-    };
-    if let Err(error) = mgr
-        .store
-        .lock()
-        .put_fingerprint_cache(&ledger_id, &outcome.cache)
-    {
-        tracing::error!(%error, ledger_id, "【声纹】版本化指纹缓存持久化失败");
-        return false;
-    }
-    tracing::info!(
-        ledger_id,
-        media_id = %unit.row.media_id,
-        season = unit.row.season.unwrap_or(1),
-        episode = unit.row.episode.unwrap_or(1),
-        path = %fp_path.display(),
-        source_version,
-        cache_key = outcome.cache.cache_key,
-        intro_cache_hit = outcome.intro_cache_hit,
-        outro_cache_hit = outcome.outro_cache_hit,
-        intro_words = outcome.cache.intro.len(),
-        outro_words = outcome.cache.outro.as_ref().map(Vec::len).unwrap_or_default(),
-        intro_elapsed_ms = outcome.intro_elapsed_ms,
-        outro_elapsed_ms = outcome.outro_elapsed_ms,
-        media_duration_ms = ?outcome.cache.media_duration_ms,
-        refresh_id = ?unit.marker_refresh_id,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "【声纹】版本化指纹缓存已持久化"
-    );
-    mgr.timings.record_fingerprint(
-        unit.job_id.as_deref(),
-        outcome.intro_cache_hit,
-        outcome.outro_cache_hit,
-        outcome.intro_elapsed_ms,
-        outcome.outro_elapsed_ms,
-    );
-    if let Some(error) = outcome.outro_error {
-        tracing::warn!(
-            %error,
-            ledger_id,
-            media_id = %unit.row.media_id,
-            season = unit.row.season.unwrap_or(1),
-            episode = unit.row.episode.unwrap_or(1),
-            require_complete_markers,
-            "【声纹】片尾指纹暂不可用，保留片头缓存并允许下次只重试片尾"
-        );
-        return !require_complete_markers;
-    }
-    true
-}
-
 pub(super) async fn probe_fingerprint_and_store_detailed(
     mgr: &ProbeManager,
     unit: &ProbeUnit,
@@ -681,48 +607,38 @@ pub(super) async fn probe_fingerprint_and_store_detailed(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "【声纹】音频指纹采集失败"
             );
-            let error_kind = if error.contains("403") {
-                "http_403"
-            } else if error.contains("404") {
-                "http_404"
-            } else {
-                "fingerprint_error"
-            };
             return super::stages::FingerprintRunOutcome::Failed {
-                error_kind: error_kind.into(),
+                error_kind: super::stages::classify_fingerprint_error(&error).into(),
                 error,
             };
         }
     };
-    if let Err(error) = mgr
-        .store
-        .lock()
-        .put_fingerprint_cache(&ledger_id, &outcome.cache)
-    {
+    let publication = {
+        let store = mgr.store.lock();
+        super::markers::validate_publication_rows(&store, std::slice::from_ref(&unit.row))
+            .and_then(|()| store.put_fingerprint_cache(&ledger_id, &outcome.cache))
+    };
+    if let Err(error) = publication {
+        if matches!(&error, crate::store::StoreError::Missing(reason) if crate::fingerprint_job::source::is_file_deleted(reason))
+        {
+            mgr.cancel_unit(unit, "file_deleted");
+            return super::stages::FingerprintRunOutcome::Cancelled {
+                reason: "file_deleted".into(),
+            };
+        }
         tracing::error!(%error, ledger_id, "【声纹】版本化指纹缓存持久化失败");
         return super::stages::FingerprintRunOutcome::Failed {
             error_kind: "store_error".into(),
             error: error.to_string(),
         };
     }
-    tracing::info!(
-        ledger_id,
-        media_id = %unit.row.media_id,
-        season = unit.row.season.unwrap_or(1),
-        episode = unit.row.episode.unwrap_or(1),
-        path = %fp_path.display(),
-        source_version,
-        cache_key = outcome.cache.cache_key,
-        intro_cache_hit = outcome.intro_cache_hit,
-        outro_cache_hit = outcome.outro_cache_hit,
-        intro_words = outcome.cache.intro.len(),
-        outro_words = outcome.cache.outro.as_ref().map(Vec::len).unwrap_or_default(),
-        intro_elapsed_ms = outcome.intro_elapsed_ms,
-        outro_elapsed_ms = outcome.outro_elapsed_ms,
-        media_duration_ms = ?outcome.cache.media_duration_ms,
-        refresh_id = ?unit.marker_refresh_id,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "【声纹】版本化指纹缓存已持久化"
+    log_fingerprint_publication(
+        unit,
+        &ledger_id,
+        &fp_path,
+        &source_version,
+        &outcome,
+        started,
     );
     mgr.timings.record_fingerprint(
         unit.job_id.as_deref(),
@@ -763,14 +679,42 @@ pub(super) async fn probe_fingerprint_and_store_detailed(
     }
 }
 
-fn update_ledger_quality(mgr: &ProbeManager, ledger_id: &str, tracks: &library::Tracks) {
+fn log_fingerprint_publication(
+    unit: &ProbeUnit,
+    ledger_id: &str,
+    fp_path: &std::path::Path,
+    source_version: &str,
+    outcome: &crate::fingerprint_job::FingerprintCaptureOutcome,
+    started: Instant,
+) {
+    tracing::info!(
+        ledger_id,
+        media_id = %unit.row.media_id,
+        season = unit.row.season.unwrap_or(1),
+        episode = unit.row.episode.unwrap_or(1),
+        path = %fp_path.display(),
+        source_version,
+        cache_key = outcome.cache.cache_key,
+        intro_cache_hit = outcome.intro_cache_hit,
+        outro_cache_hit = outcome.outro_cache_hit,
+        intro_words = outcome.cache.intro.len(),
+        outro_words = outcome.cache.outro.as_ref().map(Vec::len).unwrap_or_default(),
+        intro_elapsed_ms = outcome.intro_elapsed_ms,
+        outro_elapsed_ms = outcome.outro_elapsed_ms,
+        media_duration_ms = ?outcome.cache.media_duration_ms,
+        refresh_id = ?unit.marker_refresh_id,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "【声纹】版本化指纹缓存已持久化"
+    );
+}
+
+fn update_ledger_quality(store: &crate::Store, ledger_id: &str, tracks: &library::Tracks) {
     // 探测得到真实主视频流后，顺带回写更新 ledger 行的 resolution, codec, hdr，保证台账与缓存一致
     if let Some(video) = tracks.video.as_ref() {
         let probed_res = video.resolution();
         let probed_codec = video.codec.as_deref();
         let probed_hdr = video.hdr();
         if probed_res.is_some() || probed_codec.is_some() || probed_hdr.is_some() {
-            let store = mgr.store.lock();
             let _ = store.update_ledger_probe_quality(
                 &ledger_id,
                 probed_res.as_deref(),

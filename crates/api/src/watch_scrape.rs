@@ -39,14 +39,22 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
     }
     let owner = {
         let store = state.store.lock();
-        store.list_libraries().map_err(|e| e.to_string())?.into_iter()
-            .find(|library| library.root_paths.iter().any(|root| root == &path))
+        let mut owners = Vec::new();
+        for kind in [MediaKind::Movie, MediaKind::Tv, MediaKind::Video] {
+            if let Some(owner) = store.library_for_path_strict(&path, kind).map_err(|e| e.to_string())? { owners.push(owner); }
+        }
+        owners.into_iter().max_by_key(|library| library.root_paths.iter().filter(|root| path.starts_with(root))
+            .map(|root| root.components().count()).max().unwrap_or(0))
     };
+    if owner.is_none() && state.store.lock().path_in_removal_scope(&path).map_err(|e| e.to_string())? {
+        return Ok(());
+    }
+    let kind = owner.as_ref().map(|owner| owner.kind).unwrap_or(MediaKind::Movie);
     let lease = owner.map(|owner| state.acquire_library_work(&owner.id)).transpose()?;
     tracing::debug!(dir = %path.display(), "扫描目录，刮削并生成 NFO");
     let probe = Media {
         id: MediaId::new(),
-        kind: MediaKind::Movie,
+        kind,
         title: "inplace".into(),
         year: None,
         original_title: None,
@@ -63,7 +71,7 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
         path: path.clone(),
         scrape: nfo,
     };
-    let outcome = scan_watch(&job, &probe).map_err(|e| {
+    let mut outcome = scan_watch(&job, &probe).map_err(|e| {
         tracing::error!(dir = %path.display(), error = %e, "目录扫描失败");
         e.to_string()
     })?;
@@ -76,7 +84,14 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
     }
     let inserted = {
         let store = state.store.lock();
-        if let Some(lease) = &lease { lease.control().check().map_err(|e| e.to_string())?; }
+        if let Some(lease) = &lease {
+            lease.control().check().map_err(|e| e.to_string())?;
+            if !store.library_accepts_work(lease.library_id()).map_err(|e| e.to_string())? { return Ok(()); }
+            outcome.transferred.retain(|file| store.library_for_path_strict(&file.path, kind).ok().flatten()
+                .is_some_and(|owner| owner.id == lease.library_id()));
+        } else {
+            outcome.transferred.retain(|file| !store.path_in_removal_scope(&file.path).unwrap_or(true));
+        }
         crate::watch_ledger::record_paths(&store, outcome.transferred.clone())?
     };
 

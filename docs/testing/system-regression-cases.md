@@ -132,11 +132,22 @@ VidHub 用例通过已安装的 VidHub app 连接隔离实例执行。第一次�
 | LIB-04 | P1 | 打开 library/manage；扫描、重识别 Unidentified 文件、手动 claim、查看重复文件；删除测试文件并按产品恢复路径还原。 | 识别建议可复核；低置信度不会自动 Transfer；受影响路径与文件名可见；可恢复删除能恢复记录和文件。 |
 | LIB-05 | P1 | 加入/移出收藏夹；切换 User；在收藏页打开 Media 并返回。 | 收藏是 User 维度；成员之间不串数据；收藏页和详情状态一致。 |
 | LIB-06 | P1 | 打开 Library customize 修改可见信息、排序与卡片呈现；保存后刷新并恢复默认。 | 自定义仅影响预期视图；保存后保持；恢复默认不改变 Library 文件或其他 User 设置。 |
+| LIB-07 | P0 | 准备额外 TV Library A、本地 tvshow.nfo/STRM/字幕/图片、两 User 的 S01E03 进度 750000/120000ms 与不同已看/收藏状态；另一 Library B 保留同 Media 文件。管理员从管理页删除 A，观察确认文案、删除中卡片和终态，再从 UI 用同根目录重建并扫描；分别登录两 User 查看进度与收藏。 | 202 接受不等于成功：只有 succeeded 才移除卡片；文件及侧车字节不变；旧 ledger/探测缓存清除，新 ledger id 不同但可靠 NFO 别名复用 MediaId；两 User 状态各自恢复；B 的文件、ledger 和缓存不变；新库片头/声纹默认关闭，基本媒体探测仍安排。 |
+| LIB-08 | P0 | 用电影 Library 重复 LIB-07；再分别准备同名不同外部 ID、无 ID 且身份歧义的 NFO，删除后重建；检查原历史和新文件详情。 | 整片进度可在可靠 movie 身份下恢复；不同 ID 不串进度；无可靠身份不强行合并，保留旧历史但不承诺自动恢复；episode NFO 的单集 ID 不当作 TV 作品 ID。 |
+| LIB-09 | P0 | fixture 在扫描、probe、侧车发布或 Transfer 边界暂停；从 UI 删除其 Library，释放 fixture；删除中刷新页面。再用排空超时 fixture 观察失败并重试。 | 删除中不能新扫描/Scrape/Transfer/Playback；只有旧租约退出且不能再发布才成功；超时显示失败并保持冻结，错误可读、可重试；旧任务不能在同根新库复活数据或改写侧车；另一库的独立工作继续。 |
+| LIB-10 | P0 | 隔离实例分别在 draining 与两个数据库清理阶段之间重启，再从 UI 回到管理页；检查重复删除/重试、成员浏览和显式绑定旧库的 Subscribe。 | 恢复同一操作与快照计数，不恢复被取消 probe；冻结库成员不可见，管理卡保留状态；Subscribe 保留但提示目标 Library 不可用，不自动改绑默认库；失败不报成功。 |
+| LIB-11 | P1 | fixture 建父库与独立嵌套子库；从 UI 删除非最后一个默认库，再尝试删除同类型最后一个库；检查静态封面和其他库 Playback。 | 最长唯一根归属保证子库/同 Media 其他文件不受影响；默认只提升现存库；最后同类型库受保护；只关闭命中删除快照的播放，其他库 Playback 正常；静态 artwork 继续无需自定义 Authorization header。 |
 | TRF-01 | P0 | 在转移预览中选 hardlink、copy、move；以同盘/跨盘 fixture 运行 Transfer；对比来源与目标文件、Naming template 和 ledger。 | 目标名称按 Naming template 展开且空字段不留下多余括号；hardlink/copy 保留源文件，move 移除源文件；探测到的文件 quality 写入 ledger。 |
 | TRF-02 | P0 | 将高置信度与低置信度文件放入 intake Watch directory；运行一次 intake；对 Unidentified 项手动 claim 后再次运行。 | 可识别文件 Transfer 到目标 Library；Unidentified 留在待处理列表，不按猜测移动；claim 后使用明确 Media 重新执行。 |
 | SCR-01 | P1 | 对刚 Transfer 的文件、已有 Library 文件和单独路径分别执行 Scrape；打开输出目录检查 NFO 与 artwork。 | 每种入口都按开关生成/更新 sidecar；关闭 mirror 写入时不创建 NFO/artwork；已有文件不会被无关内容覆盖。 |
 | SCR-02 | P1 | 修改 Metadata source 语言、图片候选语言/质量、Naming template、目录写入和片头片尾标记偏好；运行 Scrape 后检查 Library 与 Playback。 | 新设置只影响后续预期操作；封面/背景候选符合语言与质量偏好；标记与章节呈现在支持的接口，数据源缺失时有提示。 |
 | DUP-01 | P1 | 从重复文件页比较同一 Media 的多个版本，保留一个并删除另一个。 | 标识、路径、probe 信息和选择结果清楚；删除确认对应正确文件；Library ledger、文件和容量统计同步。 |
+
+#### Library removal 自动化辅助验收与未覆盖项
+
+`cargo test -p api --test library_delete_reimport` 通过公开 DELETE/status/创建/scan 路由检查 TV 两 User、电影整片、不同 NFO 别名不串进度、旧缓存删除和独立 Library 同 Media 保留。fixture 在没有 Tokio runtime 时创建 ApiState，随后进入 Tokio 执行 HTTP，避免启动真实 ffprobe worker；Catalog/Indexer 为离线 fake，STRM 不访问远程源。已有 file_meta 使用有效 VideoTrack，不能用空 Tracks 的读取 miss 假装验证清理。
+
+这个 API 测试不是浏览器 E2E，不替代 LIB-07–11。它检查新 ledger 没有复制旧缓存，不验证新 fake-probe 成功写入 file_meta，也不独立覆盖重启/取消竞态、无 ID 歧义、成员权限、Subscribe 失效或实际播放。上述 UI 用例本次新增时均为 **Not run**；必须记录实际命令退出码和 UI 证据之后才能标记 Pass。
 
 ### 系统配置、管理和运维页面
 

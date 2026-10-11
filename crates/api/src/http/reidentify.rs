@@ -134,13 +134,39 @@ pub(crate) async fn reidentify(State(state): State<ApiState>, Json(body): Json<V
         .filter(|row| row.media_id == media_id)
         .collect();
     let claimed = rows.len();
+    let owners: HashSet<String> = rows
+        .iter()
+        .filter_map(|row| {
+            crate::http::library::library_for_row(&store, row, &media).map(|owner| owner.id)
+        })
+        .collect();
     drop(store);
+    let leases = match owners
+        .iter()
+        .map(|id| state.acquire_library_work(id))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(leases) => leases,
+        Err(error) => return err(StatusCode::CONFLICT, "library.frozen", &error),
+    };
+    let cancelled = || leases.iter().any(|lease| lease.control().is_cancelled());
     let target = resolve_title(&state, title_ref);
     match target {
         Ok(Some(target)) => {
             // 更新 media 身份。
             {
                 let store = state.store.lock();
+                if cancelled()
+                    || owners
+                        .iter()
+                        .any(|id| !store.library_accepts_work(id).unwrap_or(false))
+                {
+                    return err(
+                        StatusCode::CONFLICT,
+                        "library.frozen",
+                        "Library work cancelled",
+                    );
+                }
                 let mut updated = media.clone();
                 updated.title = target.title.clone();
                 updated.year = target.year;
@@ -151,12 +177,26 @@ pub(crate) async fn reidentify(State(state): State<ApiState>, Json(body): Json<V
             // 重刷元数据（海报/背景/NFO）。
             if let Some(row) = rows.first() {
                 let path = FsPath::new(&row.path).to_path_buf();
+                if cancelled() {
+                    return err(
+                        StatusCode::CONFLICT,
+                        "library.frozen",
+                        "Library work cancelled",
+                    );
+                }
                 let _ = crate::poster_fetch::attach_poster(&state, &target, &path);
                 let _ = crate::poster_fetch::attach_backdrop(&state, &target, &path);
                 if let Some(tmdb_id) = target.tmdb_id.clone() {
                     match crate::scrape_metadata::fetch_tmdb_metadata(&state, target.kind, &tmdb_id)
                     {
                         Ok(Some(meta)) => {
+                            if cancelled() {
+                                return err(
+                                    StatusCode::CONFLICT,
+                                    "library.frozen",
+                                    "Library work cancelled",
+                                );
+                            }
                             let nfo = crate::scrape_metadata::nfo_from_tmdb(&target, &meta);
                             if target.kind == MediaKind::Tv {
                                 crate::scrape_metadata::write_series_nfos(
@@ -172,7 +212,20 @@ pub(crate) async fn reidentify(State(state): State<ApiState>, Json(body): Json<V
                                 path.file_stem().and_then(|value| value.to_str())
                             {
                                 let nfo_path = path.with_file_name(format!("{stem}.nfo"));
-                                crate::scrape_metadata::write_nfo(&nfo_path, &target, &nfo);
+                                if let Some(lease) = leases.iter().find(|lease| {
+                                    state
+                                        .store
+                                        .lock()
+                                        .library_for_path_strict(&path, media.kind)
+                                        .ok()
+                                        .flatten()
+                                        .is_some_and(|owner| owner.id == lease.library_id())
+                                }) {
+                                    let _ = lease.control().signal().publish(|| {
+                                        crate::scrape_metadata::write_nfo(&nfo_path, &target, &nfo);
+                                        Ok(())
+                                    });
+                                }
                             }
                         }
                         Ok(None) => {

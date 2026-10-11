@@ -131,8 +131,7 @@ pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Ve
             }
         };
         if let Some(bytes) = picked {
-            if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { return None; }
-            return write_artwork(media, &target, "海报", &bytes);
+            return publish_artwork(lease.as_ref(), media, &target, "海报", &bytes);
         }
     }
 
@@ -165,10 +164,10 @@ pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Ve
             }
         };
         if generate_allowed {
-            match frame_poster(video) {
+            let control = lease.as_ref().map(|lease| lease.control().clone()).unwrap_or_default();
+            match frame_poster_controlled(video, &control) {
                 Ok(bytes) if !bytes.is_empty() => {
-                    if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { return None; }
-            return write_artwork(media, &target, "海报", &bytes);
+                    return publish_artwork(lease.as_ref(), media, &target, "海报", &bytes);
                 }
                 Ok(_) => {
                     tracing::warn!(media = %media.title, video = %video.display(), "视频截帧海报为空");
@@ -220,12 +219,24 @@ fn write_artwork(media: &Media, target: &Path, kind: &str, bytes: &[u8]) -> Opti
     }
 }
 
+fn publish_artwork(lease: Option<&crate::library_lifecycle::LibraryWorkLease>, media: &Media,
+    target: &Path, kind: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    match lease {
+        Some(lease) => lease.publish(|| Ok(write_artwork(media, target, kind, bytes))).ok().flatten(),
+        None => write_artwork(media, target, kind, bytes),
+    }
+}
+
 fn poster_url_at_size(url: &str, size: &str) -> String {
     url.replace("/t/p/w342/", &format!("/t/p/{size}/"))
 }
 
 /// Extract a 2:3 poster (342x513) from a video frame via ffmpeg.
 pub fn frame_poster(video: &Path) -> Result<Vec<u8>, String> {
+    frame_poster_controlled(video, &library::WorkControl::default())
+}
+
+fn frame_poster_controlled(video: &Path, control: &library::WorkControl) -> Result<Vec<u8>, String> {
     use std::process::Command;
     let out = tempfile_posters_dir()?.join(format!(
         "frame-{}-{}.jpg",
@@ -235,16 +246,15 @@ pub fn frame_poster(video: &Path) -> Result<Vec<u8>, String> {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    let status = Command::new("ffmpeg")
-        .args([
+    let mut command = Command::new("ffmpeg");
+    command.args([
             "-y", "-ss", "60", "-i", &video.display().to_string(),
             "-frames:v", "1",
             "-vf", "scale=342:513:force_original_aspect_ratio=decrease,pad=342:513:(ow-iw)/2:(oh-ih)/2:black",
             "-q:v", "2", &out.display().to_string(),
-        ])
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
+        ]);
+    let output = control.output(&mut command).map_err(|e| e.to_string())?;
+    if !output.status.success() {
         return Err("ffmpeg frame extraction failed".into());
     }
     let bytes = std::fs::read(&out).map_err(|e| e.to_string())?;
@@ -376,8 +386,7 @@ fn attach_backdrop_opts(
     let Some(bytes) = fetch_artwork(state, media, "背景图", &url) else {
         return None;
     };
-    if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { return None; }
-    write_artwork(media, &target, "背景图", &bytes)
+    publish_artwork(lease.as_ref(), media, &target, "背景图", &bytes)
 }
 
 fn lang_subtag(language: &str) -> String {

@@ -94,12 +94,18 @@ pub(crate) fn write_series_nfos(
     show_metadata: &library::NfoMeta,
     language: &str,
 ) {
-    let Some(sample) = rows.first() else { return; };
-    let lease = match state.acquire_path_work(Path::new(&sample.path), media.kind) {
-        Ok(lease) => lease, Err(_) => return,
+    let target = show_root.join("tvshow.nfo");
+    let lease = match state.acquire_path_work(&target, media.kind) {
+        Ok(Some(lease)) => lease, _ => return,
+    };
+    let rows: Vec<_> = {
+        let store = state.store.lock();
+        rows.iter().filter(|row| store.library_for_path_strict(Path::new(&row.path), media.kind)
+            .ok().flatten().is_some_and(|owner| owner.id == lease.library_id())
+            && self::show_root(Path::new(&row.path), row) == show_root).cloned().collect()
     };
     let catalog = state.catalog.as_ref();
-    write_nfo(&show_root.join("tvshow.nfo"), media, show_metadata);
+    if lease.publish(|| Ok(write_nfo(&target, media, show_metadata))).is_err() { return; }
     let seasons = rows
         .iter()
         .filter_map(|row| row.season)
@@ -120,7 +126,7 @@ pub(crate) fn write_series_nfos(
             }
         };
         for row in rows.iter().filter(|row| row.season == Some(season)) {
-            if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { return; }
+            if lease.control().is_cancelled() { return; }
             let Some(episode_number) = row.episode else {
                 continue;
             };
@@ -132,7 +138,7 @@ pub(crate) fn write_series_nfos(
                 continue;
             };
             let path = Path::new(&row.path).with_extension("nfo");
-            write_nfo(&path, media, &nfo_from_episode(row, episode));
+            if lease.publish(|| Ok(write_nfo(&path, media, &nfo_from_episode(row, episode)))).is_err() { return; }
         }
     }
 }

@@ -21,6 +21,7 @@ pub(crate) mod library_artwork;
 pub(crate) mod library_chapters;
 pub(crate) mod library_config;
 pub(crate) mod library_delete;
+pub(crate) mod library_deletion;
 pub(crate) mod library_duplicates;
 pub(crate) mod library_gallery;
 pub(crate) mod library_housekeeping;
@@ -455,6 +456,7 @@ fn admin_core_routes() -> Router<ApiState> {
 fn admin_library_routes() -> Router<ApiState> {
     Router::new()
         // libraries：实体增删改 + 条目/文件删除
+        .route("/library-removals/{operation_id}", get(library_deletion::status))
         .route("/libraries", post(library_config::create_library))
         .route(
             "/libraries/{id}",

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use domain::{Confidence, Media, MediaKind, Release};
 
 use crate::scrape::scrape_beside;
-use crate::{LibraryError, TransferMode, resolve_mode, transfer_file};
+use crate::{LibraryError, TransferMode, resolve_mode};
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "m4v", "mov", "avi", "wmv", "webm", "flv", "ts", "m2ts", "mts", "mpg", "mpeg",
@@ -52,6 +52,7 @@ pub struct TransferredFile {
     pub path: PathBuf,
     /// scan 阶段识别结果；None = 文件名即可信，调用方自行解析 basename。
     pub identified_release: Option<Release>,
+    pub nfo_identity: Option<crate::NfoIdentity>,
 }
 
 impl PartialEq<PathBuf> for TransferredFile {
@@ -81,14 +82,14 @@ pub struct WatchOutcome {
 
 pub fn scan_watch(job: &WatchJob, media: &Media) -> Result<WatchOutcome, LibraryError> {
     match job.kind {
-        WatchKind::InPlace => in_place(job),
+        WatchKind::InPlace => in_place(job, media.kind),
         WatchKind::Intake => intake(job, media),
     }
 }
 
 /// 文件名已经能确定剧名时，仍从上层目录补年份和别名。
-/// 文件名本身是 Low 时，才用 NFO 或父目录标题替换。
-fn enrich_from_ancestors(parsed: &mut Release, start: &std::path::Path) {
+/// 文件名本身是 Low 时，才用父目录标题替换；NFO 在单独的有界步骤处理。
+fn enrich_from_ancestors(parsed: &mut Release, start: &std::path::Path, root: &std::path::Path) {
     let mut current = Some(start);
     let mut depth = 0;
     while let Some(dir) = current {
@@ -96,70 +97,63 @@ fn enrich_from_ancestors(parsed: &mut Release, start: &std::path::Path) {
             break;
         }
         depth += 1;
-        if parsed.confidence == Confidence::Low {
-            if let Some(nfo) = sibling_nfo(start, dir) {
-                if apply_nfo(parsed, &nfo) {
-                    return;
-                }
-            }
-        }
         if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
             let parent_parsed = release::parse(name);
-            if parsed.confidence == Confidence::Low && parent_parsed.confidence != Confidence::Low
-            {
-                let year = parsed.year.or(parent_parsed.year);
-                *parsed = parent_parsed;
-                parsed.year = year;
+            if parsed.confidence == Confidence::Low && parent_parsed.confidence != Confidence::Low {
+                parsed.title = parent_parsed.title;
+                parsed.year = parsed.year.or(parent_parsed.year);
+                parsed.season = parsed.season.or(parent_parsed.season);
+                parsed.episode = parsed.episode.or(parent_parsed.episode);
+                parsed.confidence = parent_parsed.confidence;
                 return;
             }
             if parsed.year.is_none() {
                 parsed.year = parent_parsed.year;
             }
         }
+        if dir == root {
+            break;
+        }
         current = dir.parent();
     }
 }
 
-fn sibling_nfo(file: &std::path::Path, dir: &std::path::Path) -> Option<PathBuf> {
-    if dir != file.parent()? {
-        return None;
+fn identify_local(
+    parsed: &mut Release,
+    path: &std::path::Path,
+    root: &std::path::Path,
+    kind: MediaKind,
+) -> Option<crate::NfoIdentity> {
+    if let Err(error) = crate::watch_identity::enrich_episode(parsed, path, root) {
+        tracing::warn!(path = %path.display(), error = %error, "Unable to read episode NFO; using filename");
     }
-    let beside = file.with_extension("nfo");
-    if beside.is_file() {
-        return Some(beside);
+    let identity = match crate::read_watch_identity(path, root, kind) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), error = %error, "Unable to read work NFO; using filename");
+            None
+        }
+    };
+    if let Some(identity) = &identity {
+        if let Some(title) = &identity.title {
+            parsed.title = title.clone();
+            parsed.confidence = Confidence::High;
+        }
+        parsed.year = identity.year;
     }
-    fs::read_dir(dir).ok().and_then(|entries| {
-        entries.filter_map(Result::ok).find_map(|entry| {
-            let path = entry.path();
-            (path.extension().and_then(|ext| ext.to_str()) == Some("nfo")).then_some(path)
-        })
-    })
+    identity
 }
 
-fn apply_nfo(parsed: &mut Release, path: &std::path::Path) -> bool {
-    let Ok(content) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Some(meta) = crate::nfo::parse_nfo(&content) else {
-        return false;
-    };
-    let Some(title) = meta.title.filter(|title| !title.trim().is_empty()) else {
-        return false;
-    };
-    parsed.title = title;
-    parsed.year = meta.year.and_then(|year| year.parse::<u16>().ok());
-    parsed.confidence = Confidence::High;
-    true
-}
-
-fn in_place(job: &WatchJob) -> Result<WatchOutcome, LibraryError> {
+fn in_place(job: &WatchJob, kind: MediaKind) -> Result<WatchOutcome, LibraryError> {
     let mut outcome = WatchOutcome::default();
-    walk_in_place(&job.path, job.scrape, &mut outcome)?;
+    walk_in_place(&job.path, &job.path, kind, job.scrape, &mut outcome)?;
     Ok(outcome)
 }
 
 fn walk_in_place(
     dir: &std::path::Path,
+    root: &std::path::Path,
+    kind: MediaKind,
     scrape: bool,
     outcome: &mut WatchOutcome,
 ) -> Result<(), LibraryError> {
@@ -173,7 +167,7 @@ fn walk_in_place(
             continue;
         }
         if meta.is_dir() {
-            walk_in_place(&path, scrape, outcome)?;
+            walk_in_place(&path, root, kind, scrape, outcome)?;
             continue;
         }
         if !meta.is_file() {
@@ -188,8 +182,9 @@ fn walk_in_place(
             .unwrap_or_default();
         let mut parsed = release::parse(name);
         if let Some(parent) = path.parent() {
-            enrich_from_ancestors(&mut parsed, parent);
+            enrich_from_ancestors(&mut parsed, parent, root);
         }
+        let nfo_identity = identify_local(&mut parsed, &path, root, kind);
         if parsed.confidence == Confidence::Low {
             continue;
         }
@@ -219,6 +214,7 @@ fn walk_in_place(
         outcome.transferred.push(TransferredFile {
             path,
             identified_release: Some(parsed),
+            nfo_identity,
         });
     }
     Ok(())
@@ -226,8 +222,34 @@ fn walk_in_place(
 
 fn intake(job: &WatchJob, media: &Media) -> Result<WatchOutcome, LibraryError> {
     let mut outcome = WatchOutcome::default();
-    walk_intake(&job.path, job, media, &mut outcome)?;
+    walk_intake(&job.path, job, media, &mut outcome, None)?;
     Ok(outcome)
+}
+
+pub fn scan_watch_intake_controlled(
+    job: &WatchJob, media: &Media, movie: &crate::WorkControl, tv: Option<&crate::WorkControl>,
+) -> Result<WatchOutcome, LibraryError> {
+    movie.check()?;
+    let mut outcome = WatchOutcome::default();
+    walk_intake(&job.path, job, media, &mut outcome, Some((movie, tv)))?;
+    Ok(outcome)
+}
+
+fn same_entity(source: &std::path::Path, destination: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        source
+            .metadata()
+            .ok()
+            .zip(destination.metadata().ok())
+            .is_some_and(|(src, dst)| src.dev() == dst.dev() && src.ino() == dst.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source, destination);
+        false
+    }
 }
 
 fn walk_intake(
@@ -235,8 +257,13 @@ fn walk_intake(
     job: &WatchJob,
     media: &Media,
     outcome: &mut WatchOutcome,
+    controls: Option<(&crate::WorkControl, Option<&crate::WorkControl>)>,
 ) -> Result<(), LibraryError> {
     for entry in fs::read_dir(current_dir)? {
+        if let Some((movie, tv)) = controls {
+            movie.check()?;
+            if let Some(tv) = tv { tv.check()?; }
+        }
         let path = entry?.path();
         let meta = match fs::symlink_metadata(&path) {
             Ok(meta) => meta,
@@ -246,7 +273,7 @@ fn walk_intake(
             continue;
         }
         if meta.is_dir() {
-            walk_intake(&path, job, media, outcome)?;
+            walk_intake(&path, job, media, outcome, controls)?;
             continue;
         }
         if !meta.is_file() || !is_video_file(&path) {
@@ -258,8 +285,9 @@ fn walk_intake(
             .unwrap_or_default();
         let mut parsed = release::parse(name);
         if let Some(parent) = path.parent() {
-            enrich_from_ancestors(&mut parsed, parent);
+            enrich_from_ancestors(&mut parsed, parent, &job.path);
         }
+        let nfo_identity = identify_local(&mut parsed, &path, &job.path, media.kind);
         if parsed.confidence == Confidence::Low {
             outcome.unidentified.push(Unidentified {
                 path,
@@ -268,6 +296,13 @@ fn walk_intake(
             continue;
         }
         let is_tv = parsed.season.is_some() || parsed.episode.is_some();
+        let control = match controls {
+            Some((_, None)) if is_tv => return Err(LibraryError::Naming("TV Library is not configured".into())),
+            Some((_, Some(tv))) if is_tv => tv.clone(),
+            Some((movie, _)) => movie.clone(),
+            None => crate::WorkControl::default(),
+        };
+        control.check()?;
         let target_root = if is_tv {
             job.tv_library_root.as_ref().unwrap_or(&job.library_root)
         } else {
@@ -280,54 +315,19 @@ fn walk_intake(
         let dest = target_root.join(rel_path);
 
         if dest.exists() {
-            // B07: hardlink 模式源文件仍留存，下次轮询会再次遇到同一个目标。
-            // 若源和目标是同一个实体（dev+ino 相同，已成功 hardlink），把它视为幂等成功；
-            // 若不是同一实体，则真实碰撞——拒绝覆盖已有 Library 文件。
-            let same_entity = {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    std::fs::metadata(&path)
-                        .ok()
-                        .zip(std::fs::metadata(&dest).ok())
-                        .is_some_and(|(src_meta, dst_meta)| {
-                            src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino()
-                        })
-                }
-                #[cfg(not(unix))]
-                {
-                    false
-                }
-            };
-            if same_entity {
-                tracing::debug!(
-                    src = %path.display(),
-                    dest = %dest.display(),
-                    "Watch intake 目标已存在且与源同实体，视为幂等重试"
-                );
+            if same_entity(&path, &dest) {
                 outcome.transferred.push(TransferredFile {
-                    path: dest,
-                    identified_release: Some(parsed),
+                    path: dest, identified_release: Some(parsed), nfo_identity,
                 });
-                continue;
             } else {
-                tracing::error!(
-                    src = %path.display(),
-                    dest = %dest.display(),
-                    "Watch intake 目标已存在且与源不同，拒绝覆盖已有 Library 文件"
-                );
-                outcome.errors.push(FileError {
-                    path: path.clone(),
-                    error: format!(
-                        "watch intake destination already exists: {}",
-                        dest.display()
-                    ),
-                });
-                continue;
+                tracing::error!(src=%path.display(), dest=%dest.display(), "Watch intake 目标冲突，拒绝覆盖");
+                outcome.errors.push(FileError { path: path.clone(),
+                    error: format!("watch intake destination already exists: {}", dest.display()) });
             }
+            continue;
         }
         let mode = resolve_mode(&path, target_root, Some(TransferMode::Hardlink));
-        if let Err(err) = transfer_file(&path, &dest, mode) {
+        if let Err(err) = crate::transfer_file_controlled(&path, &dest, mode, &control) {
             tracing::error!(
                 src = %path.display(),
                 dest = %dest.display(),
@@ -341,7 +341,7 @@ fn walk_intake(
             continue;
         }
         if job.scrape {
-            if let Err(err) = scrape_beside(&dest, media, true, None) {
+            if let Err(err) = control.publish(|| scrape_beside(&dest, media, true, None).map_err(|e| e.to_string())) {
                 tracing::warn!(
                     dest = %dest.display(),
                     error = %err,
@@ -352,6 +352,7 @@ fn walk_intake(
         outcome.transferred.push(TransferredFile {
             path: dest,
             identified_release: Some(parsed),
+            nfo_identity,
         });
     }
     Ok(())

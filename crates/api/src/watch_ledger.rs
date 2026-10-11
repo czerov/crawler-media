@@ -30,14 +30,21 @@ pub fn record_paths(
         let parsed = file
             .identified_release
             .unwrap_or_else(|| release::parse(name));
-        let incoming = media_from_release(&parsed);
-        let media = match store
-            .get_media_by_title_kind_year(&incoming.title, incoming.kind, incoming.year)
-            .map_err(|e| e.to_string())?
-        {
-            Some(existing) => existing,
-            None => store.ensure_media(incoming).map_err(|e| e.to_string())?,
-        };
+        let mut incoming = media_from_release(&parsed);
+        if let Some(identity) = file.nfo_identity {
+            incoming.kind = identity.kind;
+            incoming.title = identity.title.unwrap_or(incoming.title);
+            incoming.year = identity.year;
+            incoming.original_title = identity.original_title;
+            incoming.tmdb_id = identity.tmdb_id;
+            incoming.douban_id = identity.douban_id;
+            incoming.tvdb_id = identity.tvdb_id;
+            incoming.bangumi_id = identity.bangumi_id;
+            incoming.anilist_id = identity.anilist_id;
+        }
+        let media = store
+            .resolve_scanned_media(incoming)
+            .map_err(|e| e.to_string())?;
         store
             .insert_ledger(&LedgerRow {
                 id: LedgerId::new(),

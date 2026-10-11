@@ -183,7 +183,7 @@ pub fn transfer_plan_for_library(
             if let Some(r) = lib.root_paths.first() {
                 r.clone()
             } else {
-                store.library_root(kind)?
+                return Err(crate::store::StoreError::Missing("目标 Library 没有根目录".into()));
             }
         } else {
             return Err(crate::store::StoreError::Missing("目标 Library 已删除，请重新选择".into()));

@@ -14,6 +14,47 @@ pub(crate) struct SubscriptionViewSnapshot {
     pub library_poster_candidate: Option<LedgerId>,
     pub total: i64,
     pub imported: i64,
+    pub target_library_status: &'static str,
+    pub target_library_error: Option<&'static str>,
+}
+
+// Only explicit bindings are checked: an implicit target still uses normal routing.
+fn target_library_state(
+    sub: &Subscribe,
+    targets: &HashMap<String, bool>,
+) -> (&'static str, Option<&'static str>) {
+    let Some(id) = sub.library_id else {
+        return ("ready", None);
+    };
+    match targets.get(&id.to_string()) {
+        Some(true) => ("ready", None),
+        Some(false) => (
+            "deleting",
+            Some(
+                "目标媒体库正在删除或已冻结，请重新选择媒体库。订阅仍保留原目标，不会自动切换到其他媒体库。",
+            ),
+        ),
+        None => (
+            "missing",
+            Some(
+                "目标媒体库已不存在，请重新选择媒体库。订阅仍保留原目标，不会自动切换到其他媒体库。",
+            ),
+        ),
+    }
+}
+
+fn load_target_libraries(store: &Store) -> Result<HashMap<String, bool>, crate::store::StoreError> {
+    let mut targets: HashMap<_, _> = store
+        .list_libraries()?
+        .into_iter()
+        .map(|library| (library.id, true))
+        .collect();
+    for removal in store.pending_library_removals()? {
+        if let Some(ready) = targets.get_mut(&removal.library_id) {
+            *ready = false;
+        }
+    }
+    Ok(targets)
 }
 
 pub(crate) fn load_visible_subscription_views(
@@ -38,6 +79,8 @@ pub(crate) fn load_visible_subscription_views(
         ledger_by_media.entry(row.media_id).or_default().push(row);
     }
 
+    // Two batched reads, independent of the number of subscriptions.
+    let target_libraries = load_target_libraries(store)?;
     let mut snapshots = Vec::with_capacity(subscribes.len());
 
     for sub in subscribes {
@@ -55,7 +98,11 @@ pub(crate) fn load_visible_subscription_views(
             .get(&media.id)
             .and_then(|rows| select_preferred_library_poster(rows));
 
+        let (target_library_status, target_library_error) =
+            target_library_state(&sub, &target_libraries);
         snapshots.push(SubscriptionViewSnapshot {
+            target_library_status,
+            target_library_error,
             subscribe: sub,
             media,
             facts,
@@ -90,7 +137,20 @@ pub(crate) fn load_single_subscription_view(
 
     let library_poster_candidate = select_preferred_library_poster(&rows);
 
+    let (target_library_status, target_library_error) = match load_target_libraries(store) {
+        Ok(targets) => target_library_state(sub, &targets),
+        Err(error) => {
+            tracing::error!(subscribe_id = %sub.id, %error, "读取订阅目标媒体库状态失败");
+            (
+                "deleting",
+                Some("暂时无法确认目标媒体库状态，请刷新后重试或重新选择媒体库。"),
+            )
+        }
+    };
+
     SubscriptionViewSnapshot {
+        target_library_status,
+        target_library_error,
         subscribe: sub.clone(),
         media: media.clone(),
         facts: facts.clone(),
@@ -112,7 +172,9 @@ fn select_preferred_library_poster(rows: &[LedgerRow]) -> Option<LedgerId> {
         )
     })?;
 
-    let poster = Path::new(&selected.path).parent().map(|d| d.join("poster.jpg"))?;
+    let poster = Path::new(&selected.path)
+        .parent()
+        .map(|d| d.join("poster.jpg"))?;
     if poster.is_file() {
         Some(selected.id)
     } else {

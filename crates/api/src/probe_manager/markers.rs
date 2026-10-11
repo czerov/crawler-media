@@ -57,14 +57,18 @@ pub(super) fn compare_and_store_markers(
         let replacement = build_marker_replacement(mgr, unit, &comparison)?;
         let chapter_count = replacement.chapter_updates.len();
         let chapter_updates_clone = replacement.chapter_updates.clone();
-        mgr.store
-            .lock()
-            .replace_marker_results_batch(&[replacement])?;
         {
             let store = mgr.store.lock();
+            validate_publication_rows(&store, std::slice::from_ref(&unit.row))?;
+            validate_publication_rows(&store, &comparison.samples.season_rows)?;
+            store.replace_marker_results_batch_checked(&[replacement])?;
+        }
+        let registry = mgr.library_work.lock().clone();
+        if let Some(registry) = registry {
             crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
                 &chapter_updates_clone,
-                &store,
+                &mgr.store,
+                &registry,
             );
         }
         tracing::info!(
@@ -77,6 +81,7 @@ pub(super) fn compare_and_store_markers(
     } else {
         let updates = {
             let store = mgr.store.lock();
+            validate_publication_rows(&store, std::slice::from_ref(&unit.row))?;
             let mut updates = Vec::new();
             for marker in comparison.markers.iter().cloned() {
                 updates.extend(persist_marker(
@@ -88,11 +93,13 @@ pub(super) fn compare_and_store_markers(
             }
             updates
         };
-        // 锁已放下再查媒体库开关并抓帧：抓帧会再次读取 Store，持锁调用会自死锁。
-        crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
-            &updates,
-            &mgr.store.lock(),
-        );
+        // Drop Store before acquiring the registry/lease; frame extraction reads Store again.
+        let registry = mgr.library_work.lock().clone();
+        if let Some(registry) = registry {
+            crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
+                &updates, &mgr.store, &registry,
+            );
+        }
     }
     if unit.overwrite_markers {
         log_unmatched_episodes(unit, &comparison);
@@ -101,15 +108,27 @@ pub(super) fn compare_and_store_markers(
     Ok(())
 }
 
+/// Call only while holding Store, immediately before publishing the computed result.
+pub(super) fn validate_publication_rows(
+    store: &Store,
+    rows: &[LedgerRow],
+) -> Result<(), crate::store::StoreError> {
+    for row in rows {
+        crate::fingerprint_job::source::ensure_source_available(store, row)
+            .map_err(crate::store::StoreError::Missing)?;
+    }
+    Ok(())
+}
+
 fn season_input_unchanged(
     mgr: &ProbeManager,
     unit: &ProbeUnit,
 ) -> Result<bool, crate::store::StoreError> {
     let digest = season_digest(mgr, unit)?;
-    let stored = mgr.store.lock().season_comparison_digest(
-        &unit.row.media_id.to_string(),
-        unit.row.season.unwrap_or(1),
-    )?;
+    let stored = mgr
+        .store
+        .lock()
+        .season_comparison_digest(&unit.row.media_id.to_string(), unit.row.season.unwrap_or(1))?;
     Ok(stored.as_deref() == Some(digest.as_str()))
 }
 
@@ -118,7 +137,9 @@ fn remember_season_digest(
     unit: &ProbeUnit,
 ) -> Result<(), crate::store::StoreError> {
     let digest = season_digest(mgr, unit)?;
-    mgr.store.lock().save_season_comparison_digest(
+    let store = mgr.store.lock();
+    validate_publication_rows(&store, std::slice::from_ref(&unit.row))?;
+    store.save_season_comparison_digest(
         &unit.row.media_id.to_string(),
         unit.row.season.unwrap_or(1),
         &digest,
@@ -446,6 +467,23 @@ pub(super) fn persist_marker(
 ) -> Result<Vec<(String, Vec<library::ChapterMarker>)>, crate::store::StoreError> {
     let mut chapter_updates = Vec::new();
     let started_at = Instant::now();
+    let mut live_rows = Vec::new();
+    for row in rows.iter().filter(|row| {
+        row.media_id == marker.media_id
+            && row.season.unwrap_or(1) == marker.season
+            && row.episode.unwrap_or(1) == marker.episode
+    }) {
+        match crate::fingerprint_job::source::ensure_source_available(store, row) {
+            Ok(()) => live_rows.push(row),
+            Err(reason) if crate::fingerprint_job::source::is_file_deleted(&reason) => {
+                tracing::info!(ledger_id = %row.id, %reason, "跳过已删除或冻结的标记发布目标");
+            }
+            Err(reason) => return Err(crate::store::StoreError::Missing(reason)),
+        }
+    }
+    if live_rows.is_empty() {
+        return Ok(chapter_updates);
+    }
     if let Some(existing) =
         store.get_media_marker(marker.media_id, Some(marker.season), Some(marker.episode))?
     {
@@ -466,11 +504,7 @@ pub(super) fn persist_marker(
         marker.locked = existing.locked && !overwrite_markers;
     }
     store.put_media_marker(&marker)?;
-    for row in rows.iter().filter(|row| {
-        row.media_id == marker.media_id
-            && row.season.unwrap_or(1) == marker.season
-            && row.episode.unwrap_or(1) == marker.episode
-    }) {
+    for row in live_rows {
         let intro = match (marker.intro_start_ms, marker.intro_end_ms) {
             (Some(s), Some(e)) if e > s => Some((s, e)),
             _ => None,

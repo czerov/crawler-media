@@ -51,6 +51,9 @@ pub(crate) async fn delete_item(
     let Some(library) = store.get_library(&library_id).ok().flatten() else {
         return err(StatusCode::NOT_FOUND, "library.missing", "媒体库不存在");
     };
+    if !store.library_accepts_work(&library_id).unwrap_or(false) {
+        return err(StatusCode::CONFLICT, "library.deleting", "Library 正在删除");
+    }
     let Some(media) = store.get_media(media_id).ok().flatten() else {
         return err(StatusCode::NOT_FOUND, "library.missing", "条目不存在");
     };

@@ -37,6 +37,10 @@ impl Store {
 
     /// Replace the primary root of the kind's default library.
     pub fn set_library_root(&self, kind: MediaKind, path: &str) -> Result<(), StoreError> {
+        if let Some(library) = self.default_library(kind)? {
+            self.ensure_library_mutable(&library.id)?;
+        }
+        self.ensure_removal_roots_available(&[path])?;
         let root_id: String = self.app.query_row(
             "SELECT r.id FROM library_roots r
              JOIN libraries l ON l.id = r.library_id
