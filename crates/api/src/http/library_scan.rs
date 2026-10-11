@@ -365,8 +365,14 @@ pub(crate) async fn refresh_metadata(
         let Some(media) = store.get_media(media_id).ok().flatten() else {
             continue;
         };
-        if let Some(row) = preferred_row(&media_rows) {
-            work.push((media, row.clone()));
+        let live_rows: Vec<_> = media_rows
+            .iter()
+            .filter(|row| {
+                crate::scrape_metadata::targets::video_present(std::path::Path::new(&row.path))
+            })
+            .collect();
+        if let Some(row) = preferred_row(&live_rows) {
+            work.push((media, (*row).clone()));
         }
     }
     drop(store);

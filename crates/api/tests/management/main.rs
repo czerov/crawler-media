@@ -106,3 +106,4 @@ mod user_state_isolation;
 mod wash_cut;
 mod watch_intake;
 mod watch_scrape;
+mod rename_grace_sidecars;

@@ -5,6 +5,8 @@ use crate::scrape_store::ScrapeStoreExt;
 use domain::{LedgerRow, Media};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod targets;
+
 pub(crate) fn fetch_tmdb_metadata(
     state: &crate::management::ApiState,
     kind: domain::MediaKind,
@@ -119,6 +121,9 @@ pub(crate) fn write_series_nfos(
             let Some(episode_number) = row.episode else {
                 continue;
             };
+            if !targets::video_present(Path::new(&row.path)) {
+                continue;
+            }
             let Some(episode) = episodes
                 .iter()
                 .find(|episode| episode.episode_number == episode_number)
@@ -209,12 +214,17 @@ impl media::CatalogGet for PosterFetchCatalogGet<'_> {
 pub(crate) fn scrape_tv_sidecars(
     state: &crate::management::ApiState,
     media: &Media,
-    show_root: &Path,
+    _show_root: &Path,
     rows: &[LedgerRow],
 ) {
     let Some(tmdb_id) = media.tmdb_id.as_deref() else {
         return;
     };
+    let groups = targets::live_groups(rows);
+    if groups.is_empty() {
+        tracing::debug!(media = %media.title, "没有可用的视频文件，跳过电视剧刮削");
+        return;
+    }
     tracing::info!(media = %media.title, "开始电视剧刮削与附属文件处理");
     let scrape_config = state.store.lock().get_scrape_config().ok();
     let (mirror_nfo, mirror_thumbs, mirror_images, still_size, fanart_api_key, fanart_lang) =
@@ -237,22 +247,24 @@ pub(crate) fn scrape_tv_sidecars(
             ),
         };
 
-    let matched_episodes = scrape_tv_episodes_and_nfos(
-        state,
-        media,
-        tmdb_id,
-        show_root,
-        rows,
-        mirror_nfo,
-    );
+    for (effective_root, group_rows) in groups {
+        let matched_episodes = scrape_tv_episodes_and_nfos(
+            state,
+            media,
+            tmdb_id,
+            &effective_root,
+            &group_rows,
+            mirror_nfo,
+        );
 
-    if mirror_thumbs {
-        scrape_tv_stills(state, matched_episodes, &still_size);
-    }
+        if mirror_thumbs {
+            scrape_tv_stills(state, matched_episodes, &still_size);
+        }
 
-    if mirror_images {
-        if let Some(ref api_key) = fanart_api_key {
-            scrape_tv_fanart(state, media, show_root, rows, api_key, &fanart_lang);
+        if mirror_images {
+            if let Some(ref api_key) = fanart_api_key {
+                scrape_tv_fanart(state, media, &effective_root, &group_rows, api_key, &fanart_lang);
+            }
         }
     }
     tracing::info!(media = %media.title, "完成电视剧刮削与附属文件处理");
