@@ -2,6 +2,7 @@
 //! Backed by 4 SQLite files in the data directory.
 
 mod app_write;
+mod browse_reads;
 mod catalog;
 mod collections;
 mod downloaders;
@@ -17,6 +18,7 @@ mod library;
 mod library_deletion;
 pub use library_deletion::LibraryRemoval;
 pub mod library_defaults;
+mod library_ownership;
 mod library_paths;
 mod maps;
 mod media;
@@ -36,6 +38,7 @@ mod users;
 pub mod password;
 pub mod probe_state;
 
+pub use browse_reads::PlaybackUnitSnapshot;
 pub use catalog::CatalogCacheRow;
 pub use downloaders::DownloaderRow;
 pub use fingerprint_attempts::StoredFingerprintAttempt;
@@ -44,6 +47,7 @@ pub use fingerprint_models::{StoredFingerprintModel, StoredFingerprintModelMembe
 pub use fingerprint_samples::{FingerprintSampleQuery, StoredFingerprintSample};
 pub use libraries::Library;
 pub use library::{MarkerResultReplacement, StoredMediaMarker};
+pub use library_ownership::LibraryOwnership;
 pub use playback::{PlayLogRow, SessionRow, UNIT_WHOLE, UnitRow, UnitState};
 pub use probe_state::{
     retry_delay_ms, ProbeStage, ProbeStageCompletion, ProbeStageKey, ProbeStageState, ProbeStageStatus,

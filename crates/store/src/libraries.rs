@@ -2,6 +2,7 @@
 //! (first root = primary, where new content lands). The `libraries` table is
 //! the display/config surface; `library_roots` rows belong to a library.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -9,6 +10,7 @@ use domain::MediaKind;
 use rusqlite::OptionalExtension;
 use rusqlite::params;
 
+use super::library_ownership::{LibraryOwnership, owner_with_default};
 use super::{Store, StoreError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,108 +50,187 @@ pub struct Library {
     pub auto_series_collections: bool,
 }
 
+const LIBRARY_COLS: &str = "id, kind, name, is_default, sort_order, access_mode,
+        admin_visible, member_ids_json,
+        COALESCE(detect_intros, 0), COALESCE(enable_fingerprint, 0),
+        cover_path, COALESCE(match_rules_json, '[]'), default_filter_id,
+        COALESCE(realtime_watch, 1), COALESCE(generate_thumbnails, 1),
+        COALESCE(extract_chapter_images, 1), COALESCE(exclude_from_home, 0),
+        COALESCE(auto_series_collections, 1)";
+
+/// Raw `libraries` row; roots are attached separately so list/get/snapshot can
+/// share one row mapping.
+struct LibraryRow {
+    id: String,
+    kind: String,
+    name: String,
+    is_default: bool,
+    sort_order: i32,
+    access_mode: String,
+    admin_visible: bool,
+    member_ids: Vec<String>,
+    detect_intros: bool,
+    enable_fingerprint: bool,
+    cover_path: Option<String>,
+    match_rules: Vec<serde_json::Value>,
+    default_filter_id: Option<String>,
+    realtime_watch: bool,
+    generate_thumbnails: bool,
+    extract_chapter_images: bool,
+    exclude_from_home: bool,
+    auto_series_collections: bool,
+}
+
+fn map_library_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryRow> {
+    let member_ids: Vec<String> =
+        serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default();
+    let match_rules: Vec<serde_json::Value> =
+        serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default();
+    Ok(LibraryRow {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        name: row.get(2)?,
+        is_default: row.get::<_, i64>(3)? != 0,
+        sort_order: row.get(4)?,
+        access_mode: row.get(5)?,
+        admin_visible: row.get::<_, i64>(6)? != 0,
+        member_ids,
+        detect_intros: row.get::<_, i64>(8)? != 0,
+        enable_fingerprint: row.get::<_, i64>(9)? != 0,
+        cover_path: row.get(10)?,
+        match_rules,
+        default_filter_id: row.get(12)?,
+        realtime_watch: row.get::<_, i64>(13)? != 0,
+        generate_thumbnails: row.get::<_, i64>(14)? != 0,
+        extract_chapter_images: row.get::<_, i64>(15)? != 0,
+        exclude_from_home: row.get::<_, i64>(16)? != 0,
+        auto_series_collections: row.get::<_, i64>(17)? != 0,
+    })
+}
+
+impl LibraryRow {
+    fn into_library(self, root_paths: Vec<PathBuf>) -> Result<Library, StoreError> {
+        Ok(Library {
+            id: self.id,
+            kind: MediaKind::from_str(&self.kind).map_err(StoreError::MediaKind)?,
+            name: self.name,
+            root_paths,
+            is_default: self.is_default,
+            sort_order: self.sort_order,
+            access_mode: self.access_mode,
+            admin_visible: self.admin_visible,
+            member_ids: self
+                .member_ids
+                .into_iter()
+                .filter_map(|id| domain::UserId::from_str(&id).ok())
+                .collect(),
+            detect_intros: self.detect_intros,
+            enable_fingerprint: self.enable_fingerprint,
+            cover_path: self.cover_path,
+            match_rules: self.match_rules,
+            default_filter_id: self.default_filter_id,
+            realtime_watch: self.realtime_watch,
+            generate_thumbnails: self.generate_thumbnails,
+            extract_chapter_images: self.extract_chapter_images,
+            exclude_from_home: self.exclude_from_home,
+            auto_series_collections: self.auto_series_collections,
+        })
+    }
+}
+
 impl Store {
     /// All libraries, sorted by manual sort_order, then name.
     pub fn list_libraries(&self) -> Result<Vec<Library>, StoreError> {
-        let mut stmt = self.app.prepare(
-            "SELECT id, kind, name, is_default, sort_order, access_mode,
-                    admin_visible, member_ids_json,
-                    COALESCE(detect_intros, 0), COALESCE(enable_fingerprint, 0),
-                    cover_path, COALESCE(match_rules_json, '[]'), default_filter_id,
-                    COALESCE(realtime_watch, 1), COALESCE(generate_thumbnails, 1),
-                    COALESCE(extract_chapter_images, 1), COALESCE(exclude_from_home, 0),
-                    COALESCE(auto_series_collections, 1)
-             FROM libraries ORDER BY sort_order, name",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let member_ids: Vec<String> =
-                serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default();
-            let match_rules: Vec<serde_json::Value> =
-                serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default();
-            let default_filter_id: Option<String> = row.get(12)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)? != 0,
-                row.get::<_, i32>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)? != 0,
-                member_ids,
-                row.get::<_, i64>(8)? != 0,
-                row.get::<_, i64>(9)? != 0,
-                row.get::<_, Option<String>>(10)?,
-                match_rules,
-                default_filter_id,
-                row.get::<_, i64>(13)? != 0,
-                row.get::<_, i64>(14)? != 0,
-                row.get::<_, i64>(15)? != 0,
-                row.get::<_, i64>(16)? != 0,
-                row.get::<_, i64>(17)? != 0,
-            ))
-        })?;
+        self.load_libraries()
+    }
+
+    /// Request-local ownership snapshot: one libraries read, one batch roots
+    /// read, one blocked-id read.
+    pub fn library_ownership(&self) -> Result<LibraryOwnership, StoreError> {
+        let libraries = self.load_libraries()?;
+        let blocked = self.blocked_library_ids()?;
+        Ok(LibraryOwnership::from_parts(libraries, blocked))
+    }
+
+    /// Libraries with their roots attached, via one batch roots query instead
+    /// of one query per library.
+    fn load_libraries(&self) -> Result<Vec<Library>, StoreError> {
+        let mut roots = self.roots_by_library()?;
+        let mut stmt = self.app.prepare(&format!(
+            "SELECT {LIBRARY_COLS} FROM libraries ORDER BY sort_order, name"
+        ))?;
+        let rows = stmt.query_map([], map_library_row)?;
         let mut libraries = Vec::new();
         for row in rows {
-            let (
-                id,
-                kind,
-                name,
-                is_default,
-                sort_order,
-                access_mode,
-                admin_visible,
-                member_ids,
-                detect_intros,
-                enable_fingerprint,
-                cover_path,
-                match_rules,
-                default_filter_id,
-                realtime_watch,
-                generate_thumbnails,
-                extract_chapter_images,
-                exclude_from_home,
-                auto_series_collections,
-            ) = row?;
-            libraries.push(Library {
-                root_paths: self.roots_of(&id)?,
-                id,
-                kind: MediaKind::from_str(&kind).map_err(StoreError::MediaKind)?,
-                name,
-                is_default,
-                sort_order,
-                access_mode,
-                admin_visible,
-                member_ids: member_ids
-                    .into_iter()
-                    .filter_map(|id| domain::UserId::from_str(&id).ok())
-                    .collect(),
-                detect_intros,
-                enable_fingerprint,
-                cover_path,
-                match_rules,
-                default_filter_id,
-                realtime_watch,
-                generate_thumbnails,
-                extract_chapter_images,
-                exclude_from_home,
-                auto_series_collections,
-            });
+            let row = row?;
+            let root_paths = roots.remove(&row.id).unwrap_or_default();
+            libraries.push(row.into_library(root_paths)?);
         }
         Ok(libraries)
     }
 
+    /// Every library's roots in one query. Per-library order stays
+    /// `(sort_order, path)`: the global order restricted to one library is
+    /// still that order.
+    fn roots_by_library(&self) -> Result<HashMap<String, Vec<PathBuf>>, StoreError> {
+        let mut stmt = self.app.prepare(
+            "SELECT library_id, path FROM library_roots
+             WHERE library_id IS NOT NULL
+             ORDER BY sort_order, path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut roots: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for row in rows {
+            let (library_id, path) = row?;
+            roots.entry(library_id).or_default().push(PathBuf::from(path));
+        }
+        Ok(roots)
+    }
+
+    /// Library ids that have a `library_removals` row, in any state (including
+    /// `succeeded`) — matching `library_accepts_work`, which does not filter
+    /// on state.
+    fn blocked_library_ids(&self) -> Result<HashSet<String>, StoreError> {
+        let mut stmt = self.app.prepare("SELECT library_id FROM library_removals")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut blocked = HashSet::new();
+        for row in rows {
+            blocked.insert(row?);
+        }
+        Ok(blocked)
+    }
+
     pub fn get_library(&self, id: &str) -> Result<Option<Library>, StoreError> {
-        Ok(self
-            .list_libraries()?
-            .into_iter()
-            .find(|library| library.id == id))
+        let row = self
+            .app
+            .query_row(
+                &format!("SELECT {LIBRARY_COLS} FROM libraries WHERE id = ?1"),
+                params![id],
+                map_library_row,
+            )
+            .optional()?;
+        let Some(row) = row else { return Ok(None) };
+        let root_paths = self.roots_of(id)?;
+        Ok(Some(row.into_library(root_paths)?))
     }
 
     pub fn default_library(&self, kind: MediaKind) -> Result<Option<Library>, StoreError> {
-        Ok(self
-            .list_libraries()?
-            .into_iter()
-            .find(|library| library.kind == kind && library.is_default))
+        let row = self
+            .app
+            .query_row(
+                &format!(
+                    "SELECT {LIBRARY_COLS} FROM libraries
+                     WHERE kind = ?1 AND is_default = 1 ORDER BY sort_order, name LIMIT 1"
+                ),
+                params![kind.as_str()],
+                map_library_row,
+            )
+            .optional()?;
+        let Some(row) = row else { return Ok(None) };
+        let root_paths = self.roots_of(&row.id)?;
+        Ok(Some(row.into_library(root_paths)?))
     }
 
     /// 把文件路径归属到唯一的媒体库：**最长根目录前缀**获胜（嵌套库不被父库
@@ -160,36 +241,8 @@ impl Store {
         path: &std::path::Path,
         kind: MediaKind,
     ) -> Result<Option<Library>, StoreError> {
-        let libraries = self.list_libraries()?;
-        let mut best: Option<(usize, Library)> = None;
-        let mut ambiguous = false;
-        for library in libraries {
-            if library.kind != kind {
-                continue;
-            }
-            let depth = library
-                .root_paths
-                .iter()
-                .filter(|root| path.starts_with(root))
-                .map(|root| root.components().count())
-                .max();
-            let Some(depth) = depth else { continue };
-            match &best {
-                Some((best_depth, _)) if *best_depth > depth => {}
-                Some((best_depth, _)) if *best_depth == depth => ambiguous = true,
-                _ => {
-                    best = Some((depth, library));
-                    ambiguous = false;
-                }
-            }
-        }
-        if ambiguous {
-            Ok(None)
-        } else if let Some((_, library)) = best {
-            Ok(Some(library))
-        } else {
-            self.default_library(kind)
-        }
+        let libraries = self.load_libraries()?;
+        Ok(owner_with_default(&libraries, path, kind).cloned())
     }
 
     /// 严格按根目录前缀匹配媒体库：不回退到默认媒体库。
