@@ -38,9 +38,6 @@ export async function waitForLibraryRemoval(
     isFirst = false;
     await pause(options.intervalMs ?? 1000, options.signal);
     operation = await getStatus(operation.operation_id, options.signal);
-    if (operation.state === "failed") {
-      throw new Error(operation.error ?? "删除失败，可重新尝试");
-    }
   }
 }
 

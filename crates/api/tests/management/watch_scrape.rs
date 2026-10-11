@@ -308,3 +308,77 @@ async fn scrape_job_scans_extra_tv_root_for_strm_into_ledger() {
     assert_eq!(row["media_title"], "The Long Watch");
     assert_eq!(row["path"], video.display().to_string());
 }
+
+#[tokio::test]
+async fn watch_scrape_job_rebinds_incoming_rows_to_canonical_media_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old_canonical = domain::Media {
+        id: domain::MediaId::new(),
+        kind: domain::MediaKind::Movie,
+        title: "Canonical Orbit".into(),
+        year: Some(2022),
+        original_title: None,
+        tmdb_id: Some("orbit-tmdb".into()),
+        douban_id: None,
+        tvdb_id: None,
+        bangumi_id: None,
+        anilist_id: None,
+    };
+    struct OrbitCatalog(media::CatalogHit);
+    impl api::catalog::Catalog for OrbitCatalog {
+        fn search_movie(&self, _query: &str) -> Result<Vec<media::CatalogHit>, String> {
+            Ok(vec![self.0.clone()])
+        }
+        fn search_tv(&self, _query: &str) -> Result<Vec<media::CatalogHit>, String> { Ok(Vec::new()) }
+        fn popular_movie(&self) -> Result<Vec<media::CatalogHit>, String> { Ok(Vec::new()) }
+        fn popular_tv(&self) -> Result<Vec<media::CatalogHit>, String> { Ok(Vec::new()) }
+        fn details(&self, _kind: domain::MediaKind, _id: &str) -> Result<Option<domain::Media>, String> { Ok(None) }
+    }
+    let hit = media::CatalogHit {
+        media: domain::Media {
+            id: domain::MediaId::new(),
+            kind: domain::MediaKind::Movie,
+            title: "Orbit".into(),
+            year: Some(2022),
+            original_title: None,
+            tmdb_id: Some("orbit-tmdb".into()),
+            douban_id: None,
+            tvdb_id: None,
+            bangumi_id: None,
+            anilist_id: None,
+        },
+        poster_path: None,
+        backdrop_path: None,
+        rating: None,
+        overview: None,
+    };
+    let catalog = Arc::new(OrbitCatalog(hit));
+    let state = state(
+        tmp.path(),
+        Arc::new(Fixtures {
+            requests: Mutex::new(Vec::new()),
+            bodies: HashMap::new(),
+        }),
+        Arc::new(MemoryDownloader::new(tmp.path().join("stage"))),
+    )
+    .with_catalog(catalog);
+
+    state.store().lock().insert_media(&old_canonical).unwrap();
+    let app = router(state.clone());
+
+    let watch = tmp.path().join("inplace");
+    std::fs::create_dir_all(&watch).unwrap();
+    let video = watch.join("Orbit.2022.1080p.mkv");
+    std::fs::write(&video, b"orbit video").unwrap();
+
+    put_inplace(&app, &tmp, &watch).await;
+    tick(&app, 1).await;
+
+    let store_arc = state.store();
+    let store = store_arc.lock();
+    let row = store
+        .ledger_by_path(&video.display().to_string())
+        .unwrap()
+        .expect("scanned ledger should exist via watch inplace job");
+    assert_eq!(row.media_id, old_canonical.id, "通过真实 watch_inplace 任务扫描的文件台账必须重绑到已有 canonical Media");
+}

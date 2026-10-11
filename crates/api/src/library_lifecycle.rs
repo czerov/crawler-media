@@ -31,14 +31,16 @@ pub fn start_library_removal(state: &ApiState, library_id: &str)
 pub(crate) fn launch_library_removal(state: &ApiState, mut operation: store::LibraryRemoval,
     handle: tokio::runtime::Handle) -> Result<store::LibraryRemoval, String> {
     if operation.state == "succeeded" { return Ok(operation); }
-    if operation.state == "failed" {
-        state.store.lock().set_removal_state(&operation.operation_id, "draining", None)
-            .map_err(|e| e.to_string())?;
-        operation.state = "draining".into();
-        operation.error = None;
-    }
     if !state.library_work.removals.lock().insert(operation.operation_id.clone()) {
         return Ok(operation);
+    }
+    if operation.state == "failed" {
+        if let Err(error) = state.store.lock().set_removal_state(&operation.operation_id, "draining", None) {
+            state.library_work.removals.lock().remove(&operation.operation_id);
+            return Err(error.to_string());
+        }
+        operation.state = "draining".into();
+        operation.error = None;
     }
     let state = state.clone();
     let operation_id = operation.operation_id.clone();

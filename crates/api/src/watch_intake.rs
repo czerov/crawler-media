@@ -126,8 +126,24 @@ fn finish_intake_metadata(
     };
     for (_, (media, dest)) in unresolved_media {
         check_intake_libraries(&state.store.lock(), movie_lease, tv_lease)?;
-        if let Some(canonical) = crate::auto_resolve::auto_resolve_media(state, &media, &dest) {
+        let resolved = crate::auto_resolve::resolve_scanned_media(state, &media, &dest);
+        let active_media = if let Some(canonical) = resolved {
             crate::auto_resolve::rebind_scan_rows(state, media.id, canonical.id, &inserted)?;
+            canonical
+        } else {
+            media
+        };
+        let nfo_enabled = state
+            .store
+            .lock()
+            .get_scrape_config()
+            .ok()
+            .map(|config| config.effective.mirror_nfo)
+            .unwrap_or(true);
+        if nfo_enabled && active_media.tmdb_id.is_some() {
+            let _ = crate::poster_fetch::attach_poster(state, &active_media, &dest);
+            let _ = crate::poster_fetch::attach_backdrop(state, &active_media, &dest);
+            crate::auto_resolve::write_resolved_nfo(state, &active_media, &dest);
         }
     }
 

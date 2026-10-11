@@ -542,7 +542,7 @@ async fn metadata_refresh_writes_each_episode_still_in_shared_directory() {
 }
 
 #[tokio::test]
-async fn watch_scrape_rebinds_incoming_rows_to_canonical_media_identity() {
+async fn http_scan_rebinds_incoming_rows_to_canonical_media_identity() {
     let tmp = tempfile::tempdir().unwrap();
     let old_canonical = domain::Media {
         id: domain::MediaId::new(),

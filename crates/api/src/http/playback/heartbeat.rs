@@ -19,6 +19,7 @@ struct Heartbeat<'a> {
     body: &'a Value,
     user_id: domain::UserId,
     media_id: domain::MediaId,
+    kind: domain::MediaKind,
     ledger_id: String,
     season: i32,
     episode: i32,
@@ -62,6 +63,7 @@ pub(crate) async fn progress(
         body: &body,
         user_id,
         media_id: media.id,
+        kind: media.kind,
         ledger_id: row.id.to_string(),
         season,
         episode,
@@ -185,6 +187,25 @@ fn persist_heartbeat(
     heartbeat: &Heartbeat<'_>,
     device: &str,
 ) -> Result<(UnitState, bool), StoreError> {
+    // 验证目标所属媒体库未处于删除冻结中且台账未被清理，防止已删除文件在心跳中复活或篡改观看数据
+    if let Some(row) = store.get_ledger(&heartbeat.ledger_id)? {
+        if let Some(owner) = store.library_for_path_strict(std::path::Path::new(&row.path), heartbeat.kind)? {
+            if !store.library_accepts_work(&owner.id)? {
+                return Ok((
+                    store.unit_state(heartbeat.user_id, heartbeat.media_id, heartbeat.season, heartbeat.episode)?
+                        .unwrap_or_default(),
+                    true,
+                ));
+            }
+        }
+    } else {
+        return Ok((
+            store.unit_state(heartbeat.user_id, heartbeat.media_id, heartbeat.season, heartbeat.episode)?
+                .unwrap_or_default(),
+            true,
+        ));
+    }
+
     let event = heartbeat.body["event"].as_str().unwrap_or("progress");
     let previous = store.get_session(heartbeat.user_id, device)?;
     let unit = update_unit(store, heartbeat, event)?;

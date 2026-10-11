@@ -156,7 +156,7 @@ fn persist_event(
     // 验证目标所属媒体库未处于删除冻结中且台账未被清理，防止已删除文件在心跳中复活
     if let Some(row) = store.get_ledger(&target.ledger_id)? {
         if let Some(owner) = store.library_for_path_strict(std::path::Path::new(&row.path), target.media.kind)? {
-            if !store.library_accepts_work(&owner.id).unwrap_or(true) {
+            if !store.library_accepts_work(&owner.id)? {
                 return Ok(());
             }
         }

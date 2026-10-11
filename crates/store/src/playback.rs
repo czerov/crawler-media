@@ -10,7 +10,7 @@ use super::{Store, StoreError};
 
 pub const UNIT_WHOLE: i32 = -1;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnitState {
     pub position_ms: i64,
     pub played: bool,

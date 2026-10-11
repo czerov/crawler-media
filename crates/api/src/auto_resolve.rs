@@ -138,13 +138,13 @@ fn resolve_media(
         .map(|config| config.effective.mirror_nfo)
         .unwrap_or(true);
     if nfo_enabled {
-        write_auto_resolved_nfo(state, &updated, sample_path);
+        write_resolved_nfo(state, &updated, sample_path);
     }
 
     Some(updated)
 }
 
-fn write_auto_resolved_nfo(state: &ApiState, media: &Media, sample_path: &std::path::Path) {
+pub(crate) fn write_resolved_nfo(state: &ApiState, media: &Media, sample_path: &std::path::Path) {
     let lease = match state.acquire_path_work(sample_path, media.kind) {
         Ok(lease) => lease,
         Err(error) => {
@@ -413,15 +413,14 @@ pub(crate) fn rebind_scan_rows(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "canonical Media missing".to_string())?
             .kind;
-        let owner = store
-            .library_for_path_strict(path, kind)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "scanned path no longer owned".to_string())?;
-        if !store
-            .library_accepts_work(&owner.id)
-            .map_err(|e| e.to_string())?
-        {
-            return Err("Library 正在删除".into());
+        let in_removal = store.path_in_removal_scope(path).map_err(|e| e.to_string())?;
+        if in_removal {
+            return Err("Library 正在删除，拒绝重绑旧目录文件".into());
+        }
+        if let Some(owner) = store.library_for_path_strict(path, kind).map_err(|e| e.to_string())? {
+            if !store.library_accepts_work(&owner.id).map_err(|e| e.to_string())? {
+                return Err("Library 正在删除".into());
+            }
         }
         store
             .rebind_scanned_ledger(row.id, canonical)

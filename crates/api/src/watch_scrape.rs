@@ -111,24 +111,32 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
         map
     };
     for (_, (media, dest)) in unresolved_media {
-        if let Some(canonical) = crate::auto_resolve::auto_resolve_media(state, &media, &dest) {
+        let resolved = crate::auto_resolve::resolve_scanned_media(state, &media, &dest);
+        let active_media = if let Some(canonical) = resolved {
             crate::auto_resolve::rebind_scan_rows(state, media.id, canonical.id, &inserted)?;
+            canonical
+        } else {
+            media
+        };
+        if nfo && active_media.tmdb_id.is_some() {
+            let _ = crate::poster_fetch::attach_poster(state, &active_media, &dest);
+            let _ = crate::poster_fetch::attach_backdrop(state, &active_media, &dest);
+            crate::auto_resolve::write_resolved_nfo(state, &active_media, &dest);
         }
     }
     crate::http::library::enqueue_probes_for_paths(state, inserted);
+    attach_missing_posters(state, &job.path);
+    Ok(())
+}
 
-    // 自动补封面：目录内缺 poster.jpg 的文件从 TMDB 拉海报 + 背板
-    // （Emby/Jellyfin 式「没封面自动设置」；已有封面跳过，手动选过的不会被覆盖）。
-    // 注意：先收集目标再逐个补图——attach_poster 内部会再锁 store，
-    // 持锁调用是死锁。
+fn attach_missing_posters(state: &ApiState, dir_to_scan: &std::path::Path) {
     let targets: Vec<(domain::MediaId, PathBuf)> = {
-        let dir_to_scan = job.path.clone();
         let store = state.store.lock();
         store
             .list_ledger()
             .unwrap_or_default()
             .into_iter()
-            .filter(|row| std::path::Path::new(&row.path).starts_with(&dir_to_scan))
+            .filter(|row| std::path::Path::new(&row.path).starts_with(dir_to_scan))
             .filter(|row| {
                 std::path::Path::new(&row.path)
                     .parent()
@@ -142,8 +150,7 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
         let Some(real) = state.store.lock().get_media(media_id).ok().flatten() else {
             continue;
         };
-        let _ = crate::poster_fetch::attach_poster(&state, &real, &row_path);
-        let _ = crate::poster_fetch::attach_backdrop(&state, &real, &row_path);
+        let _ = crate::poster_fetch::attach_poster(state, &real, &row_path);
+        let _ = crate::poster_fetch::attach_backdrop(state, &real, &row_path);
     }
-    Ok(())
 }
