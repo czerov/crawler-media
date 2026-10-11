@@ -55,9 +55,15 @@ impl Catalog for OfflineCatalog {
         self.reject(format!("poster:{id}"))
     }
 }
-struct OnlineCatalog(media::CatalogHit);
+struct OnlineCatalog {
+    hit: media::CatalogHit,
+    requests: Mutex<Vec<String>>,
+}
 impl Catalog for OnlineCatalog {
-    fn search_movie(&self, _: &str) -> Result<Vec<media::CatalogHit>, String> { Ok(vec![self.0.clone()]) }
+    fn search_movie(&self, query: &str) -> Result<Vec<media::CatalogHit>, String> {
+        self.requests.lock().push(query.to_string());
+        Ok(vec![self.hit.clone()])
+    }
     fn search_tv(&self, _: &str) -> Result<Vec<media::CatalogHit>, String> { Ok(vec![]) }
     fn popular_movie(&self) -> Result<Vec<media::CatalogHit>, String> { Ok(vec![]) }
     fn popular_tv(&self) -> Result<Vec<media::CatalogHit>, String> { Ok(vec![]) }
@@ -525,6 +531,25 @@ fn online_identity_rebind_succeeds_when_reimported_library_reuses_removed_root()
         .unwrap()
         .block_on(async {
             remove(&fixture, &app).await;
+            // 移除本地完备的 NFO，迫使重新扫描时无法直接读取本地身份，必须走到在线识别与重绑
+            let local_nfo = fixture.root.join("English.Name.2025.nfo");
+            if local_nfo.exists() {
+                std::fs::remove_file(&local_nfo).unwrap();
+            }
+            let hit = media::CatalogHit {
+                media: Media {
+                    id: MediaId::new(), kind: MediaKind::Movie, title: "English Name".into(),
+                    year: Some(2025), original_title: None, tmdb_id: Some("207890".into()),
+                    douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None,
+                },
+                poster_path: None, backdrop_path: None, rating: None, overview: None,
+            };
+            let online_catalog = Arc::new(OnlineCatalog {
+                hit,
+                requests: Mutex::new(Vec::new()),
+            });
+            fixture.state = fixture.state.clone().with_catalog(online_catalog.clone());
+            let app = api::router(fixture.state.clone());
             let created = call(
                 &app,
                 "POST",
@@ -533,17 +558,8 @@ fn online_identity_rebind_succeeds_when_reimported_library_reuses_removed_root()
                 StatusCode::OK,
             ).await;
             let library_id = created["id"].as_str().unwrap();
-            let hit = media::CatalogHit {
-                media: Media {
-                    id: MediaId::new(), kind: MediaKind::Movie, title: "Different filename title".into(),
-                    year: Some(2022), original_title: None, tmdb_id: Some("207890".into()),
-                    douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None,
-                },
-                poster_path: None, backdrop_path: None, rating: None, overview: None,
-            };
-            fixture.state = fixture.state.clone().with_catalog(Arc::new(OnlineCatalog(hit)));
-            let app = api::router(fixture.state.clone());
             call(&app, "POST", &format!("/api/v1/libraries/{library_id}/scan"), Value::Null, StatusCode::OK).await;
+            assert!(!online_catalog.requests.lock().is_empty(), "必须真正走到在线搜索");
             let shared = fixture.state.store();
             let store = shared.lock();
             let row = store.ledger_by_path(&fixture.old.path).unwrap().unwrap();

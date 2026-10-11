@@ -334,8 +334,11 @@ async fn watch_scrape_job_rebinds_incoming_rows_to_canonical_media_identity() {
         fn metadata(&self, _kind: domain::MediaKind, _id: &str) -> Result<Option<media::ItemMeta>, String> {
             Ok(Some(media::ItemMeta { overview: Some("Show summary".into()), ..Default::default() }))
         }
-        fn season_details(&self, _id: &str, season: u32) -> Result<Vec<media::EpisodeMeta>, String> {
-            Ok(vec![media::EpisodeMeta { episode_number: 1, name: Some("Pilot Episode".into()), overview: Some("Episode summary".into()), ..Default::default() }])
+        fn season_details(&self, _id: &str, _season: u32) -> Result<Vec<media::EpisodeMeta>, String> {
+            Ok(vec![
+                media::EpisodeMeta { episode_number: 1, name: Some("Pilot Episode".into()), overview: Some("Episode summary".into()), ..Default::default() },
+                media::EpisodeMeta { episode_number: 2, name: Some("Second Episode".into()), overview: Some("Episode 2 summary".into()), ..Default::default() },
+            ])
         }
     }
     let hit = media::CatalogHit {
@@ -367,7 +370,25 @@ async fn watch_scrape_job_rebinds_incoming_rows_to_canonical_media_identity() {
     )
     .with_catalog(catalog);
 
-    state.store().lock().insert_media(&old_canonical).unwrap();
+    {
+        let store_arc = state.store();
+        let store = store_arc.lock();
+        store.insert_media(&old_canonical).unwrap();
+        // 预存 canonical Media 在已有其它目录的既有分集（Season 1 Episode 2），使 rows 非空
+        store.insert_ledger(&domain::LedgerRow {
+            id: domain::LedgerId::new(),
+            media_id: old_canonical.id,
+            path: tmp.path().join("data/library/tv/Orbit/Season 1/Orbit.S01E02.1080p.mkv").display().to_string(),
+            season: Some(1),
+            episode: Some(2),
+            resolution: None,
+            codec: None,
+            hdr: None,
+            quality_source: domain::QualitySource::Probe,
+            confidence: domain::Confidence::High,
+            filter_score: None,
+        }).unwrap();
+    }
     let app = router(state.clone());
 
     let watch = tmp.path().join("extra-tv");
