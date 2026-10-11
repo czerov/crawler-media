@@ -358,16 +358,11 @@ async fn item_counts(
             series_count += 1;
         }
     }
-    let mut episode_count = 0;
-    for series in items.iter().filter(|item| item.is_series) {
-        let series_id = series.media.id.to_string().replace('-', "");
-        episode_count += state
-            .provider
-            .list_visible_items(user.id, Some(&series_id))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .len();
-    }
+    let episode_count: usize = items
+        .iter()
+        .filter(|item| item.is_series)
+        .map(|series| series.metadata.child_count.or(series.metadata.number_of_episodes.map(|n| n as usize)).unwrap_or(0))
+        .sum();
     Ok(Json(json!({
         "MovieCount": movie_count,
         "SeriesCount": series_count,
@@ -541,23 +536,30 @@ async fn resume_items(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut rows = Vec::new();
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
     for item in root_rows {
+        if rows.len() >= limit {
+            break;
+        }
         if item.media.kind == domain::MediaKind::Tv && item.is_series {
+            if item.played {
+                continue;
+            }
             let series_id = item.media.id.to_string().replace('-', "");
-            let mut episodes = state
+            let episodes = state
                 .provider
                 .list_visible_items(user.id, Some(&series_id))
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            episodes.retain(|episode| episode.ticks > 0 && !episode.played);
-            episodes.sort_by_key(|episode| {
+            let mut in_progress: Vec<_> = episodes.into_iter().filter(|ep| ep.ticks > 0 && !ep.played).collect();
+            in_progress.sort_by_key(|episode| {
                 (
                     episode.metadata.resume_updated_at,
                     episode.row.season.unwrap_or_default(),
                     episode.row.episode.unwrap_or_default(),
                 )
             });
-            if let Some(episode) = episodes.pop() {
+            if let Some(episode) = in_progress.pop() {
                 rows.push(episode);
             }
         } else if item.ticks > 0 && !item.played {
