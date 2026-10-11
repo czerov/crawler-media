@@ -23,6 +23,8 @@ pub struct ApiState {
     pub(crate) http_work: Arc<crate::blocking_budget::BlockingBudget>,
     /// notify 发送 seam（生产为显式超时的 HTTP 实现；测试可注入阻塞实现）。
     pub(crate) notify_transport: Arc<dyn crate::NotifyTransport>,
+    /// 共享 single-flight 字幕交付（生产默认并发 2、受控 ffmpeg runner）。
+    pub(crate) subtitle_delivery: Arc<crate::subtitle_delivery::SubtitleDelivery>,
     pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
     pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
     /// Job attempts still executing in this process; protects them from timeout recovery.
@@ -190,6 +192,10 @@ impl ApiState {
             )),
             http_work: Arc::new(crate::blocking_budget::BlockingBudget::new(8)),
             notify_transport: Arc::new(crate::http::notify::notify_transport::HttpNotifyTransport),
+            subtitle_delivery: Arc::new(crate::subtitle_delivery::SubtitleDelivery::new(
+                Arc::new(library::ControlledSubtitleRunner),
+                2,
+            )),
             library_work,
             jobs: Arc::new(Mutex::new(jobs)),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -240,6 +246,15 @@ impl ApiState {
     /// 替换 notify 发送实现（测试注入阻塞实现以验证预算准入）。
     pub fn with_notify_transport(mut self, transport: Arc<dyn crate::NotifyTransport>) -> Self {
         self.notify_transport = transport;
+        self
+    }
+
+    /// 替换字幕交付服务（测试注入 FakeRunner 与并发上限）。
+    pub fn with_subtitle_delivery(
+        mut self,
+        service: Arc<crate::subtitle_delivery::SubtitleDelivery>,
+    ) -> Self {
+        self.subtitle_delivery = service;
         self
     }
 

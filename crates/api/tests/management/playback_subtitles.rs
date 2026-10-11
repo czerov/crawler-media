@@ -140,9 +140,10 @@ async fn playback_decide_and_subtitle_delivery_returns_tracks_and_content() {
     );
 
     // 3. 验证内封字幕轨交付与缓存命中 (无 external 路径时走内封提取或缓存)
-    let cache_dir = std::env::temp_dir()
-        .join("crawler-media-subtitles")
-        .join(row.id.to_string());
+    // cache 维度包含 source_version：预置与 service 相同的版本化布局。
+    let source_version =
+        api::fingerprint_job::current_source_version(std::path::Path::new(&row.path));
+    let cache_dir = api::subtitle_delivery::subtitle_cache_dir(row.id, &source_version);
     std::fs::create_dir_all(&cache_dir).unwrap();
     std::fs::write(
         cache_dir.join("sub_3.vtt"),

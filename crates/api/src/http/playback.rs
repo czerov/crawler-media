@@ -715,7 +715,7 @@ pub(crate) async fn get_subtitle_file(
     axum::extract::Path((ledger_id, index)): axum::extract::Path<(String, u32)>,
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let (row, media_title, tracks) = {
+    let (row, media_title, media_kind, tracks) = {
         let store = state.store.lock();
         // G07: 先校验该 ledger 行对当前用户可见，防止普通成员跨 Library 读取字幕。
         let Some(row) =
@@ -723,33 +723,29 @@ pub(crate) async fn get_subtitle_file(
         else {
             return err(StatusCode::NOT_FOUND, "subtitle.not_found", "字幕未找到");
         };
-        let media_title = store
-            .get_media(row.media_id)
-            .ok()
-            .flatten()
-            .map(|m| m.title)
-            .unwrap_or_default();
-        let Ok(Some(tracks)) = store.get_file_meta(&ledger_id) else {
+        let Some(media) = store.get_media(row.media_id).ok().flatten() else {
             return err(StatusCode::NOT_FOUND, "subtitle.not_found", "字幕未找到");
         };
-        (row, media_title, tracks)
+        // canonical ledger row id（不是 URL 原文）才是 cache 维度与 file_meta key。
+        let Ok(Some(tracks)) = store.get_file_meta(&row.id.to_string()) else {
+            return err(StatusCode::NOT_FOUND, "subtitle.not_found", "字幕未找到");
+        };
+        (row, media.title, media.kind, tracks)
     };
     let wants_vtt = query
         .get("format")
         .map(|f| f.eq_ignore_ascii_case("vtt"))
         .unwrap_or(false);
-    let cache_dir = std::env::temp_dir()
-        .join("crawler-media-subtitles")
-        .join(&ledger_id);
-    let source_path = std::path::Path::new(&row.path);
-
-    match library::deliver_subtitle_with_source(
-        &tracks,
+    let request = crate::subtitle_delivery::SubtitleRequest {
+        ledger_id: row.id,
+        source_path: std::path::PathBuf::from(&row.path),
+        kind: media_kind,
+        tracks,
         index,
         wants_vtt,
-        Some(source_path),
-        Some(&cache_dir),
-    ) {
+    };
+
+    match state.subtitle_delivery.deliver(&state, request).await {
         Ok(payload) => (
             [(axum::http::header::CONTENT_TYPE, payload.content_type)],
             payload.bytes,
@@ -764,21 +760,46 @@ pub(crate) async fn get_subtitle_file(
                 %error,
                 "交付字幕文件失败"
             );
-            match error {
-                library::DeliveryError::TrackNotFound => {
-                    err(StatusCode::NOT_FOUND, "subtitle.not_found", "字幕轨不存在")
-                }
-                library::DeliveryError::FileMissing | library::DeliveryError::Io(_) => err(
-                    StatusCode::NOT_FOUND,
-                    "subtitle.file_missing",
-                    "字幕文件不存在",
-                ),
-                library::DeliveryError::Extraction(msg) => err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "subtitle.extraction_failed",
-                    &format!("提取内封字幕失败: {msg}"),
-                ),
-            }
+            subtitle_error_response(error)
         }
+    }
+}
+
+/// 字幕服务错误 → REST 状态码（原有 404/500 语义保留，新增 503/504/409）。
+fn subtitle_error_response(error: crate::subtitle_delivery::SubtitleServiceError) -> Response {
+    use crate::subtitle_delivery::SubtitleServiceError;
+    use library::DeliveryError;
+    match error {
+        SubtitleServiceError::Delivery(DeliveryError::TrackNotFound) => {
+            err(StatusCode::NOT_FOUND, "subtitle.not_found", "字幕轨不存在")
+        }
+        SubtitleServiceError::Delivery(DeliveryError::FileMissing | DeliveryError::Io(_)) => err(
+            StatusCode::NOT_FOUND,
+            "subtitle.file_missing",
+            "字幕文件不存在",
+        ),
+        SubtitleServiceError::Delivery(DeliveryError::Extraction(msg)) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "subtitle.extraction_failed",
+            &format!("提取内封字幕失败: {msg}"),
+        ),
+        SubtitleServiceError::Busy => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "subtitle.busy",
+            "字幕服务繁忙，请稍后重试",
+        ),
+        SubtitleServiceError::Timeout => err(
+            StatusCode::GATEWAY_TIMEOUT,
+            "subtitle.timeout",
+            "字幕提取超时",
+        ),
+        SubtitleServiceError::Cancelled => {
+            err(StatusCode::CONFLICT, "subtitle.cancelled", "字幕提取已取消")
+        }
+        SubtitleServiceError::Worker(message) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "subtitle.worker",
+            &format!("字幕提取任务异常: {message}"),
+        ),
     }
 }

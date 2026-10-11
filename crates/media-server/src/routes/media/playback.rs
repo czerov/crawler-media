@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::auth::{AuthUser, authenticate};
 use crate::dto;
-use crate::provider::MediaServerProvider;
+use crate::provider::{MediaServerProvider, SubtitleDeliveryError};
 
 use super::super::AppState;
 
@@ -80,51 +80,34 @@ async fn check_device_revocation(
 async fn subtitle_stream(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
-    Path((id, index, _codec)): Path<(String, u32, String)>,
+    Path((id, index, codec)): Path<(String, u32, String)>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     check_device_revocation(state.provider.as_ref(), &user, &headers, "Jellyfin 字幕").await?;
 
-    let snapshot = state
+    let wants_vtt = codec.eq_ignore_ascii_case("vtt");
+    // 协议层只调用 provider seam；同步提取与 single-flight 都在 provider 内部。
+    match state
         .provider
-        .resolve_single_item(user.id, &id)
+        .deliver_subtitle(user.id, &id, index, wants_vtt)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let tracks = &snapshot.metadata.tracks;
-    let wants_vtt = _codec.eq_ignore_ascii_case("vtt");
-    let cache_dir = std::env::temp_dir()
-        .join("crawler-media-subtitles")
-        .join(snapshot.row.id.to_string());
-    let source_path = std::path::Path::new(&snapshot.row.path);
-    match library::deliver_subtitle_with_source(
-        tracks,
-        index,
-        wants_vtt,
-        Some(source_path),
-        Some(&cache_dir),
-    ) {
-        Ok(payload) => Ok((
+    {
+        Ok(Some(payload)) => Ok((
             [(axum::http::header::CONTENT_TYPE, payload.content_type)],
             payload.bytes,
         )
             .into_response()),
-        Err(error) => {
-            tracing::error!(
-                media = %snapshot.media.title,
-                path = %snapshot.row.path,
-                item_id = %id,
-                index,
-                %error,
-                "Jellyfin 交付字幕失败"
-            );
-            match error {
-                library::DeliveryError::TrackNotFound => Err(StatusCode::NOT_FOUND),
-                library::DeliveryError::FileMissing | library::DeliveryError::Io(_) => {
-                    Err(StatusCode::NOT_FOUND)
-                }
-                library::DeliveryError::Extraction(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-            }
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(SubtitleDeliveryError::Busy) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(SubtitleDeliveryError::Timeout) => Err(StatusCode::GATEWAY_TIMEOUT),
+        Err(SubtitleDeliveryError::Cancelled) => Err(StatusCode::CONFLICT),
+        Err(SubtitleDeliveryError::Failed(message)) => {
+            tracing::error!(item_id = %id, index, error = %message, "Jellyfin 交付字幕失败");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(SubtitleDeliveryError::Unsupported) => {
+            tracing::error!(item_id = %id, index, "Jellyfin provider 未实现字幕交付");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }

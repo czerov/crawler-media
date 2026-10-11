@@ -6,8 +6,11 @@ use std::path::PathBuf;
 
 use media_server::provider::{
     AuthenticateError, MediaItemSnapshot, MediaPerson, MediaServerProvider, PlaybackClientInfo,
-    PlaybackEvent, ServerLibrary, ServerUser,
+    PlaybackEvent, ServerLibrary, ServerUser, SubtitleDeliveryError,
 };
+
+use crate::subtitle_delivery::SubtitleServiceError;
+use library::DeliveryError;
 
 use crate::management::ApiState;
 mod item_metadata;
@@ -142,6 +145,51 @@ impl MediaServerProvider for ApiServerProvider {
     async fn user_id_by_token(&self, token: &str) -> Result<Option<UserId>, String> {
         let store = self.state.store.lock();
         store.user_id_by_token(token).map_err(|e| e.to_string())
+    }
+
+    /// 先 resolve 可见行，再交给共享 single-flight 字幕服务。
+    async fn deliver_subtitle(
+        &self,
+        user_id: UserId,
+        item_id: &str,
+        index: u32,
+        wants_vtt: bool,
+    ) -> Result<Option<library::SubtitlePayload>, SubtitleDeliveryError> {
+        let snapshot = self
+            .resolve_single_item(user_id, item_id)
+            .await
+            .map_err(SubtitleDeliveryError::Failed)?;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        let request = crate::subtitle_delivery::SubtitleRequest {
+            ledger_id: snapshot.row.id,
+            source_path: std::path::PathBuf::from(&snapshot.row.path),
+            kind: snapshot.media.kind,
+            tracks: snapshot.metadata.tracks,
+            index,
+            wants_vtt,
+        };
+        match self
+            .state
+            .subtitle_delivery
+            .deliver(&self.state, request)
+            .await
+        {
+            Ok(payload) => Ok(Some(payload)),
+            Err(SubtitleServiceError::Delivery(
+                DeliveryError::TrackNotFound | DeliveryError::FileMissing | DeliveryError::Io(_),
+            )) => Ok(None),
+            Err(SubtitleServiceError::Delivery(DeliveryError::Extraction(message))) => {
+                Err(SubtitleDeliveryError::Failed(message))
+            }
+            Err(SubtitleServiceError::Busy) => Err(SubtitleDeliveryError::Busy),
+            Err(SubtitleServiceError::Timeout) => Err(SubtitleDeliveryError::Timeout),
+            Err(SubtitleServiceError::Cancelled) => Err(SubtitleDeliveryError::Cancelled),
+            Err(SubtitleServiceError::Worker(message)) => {
+                Err(SubtitleDeliveryError::Failed(message))
+            }
+        }
     }
 
     async fn bind_playback_credential(

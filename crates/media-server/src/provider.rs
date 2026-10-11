@@ -172,6 +172,22 @@ pub enum AuthenticateError {
     Internal(String),
 }
 
+/// 字幕交付失败原因。协议层据此映射 503/504/409/500；`Ok(None)` 表示没有
+/// 可见的字幕轨或文件（映射 404）。
+#[derive(Debug, thiserror::Error)]
+pub enum SubtitleDeliveryError {
+    #[error("subtitle delivery unsupported")]
+    Unsupported,
+    #[error("subtitle service busy")]
+    Busy,
+    #[error("subtitle operation timed out")]
+    Timeout,
+    #[error("Library no longer available")]
+    Cancelled,
+    #[error("subtitle delivery failed: {0}")]
+    Failed(String),
+}
+
 #[async_trait::async_trait]
 pub trait MediaServerProvider: Send + Sync + 'static {
     fn server_id(&self) -> String;
@@ -183,6 +199,20 @@ pub trait MediaServerProvider: Send + Sync + 'static {
     ) -> Result<Option<(String, ServerUser)>, AuthenticateError>;
 
     async fn user_id_by_token(&self, token: &str) -> Result<Option<UserId>, String>;
+
+    /// 通过共享 single-flight 服务交付字幕轨。
+    ///
+    /// 默认不支持：实现方必须显式 override，**绝不默认回退到同步提取**
+    /// （那会在 async worker 上阻塞）。`Ok(None)` 表示没有可见的字幕轨/文件。
+    async fn deliver_subtitle(
+        &self,
+        _user_id: UserId,
+        _item_id: &str,
+        _index: u32,
+        _wants_vtt: bool,
+    ) -> Result<Option<library::SubtitlePayload>, SubtitleDeliveryError> {
+        Err(SubtitleDeliveryError::Unsupported)
+    }
 
     /// Persist credentials observed on authenticated protocol requests. Mock providers
     /// may omit persistence; production uses this binding for secure device revocation.
