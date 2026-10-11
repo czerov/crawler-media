@@ -24,7 +24,29 @@ pub(crate) fn auto_generate_chapters(state: &ApiState, path: &std::path::Path) {
         tracing::debug!(path = %path.display(), "媒体库已关闭章节场景图提取，跳过自动抓帧");
         return;
     }
-    let _ = generate_chapter_frames(path);
+    let kind = state
+        .store
+        .lock()
+        .list_libraries()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|owner| owner.root_paths.iter().any(|root| path.starts_with(root)))
+        .map(|owner| owner.kind);
+    let lease = match kind
+        .map(|kind| state.acquire_path_work(path, kind))
+        .transpose()
+    {
+        Ok(lease) => lease.flatten(),
+        Err(error) => {
+            tracing::debug!(%error, "chapter generation rejected");
+            return;
+        }
+    };
+    let control = lease
+        .as_ref()
+        .map(|lease| lease.control().clone())
+        .unwrap_or_default();
+    let _ = generate_chapter_frames(path, &control);
 }
 
 /// 最长根目录前缀所属媒体库的「生成章节」开关。路径不落在任何库时默认开启，
@@ -54,16 +76,25 @@ pub(crate) fn generate_chapter_frames_for_targets(
     path: &std::path::Path,
     targets: &[(i64, i64)],
 ) -> (usize, usize) {
-    generate_chapter_frames_for_targets_with(&scene_frame_ffmpeg(), path, targets)
+    generate_chapter_frames_for_targets_with(
+        &scene_frame_ffmpeg(),
+        path,
+        targets,
+        &library::WorkControl::default(),
+    )
 }
 
 fn generate_chapter_frames_for_targets_with(
     ffmpeg: &str,
     path: &std::path::Path,
     targets: &[(i64, i64)],
+    control: &library::WorkControl,
 ) -> (usize, usize) {
     let mut generated = 0usize;
     for (index, &(start_ms, end_ms)) in targets.iter().enumerate() {
+        if control.is_cancelled() {
+            break;
+        }
         let out = chapter_image_path(path, index);
         if out.is_file() {
             generated += 1;
@@ -74,16 +105,54 @@ fn generate_chapter_frames_for_targets_with(
         } else {
             start_ms
         };
-        if library::extract_frame_with_ffmpeg(path, midpoint, &out, ffmpeg).is_ok() {
+        if extract_chapter_frame(path, midpoint, &out, ffmpeg, control).is_ok() {
             generated += 1;
         }
     }
     (generated, targets.len())
 }
 
+fn extract_chapter_frame(
+    path: &std::path::Path,
+    midpoint: i64,
+    out: &std::path::Path,
+    ffmpeg: &str,
+    control: &library::WorkControl,
+) -> Result<(), String> {
+    // The child never writes the visible sidecar. Retain staging through reaping
+    // and publish only under the cancellation gate.
+    let staged = out.with_file_name(format!(".chapter-{}.jpg", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut command = std::process::Command::new(ffmpeg);
+        command.args(["-y", "-ss", &format!("{:.3}", midpoint as f64 / 1000.0)]);
+        library::ProbeTarget::from_path(path).apply_ffmpeg_input(&mut command);
+        command.args(["-frames:v", "1", "-vf", "scale=960:-2", "-q:v", "4"]);
+        command.arg(&staged);
+        let output = control
+            .output(&mut command)
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        control
+            .signal()
+            .publish(|| std::fs::rename(&staged, out).map_err(|error| error.to_string()))
+    })();
+    if staged.exists() {
+        if let Err(error) = std::fs::remove_file(&staged) {
+            tracing::warn!(%error, path = %staged.display(), "failed to remove staged chapter frame");
+        }
+    }
+    if let Err(error) = &result {
+        tracing::debug!(%error, path = %path.display(), "chapter frame extraction stopped");
+    }
+    result
+}
+
 pub(crate) fn trigger_scene_frames_for_chapter_updates(
     updates: &[(String, Vec<library::ChapterMarker>)],
-    store: &crate::Store,
+    store: &std::sync::Arc<parking_lot::Mutex<crate::Store>>,
+    registry: &std::sync::Arc<crate::library_lifecycle::LibraryWorkRegistry>,
 ) {
     for (ledger_id, chapters) in updates {
         if chapters.is_empty() {
@@ -94,23 +163,63 @@ pub(crate) fn trigger_scene_frames_for_chapter_updates(
             continue;
         }
         let row_path = store
+            .lock()
             .get_ledger(&ledger_id.replace('-', ""))
             .ok()
             .flatten()
             .map(|r| std::path::PathBuf::from(r.path));
         if let Some(path) = row_path {
-            if !chapter_images_enabled(store, &path) {
+            if !chapter_images_enabled(&store.lock(), &path) {
                 tracing::debug!(path = %path.display(), "媒体库已关闭章节场景图提取，跳过声纹章节抓帧");
                 continue;
             }
+            let owner = {
+                let store = store.lock();
+                store
+                    .get_ledger(&ledger_id.replace('-', ""))
+                    .ok()
+                    .flatten()
+                    .and_then(|row| {
+                        store
+                            .get_media(row.media_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|media| {
+                                store
+                                    .library_for_path_strict(&path, media.kind)
+                                    .ok()
+                                    .flatten()
+                            })
+                    })
+            };
+            let Some(owner) = owner else {
+                continue;
+            };
+            let lease = match registry.acquire(store, &owner.id) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    tracing::debug!(%error, "chapter task rejected");
+                    continue;
+                }
+            };
             let ffmpeg = scene_frame_ffmpeg();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn_blocking(move || {
-                    generate_chapter_frames_for_targets_with(&ffmpeg, &path, &targets);
+                    generate_chapter_frames_for_targets_with(
+                        &ffmpeg,
+                        &path,
+                        &targets,
+                        lease.control(),
+                    );
                 });
             } else {
                 std::thread::spawn(move || {
-                    generate_chapter_frames_for_targets_with(&ffmpeg, &path, &targets);
+                    generate_chapter_frames_for_targets_with(
+                        &ffmpeg,
+                        &path,
+                        &targets,
+                        lease.control(),
+                    );
                 });
             }
         }
@@ -133,14 +242,47 @@ pub(crate) fn set_scene_frame_ffmpeg_for_test(ffmpeg: &'static str) {
     SCENE_FRAME_FFMPEG.with(|slot| slot.set(Some(ffmpeg)));
 }
 
-fn generate_chapter_frames(path: &std::path::Path) -> Option<(usize, usize)> {
-    let chapters = library::probe_chapters(path)?;
-    let targets: Vec<(i64, i64)> = chapters.iter().map(|c| (c.start_ms, c.end_ms)).collect();
+fn generate_chapter_frames(
+    path: &std::path::Path,
+    control: &library::WorkControl,
+) -> Option<(usize, usize)> {
+    let targets = probe_chapter_targets(path, control)?;
     Some(generate_chapter_frames_for_targets_with(
         &scene_frame_ffmpeg(),
         path,
         &targets,
+        control,
     ))
+}
+
+fn probe_chapter_targets(
+    path: &std::path::Path,
+    control: &library::WorkControl,
+) -> Option<Vec<(i64, i64)>> {
+    let mut command = std::process::Command::new("ffprobe");
+    command.args(["-v", "error", "-show_chapters", "-of", "json"]);
+    library::ProbeTarget::from_path(path).apply_input(&mut command);
+    let output = control
+        .output(&mut command)
+        .map_err(|error| {
+            tracing::debug!(%error, path = %path.display(), "chapter probe stopped");
+        })
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(
+        value["chapters"]
+            .as_array()?
+            .iter()
+            .filter_map(|chapter| {
+                let start = chapter["start_time"].as_str()?.parse::<f64>().ok()?;
+                let end = chapter["end_time"].as_str()?.parse::<f64>().ok()?;
+                Some(((start * 1000.0) as i64, (end * 1000.0) as i64))
+            })
+            .collect(),
+    )
 }
 
 fn chapter_image_path(video: &std::path::Path, index: usize) -> std::path::PathBuf {
@@ -509,6 +651,10 @@ pub(crate) async fn generate_chapters(
     Path((id, item_id)): Path<(String, String)>,
     Query(query): Query<ChapterQuery>,
 ) -> Response {
+    let lease = match state.acquire_library_work(&id) {
+        Ok(lease) => lease,
+        Err(error) => return err(StatusCode::CONFLICT, "library.frozen", &error),
+    };
     let media_id = match domain::MediaId::from_str(&item_id) {
         Ok(id) => id,
         Err(_) => return err(StatusCode::BAD_REQUEST, "library.invalid", "条目 id 无效"),
@@ -540,15 +686,19 @@ pub(crate) async fn generate_chapters(
         (row, media)
     };
     let path = std::path::PathBuf::from(row.path.clone());
+    let probe_lease = match state.acquire_library_work(&id) {
+        Ok(lease) => lease,
+        Err(error) => return err(StatusCode::CONFLICT, "library.frozen", &error),
+    };
     let mut targets: Vec<(i64, i64)> = match tokio::task::spawn_blocking({
         let path = path.clone();
-        move || library::probe_chapters(&path)
+        move || probe_chapter_targets(&path, probe_lease.control())
     })
     .await
     .ok()
     .flatten()
     {
-        Some(chapters) => chapters.iter().map(|c| (c.start_ms, c.end_ms)).collect(),
+        Some(targets) => targets,
         None => Vec::new(),
     };
 
@@ -575,8 +725,9 @@ pub(crate) async fn generate_chapters(
         );
     }
 
+    let ffmpeg = scene_frame_ffmpeg();
     let (generated, total) = tokio::task::spawn_blocking(move || {
-        generate_chapter_frames_for_targets(&path, &targets)
+        generate_chapter_frames_for_targets_with(&ffmpeg, &path, &targets, lease.control())
     })
     .await
     .unwrap_or((0, 0));

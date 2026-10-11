@@ -259,18 +259,16 @@ pub(crate) async fn delete_library(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Response {
-    let store = state.store.lock();
-    match store.delete_library(&id) {
-        Ok(()) => ok(json!({ "deleted": true })).into_response(),
+    let preflight = state.library_work.freeze(&state.store, &id);
+    match preflight {
+        Ok(operation) => match crate::library_lifecycle::launch_library_removal(
+            &state, operation, tokio::runtime::Handle::current()) {
+            Ok(operation) => (StatusCode::ACCEPTED, ok(json!(operation))).into_response(),
+            Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, "library.removal", &error),
+        },
         Err(StoreError::Missing(_)) => missing_library(),
-        Err(StoreError::Protected(message)) => {
-            err(StatusCode::BAD_REQUEST, "library.protected", &message)
-        }
-        Err(error) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store.error",
-            &error.to_string(),
-        ),
+        Err(StoreError::Protected(message)) => err(StatusCode::CONFLICT, "library.protected", &message),
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &error.to_string()),
     }
 }
 

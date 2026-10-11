@@ -59,10 +59,20 @@ pub(super) fn apply_marker_refresh(
             return;
         }
     };
-    let publication = mgr
-        .store
-        .lock()
-        .complete_marker_refresh_checked(&job.id, &replacements);
+    let publication = {
+        let store = mgr.store.lock();
+        let rows = all_rows
+            .iter()
+            .filter(|row| row.media_id == media_id && seasons.contains(&row.season.unwrap_or(1)))
+            .cloned()
+            .collect::<Vec<_>>();
+        markers::validate_publication_rows(&store, &rows).and_then(|()| {
+            // Validate every original job member under this same lock, not just the
+            // anchor or the expanded lease that ended during result preparation.
+            validate_refresh_units(&store, &job.id)?;
+            store.complete_marker_refresh_checked(&job.id, &replacements)
+        })
+    };
     if let Err(error) = publication {
         if matches!(&error, crate::store::StoreError::Missing(reason) if crate::fingerprint_job::source::is_file_deleted(reason))
         {
@@ -73,16 +83,35 @@ pub(super) fn apply_marker_refresh(
         tracing::error!(%error, job_id = %job.id, %media_id, seasons = ?seasons, "【片头片尾】多季原子写入失败，旧标记保持可见");
         return;
     }
-    {
-        let store = mgr.store.lock();
+    let registry = mgr.library_work.lock().clone();
+    if let Some(registry) = registry {
         for rep in &replacements {
             crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
                 &rep.chapter_updates,
-                &store,
+                &mgr.store,
+                &registry,
             );
         }
     }
     log_marker_refresh_success(job, media_id, &seasons);
+}
+
+fn validate_refresh_units(
+    store: &crate::Store,
+    job_id: &str,
+) -> Result<(), crate::store::StoreError> {
+    for unit in store.probe_job_units(job_id)? {
+        let row = store
+            .get_ledger(&unit.ledger_id.replace('-', ""))?
+            .ok_or_else(|| {
+                crate::store::StoreError::Missing(format!(
+                    "file_deleted: ledger {}",
+                    unit.ledger_id
+                ))
+            })?;
+        markers::validate_publication_rows(store, &[row])?;
+    }
+    Ok(())
 }
 
 fn log_marker_refresh_success(job: &crate::store::ProbeJob, media_id: MediaId, seasons: &[u32]) {

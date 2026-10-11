@@ -59,6 +59,7 @@ pub(crate) enum ProbeEnqueueError {
 
 pub struct ProbeManager {
     store: Arc<Mutex<Store>>,
+    library_work: Mutex<Option<Arc<crate::library_lifecycle::LibraryWorkRegistry>>>,
     fingerprint_engine: Arc<dyn FingerprintEngine>,
     capture_engine: Arc<dyn FingerprintCaptureEngine>,
     metadata_tx: mpsc::UnboundedSender<ProbeUnit>,
@@ -103,6 +104,7 @@ impl ProbeManager {
         let (fingerprint_tx, fingerprint_rx) = mpsc::unbounded_channel();
         let manager = Self {
             store,
+            library_work: Mutex::new(None),
             fingerprint_engine,
             capture_engine,
             metadata_tx,
@@ -121,6 +123,10 @@ impl ProbeManager {
         };
         manager.recover_pending_jobs();
         manager
+    }
+
+    pub(crate) fn set_library_registry(&self, registry: Arc<crate::library_lifecycle::LibraryWorkRegistry>) {
+        *self.library_work.lock() = Some(registry);
     }
 
     pub fn priority_gate(&self) -> Arc<dyn crate::fingerprint_job::CaptureGate> {
@@ -452,6 +458,27 @@ impl ProbeManager {
             "【媒体探测】手动整条目刷新已持久化入队，旧结果保持可见"
         );
         Ok(queued)
+    }
+
+    pub fn cancel_ledger_work(&self, ledger_ids: &[String], reason: &str) -> Result<(), store::StoreError> {
+        for ledger_id in ledger_ids {
+            let unit = self.store.lock().active_probe_unit_for_ledger(ledger_id)?;
+            if let Some(unit) = unit {
+                {
+                    let store = self.store.lock();
+                    let job = store.get_probe_job(&unit.job_id)?;
+                    if job.as_ref().is_some_and(|job| job.kind == "marker_refresh") {
+                        store.cancel_probe_job(&unit.job_id, reason)?;
+                    } else {
+                        store.cancel_probe_unit(&unit.job_id, ledger_id, reason)?;
+                    }
+                }
+                let units = self.store.lock().probe_job_units(&unit.job_id)?;
+                let mut seen = self.seen.lock();
+                for unit in units { seen.remove(&unit.ledger_id); }
+            }
+        }
+        Ok(())
     }
 
     /// 是否已在排队/执行（前端「探测中」状态用）。

@@ -11,9 +11,9 @@ impl Store {
                 (device_id, user_id, media_id, season, episode, client, device_name,
                  client_version, play_method, position_ms, start_position_ms, duration_ms,
                  paused, watched_ms, rate_bps, bytes_sent, connections, admin_ended,
-                 started_at, last_report_at)
+                 started_at, last_report_at, ledger_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19, ?20)",
+                     ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 session.device_id,
                 session.user_id.to_string(),
@@ -35,6 +35,7 @@ impl Store {
                 session.admin_ended as i64,
                 session.started_at,
                 session.last_report_at,
+                session.ledger_id,
             ],
         )?;
         Ok(())
@@ -50,7 +51,7 @@ impl Store {
                 "SELECT device_id, user_id, media_id, season, episode, client, device_name,
                         client_version, play_method, position_ms, start_position_ms,
                         duration_ms, paused, watched_ms, rate_bps, bytes_sent, connections,
-                        admin_ended, started_at, last_report_at
+                        admin_ended, started_at, last_report_at, ledger_id
                  FROM playback_sessions WHERE user_id = ?1 AND device_id = ?2",
                 params![user_id.to_string(), device_id],
                 map_session,
@@ -64,7 +65,7 @@ impl Store {
             "SELECT device_id, user_id, media_id, season, episode, client, device_name,
                     client_version, play_method, position_ms, start_position_ms,
                     duration_ms, paused, watched_ms, rate_bps, bytes_sent, connections,
-                    admin_ended, started_at, last_report_at
+                    admin_ended, started_at, last_report_at, ledger_id
              FROM playback_sessions WHERE device_id = ?1
              ORDER BY last_report_at DESC",
         )?;
@@ -83,7 +84,7 @@ impl Store {
             "SELECT device_id, user_id, media_id, season, episode, client, device_name,
                     client_version, play_method, position_ms, start_position_ms,
                     duration_ms, paused, watched_ms, rate_bps, bytes_sent, connections,
-                    admin_ended, started_at, last_report_at
+                    admin_ended, started_at, last_report_at, ledger_id
              FROM playback_sessions WHERE last_report_at >= ?1
              ORDER BY last_report_at DESC",
         )?;
@@ -222,5 +223,6 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         admin_ended: row.get::<_, i64>(17)? != 0,
         started_at: row.get(18)?,
         last_report_at: row.get(19)?,
+        ledger_id: row.get(20)?,
     })
 }

@@ -110,6 +110,12 @@ pub(crate) async fn delete_ledger_row(
     let Some(target) = rows.into_iter().find(|r| r.id == ledger_id) else {
         return err(StatusCode::NOT_FOUND, "ledger.missing", "整理记录不存在");
     };
+    if let Some(media) = store.get_media(target.media_id).ok().flatten() {
+        if crate::http::library::library_for_row_strict(&store, &target, &media)
+            .is_some_and(|owner| !store.library_accepts_work(&owner.id).unwrap_or(false)) {
+            return err(StatusCode::CONFLICT, "library.deleting", "Library 正在删除");
+        }
+    }
     let delete_file = query.delete_file.unwrap_or(false);
     if delete_file {
         let owned = store

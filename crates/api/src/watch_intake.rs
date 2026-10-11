@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
 use domain::{Media, MediaId, MediaKind};
-use library::{WatchJob, WatchKind, scan_watch};
+use library::{WatchJob, WatchKind, scan_watch_intake_controlled};
 
 use crate::management::ApiState;
 use crate::scrape_store::ScrapeStoreExt;
 pub fn run(state: &ApiState) -> Result<(), String> {
-    let (intake, library_root, tv_library_root, nfo) = {
+    let (intake, movie_library, tv_library, nfo) = {
         let store = state.store.lock();
         let Some(path) = store.watch_intake().map_err(|e| e.to_string())? else {
             return Ok(());
@@ -14,20 +14,36 @@ pub fn run(state: &ApiState) -> Result<(), String> {
         if path.is_empty() {
             return Ok(());
         }
-        let root = store
-            .library_root(MediaKind::Movie)
+        let movie = store
+            .default_library(MediaKind::Movie)
+            .map_err(|e| e.to_string())?
+            .ok_or("Movie Library 不存在")?;
+        let tv = store
+            .default_library(MediaKind::Tv)
             .map_err(|e| e.to_string())?;
-        let tv_root = store.library_root(MediaKind::Tv).ok();
         let nfo = store
             .get_scrape_config()
             .map_err(|e| e.to_string())?
             .effective
             .mirror_nfo;
-        (PathBuf::from(path), root, tv_root, nfo)
+        (PathBuf::from(path), movie, tv, nfo)
     };
     if !intake.is_dir() {
         return Ok(());
     }
+    let movie_lease = state.acquire_library_work(&movie_library.id)?;
+    let tv_lease = tv_library
+        .as_ref()
+        .map(|library| state.acquire_library_work(&library.id))
+        .transpose()?;
+    let library_root = movie_library
+        .root_paths
+        .first()
+        .cloned()
+        .ok_or("Movie Library 没有根目录")?;
+    let tv_library_root = tv_library
+        .as_ref()
+        .and_then(|library| library.root_paths.first().cloned());
     let probe = Media {
         id: MediaId::new(),
         kind: MediaKind::Movie,
@@ -47,10 +63,17 @@ pub fn run(state: &ApiState) -> Result<(), String> {
         tv_library_root,
         scrape: nfo,
     };
-    let outcome = scan_watch(&job, &probe).map_err(|e| e.to_string())?;
+    let outcome = scan_watch_intake_controlled(
+        &job,
+        &probe,
+        movie_lease.control(),
+        tv_lease.as_ref().map(|lease| lease.control()),
+    )
+    .map_err(|e| e.to_string())?;
     let transferred = outcome.transferred;
     {
         let store = state.store.lock();
+        check_intake_libraries(&store, &movie_lease, tv_lease.as_ref())?;
         for parked in outcome.unidentified {
             store
                 .insert_unidentified(parked.path.display().to_string(), parked.confidence)
@@ -59,14 +82,39 @@ pub fn run(state: &ApiState) -> Result<(), String> {
     }
     let inserted = {
         let store = state.store.lock();
+        check_intake_libraries(&store, &movie_lease, tv_lease.as_ref())?;
         crate::watch_ledger::record_paths(&store, transferred.clone())?
     };
 
+    finish_intake_metadata(state, &transferred, inserted, &movie_lease, tv_lease.as_ref(), nfo)?;
+    if !outcome.errors.is_empty() {
+        let err_msgs: Vec<String> = outcome
+            .errors
+            .iter()
+            .map(|e| format!("{}: {}", e.path.display(), e.error))
+            .collect();
+        return Err(format!(
+            "watch intake completed with {} error(s): {}",
+            outcome.errors.len(),
+            err_msgs.join("; ")
+        ));
+    }
+    Ok(())
+}
+
+fn finish_intake_metadata(
+    state: &ApiState,
+    transferred: &[library::TransferredFile],
+    inserted: Vec<PathBuf>,
+    movie_lease: &crate::library_lifecycle::LibraryWorkLease,
+    tv_lease: Option<&crate::library_lifecycle::LibraryWorkLease>,
+    nfo: bool,
+) -> Result<(), String> {
     // 为没有 TMDB ID 的影视条目自动匹配 TMDB 元数据与海报
     let unresolved_media = {
         let store = state.store.lock();
         let mut map = std::collections::HashMap::new();
-        for dest in &transferred {
+        for dest in transferred {
             if let Ok(Some(row)) = store.ledger_by_path(&dest.path.display().to_string()) {
                 if let Ok(Some(m)) = store.get_media(row.media_id) {
                     if m.tmdb_id.is_none() && m.kind != domain::MediaKind::Video {
@@ -78,7 +126,19 @@ pub fn run(state: &ApiState) -> Result<(), String> {
         map
     };
     for (_, (media, dest)) in unresolved_media {
-        let _ = crate::auto_resolve::auto_resolve_media(state, &media, &dest);
+        check_intake_libraries(&state.store.lock(), movie_lease, tv_lease)?;
+        let resolved = crate::auto_resolve::resolve_scanned_media(state, &media, &dest);
+        let active_media = if let Some(canonical) = resolved {
+            crate::auto_resolve::rebind_scan_rows(state, media.id, canonical.id, &inserted)?;
+            canonical
+        } else {
+            media
+        };
+        if nfo && active_media.tmdb_id.is_some() {
+            let _ = crate::poster_fetch::attach_poster(state, &active_media, &dest);
+            let _ = crate::poster_fetch::attach_backdrop(state, &active_media, &dest);
+            crate::auto_resolve::write_resolved_nfo(state, &active_media, &dest);
+        }
     }
 
     crate::http::library::enqueue_probes_for_paths(state, inserted);
@@ -89,7 +149,10 @@ pub fn run(state: &ApiState) -> Result<(), String> {
         transferred
             .iter()
             .filter_map(|t| {
-                let row = store.ledger_by_path(&t.path.display().to_string()).ok().flatten()?;
+                let row = store
+                    .ledger_by_path(&t.path.display().to_string())
+                    .ok()
+                    .flatten()?;
                 let missing_poster = t
                     .path
                     .parent()
@@ -104,23 +167,29 @@ pub fn run(state: &ApiState) -> Result<(), String> {
             .collect()
     };
     for (media_id, row_path) in targets {
+        check_intake_libraries(&state.store.lock(), movie_lease, tv_lease)?;
         let Some(real) = state.store.lock().get_media(media_id).ok().flatten() else {
             continue;
         };
         let _ = crate::poster_fetch::attach_poster(state, &real, &row_path);
         let _ = crate::poster_fetch::attach_backdrop(state, &real, &row_path);
     }
-    if !outcome.errors.is_empty() {
-        let err_msgs: Vec<String> = outcome
-            .errors
-            .iter()
-            .map(|e| format!("{}: {}", e.path.display(), e.error))
-            .collect();
-        return Err(format!(
-            "watch intake completed with {} error(s): {}",
-            outcome.errors.len(),
-            err_msgs.join("; ")
-        ));
+    Ok(())
+}
+
+fn check_intake_libraries(
+    store: &crate::Store,
+    movie: &crate::library_lifecycle::LibraryWorkLease,
+    tv: Option<&crate::library_lifecycle::LibraryWorkLease>,
+) -> Result<(), String> {
+    for lease in std::iter::once(movie).chain(tv) {
+        lease.control().check().map_err(|e| e.to_string())?;
+        if !store
+            .library_accepts_work(lease.library_id())
+            .map_err(|e| e.to_string())?
+        {
+            return Err("Watch intake 的目标 Library 正在删除或已不存在".into());
+        }
     }
     Ok(())
 }

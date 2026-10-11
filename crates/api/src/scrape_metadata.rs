@@ -7,6 +7,26 @@ use std::path::{Path, PathBuf};
 
 pub(crate) mod targets;
 
+struct LeasedArtworkFetch<'a> {
+    fetch: &'a dyn crate::poster_fetch::PosterFetch,
+    lease: Option<&'a crate::library_lifecycle::LibraryWorkLease>,
+}
+impl crate::poster_fetch::PosterFetch for LeasedArtworkFetch<'_> {
+    fn get(&self, url: &str) -> Result<Vec<u8>, String> {
+        if let Some(lease) = self.lease { lease.control().check().map_err(|e| e.to_string())?; }
+        let bytes = self.fetch.get(url)?;
+        if let Some(lease) = self.lease { lease.control().check().map_err(|e| e.to_string())?; }
+        Ok(bytes)
+    }
+    fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        match self.lease {
+            Some(lease) => lease.publish(|| self.fetch.write(path, bytes).map_err(|error| error.to_string()))
+                .map_err(std::io::Error::other),
+            None => self.fetch.write(path, bytes),
+        }
+    }
+}
+
 pub(crate) fn fetch_tmdb_metadata(
     state: &crate::management::ApiState,
     kind: domain::MediaKind,
@@ -88,7 +108,7 @@ pub(crate) fn write_nfo(path: &Path, media: &Media, metadata: &library::NfoMeta)
 }
 
 pub(crate) fn write_series_nfos(
-    catalog: &dyn Catalog,
+    state: &crate::management::ApiState,
     media: &Media,
     tmdb_id: &str,
     show_root: &Path,
@@ -96,7 +116,18 @@ pub(crate) fn write_series_nfos(
     show_metadata: &library::NfoMeta,
     language: &str,
 ) -> Vec<(PathBuf, Option<String>)> {
-    write_nfo(&show_root.join("tvshow.nfo"), media, show_metadata);
+    let target = show_root.join("tvshow.nfo");
+    let lease = match state.acquire_path_work(&target, media.kind) {
+        Ok(Some(lease)) => lease, _ => return Vec::new(),
+    };
+    let rows: Vec<_> = {
+        let store = state.store.lock();
+        rows.iter().filter(|row| store.library_for_path_strict(Path::new(&row.path), media.kind)
+            .ok().flatten().is_some_and(|owner| owner.id == lease.library_id())
+            && self::show_root(Path::new(&row.path), row) == show_root).cloned().collect()
+    };
+    let catalog = state.catalog.as_ref();
+    if lease.publish(|| Ok(write_nfo(&target, media, show_metadata))).is_err() { return Vec::new(); }
     let mut matched_episodes = Vec::new();
     let seasons = rows
         .iter()
@@ -118,6 +149,7 @@ pub(crate) fn write_series_nfos(
             }
         };
         for row in rows.iter().filter(|row| row.season == Some(season)) {
+            if lease.control().is_cancelled() { return matched_episodes; }
             let Some(episode_number) = row.episode else {
                 continue;
             };
@@ -138,7 +170,7 @@ pub(crate) fn write_series_nfos(
                     still_path = stills.into_iter().next();
                 }
             }
-            write_nfo(&path, media, &nfo_from_episode(row, episode));
+            if lease.publish(|| Ok(write_nfo(&path, media, &nfo_from_episode(row, episode)))).is_err() { return matched_episodes; }
             matched_episodes.push((PathBuf::from(&row.path), still_path));
         }
     }
@@ -220,7 +252,12 @@ pub(crate) fn scrape_tv_sidecars(
     let Some(tmdb_id) = media.tmdb_id.as_deref() else {
         return;
     };
-    let groups = targets::live_groups(rows);
+    let path_leases: Vec<_> = rows.iter().filter_map(|row| {
+        state.acquire_path_work(Path::new(&row.path), media.kind).ok()
+            .map(|lease| (row.clone(), lease))
+    }).collect();
+    let allowed_rows: Vec<_> = path_leases.iter().map(|(row, _)| row.clone()).collect();
+    let groups = targets::live_groups(&allowed_rows);
     if groups.is_empty() {
         tracing::debug!(media = %media.title, "没有可用的视频文件，跳过电视剧刮削");
         return;
@@ -309,7 +346,7 @@ fn scrape_tv_episodes_and_nfos(
 
     if mirror_nfo {
         let mut ep_matches = write_series_nfos(
-            state.catalog.as_ref(),
+            state,
             media,
             tmdb_id,
             show_root,
@@ -317,7 +354,10 @@ fn scrape_tv_episodes_and_nfos(
             &show_nfo,
             &preferred_lang,
         );
-        crate::fanart_artwork::write_season_nfos(show_root, rows, &season_artworks);
+        if let Ok(lease) = state.acquire_path_work(show_root, media.kind) {
+            let write = || { crate::fanart_artwork::write_season_nfos(show_root, rows, &season_artworks); Ok(()) };
+            let _ = match lease { Some(lease) => lease.publish(write), None => write() };
+        }
         for row in rows {
             let row_path = PathBuf::from(&row.path);
             if !ep_matches.iter().any(|(p, _)| p == &row_path) {
@@ -360,7 +400,11 @@ fn scrape_tv_stills(
     matched_episodes: Vec<(PathBuf, Option<String>)>,
     still_size: &str,
 ) {
-    scrape_tv_stills_with(state, matched_episodes, still_size, library::extract_frame);
+    scrape_tv_stills_with(state, matched_episodes, still_size, |video, at, target| {
+        let lease = state.acquire_path_work(video, domain::MediaKind::Tv)?;
+        let control = lease.as_ref().map(|lease| lease.control().clone()).unwrap_or_default();
+        library::extract_frame_controlled(video, at, target, &control).map_err(|error| error.to_string())
+    });
 }
 
 fn scrape_tv_stills_with(
@@ -394,12 +438,15 @@ fn scrape_tv_stills_with(
         if !targets::video_present(&ep_path) {
             continue;
         }
+        let Ok(lease) = state.acquire_path_work(&ep_path, domain::MediaKind::Tv) else { continue };
+        let fetch = LeasedArtworkFetch { fetch: state.poster_fetch.as_ref(), lease: lease.as_ref() };
         let ok = crate::fanart_artwork::mirror_episode_still(
-            state.poster_fetch.as_ref(),
+            &fetch,
             &ep_path,
             still_path.as_deref(),
             still_size,
         );
+        if lease.as_ref().is_some_and(|lease| lease.control().is_cancelled()) { continue; }
         if !ok && targets::video_present(&ep_path) && is_allowed(&ep_path) {
             if crate::episode_still::existing(&ep_path).is_none() {
                 let still_dest = crate::episode_still::path(&ep_path);
@@ -495,9 +542,9 @@ fn scrape_tv_fanart(
         return;
     };
 
-    let getter = PosterFetchCatalogGet {
-        fetch: state.poster_fetch.as_ref(),
-    };
+    let Ok(lease) = state.acquire_path_work(show_root, media.kind) else { return };
+    let fetch = LeasedArtworkFetch { fetch: state.poster_fetch.as_ref(), lease: lease.as_ref() };
+    let getter = PosterFetchCatalogGet { fetch: &fetch };
     let fanart_db = state.store.lock().data_dir().join("fanart.db");
     match media::fanart::FanartClient::new(getter, &fanart_db, api_key) {
         Ok(client) => {
@@ -505,7 +552,7 @@ fn scrape_tv_fanart(
             match client.tv(&tvdb_id, &lang_refs) {
                 Ok(set) => {
                     crate::fanart_artwork::save_fanart_files(
-                        state.poster_fetch.as_ref(),
+                        &fetch,
                         show_root,
                         rows,
                         &set,
@@ -553,9 +600,9 @@ pub(crate) fn scrape_movie_fanart(
         return;
     };
 
-    let getter = PosterFetchCatalogGet {
-        fetch: state.poster_fetch.as_ref(),
-    };
+    let Ok(lease) = state.acquire_path_work(movie_root, media.kind) else { return };
+    let fetch = LeasedArtworkFetch { fetch: state.poster_fetch.as_ref(), lease: lease.as_ref() };
+    let getter = PosterFetchCatalogGet { fetch: &fetch };
     let fanart_db = state.store.lock().data_dir().join("fanart.db");
     match media::fanart::FanartClient::new(getter, &fanart_db, &api_key) {
         Ok(client) => {
@@ -563,7 +610,7 @@ pub(crate) fn scrape_movie_fanart(
             match client.movie(tmdb_id, &lang_refs) {
                 Ok(set) => {
                     crate::fanart_artwork::save_fanart_files(
-                        state.poster_fetch.as_ref(),
+                        &fetch,
                         movie_root,
                         &[],
                         &set,

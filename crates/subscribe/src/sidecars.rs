@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use library::{TransferMode, resolve_mode, transfer_file};
+use library::{TransferMode, resolve_mode, transfer_file_controlled};
 
 use crate::SubscribeError;
 
@@ -41,6 +41,16 @@ pub fn place_mapped_subtitle(
     mappings: &[crate::collection_destinations::DestinationMapping],
     configured: Option<TransferMode>,
 ) -> Result<(), SubscribeError> {
+    place_mapped_subtitle_controlled(src, mappings, configured, &library::WorkControl::default())
+}
+
+pub fn place_mapped_subtitle_controlled(
+    src: &Path,
+    mappings: &[crate::collection_destinations::DestinationMapping],
+    configured: Option<TransferMode>,
+    control: &library::WorkControl,
+) -> Result<(), SubscribeError> {
+    control.check()?;
     let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
     let lang = extract_sub_lang_suffix(stem);
     let clean = if lang.is_some() {
@@ -66,7 +76,7 @@ pub fn place_mapped_subtitle(
         dest.parent().unwrap_or_else(|| Path::new(".")),
         configured,
     );
-    match transfer_file(src, &dest, mode) {
+    match transfer_file_controlled(src, &dest, mode, control) {
         Ok(()) => Ok(()),
         Err(library::LibraryError::Io(err))
             if err.kind() == std::io::ErrorKind::NotFound

@@ -16,7 +16,18 @@ use crate::target::ProbeTarget;
 pub fn capture_window_chromaprint(
     request: &CaptureRequest,
 ) -> Result<CapturedFingerprint, CaptureFailure> {
+    capture_window_controlled(request, &crate::WorkControl::default())
+}
+
+pub fn capture_window_controlled(
+    request: &CaptureRequest,
+    control: &crate::WorkControl,
+) -> Result<CapturedFingerprint, CaptureFailure> {
     let started = Instant::now();
+    if control.is_cancelled() {
+        return Err(CaptureFailure { kind: CaptureFailureKind::Cancelled,
+            message: "Library work cancelled".into(), metrics: CaptureMetrics::default() });
+    }
     request.window.validate()?;
 
     let mut timings = ExtractionTimings::default();
@@ -48,22 +59,28 @@ pub fn capture_window_chromaprint(
         }
     };
 
-    let pcm_duration_calc = |samples: u64| -> Option<i64> {
-        // 16000 samples per second = 16 samples per millisecond
-        Some((samples / 16) as i64)
-    };
-
     let run_res = run_ffmpeg_with_deadline(
         &mut child,
         &mut fingerprinter,
         &mut timings,
         request.process_deadline_ms,
+        control,
     );
 
     let finish_started = Instant::now();
     fingerprinter.finish();
     timings.chromaprint_finish_ms = finish_started.elapsed().as_millis();
 
+    finish_captured_fingerprint(request, run_res, &mut fingerprinter, timings, started)
+}
+
+fn finish_captured_fingerprint(
+    request: &CaptureRequest,
+    run_res: Result<(), CaptureFailure>,
+    fingerprinter: &mut Fingerprinter,
+    timings: ExtractionTimings,
+    started: Instant,
+) -> Result<CapturedFingerprint, CaptureFailure> {
     let source = match ProbeTarget::from_path(&request.path) {
         ProbeTarget::Local(_) => "local",
         ProbeTarget::Remote(_) => "remote",
@@ -109,7 +126,7 @@ pub fn capture_window_chromaprint(
             Ok(CapturedFingerprint {
                 window: request.window.clone(),
                 words,
-                pcm_duration_ms: pcm_duration_calc(timings.sample_count),
+                pcm_duration_ms: Some((timings.sample_count / 16) as i64),
                 metrics,
             })
         }
@@ -171,11 +188,84 @@ fn spawn_ffmpeg(mut command: Command, timings: &mut ExtractionTimings) -> Result
     spawn_result.map_err(|error| error.to_string())
 }
 
+fn spawn_stdout_reader(
+    stdout: std::process::ChildStdout,
+) -> (mpsc::Receiver<Vec<u8>>, std::thread::JoinHandle<Result<(), String>>) {
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut reader = stdout;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Vec::new());
+                    return Err(e.to_string());
+                }
+            }
+        }
+        Ok(())
+    });
+    (rx, handle)
+}
+
+fn finalize_ffmpeg_exit(
+    child: &mut Child,
+    stderr_reader: std::thread::JoinHandle<Result<CapturedStderr, String>>,
+    timings: &mut ExtractionTimings,
+    pending_low_byte: Option<u8>,
+    process_started: Instant,
+) -> Result<(), CaptureFailure> {
+    let wait_started = Instant::now();
+    let status_res = child.wait();
+    timings.ffmpeg_wait_ms = wait_started.elapsed().as_millis();
+
+    let stderr = collect_stderr_to_timings(stderr_reader, timings)?;
+
+    let status = match status_res {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(CaptureFailure {
+                kind: CaptureFailureKind::Io,
+                message: format!("Failed waiting for ffmpeg: {e}"),
+                metrics: build_metrics(timings, process_started, None),
+            });
+        }
+    };
+
+    timings.ffmpeg_exit_code = status.code();
+
+    if pending_low_byte.is_some() {
+        return Err(CaptureFailure {
+            kind: CaptureFailureKind::Decode,
+            message: "ffmpeg produced an incomplete 16-bit PCM sample".into(),
+            metrics: build_metrics(timings, process_started, None),
+        });
+    }
+
+    if !status.success() {
+        return Err(CaptureFailure {
+            kind: CaptureFailureKind::Decode,
+            message: ffmpeg_exit_error(status, &stderr.text),
+            metrics: build_metrics(timings, process_started, None),
+        });
+    }
+
+    Ok(())
+}
+
 fn run_ffmpeg_with_deadline(
     child: &mut Child,
     fingerprinter: &mut Fingerprinter,
     timings: &mut ExtractionTimings,
     deadline_ms: u64,
+    control: &crate::WorkControl,
 ) -> Result<(), CaptureFailure> {
     let process_started = Instant::now();
     let stdout = child.stdout.take().ok_or_else(|| CaptureFailure {
@@ -193,29 +283,7 @@ fn run_ffmpeg_with_deadline(
         super::chromaprint::diagnostics::read_stderr_tail(stderr)
     });
 
-    let (tx, rx) = mpsc::channel();
-    let stdout_join = {
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut reader = stdout;
-            let mut chunk = [0u8; 8192];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(chunk[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Vec::new());
-                        return Err(e.to_string());
-                    }
-                }
-            }
-            Ok(())
-        })
-    };
+    let (rx, stdout_join) = spawn_stdout_reader(stdout);
 
     let deadline = Duration::from_millis(deadline_ms);
     let mut pending_low_byte = None;
@@ -223,6 +291,7 @@ fn run_ffmpeg_with_deadline(
     let mut timed_out = false;
 
     loop {
+        if control.is_cancelled() { break; }
         let elapsed = process_started.elapsed();
         if deadline_ms > 0 && elapsed >= deadline {
             timed_out = true;
@@ -265,56 +334,23 @@ fn run_ffmpeg_with_deadline(
 
     timings.pcm_stream_elapsed_ms = process_started.elapsed().as_millis();
 
-    if timed_out {
+    if timed_out || control.is_cancelled() {
+        let cancelled = control.is_cancelled();
         let _ = child.kill();
         let _ = child.wait();
         let _ = stdout_join.join();
         let _ = collect_stderr_to_timings(stderr_reader, timings);
         return Err(CaptureFailure {
-            kind: CaptureFailureKind::Timeout,
-            message: format!("FFmpeg process exceeded deadline of {deadline_ms}ms"),
+            kind: if cancelled { CaptureFailureKind::Cancelled } else { CaptureFailureKind::Timeout },
+            message: if cancelled { "Library work cancelled".into() }
+                else { format!("FFmpeg process exceeded deadline of {deadline_ms}ms") },
             metrics: build_metrics(timings, process_started, None),
         });
     }
 
     let _ = stdout_join.join();
 
-    let wait_started = Instant::now();
-    let status_res = child.wait();
-    timings.ffmpeg_wait_ms = wait_started.elapsed().as_millis();
-
-    let stderr = collect_stderr_to_timings(stderr_reader, timings)?;
-
-    let status = match status_res {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(CaptureFailure {
-                kind: CaptureFailureKind::Io,
-                message: format!("Failed waiting for ffmpeg: {e}"),
-                metrics: build_metrics(timings, process_started, None),
-            });
-        }
-    };
-
-    timings.ffmpeg_exit_code = status.code();
-
-    if pending_low_byte.is_some() {
-        return Err(CaptureFailure {
-            kind: CaptureFailureKind::Decode,
-            message: "ffmpeg produced an incomplete 16-bit PCM sample".into(),
-            metrics: build_metrics(timings, process_started, None),
-        });
-    }
-
-    if !status.success() {
-        return Err(CaptureFailure {
-            kind: CaptureFailureKind::Decode,
-            message: ffmpeg_exit_error(status, &stderr.text),
-            metrics: build_metrics(timings, process_started, None),
-        });
-    }
-
-    Ok(())
+    finalize_ffmpeg_exit(child, stderr_reader, timings, pending_low_byte, process_started)
 }
 
 fn decode_pcm_chunk_ref(bytes: &[u8], pending_low_byte: &mut Option<u8>, samples: &mut Vec<i16>) {

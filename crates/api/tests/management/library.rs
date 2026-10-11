@@ -175,7 +175,7 @@ async fn libraries_delete_extra_but_protect_last_of_kind() {
         ))
         .await
         .unwrap();
-    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
     let body = get(&app, "/api/v1/libraries").await;
     assert!(
         !body["data"]
@@ -205,7 +205,7 @@ async fn libraries_delete_extra_but_protect_last_of_kind() {
         ))
         .await
         .unwrap();
-    assert_eq!(protected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(protected.status(), StatusCode::CONFLICT);
     let pbody = json_body(protected).await;
     assert_eq!(pbody["error"]["code"], "library.protected");
 }

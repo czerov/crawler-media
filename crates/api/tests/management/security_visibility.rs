@@ -55,30 +55,7 @@ async fn create_member(app: &axum::Router, login: &str) -> (domain::UserId, Stri
     (id, token)
 }
 
-#[tokio::test]
-async fn nested_hidden_library_does_not_leak_through_visible_parent() {
-    let tmp = tempfile::tempdir().unwrap();
-    let app = app(&tmp);
-    let (member_id, member) = create_member(&app, "nested-member").await;
-    let store = Store::open(tmp.path().join("data")).unwrap();
-    let parent = store
-        .list_libraries()
-        .unwrap()
-        .into_iter()
-        .find(|library| library.kind == MediaKind::Movie && library.is_default)
-        .unwrap();
-    let child_root = parent.root_paths[0].join("private");
-    std::fs::create_dir_all(&child_root).unwrap();
-    let child = store
-        .create_library(
-            MediaKind::Movie,
-            "Private",
-            &[child_root.to_str().unwrap()],
-            "selected",
-            true,
-            &[],
-        )
-        .unwrap();
+fn seed_nested_hidden_movie(store: &Store, child_root: &std::path::Path, member_id: domain::UserId) -> Media {
     let media = Media {
         id: MediaId::new(),
         kind: MediaKind::Movie,
@@ -133,11 +110,40 @@ async fn nested_hidden_library_does_not_leak_through_visible_parent() {
             admin_ended: false,
             started_at: now,
             last_report_at: now,
+            ledger_id: None,
         })
         .unwrap();
     store
         .close_session(member_id, "legacy-hidden", now + 1)
         .unwrap();
+    media
+}
+
+#[tokio::test]
+async fn nested_hidden_library_does_not_leak_through_visible_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app(&tmp);
+    let (member_id, member) = create_member(&app, "nested-member").await;
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let parent = store
+        .list_libraries()
+        .unwrap()
+        .into_iter()
+        .find(|library| library.kind == MediaKind::Movie && library.is_default)
+        .unwrap();
+    let child_root = parent.root_paths[0].join("private");
+    std::fs::create_dir_all(&child_root).unwrap();
+    let child = store
+        .create_library(
+            MediaKind::Movie,
+            "Private",
+            &[child_root.to_str().unwrap()],
+            "selected",
+            true,
+            &[],
+        )
+        .unwrap();
+    let media = seed_nested_hidden_movie(&store, &child_root, member_id);
     drop(store);
 
     let search = app

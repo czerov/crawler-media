@@ -17,6 +17,8 @@ import {
   LibraryManageRow,
 } from "@/components/library-manage-row";
 import { Modal } from "@/components/modal";
+import { LibraryRemovalNotice } from "@/components/library-removal-notice";
+import { useLibraryRemoval } from "@/lib/use-library-removal";
 import { PageNav } from "@/components/page-nav";
 import {
   type DuplicateEntryGroup,
@@ -28,7 +30,6 @@ import {
   startLibraryOrganize,
   type MediaLibrary,
   deleteDuplicateFile,
-  deleteLibrary,
   listLibraries,
   listLibraryDuplicates,
   reorderLibraries,
@@ -109,6 +110,12 @@ export function LibraryManageView() {
         if (seq === reloadSeq.current) setFailed(true);
       });
   }, []);
+
+  const removal = useLibraryRemoval(libraries, (library) => {
+    toast.success(`已删除媒体库「${library.name}」`);
+    setLibraries((prev) => prev?.filter((entry) => entry.id !== library.id) ?? null);
+    reload();
+  });
 
   useEffect(() => {
     reload();
@@ -232,17 +239,12 @@ export function LibraryManageView() {
       onDelete: (library) => {
         void confirm({
           title: `删除媒体库「${library.name}」？`,
-          description: "删除媒体库会移除库的配置与全部台账记录（磁盘文件不受影响）。",
+          description: "将停止该库相关任务，清除扫描记录与探测缓存。磁盘文件、NFO 和图片不会删除，观看进度、已看和收藏会保留。重新添加目录后将重新扫描。",
           confirmLabel: "删除媒体库",
           tone: "danger",
         }).then((ok) => {
           if (ok) {
-            void deleteLibrary(library.id)
-              .then(() => {
-                toast.success(`已删除媒体库「${library.name}」`);
-                reload();
-              })
-              .catch((e: Error) => toast.error(e.message));
+            removal.remove(library);
           }
         });
       },
@@ -260,7 +262,7 @@ export function LibraryManageView() {
       },
       onReorder: isMobile ? () => setReorderOpen(true) : undefined,
     }),
-    [confirm, isMobile, navigate, reload, run, toast],
+    [confirm, isMobile, navigate, reload, run, toast, removal],
   );
 
   // —— 拖拽排序（桌面端、未筛选时）——
@@ -518,12 +520,17 @@ export function LibraryManageView() {
             ) : (
               <div role="list" aria-label="媒体库列表" className="divide-y divide-white/[0.06]">
                 {visible.map((library) => (
-                  <LibraryManageRow
-                    key={library.id}
-                    library={library}
-                    actions={actions}
-                    drag={dragFor(library)}
-                  />
+                  <div key={library.id}>
+                    <LibraryManageRow
+                      library={library}
+                      actions={actions}
+                      removalBlocked={Boolean(removal.states[library.id]?.pending || removal.states[library.id]?.operation || library.removal)}
+                      drag={removal.states[library.id]?.pending || library.removal ? null : dragFor(library)}
+                    />
+                    <div className="px-4">
+                      <LibraryRemovalNotice library={library} state={removal.states[library.id]} onRetry={(operation) => operation ? removal.resume(library, operation) : removal.remove(library)} />
+                    </div>
+                  </div>
                 ))}
               </div>
             )}

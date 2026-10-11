@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -130,7 +129,7 @@ pub(crate) fn mirror_episode_still(
             if !crate::scrape_metadata::targets::video_present(video) {
                 return false;
             }
-            if let Err(error) = fs::write(&still_dest, &bytes) {
+            if let Err(error) = fetch.write(&still_dest, &bytes) {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     tracing::debug!(path = %still_dest.display(), "目标目录已不存在，跳过分集剧照保存");
                 } else {
@@ -204,7 +203,7 @@ fn write_destination_if_missing(
     }
 
     if let Some(bytes) = cached_bytes.as_deref() {
-        if let Err(error) = fs::write(dest, bytes) {
+        if let Err(error) = fetch.write(dest, bytes) {
             if error.kind() == std::io::ErrorKind::NotFound {
                 tracing::debug!(path = %dest.display(), "目标目录不存在，跳过 Fanart 图片保存");
             } else {

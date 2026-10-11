@@ -74,7 +74,8 @@ pub async fn run_adaptive_season_pipeline(
         seed_ledger_ids: seed_ids,
     };
 
-    let ctx = adaptive_capture_context(mgr);
+    let (gate, _leases) = super::progress::MetadataPriorityGate::for_rows(mgr, units)?;
+    let ctx = adaptive_capture_context(mgr, std::sync::Arc::new(gate));
     let pipeline = SeasonPipeline {
         mgr,
         job_id,
@@ -141,6 +142,9 @@ pub async fn run_adaptive_season_pipeline(
 
 fn ensure_season_sources(pipeline: &SeasonPipeline<'_>, units: &[ProbeUnit]) -> Result<(), String> {
     for unit in units {
+        if pipeline.ctx.gate.work_control(&unit.row).is_cancelled() {
+            return Err("Library probe source cancelled or changed".into());
+        }
         let availability = crate::fingerprint_job::source::ensure_source_available(
             &pipeline.mgr.store.lock(),
             &unit.row,
@@ -189,12 +193,15 @@ fn known_media_duration(store: &crate::Store, ledger_id: &str) -> Option<i64> {
         .and_then(|cached| cached.format_duration_ms)
 }
 
-fn adaptive_capture_context(mgr: &ProbeManager) -> AdaptiveCaptureContext {
+fn adaptive_capture_context(
+    mgr: &ProbeManager,
+    gate: std::sync::Arc<dyn crate::fingerprint_job::CaptureGate>,
+) -> AdaptiveCaptureContext {
     AdaptiveCaptureContext {
         store: mgr.store.clone(),
         matcher: mgr.fingerprint_engine.clone(),
         capture: mgr.capture_engine.clone(),
-        gate: mgr.priority_gate(),
+        gate,
         timings: Some(mgr.timings.clone()),
     }
 }
@@ -322,6 +329,33 @@ fn persist_season_model(pipeline: &SeasonPipeline<'_>, model: &TemplateModel) {
         .collect();
 
     let store = pipeline.mgr.store.lock();
+    if members.iter().any(|member| {
+        store
+            .get_ledger(&member.ledger_id)
+            .ok()
+            .flatten()
+            .is_none_or(|row| {
+                store
+                    .get_media(row.media_id)
+                    .ok()
+                    .flatten()
+                    .is_none_or(|media| {
+                        store
+                            .library_for_path_strict(std::path::Path::new(&row.path), media.kind)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|owner| {
+                                !store.library_accepts_work(&owner.id).unwrap_or(false)
+                            })
+                    })
+            })
+    }) {
+        tracing::warn!(
+            job_id = pipeline.job_id,
+            "cancelled Library season model publication"
+        );
+        return;
+    }
     if let Err(error) = store.put_fingerprint_model(&stored_model, &members) {
         tracing::warn!(error = %error, "failed to persist fingerprint season model");
     }

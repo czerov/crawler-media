@@ -37,10 +37,24 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
     if path.as_os_str().is_empty() || !path.is_dir() {
         return Ok(());
     }
+    let owner = {
+        let store = state.store.lock();
+        let mut owners = Vec::new();
+        for kind in [MediaKind::Movie, MediaKind::Tv, MediaKind::Video] {
+            if let Some(owner) = store.library_for_path_strict(&path, kind).map_err(|e| e.to_string())? { owners.push(owner); }
+        }
+        owners.into_iter().max_by_key(|library| library.root_paths.iter().filter(|root| path.starts_with(root))
+            .map(|root| root.components().count()).max().unwrap_or(0))
+    };
+    if owner.is_none() && state.store.lock().path_in_removal_scope(&path).map_err(|e| e.to_string())? {
+        return Ok(());
+    }
+    let kind = owner.as_ref().map(|owner| owner.kind).unwrap_or(MediaKind::Movie);
+    let lease = owner.map(|owner| state.acquire_library_work(&owner.id)).transpose()?;
     tracing::debug!(dir = %path.display(), "扫描目录，刮削并生成 NFO");
     let probe = Media {
         id: MediaId::new(),
-        kind: MediaKind::Movie,
+        kind,
         title: "inplace".into(),
         year: None,
         original_title: None,
@@ -57,7 +71,7 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
         path: path.clone(),
         scrape: nfo,
     };
-    let outcome = scan_watch(&job, &probe).map_err(|e| {
+    let mut outcome = scan_watch(&job, &probe).map_err(|e| {
         tracing::error!(dir = %path.display(), error = %e, "目录扫描失败");
         e.to_string()
     })?;
@@ -68,8 +82,18 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
             "已记录目录中新增刮削的媒体路径"
         );
     }
-    let inserted =
-        crate::watch_ledger::record_paths(&state.store.lock(), outcome.transferred.clone())?;
+    let inserted = {
+        let store = state.store.lock();
+        if let Some(lease) = &lease {
+            lease.control().check().map_err(|e| e.to_string())?;
+            if !store.library_accepts_work(lease.library_id()).map_err(|e| e.to_string())? { return Ok(()); }
+            outcome.transferred.retain(|file| store.library_for_path_strict(&file.path, kind).ok().flatten()
+                .is_some_and(|owner| owner.id == lease.library_id()));
+        } else {
+            outcome.transferred.retain(|file| !store.path_in_removal_scope(&file.path).unwrap_or(true));
+        }
+        crate::watch_ledger::record_paths(&store, outcome.transferred.clone())?
+    };
 
     // MovieClaw / MoviePilot 模式：扫描入库后，为没有 TMDB ID 的影视条目自动匹配 TMDB 元数据与海报
     let unresolved_media = {
@@ -87,22 +111,32 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
         map
     };
     for (_, (media, dest)) in unresolved_media {
-        let _ = crate::auto_resolve::auto_resolve_media(state, &media, &dest);
+        let resolved = crate::auto_resolve::resolve_scanned_media(state, &media, &dest);
+        let active_media = if let Some(canonical) = resolved {
+            crate::auto_resolve::rebind_scan_rows(state, media.id, canonical.id, &inserted)?;
+            canonical
+        } else {
+            media
+        };
+        if nfo && active_media.tmdb_id.is_some() {
+            let _ = crate::poster_fetch::attach_poster(state, &active_media, &dest);
+            let _ = crate::poster_fetch::attach_backdrop(state, &active_media, &dest);
+            crate::auto_resolve::write_resolved_nfo(state, &active_media, &dest);
+        }
     }
     crate::http::library::enqueue_probes_for_paths(state, inserted);
+    attach_missing_posters(state, &job.path);
+    Ok(())
+}
 
-    // 自动补封面：目录内缺 poster.jpg 的文件从 TMDB 拉海报 + 背板
-    // （Emby/Jellyfin 式「没封面自动设置」；已有封面跳过，手动选过的不会被覆盖）。
-    // 注意：先收集目标再逐个补图——attach_poster 内部会再锁 store，
-    // 持锁调用是死锁。
+fn attach_missing_posters(state: &ApiState, dir_to_scan: &std::path::Path) {
     let targets: Vec<(domain::MediaId, PathBuf)> = {
-        let dir_to_scan = job.path.clone();
         let store = state.store.lock();
         store
             .list_ledger()
             .unwrap_or_default()
             .into_iter()
-            .filter(|row| std::path::Path::new(&row.path).starts_with(&dir_to_scan))
+            .filter(|row| std::path::Path::new(&row.path).starts_with(dir_to_scan))
             .filter(|row| {
                 std::path::Path::new(&row.path)
                     .parent()
@@ -116,8 +150,7 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
         let Some(real) = state.store.lock().get_media(media_id).ok().flatten() else {
             continue;
         };
-        let _ = crate::poster_fetch::attach_poster(&state, &real, &row_path);
-        let _ = crate::poster_fetch::attach_backdrop(&state, &real, &row_path);
+        let _ = crate::poster_fetch::attach_poster(state, &real, &row_path);
+        let _ = crate::poster_fetch::attach_backdrop(state, &real, &row_path);
     }
-    Ok(())
 }

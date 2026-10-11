@@ -30,6 +30,7 @@ fn fresh_fingerprint_replaces_stale_unlocked_intro_marker() {
         confidence: Confidence::High,
         filter_score: None,
     };
+    std::fs::write(&row.path, b"fixture").unwrap();
     store.insert_ledger(&row).unwrap();
     store
         .put_media_marker(&crate::store::StoredMediaMarker {
@@ -165,7 +166,11 @@ fn fingerprint_marker_extracts_scene_frames_when_library_enables_them() {
     crate::http::library_chapters::set_scene_frame_ffmpeg_for_test(leak_path(ffmpeg));
     let updates =
         persist_marker(&store, &[row.clone()], fingerprint_marker(media_id), false).unwrap();
-    crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(&updates, &store);
+    let store = std::sync::Arc::new(parking_lot::Mutex::new(store));
+    let registry = std::sync::Arc::new(crate::library_lifecycle::LibraryWorkRegistry::default());
+    crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
+        &updates, &store, &registry,
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline && !args.is_file() {
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -193,17 +198,151 @@ fn fingerprint_marker_skips_scene_frames_when_library_disables_them() {
     crate::http::library_chapters::set_scene_frame_ffmpeg_for_test(leak_path(ffmpeg));
     let updates =
         persist_marker(&store, &[row.clone()], fingerprint_marker(media_id), false).unwrap();
-    crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(&updates, &store);
+    let store = std::sync::Arc::new(parking_lot::Mutex::new(store));
+    let registry = std::sync::Arc::new(crate::library_lifecycle::LibraryWorkRegistry::default());
+    crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
+        &updates, &store, &registry,
+    );
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(
         !args.is_file(),
         "关闭生成章节后，声纹写入片头片尾不得抓场景图"
     );
     let marker = store
+        .lock()
         .get_media_marker(media_id, Some(1), Some(1))
         .unwrap()
         .unwrap();
     assert_eq!(marker.source, "fingerprint");
+}
+
+#[tokio::test]
+async fn cancelling_detached_chapter_frames_reaps_child_and_preserves_sidecars() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, media_id, row) = tv_episode(&tmp);
+    let root = tmp.path().to_str().unwrap().to_string();
+    let owner = store
+        .create_library(MediaKind::Tv, "Extra", &[&root], "everyone", true, &[])
+        .unwrap();
+    store
+        .set_library_switch_settings(&owner.id, None, None, Some(true), None, None)
+        .unwrap();
+    let started = tmp.path().join("frame-started");
+    let ffmpeg = tmp.path().join("blocking-ffmpeg");
+    std::fs::write(
+        &ffmpeg,
+        format!(
+            "#!/bin/sh\nprintf ready > '{}'\nwhile :; do :; done\n",
+            started.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    crate::http::library_chapters::set_scene_frame_ffmpeg_for_test(leak_path(ffmpeg));
+    let updates =
+        persist_marker(&store, &[row.clone()], fingerprint_marker(media_id), false).unwrap();
+    let store = std::sync::Arc::new(parking_lot::Mutex::new(store));
+    let registry = std::sync::Arc::new(crate::library_lifecycle::LibraryWorkRegistry::default());
+    crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
+        &updates, &store, &registry,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !started.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    registry.freeze(&store, &owner.id).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        registry.wait_idle(&owner.id),
+    )
+    .await
+    .unwrap();
+    let image = std::path::Path::new(&row.path).with_file_name("episode-chapter_0.jpg");
+    assert!(!image.exists());
+    assert_eq!(
+        std::fs::read_to_string(&row.path).unwrap(),
+        "https://cdn.example.test/episode.mkv\n"
+    );
+    assert!(!std::fs::read_dir(tmp.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".chapter-")
+    }));
+}
+
+#[test]
+fn stale_marker_snapshot_does_not_resurrect_deleted_episode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, media_id, row) = tv_episode(&tmp);
+    store.delete_ledger_path(&row.path).unwrap();
+    let updates = persist_marker(&store, &[row.clone()], fingerprint_marker(media_id), false).unwrap();
+    assert!(updates.is_empty());
+    assert!(store.get_media_marker(media_id, Some(1), Some(1)).unwrap().is_none());
+    assert!(store.get_cached_chapters(&row.id.to_string()).unwrap().is_none());
+}
+
+#[test]
+fn marker_snapshot_cannot_follow_reimported_path_to_a_new_ledger_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, media_id, row) = tv_episode(&tmp);
+    store.delete_ledger_path(&row.path).unwrap();
+    let mut reimported = row.clone();
+    reimported.id = LedgerId::new();
+    store.insert_ledger(&reimported).unwrap();
+    let updates = persist_marker(&store, &[row.clone()], fingerprint_marker(media_id), false).unwrap();
+    assert!(updates.is_empty());
+    assert!(store.get_media_marker(media_id, Some(1), Some(1)).unwrap().is_none());
+    assert!(store.get_cached_chapters(&reimported.id.to_string()).unwrap().is_none());
+}
+
+#[test]
+fn frozen_marker_snapshot_does_not_publish_any_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, media_id, row) = tv_episode(&tmp);
+    let owner = store.create_library(
+        MediaKind::Tv, "Frozen", &[tmp.path().to_str().unwrap()], "everyone", true, &[],
+    ).unwrap();
+    store.begin_library_removal(&owner.id).unwrap();
+    let updates = persist_marker(&store, &[row.clone()], fingerprint_marker(media_id), false).unwrap();
+    assert!(updates.is_empty());
+    assert!(store.get_media_marker(media_id, Some(1), Some(1)).unwrap().is_none());
+    assert!(store.get_cached_chapters(&row.id.to_string()).unwrap().is_none());
+    assert!(std::path::Path::new(&row.path).exists());
+}
+
+#[test]
+fn marker_publication_skips_frozen_library_but_updates_live_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, media_id, row) = tv_episode(&tmp);
+    let frozen = store.create_library(
+        MediaKind::Tv, "Frozen", &[tmp.path().to_str().unwrap()], "everyone", true, &[],
+    ).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    store.create_library(
+        MediaKind::Tv, "Live", &[other.path().to_str().unwrap()], "everyone", true, &[],
+    ).unwrap();
+    let mut live = row.clone();
+    live.id = LedgerId::new();
+    live.path = other.path().join("episode.strm").display().to_string();
+    std::fs::write(&live.path, "https://fixture.invalid/episode.mkv").unwrap();
+    store.insert_ledger(&live).unwrap();
+    store.begin_library_removal(&frozen.id).unwrap();
+    let updates = persist_marker(
+        &store, &[row.clone(), live.clone()], fingerprint_marker(media_id), false,
+    ).unwrap();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].0, live.id.to_string());
+    assert!(store.get_cached_chapters(&row.id.to_string()).unwrap().is_none());
+    assert!(store.get_cached_chapters(&live.id.to_string()).unwrap().is_some());
 }
 
 fn leak_path(path: std::path::PathBuf) -> &'static str {

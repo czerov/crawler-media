@@ -37,6 +37,10 @@ impl Store {
 
     /// Replace the primary root of the kind's default library.
     pub fn set_library_root(&self, kind: MediaKind, path: &str) -> Result<(), StoreError> {
+        if let Some(library) = self.default_library(kind)? {
+            self.ensure_library_mutable(&library.id)?;
+        }
+        self.ensure_removal_roots_available(&[path])?;
         let root_id: String = self.app.query_row(
             "SELECT r.id FROM library_roots r
              JOIN libraries l ON l.id = r.library_id
@@ -440,6 +444,10 @@ pub(crate) fn delete_file_meta_for_ledger(
     tx.execute("DELETE FROM file_meta WHERE ledger_id = ?1", [ledger_id])?;
     tx.execute(
         "DELETE FROM fingerprint_cache WHERE ledger_id = ?1",
+        [ledger_id],
+    )?;
+    tx.execute(
+        "DELETE FROM fingerprint_attempts WHERE ledger_id = ?1",
         [ledger_id],
     )?;
     super::probe_state::delete_probe_stages_for_ledger(tx, ledger_id)?;

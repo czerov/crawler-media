@@ -10,7 +10,7 @@ use super::{Store, StoreError};
 
 pub const UNIT_WHOLE: i32 = -1;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnitState {
     pub position_ms: i64,
     pub played: bool,
@@ -53,6 +53,7 @@ pub struct SessionRow {
     pub admin_ended: bool,
     pub started_at: i64,
     pub last_report_at: i64,
+    pub ledger_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

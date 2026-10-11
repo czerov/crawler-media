@@ -1,27 +1,35 @@
 mod file_transfer;
+mod frame_control;
+pub use frame_control::extract_frame_controlled;
 pub mod fingerprint;
 pub mod latest;
 pub mod markers;
 mod naming;
 mod nfo;
 mod nfo_season;
+mod nfo_identity;
+mod watch_identity;
+pub use nfo_identity::{NfoIdentity, parse_nfo_identity};
+pub use watch_identity::read_watch_identity;
 mod probe_target;
 mod scrape;
 pub mod subtitles;
 mod tracks;
 mod watch;
+mod work_control;
+pub use work_control::WorkControl;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-pub use file_transfer::transfer_file;
+pub use file_transfer::{transfer_file, transfer_file_controlled};
 pub use fingerprint::{CommonSegment, extract_audio_fingerprint, find_common_segment};
 pub use latest::{WatchTier, played_last};
 pub use marker::{
     Chapter, ChapterMarker, MarkerType, annotate_chapters, build_complete_timeline_chapters,
-    classify_chapter_title, probe_chapters,
+    classify_chapter_title, probe_chapters, probe_chapters_controlled,
 };
 pub use naming::{default_pattern, render_path, validate_pattern};
 pub use nfo::{CastMember, NfoMeta, parse_nfo, read_nfo, write_nfo, write_streamdetails_into_nfo};
@@ -36,11 +44,11 @@ pub use subtitles::{
 };
 pub use tracks::{
     AudioTrack, SubtitleTrack, Tracks, VideoTrack, classify_resolution, external_subtitle_tracks,
-    probe_tracks, probe_tracks_and_duration,
+    probe_tracks, probe_tracks_and_duration, probe_tracks_and_duration_controlled,
 };
 pub use watch::{
     FileError, TransferredFile, Unidentified, VIDEO_EXTENSIONS, WatchJob, WatchKind, WatchOutcome,
-    is_video_file, scan_watch,
+    is_video_file, scan_watch, scan_watch_intake_controlled,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferMode {
@@ -51,6 +59,8 @@ pub enum TransferMode {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LibraryError {
+    #[error("Library work cancelled")]
+    Cancelled,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("ffprobe failed: {0}")]
@@ -79,6 +89,12 @@ pub fn resolve_mode(src: &Path, dest_dir: &Path, configured: Option<TransferMode
 
 pub trait MediaProbe: Send + Sync {
     fn probe(&self, path: &Path) -> Result<FileQuality, LibraryError>;
+    fn probe_controlled(&self, path: &Path, control: &WorkControl) -> Result<FileQuality, LibraryError> {
+        control.check()?;
+        let result = self.probe(path);
+        control.check()?;
+        result
+    }
 }
 
 pub struct Ffprobe {
@@ -101,7 +117,11 @@ impl Ffprobe {
 
 impl MediaProbe for Ffprobe {
     fn probe(&self, path: &Path) -> Result<FileQuality, LibraryError> {
-        let output = Command::new(&self.program)
+        self.probe_controlled(path, &WorkControl::default())
+    }
+    fn probe_controlled(&self, path: &Path, control: &WorkControl) -> Result<FileQuality, LibraryError> {
+        let mut command = Command::new(&self.program);
+        command
             .args([
                 "-v",
                 "error",
@@ -112,8 +132,8 @@ impl MediaProbe for Ffprobe {
                 "-of",
                 "json",
             ])
-            .arg(path)
-            .output()?;
+            .arg(path);
+        let output = control.output(&mut command)?;
         if !output.status.success() {
             return Err(LibraryError::Probe(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),

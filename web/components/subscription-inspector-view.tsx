@@ -60,6 +60,7 @@ import { formatBytes, formatDuration } from "@/lib/format";
 import { seasonsWithIndeterminate } from "@/lib/media-source-annotation";
 import { shouldShowResourceTiming } from "@/lib/resource-timing";
 import { subscriptionStatus, subscriptionStatusMeta } from "@/lib/subscription-ui";
+import { targetLibraryNotice } from "@/lib/subscription-target-library";
 import { ruleSetSpecFromAtoms } from "@/lib/subscription-ui";
 import { useJobs } from "@/lib/jobs";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
@@ -455,6 +456,20 @@ export function SubscriptionInspectorView({
           fallback={navFallback}
           className="-mx-6 max-md:-mx-4"
         />
+      )}
+      {targetLibraryNotice(detail) && (
+        <div role="alert" className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-400/25 bg-amber-400/10 px-4 py-3 text-sub text-amber-200">
+          <div>
+            <p className="font-semibold">目标媒体库不可用</p>
+            <p className="mt-1">{targetLibraryNotice(detail)}</p>
+            {!canManageSubscriptions && <p className="mt-1">请联系管理员重新选择媒体库。</p>}
+          </div>
+          {canSubscribe && canManageSubscriptions && (
+            <button type="button" onClick={() => setAdjusting(true)} className="shrink-0 rounded-lg border border-amber-300/30 px-3 py-2 font-semibold hover:bg-amber-300/10">
+              重新选择媒体库
+            </button>
+          )}
+        </div>
       )}
       {/* —— 1. 订阅摘要卡：状态、身份、配置、进度、操作自上而下形成单路径。
           海报仍提供条目辨识与轻量氛围，但背景只低透明度取色，不再压过正文。

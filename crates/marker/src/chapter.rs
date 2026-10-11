@@ -67,11 +67,15 @@ pub fn annotate_chapters(chapters: &[Chapter]) -> Vec<ChapterMarker> {
 
 /// Best-effort container chapters via ffprobe (`-show_chapters`).
 pub fn probe_chapters(path: &Path) -> Option<Vec<Chapter>> {
+    probe_chapters_controlled(path, &crate::WorkControl::default())
+}
+
+pub fn probe_chapters_controlled(path: &Path, control: &crate::WorkControl) -> Option<Vec<Chapter>> {
     let target = ProbeTarget::from_path(path);
     let mut cmd = Command::new("ffprobe");
     cmd.args(["-v", "error", "-show_chapters", "-of", "json"]);
     target.apply_input(&mut cmd);
-    let output = match cmd.output() {
+    let output = match control.output(&mut cmd) {
         Ok(output) => output,
         Err(error) => {
             tracing::warn!(

@@ -17,6 +17,7 @@ use domain::{SubscribeId, UserId};
 #[derive(Clone)]
 pub struct ApiState {
     pub(crate) store: Arc<Mutex<Store>>,
+    pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
     pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
     /// Job attempts still executing in this process; protects them from timeout recovery.
     pub(crate) active_job_attempts: Arc<Mutex<HashMap<domain::JobId, jobs::Job>>>,
@@ -172,10 +173,12 @@ impl ApiState {
         let data_dir = store.lock().data_dir().to_path_buf();
         // 异步探测队列：ApiState 创建时启动 worker（生产在 Tokio main 内，
         // 有 runtime 才真正 spawn；测试路径仅创建队列不启动）。
+        let library_work = Arc::new(crate::library_lifecycle::LibraryWorkRegistry::default());
         let probe = Arc::new(crate::probe_manager::ProbeManager::new(store.clone()));
-        probe.try_start_workers();
-        Ok(Self {
+        probe.set_library_registry(library_work.clone());
+        let state = Self {
             store: store.clone(),
+            library_work,
             jobs: Arc::new(Mutex::new(jobs)),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
             subscribe_guards: Arc::new(Mutex::new(HashMap::new())),
@@ -193,7 +196,13 @@ impl ApiState {
             log_buffer: LogBuffer::new(DEFAULT_CAPACITY),
             obscura: Arc::new(crate::obscura_manager::ObscuraManager::new(&data_dir)),
             probe,
-        })
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            crate::library_lifecycle::resume_library_removals(&state)
+                .map_err(std::io::Error::other)?;
+            state.probe.try_start_workers();
+        }
+        Ok(state)
     }
 
     pub fn with_log_buffer(mut self, log_buffer: LogBuffer) -> Self {

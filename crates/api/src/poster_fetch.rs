@@ -10,6 +10,9 @@ use crate::scrape_store::ScrapeStoreExt;
 
 pub trait PosterFetch: Send + Sync {
     fn get(&self, url: &str) -> Result<Vec<u8>, String>;
+    fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        std::fs::write(path, bytes)
+    }
 }
 
 pub struct HttpPoster;
@@ -29,7 +32,11 @@ impl PosterFetch for HttpPoster {
 /// 2. else extract a video frame locally (network-independent fallback).
 /// Writes `poster.jpg` beside the video. Any failure keeps sidecars intact.
 pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Vec<u8>> {
-    attach_poster_with(state, media, video, frame_poster)
+    attach_poster_with(state, media, video, |video| {
+        let lease = state.acquire_path_work(video, media.kind)?;
+        let control = lease.as_ref().map(|lease| lease.control().clone()).unwrap_or_default();
+        frame_poster_controlled(video, &control)
+    })
 }
 
 fn attach_poster_with(
@@ -41,6 +48,7 @@ fn attach_poster_with(
     if !crate::scrape_metadata::targets::video_present(video) {
         return None;
     }
+    let lease = state.acquire_path_work(video, media.kind).ok()?;
     // 刮削与整理设置：写入图片总开关（mirror_images）。
     let mirror_images = state
         .store
@@ -119,7 +127,7 @@ fn attach_poster_with(
             if !crate::scrape_metadata::targets::video_present(video) {
                 return None;
             }
-            return write_artwork(media, &target, "海报", &bytes);
+            return publish_artwork(lease.as_ref(), media, &target, "海报", &bytes);
         }
     }
 
@@ -188,13 +196,14 @@ fn write_frame_poster(
     if is_strm || !thumbnails_allowed(state, video) || !crate::scrape_metadata::targets::video_present(video) {
         return false;
     }
+    let Ok(lease) = state.acquire_path_work(video, media.kind) else { return false };
     match frame_poster_with(video, frame) {
         Ok(bytes) if !bytes.is_empty() => {
             if !crate::scrape_metadata::targets::video_present(video) {
                 tracing::debug!(video = %video.display(), "源视频已不存在，跳过截帧海报写入");
                 return true;
             }
-            write_artwork(media, target, "海报", &bytes);
+            publish_artwork(lease.as_ref(), media, target, "海报", &bytes);
             true
         }
         Ok(_) => {
@@ -274,12 +283,24 @@ fn write_artwork(media: &Media, target: &Path, kind: &str, bytes: &[u8]) -> Opti
     }
 }
 
+fn publish_artwork(lease: Option<&crate::library_lifecycle::LibraryWorkLease>, media: &Media,
+    target: &Path, kind: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    match lease {
+        Some(lease) => lease.publish(|| Ok(write_artwork(media, target, kind, bytes))).ok().flatten(),
+        None => write_artwork(media, target, kind, bytes),
+    }
+}
+
 fn poster_url_at_size(url: &str, size: &str) -> String {
     url.replace("/t/p/w342/", &format!("/t/p/{size}/"))
 }
 
 /// Extract a 2:3 poster (342x513) from a video frame via ffmpeg.
 pub fn frame_poster(video: &Path) -> Result<Vec<u8>, String> {
+    frame_poster_controlled(video, &library::WorkControl::default())
+}
+
+fn frame_poster_controlled(video: &Path, control: &library::WorkControl) -> Result<Vec<u8>, String> {
     use std::process::Command;
     let out = tempfile_posters_dir()?.join(format!(
         "frame-{}-{}.jpg",
@@ -289,16 +310,15 @@ pub fn frame_poster(video: &Path) -> Result<Vec<u8>, String> {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    let status = Command::new("ffmpeg")
-        .args([
+    let mut command = Command::new("ffmpeg");
+    command.args([
             "-y", "-ss", "60", "-i", &video.display().to_string(),
             "-frames:v", "1",
             "-vf", "scale=342:513:force_original_aspect_ratio=decrease,pad=342:513:(ow-iw)/2:(oh-ih)/2:black",
             "-q:v", "2", &out.display().to_string(),
-        ])
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
+        ]);
+    let output = control.output(&mut command).map_err(|e| e.to_string())?;
+    if !output.status.success() {
         return Err("ffmpeg frame extraction failed".into());
     }
     let bytes = std::fs::read(&out).map_err(|e| e.to_string())?;
@@ -363,6 +383,7 @@ fn attach_backdrop_opts(
     video: &Path,
     force: bool,
 ) -> Option<Vec<u8>> {
+    let lease = state.acquire_path_work(video, media.kind).ok()?;
     let Some(config) = state.store.lock().get_scrape_config().ok() else {
         tracing::warn!(media = %media.title, "读取刮削配置失败，跳过背景图");
         return None;
@@ -435,7 +456,7 @@ fn attach_backdrop_opts(
     if !crate::scrape_metadata::targets::video_present(video) {
         return None;
     }
-    write_artwork(media, &target, "背景图", &bytes)
+    publish_artwork(lease.as_ref(), media, &target, "背景图", &bytes)
 }
 
 fn lang_subtag(language: &str) -> String {

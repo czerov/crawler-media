@@ -132,6 +132,9 @@ export interface Subscription {
   full_season_pack: boolean;
   downloader_id?: string | null;
   library_id?: string | null;
+  /** Explicit target availability; never silently resets library_id. */
+  target_library_status: "ready" | "deleting" | "missing";
+  target_library_error: string | null;
   tracking_state: "active" | "paused";
   follow_future: boolean;
   /** Seconds between automatic Site searches. Default 1800. */

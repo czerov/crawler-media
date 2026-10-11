@@ -16,7 +16,8 @@ fn is_generic_episode_stem(title: &str) -> bool {
     let token = token.split('-').next().unwrap_or(token);
     if let Some(rest) = token.strip_prefix('s') {
         if let Some((season, episode)) = rest.split_once('e') {
-            return !season.is_empty() && !episode.is_empty()
+            return !season.is_empty()
+                && !episode.is_empty()
                 && season.chars().all(|c| c.is_ascii_digit())
                 && episode.chars().all(|c| c.is_ascii_digit());
         }

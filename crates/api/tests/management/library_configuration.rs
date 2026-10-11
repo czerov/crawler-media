@@ -193,7 +193,7 @@ async fn libraries_delete_extra_but_protect_last_of_kind() {
         ))
         .await
         .unwrap();
-    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
 
     let listed = get(&app, "/api/v1/libraries").await;
     let default_movie = listed["data"]
@@ -214,5 +214,5 @@ async fn libraries_delete_extra_but_protect_last_of_kind() {
         ))
         .await
         .unwrap();
-    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
 }

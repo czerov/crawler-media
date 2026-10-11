@@ -61,6 +61,10 @@ pub async fn resolve_item_chapters(
     media: &Media,
     theintrodb: Option<TheIntroDbClient>,
 ) -> Vec<ChapterMarker> {
+    let _lease = match state.acquire_path_work(std::path::Path::new(&row.path), media.kind) {
+        Ok(lease) => lease,
+        Err(_) => return Vec::new(),
+    };
     let snapshot = snapshot(state, row, media, theintrodb);
     // 存在缓存时：若缓存仅包含 1 个孤立的片头卡片，或为空，但已有/同季有 marker，
     // 则动态构造分段章节更新缓存并返回，确保前端展示 [0:00 片头] 和 [1:44 正片] 两个完整段落！
@@ -71,6 +75,7 @@ pub async fn resolve_item_chapters(
             return cached;
         }
         let store = state.store.lock();
+        if crate::fingerprint_job::source::ensure_source_available(&store, row).is_err() { return Vec::new(); }
         // A read may reconstruct chapters from this episode's verified marker,
         // but cannot promote a neighboring episode's candidate into target facts.
         let marker_candidate = store
@@ -104,6 +109,7 @@ pub async fn resolve_item_chapters(
     let mut chapters = output.chapters;
     {
         let store = state.store.lock();
+        if crate::fingerprint_job::source::ensure_source_available(&store, row).is_err() { return Vec::new(); }
         for marker in &output.markers {
             let _ = store.put_media_marker(marker);
         }

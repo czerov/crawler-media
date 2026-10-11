@@ -8,12 +8,22 @@ pub(crate) fn ensure_source_available(store: &Store, row: &LedgerRow) -> Result<
     })?;
     if current
         .as_ref()
-        .is_none_or(|current| current.path != row.path)
+        .is_none_or(|current| current.path != row.path || current.media_id != row.media_id
+            || current.season != row.season || current.episode != row.episode)
     {
         return Err(format!(
             "file_deleted: ledger {} is no longer available",
             row.id
         ));
+    }
+    if let Some(media) = store.get_media(row.media_id).map_err(|e| e.to_string())? {
+        if let Some(owner) = store.library_for_path_strict(std::path::Path::new(&row.path), media.kind)
+            .map_err(|e| e.to_string())?
+        {
+            if !store.library_accepts_work(&owner.id).map_err(|e| e.to_string())? {
+                return Err(format!("file_deleted: Library {} is being removed", owner.id));
+            }
+        }
     }
     match std::path::Path::new(&row.path).try_exists() {
         Ok(true) => Ok(()),

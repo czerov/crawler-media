@@ -273,3 +273,93 @@ async fn delete_reserved_first_prevents_transfer_mutation() {
     let store = store_arc.lock();
     assert!(store.ledger_for_media(media_id).unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn library_freeze_while_downloader_is_blocked_prevents_physical_transfer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stage_dir = tmp.path().join("stage");
+    std::fs::create_dir_all(&stage_dir).unwrap();
+    let src_file = stage_dir.join("The.Matrix.1999.1080p.mkv");
+    std::fs::write(&src_file, b"video content").unwrap();
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    let downloader = Arc::new(GatedDownloader {
+        stage_dir,
+        started_tx: Mutex::new(Some(started_tx)),
+        resume_rx: Mutex::new(Some(resume_rx)),
+        completed_called: Arc::new(AtomicBool::new(false)),
+    });
+    let api_state = state(
+        tmp.path(),
+        Arc::new(Fixtures {
+            requests: Mutex::new(Vec::new()),
+            bodies: HashMap::new(),
+        }),
+        downloader,
+    );
+    let app = router(api_state.clone());
+    let mut body = subscribe_payload("search");
+    body["media"] = json!({"kind": "movie", "title": "The Matrix", "year": 1999});
+    let response = app
+        .oneshot(request(
+            "POST",
+            "/api/v1/subscriptions",
+            Some("management-secret"),
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let sub = json_data(response).await;
+    let id = sub["id"].as_str().unwrap().parse().unwrap();
+    let library = api_state
+        .store()
+        .lock()
+        .default_library(domain::MediaKind::Movie)
+        .unwrap()
+        .unwrap();
+    api_state
+        .store()
+        .lock()
+        .record_pending_submission(
+            id,
+            100,
+            &api::store::PendingDownload {
+                torrent: make_torrent(),
+                submitted_at: Some(1000),
+                release_override: None,
+                downloader_id: None,
+            },
+        )
+        .unwrap();
+    let runner = api_state.clone();
+    let transfer = tokio::task::spawn_blocking(move || api::worker::transfer_one(&runner, id));
+    tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let other_root = tmp.path().join("other-library");
+    api_state
+        .store()
+        .lock()
+        .create_library(
+            domain::MediaKind::Movie,
+            "other",
+            &[other_root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+    let removal = api::library_lifecycle::start_library_removal(&api_state, &library.id).unwrap();
+    assert_ne!(removal.state, "succeeded");
+    resume_tx.send(()).unwrap();
+    assert!(transfer.await.unwrap().is_err());
+    assert_eq!(std::fs::read(src_file).unwrap(), b"video content");
+    assert!(api_state.store().lock().list_ledger().unwrap().is_empty());
+    for root in library.root_paths {
+        if root.exists() {
+            assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+        }
+    }
+}

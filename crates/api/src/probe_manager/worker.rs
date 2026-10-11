@@ -37,9 +37,27 @@ async fn run_metadata_worker(manager: Arc<ProbeManager>) {
         };
         let Some(unit) = unit else { break };
         let pending = MetadataStageGuard(manager.clone());
+        let _lease = match work_lease(&manager, &unit) {
+            Ok(lease) => lease,
+            Err(reason) => {
+                manager.cancel_unit(&unit, &reason);
+                continue;
+            }
+        };
         if !source_ready(&manager, &unit) || !start_persisted_unit(&manager, &unit) {
             continue;
         }
+        let _refresh_leases = if unit.marker_refresh_id.is_some() {
+            match refresh_leases(&manager, &unit) {
+                Ok(leases) => leases,
+                Err(reason) => {
+                    manager.cancel_unit(&unit, &reason);
+                    continue;
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let outcome = probe::probe_metadata(&manager, &unit).await;
         drop(pending);
         if !source_ready(&manager, &unit) {
@@ -74,6 +92,13 @@ async fn run_fingerprint_worker(manager: Arc<ProbeManager>) {
             }
         };
         if let Some((refreshed, unit)) = recovered {
+            let _leases = match refresh_leases(&manager, &unit) {
+                Ok(leases) => leases,
+                Err(reason) => {
+                    manager.cancel_unit(&unit, &reason);
+                    continue;
+                }
+            };
             wait_for_metadata_idle(&manager).await;
             super::marker_jobs::apply_marker_refresh(&manager, &refreshed, &unit);
             super::timings::log_terminal_job(&manager.store, &manager.timings, &refreshed);
@@ -85,6 +110,13 @@ async fn run_fingerprint_worker(manager: Arc<ProbeManager>) {
             rx.recv().await
         };
         let Some(work) = work else { break };
+        let _lease = match work_lease(&manager, &work.unit) {
+            Ok(lease) => lease,
+            Err(reason) => {
+                manager.cancel_unit(&work.unit, &reason);
+                continue;
+            }
+        };
         wait_for_metadata_idle(&manager).await;
 
         if !source_ready(&manager, &work.unit) {
@@ -94,6 +126,17 @@ async fn run_fingerprint_worker(manager: Arc<ProbeManager>) {
         if work.start_job && !start_persisted_unit(&manager, &work.unit) {
             continue;
         }
+        let _refresh_leases = if work.unit.marker_refresh_id.is_some() {
+            match refresh_leases(&manager, &work.unit) {
+                Ok(leases) => leases,
+                Err(reason) => {
+                    manager.cancel_unit(&work.unit, &reason);
+                    continue;
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let outcome = probe::probe_fingerprint_detailed(&manager, &work).await;
         if source_ready(&manager, &work.unit) {
             match outcome {
@@ -101,10 +144,20 @@ async fn run_fingerprint_worker(manager: Arc<ProbeManager>) {
                     manager.finish_with_status(&work.unit, "succeeded", None, None);
                 }
                 super::stages::FingerprintRunOutcome::Partial { error_kind, error } => {
-                    manager.finish_with_status(&work.unit, "partial", Some(&error_kind), Some(&error));
+                    manager.finish_with_status(
+                        &work.unit,
+                        "partial",
+                        Some(&error_kind),
+                        Some(&error),
+                    );
                 }
                 super::stages::FingerprintRunOutcome::Failed { error_kind, error } => {
-                    manager.finish_with_status(&work.unit, "failed", Some(&error_kind), Some(&error));
+                    manager.finish_with_status(
+                        &work.unit,
+                        "failed",
+                        Some(&error_kind),
+                        Some(&error),
+                    );
                 }
                 super::stages::FingerprintRunOutcome::Cancelled { reason } => {
                     manager.cancel_unit(&work.unit, &reason);
@@ -112,6 +165,51 @@ async fn run_fingerprint_worker(manager: Arc<ProbeManager>) {
             }
         }
     }
+}
+
+fn refresh_leases(
+    manager: &ProbeManager,
+    unit: &ProbeUnit,
+) -> Result<Vec<crate::library_lifecycle::LibraryWorkLease>, String> {
+    if manager.library_work.lock().is_none() {
+        return Ok(Vec::new());
+    }
+    // Refresh expands its requested units to every row of the same Media.
+    // Hold every original owner until publication, not only during capture.
+    let rows = manager
+        .store
+        .lock()
+        .list_ledger()
+        .map_err(|e| e.to_string())?;
+    let units: Vec<_> = rows
+        .into_iter()
+        .filter(|row| row.media_id == unit.row.media_id)
+        .map(|row| {
+            let mut expanded = unit.clone();
+            expanded.row = row;
+            expanded
+        })
+        .collect();
+    super::progress::MetadataPriorityGate::for_rows(manager, &units).map(|(_, leases)| leases)
+}
+
+fn work_lease(
+    manager: &ProbeManager,
+    unit: &ProbeUnit,
+) -> Result<Option<crate::library_lifecycle::LibraryWorkLease>, String> {
+    let registry = manager.library_work.lock().clone();
+    let Some(registry) = registry else {
+        return Ok(None);
+    };
+    let library_id = {
+        let store = manager.store.lock();
+        store
+            .library_for_path_strict(std::path::Path::new(&unit.row.path), unit.kind)
+            .map_err(|e| e.to_string())?
+            .map(|library| library.id)
+    }
+    .ok_or("Library no longer owns probe source")?;
+    registry.acquire(&manager.store, &library_id).map(Some)
 }
 
 fn source_ready(manager: &ProbeManager, unit: &ProbeUnit) -> bool {

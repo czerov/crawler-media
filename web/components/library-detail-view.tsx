@@ -23,6 +23,8 @@ import { PAGE_NAV_BUTTON_CLASS, PageNav } from "@/components/page-nav";
 import { usePageTitle } from "@/lib/use-page-title";
 import { useIsMobile } from "@/lib/use-media-query";
 import { LibraryFormDialog } from "@/components/library-form-dialog";
+import { LibraryRemovalNotice } from "@/components/library-removal-notice";
+import { useLibraryRemoval } from "@/lib/use-library-removal";
 import { LibraryCoverModal } from "@/components/library-cover-modal";
 import { LIBRARY_KIND_META } from "@/components/library-kind-meta";
 import { remeasureWalls, usePhotoWallDensity, type PhotoWallDensity } from "@/components/wall";
@@ -63,7 +65,6 @@ import {
   listUnidentifiedLibraryFiles,
   startLibraryMetadataRefresh,
   startLibraryScan,
-  deleteLibrary,
   setDefaultLibrary,
   verifyLibraryFiles,
   deleteMissingRows,
@@ -446,7 +447,12 @@ export function LibraryDetailView({ libraryId }: { libraryId: string }) {
     const lseq = ++listsSeq.current;
     const wanted = wallLoaded.current;
     Promise.all([
-      listLibraries(),
+      // Removal freezes inventory endpoints; the library status must still load
+      // even when another request in this batch is rejected.
+      listLibraries(undefined, canManageLibraries ? { manage: true } : undefined).then((libs) => {
+        if (lseq === listsSeq.current) setLibraries((prev) => prev ? keepIfEqual(prev, libs) : libs);
+        return libs;
+      }),
       fetchWall(),
       // 临时条目通常是几个到几十个，一次拉全、按入账时间倒序；不参与主墙分页与索引
       listLibraryItems(libraryId, {
@@ -712,6 +718,20 @@ export function LibraryDetailView({ libraryId }: { libraryId: string }) {
   );
 
   const library = libraries?.find((l) => l.id === libraryId) ?? null;
+  const removal = useLibraryRemoval(libraries, (removed) => {
+    toast.success(`已删除媒体库「${removed.name}」`);
+    navigate("/library");
+  }, libraryId);
+  const removeLibrary = async () => {
+    if (!library || removal.states[libraryId]?.pending) return;
+    const ok = await confirm({
+      title: `删除媒体库「${library.name}」？`,
+      description: "将停止该库相关任务，清除扫描记录与探测缓存。磁盘文件、NFO 和图片不会删除，观看进度、已看和收藏会保留。重新添加目录后将重新扫描。",
+      confirmLabel: "删除媒体库",
+      tone: "danger",
+    });
+    if (ok) removal.remove(library);
+  };
   usePageTitle(library?.name);
 
   // 新契约无扫描/整理/入库中状态（字段已删），空闲低频轮询兜底即可
@@ -1183,7 +1203,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: string }) {
   // 平时浏览不印（见 InventoryCell 的 ratingText）
   const showRating = wallSortPref === "rating" || filter.ratingGte != null;
   const hasMenuItems = canManageLibraries || gallery || galleryAvailable;
-  const actionsMenu = hasMenuItems && (
+  const actionsMenu = hasMenuItems && !removal.states[libraryId]?.pending && !removal.states[libraryId]?.operation && !library.removal && (
     <LibraryActionsMenu
       library={library}
       canManage={canManageLibraries}
@@ -1246,23 +1266,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: string }) {
           }
         }
       }}
-      onDelete={async () => {
-        const ok = await confirm({
-          title: `删除媒体库「${library.name}」？`,
-          description: "删除媒体库会移除库的配置与全部台账记录（磁盘文件不受影响）。",
-          confirmLabel: "删除媒体库",
-          tone: "danger",
-        });
-        if (ok) {
-          try {
-            await deleteLibrary(library.id);
-            toast.success(`已删除媒体库「${library.name}」`);
-            navigate("/library");
-          } catch (e: any) {
-            toast.error(e?.message || "删除媒体库失败");
-          }
-        }
-      }}
+      onDelete={() => void removeLibrary()}
       onCoverModal={() => setCoverModalOpen(true)}
     />
   );
@@ -1306,8 +1310,9 @@ export function LibraryDetailView({ libraryId }: { libraryId: string }) {
             return " · 流媒体/云挂载";
           })()}
         </p>
+        <LibraryRemovalNotice library={library} state={removal.states[libraryId]} onRetry={(operation) => operation ? removal.resume(library, operation) : removal.remove(library)} />
         {/* —— 根目录缺失：目录被删/未挂载不能当「空库」展示，给恢复/删除两条路 —— */}
-        {library.root_missing && canManageLibraries && (
+        {library.root_missing && canManageLibraries && !removal.states[libraryId]?.pending && !removal.states[libraryId]?.operation && !library.removal && (
           <div className="mt-3 rounded-xl border border-red-400/30 bg-red-500/[0.08] px-3.5 py-3">
             <p className="text-sub font-semibold text-red-200">
               媒体库目录不存在（可能被删除或存储未挂载）
@@ -1325,17 +1330,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: string }) {
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  void confirm({
-                    title: `删除「${library.name}」？`,
-                    description: "删除媒体库会移除库的根目录配置与全部台账记录（磁盘文件不受影响）。",
-                    tone: "danger",
-                    confirmLabel: "删除媒体库",
-                  }).then((ok) => {
-                    if (!ok) return;
-                    void deleteLibrary(library.id).then(() => navigate("/library"));
-                  });
-                }}
+                onClick={() => void removeLibrary()}
                 className="h-7 shrink-0 rounded-lg border border-red-400/40 px-2.5 text-caption font-medium text-red-200 transition hover:bg-red-500/20"
               >
                 删除媒体库
@@ -1751,16 +1746,14 @@ function LibraryActionsMenu({
               设为默认库
             </DropdownMenu.Item>
           )}
-          {!library.is_default && (
-            <DropdownMenu.Item
-              onSelect={() => {
-                setTimeout(() => onDelete(), 50);
-              }}
-              className="glass-row nav-item cursor-pointer px-3 py-2 text-ui font-medium text-red-400 outline-none hover:!bg-red-500/10 hover:!text-red-300"
-            >
-              删除媒体库
-            </DropdownMenu.Item>
-          )}
+          <DropdownMenu.Item
+            onSelect={() => {
+              setTimeout(() => onDelete(), 50);
+            }}
+            className="glass-row nav-item cursor-pointer px-3 py-2 text-ui font-medium text-red-400 outline-none hover:!bg-red-500/10 hover:!text-red-300"
+          >
+            删除媒体库
+          </DropdownMenu.Item>
           </>
           )}
           {/* 浏览偏好收在菜单里，不占墙上的位置，选完即生效并记住。 */}

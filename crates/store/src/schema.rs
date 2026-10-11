@@ -3,12 +3,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::StoreError;
 
 mod fingerprint;
+mod library_deletion;
 mod probe_state;
 mod tables;
 
 /// Schema version constants. Bump when adding new migrations.
 /// The version is stored via `PRAGMA user_version` on each database file.
-pub const APP_SCHEMA_VERSION: i64 = 3;
+pub const APP_SCHEMA_VERSION: i64 = 4;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 pub const LIBRARY_SCHEMA_VERSION: i64 = 7;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 3;
@@ -28,6 +29,7 @@ fn set_schema_version(conn: &Connection, version: i64) -> Result<(), StoreError>
 pub fn migrate_app(conn: &Connection) -> Result<(), StoreError> {
     let _current = schema_version(conn);
     conn.execute_batch(tables::APP_TABLES)?;
+    conn.execute_batch(library_deletion::TABLES)?;
     ensure_column(conn, "downloaders", "path_maps", "TEXT")?;
     // downloaders.enabled：停用的下载器不参与自动投递（手动提交仍可用）。
     ensure_column(conn, "downloaders", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
@@ -225,6 +227,7 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     migrate_playback_session_key(conn)?;
     // Old logs have no trustworthy device identity and remain nonrevocable.
     ensure_column(conn, "playback_logs", "device_id", "TEXT")?;
+    ensure_column(conn, "playback_sessions", "ledger_id", "TEXT")?;
     ensure_column(
         conn,
         "subscribes",

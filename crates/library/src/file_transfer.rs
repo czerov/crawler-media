@@ -1,10 +1,21 @@
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{LibraryError, TransferMode};
 
 pub fn transfer_file(src: &Path, dest: &Path, mode: TransferMode) -> Result<(), LibraryError> {
+    transfer_file_controlled(src, dest, mode, &crate::WorkControl::default())
+}
+
+pub fn transfer_file_controlled(
+    src: &Path,
+    dest: &Path,
+    mode: TransferMode,
+    control: &crate::WorkControl,
+) -> Result<(), LibraryError> {
+    control.check()?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -33,11 +44,11 @@ pub fn transfer_file(src: &Path, dest: &Path, mode: TransferMode) -> Result<(), 
 
     // 第一阶段：生成暂存文件。Move 模式在暂存阶段先复制，保留原文件 src
     let stage_res = match mode {
-        TransferMode::Copy | TransferMode::Move => fs::copy(src, &temp).map(|_| ()),
+        TransferMode::Copy | TransferMode::Move => copy_controlled(src, &temp, control),
         TransferMode::Hardlink => {
             if fs::hard_link(src, &temp).is_err() {
                 tracing::warn!(src = %src.display(), dest = %dest.display(), "硬链接失败（可能跨设备），回退为复制");
-                fs::copy(src, &temp).map(|_| ())
+                copy_controlled(src, &temp, control)
             } else {
                 Ok(())
             }
@@ -47,38 +58,32 @@ pub fn transfer_file(src: &Path, dest: &Path, mode: TransferMode) -> Result<(), 
         if temp.exists() {
             let _ = fs::remove_file(&temp);
         }
-        return Err(LibraryError::Io(e));
+        return Err(e);
     }
 
-    // 第二阶段：发布暂存文件到目标 dest
-    let publish_res = if dest.exists() {
-        fs::remove_file(dest).and_then(|_| fs::rename(&temp, dest))
-    } else {
-        fs::rename(&temp, dest)
-    };
-
-    match publish_res {
-        Ok(()) => {
-            // 只有当目标彻底成功发布后，Move 模式才安全移除源文件
-            if mode == TransferMode::Move {
-                if let Err(e) = fs::remove_file(src) {
-                    tracing::warn!(
-                        src = %src.display(),
-                        dest = %dest.display(),
-                        error = %e,
-                        "文件已成功发布到目标，但清理源文件失败"
-                    );
-                }
-            }
-            Ok(())
-        }
-        Err(e) => {
-            if temp.exists() {
-                let _ = fs::remove_file(&temp);
-            }
-            Err(LibraryError::Io(e))
-        }
+    if let Err(error) = control.check() {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
     }
+    // The shared publication gate linearizes final rename/source removal with cancellation.
+    let result = control.publish(|| {
+        fs::rename(&temp, dest).map_err(|e| e.to_string())?;
+        if mode == TransferMode::Move {
+            if let Err(error) = fs::remove_file(src) {
+                tracing::warn!(src = %src.display(), dest = %dest.display(), %error,
+                    "文件已发布，但清理源文件失败");
+            }
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp);
+        if control.is_cancelled() {
+            return Err(LibraryError::Cancelled);
+        }
+        return Err(LibraryError::Io(std::io::Error::other(error)));
+    }
+    Ok(())
 }
 
 fn temporary_path(dest: &Path) -> PathBuf {
@@ -90,4 +95,26 @@ fn temporary_path(dest: &Path) -> PathBuf {
         .to_os_string();
     name.push(format!(".transfer-{}-{nonce}", std::process::id()));
     dest.with_file_name(name)
+}
+
+fn copy_controlled(
+    src: &Path,
+    dest: &Path,
+    control: &crate::WorkControl,
+) -> Result<(), LibraryError> {
+    let mut source = fs::File::open(src)?;
+    let mut target = fs::File::create(dest)?;
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        control.check()?;
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        control.check()?;
+        target.write_all(&buffer[..count])?;
+    }
+    target.set_permissions(source.metadata()?.permissions())?;
+    control.check()?;
+    Ok(())
 }

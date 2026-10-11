@@ -1,5 +1,6 @@
 import { request, resolveRequestUrl } from "@/lib/http";
 import type { LibraryKind, MediaType } from "@/lib/media-types";
+import { waitForLibraryRemoval, type RemovalWaitOptions } from "@/lib/library-removal";
 
 export type { LibraryKind, MediaType };
 
@@ -64,6 +65,8 @@ export interface MediaLibrary {
   exclude_from_home?: boolean;
   /** 是否按系列自动生成合集 */
   auto_series_collections?: boolean;
+  /** 持久化删除状态；刷新或重新进入页面后继续跟踪。 */
+  removal?: LibraryRemoval | null;
   /** 库存统计快照 */
   stats: LibraryStats;
 }
@@ -920,6 +923,7 @@ function libraryFrom(raw: unknown): MediaLibrary {
     kind: (r.kind as LibraryKind) ?? "movie",
     root_paths: Array.isArray(r.root_paths) ? (r.root_paths as string[]) : [],
     root_missing: r.root_missing == null ? false : bool(r.root_missing),
+    removal: r.removal == null ? null : r.removal as LibraryRemoval,
     is_default: bool(r.is_default),
     access_mode: (r.access_mode as LibraryAccessMode) ?? "everyone",
     admin_visible: r.admin_visible == null ? true : bool(r.admin_visible),
@@ -1037,9 +1041,27 @@ export function reorderLibraries(orderedIds: string[]): Promise<Record<string, n
   }));
 }
 
-/** 删除媒体库（DELETE /libraries/{id}；每种类型的最后一个库受保护）。 */
-export function deleteLibrary(id: string): Promise<Record<string, never>> {
-  return unwrap(request<ApiEnvelope<Record<string, never>>>(`/libraries/${id}`, { method: "DELETE" }));
+export interface LibraryRemoval {
+  operation_id: string;
+  library_id: string;
+  state: "frozen" | "draining" | "cleaning" | "succeeded" | "failed";
+  removed_ledger_count: number;
+  error: string | null;
+}
+
+export function getLibraryRemoval(operationId: string, signal?: AbortSignal): Promise<LibraryRemoval> {
+  return unwrap(request<ApiEnvelope<LibraryRemoval>>(`/library-removals/${operationId}`, { signal }));
+}
+
+/** 发起删除；调用者必须等到操作成功，不能把 202 当成已完成。 */
+export function deleteLibrary(id: string, signal?: AbortSignal): Promise<LibraryRemoval> {
+  signal?.throwIfAborted();
+  return unwrap(request<ApiEnvelope<LibraryRemoval>>(`/libraries/${id}`, { method: "DELETE", signal }));
+}
+
+export async function removeLibraryAndWait(id: string, options: RemovalWaitOptions = {}): Promise<LibraryRemoval> {
+  const operation = await deleteLibrary(id, options.signal);
+  return waitForLibraryRemoval(operation, getLibraryRemoval, options);
 }
 
 /** 核验库内文件：缺失的 ledger 行打标、恢复的清除。返回 {missing, restored}。 */

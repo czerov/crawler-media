@@ -19,6 +19,9 @@ pub enum CapturePolicy {
 }
 
 pub trait CaptureGate: Send + Sync {
+    fn work_control(&self, _row: &domain::LedgerRow) -> marker::WorkControl {
+        marker::WorkControl::default()
+    }
     fn wait_before_capture(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 

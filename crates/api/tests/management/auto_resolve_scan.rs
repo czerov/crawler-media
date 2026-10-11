@@ -235,9 +235,17 @@ fn auto_resolve_uses_ancestor_alias_when_filename_title_misses() {
     )
     .with_catalog(catalog.clone())
     .with_poster_fetch(Arc::new(StillBytes));
-    let show = tmp
-        .path()
-        .join("children/动灵守护者 (2022)/Spirit.Rangers.S01");
+    let root = state
+        .store()
+        .lock()
+        .list_libraries()
+        .unwrap()
+        .into_iter()
+        .find(|library| library.kind == domain::MediaKind::Tv)
+        .unwrap()
+        .root_paths[0]
+        .clone();
+    let show = root.join("动灵守护者 (2022)/Spirit.Rangers.S01");
     std::fs::create_dir_all(&show).unwrap();
     let episode = show.join("Spirit.Rangers.S01E01.1080p.strm");
     std::fs::write(&episode, b"https://cdn.example/ep.mkv").unwrap();
@@ -263,7 +271,7 @@ fn auto_resolve_uses_ancestor_alias_when_filename_title_misses() {
     assert!(queries.iter().any(|query| query == "动灵守护者|2022"));
 
     // Verify auto_resolve writes tvshow.nfo and episode nfo
-    let tvshow_nfo = tmp.path().join("children/动灵守护者 (2022)/tvshow.nfo");
+    let tvshow_nfo = root.join("动灵守护者 (2022)/tvshow.nfo");
     assert!(
         tvshow_nfo.is_file(),
         "auto_resolve should write tvshow.nfo at show root"
@@ -274,7 +282,7 @@ fn auto_resolve_uses_ancestor_alias_when_filename_title_misses() {
         "auto_resolve should write episode nfo beside video"
     );
 
-    let show_root = tmp.path().join("children/动灵守护者 (2022)");
+    let show_root = root.join("动灵守护者 (2022)");
     let season_nfo = show_root.join("season.nfo");
     let season_body = std::fs::read_to_string(&season_nfo).expect("season.nfo");
     assert!(season_body.contains("<seasonnumber>1</seasonnumber>"), "{season_body}");
@@ -701,3 +709,6 @@ async fn metadata_refresh_writes_each_episode_still_in_shared_directory() {
         b"two"
     );
 }
+
+#[path = "auto_resolve_identity.rs"]
+mod identity;

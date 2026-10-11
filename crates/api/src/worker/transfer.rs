@@ -1,6 +1,6 @@
 use domain::{LedgerRow, Media, Subscribe, SubscribeId};
 use filter::ScoredTorrent;
-use subscribe::{Added, RunInput, RunOutcome, SubscribeFacts, collect_completed_with_destinations};
+use subscribe::{Added, RunInput, RunOutcome, SubscribeFacts, collect_completed_controlled};
 
 use crate::management::ApiState;
 use crate::scrape_store::ScrapeStoreExt;
@@ -20,8 +20,16 @@ fn commit_transfer_outcome(
     state: &ApiState,
     subscribe: &Subscribe,
     outcome: &RunOutcome,
+    lease: &crate::library_lifecycle::LibraryWorkLease,
 ) -> Result<(), String> {
     let store = state.store.lock();
+    lease.control().check().map_err(|e| e.to_string())?;
+    if !store
+        .library_accepts_work(lease.library_id())
+        .map_err(|e| e.to_string())?
+    {
+        return Err("目标 Library 正在删除或已不存在".into());
+    }
     // T1 / plan §95: 先持久化新 replacement ledger/source mapping 与 facts，
     // 旧文件物理删除绝不早于新 replacement 记录的持久化。
     for row in &outcome.ledger {
@@ -97,11 +105,37 @@ fn load_transfer_context(
 }
 
 struct TransferPlan {
+    library_id: String,
     root: std::path::PathBuf,
     mode: Option<library::TransferMode>,
     naming: String,
     scrape: bool,
     nfo: bool,
+}
+
+fn filter_matched_pending(
+    subscribe: &Subscribe,
+    media: &Media,
+    pending: Vec<(i32, crate::store::PendingDownload)>,
+) -> Vec<ScoredTorrent> {
+    pending
+        .into_iter()
+        .filter_map(|(score, pending)| {
+            let release = pending
+                .release_override
+                .unwrap_or_else(|| release::parse(&pending.torrent.title));
+            if !subscribe::candidate_matches_subscribe(subscribe, media, &release) {
+                tracing::error!(subscribe_id = %subscribe.id, media = %media.title,
+                    torrent = %pending.torrent.title, "拒绝转存与订阅不匹配的待处理种子");
+                return None;
+            }
+            Some(ScoredTorrent {
+                release,
+                torrent: pending.torrent,
+                score,
+            })
+        })
+        .collect()
 }
 
 fn build_added_input<'a>(
@@ -132,16 +166,23 @@ fn resolve_transfer_plan(
     media: &Media,
     subscribe: &Subscribe,
 ) -> Result<TransferPlan, String> {
-    let (library_root, transfer_mode, scrape) = crate::directory::transfer_plan_for_library(
-        &state.store.lock(),
-        media.kind,
-        subscribe
-            .library_id
-            .as_ref()
-            .map(|id| id.to_string())
-            .as_deref(),
-    )
-    .map_err(|e| e.to_string())?;
+    let (library_id, library_root, transfer_mode, scrape) = {
+        let store = state.store.lock();
+        let library_id = match subscribe.library_id {
+            Some(id) => id.to_string(),
+            None => {
+                store
+                    .default_library(media.kind)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("目标 Library 不存在")?
+                    .id
+            }
+        };
+        let (root, mode, scrape) =
+            crate::directory::transfer_plan_for_library(&store, media.kind, Some(&library_id))
+                .map_err(|e| e.to_string())?;
+        (library_id, root, mode, scrape)
+    };
 
     let naming = state
         .store
@@ -154,6 +195,7 @@ fn resolve_transfer_plan(
         scrape && cfg.effective.mirror_nfo
     };
     Ok(TransferPlan {
+        library_id,
         root: library_root,
         mode: transfer_mode,
         naming,
@@ -192,26 +234,11 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
 
     let (media, filter, facts, wash_filter) = load_transfer_context(state, &subscribe)?;
     let routed = crate::delivery::RoutedDownloader::with_pending(state, &subscribe, &pending);
-    let chosen: Vec<ScoredTorrent> = pending
-        .into_iter()
-        .filter_map(|(score, pending)| {
-            let release = pending
-                .release_override
-                .unwrap_or_else(|| release::parse(&pending.torrent.title));
-            if !subscribe::candidate_matches_subscribe(&subscribe, &media, &release) {
-                tracing::error!(subscribe_id = %subscribe.id, media = %media.title,
-                    torrent = %pending.torrent.title, "拒绝转存与订阅不匹配的待处理种子");
-                return None;
-            }
-            Some(ScoredTorrent {
-                release,
-                torrent: pending.torrent,
-                score,
-            })
-        })
-        .collect();
+    let chosen = filter_matched_pending(&subscribe, &media, pending);
 
     let plan = resolve_transfer_plan(state, &media, &subscribe)?;
+    let library_lease = state.acquire_library_work(&plan.library_id)?;
+    library_lease.control().check().map_err(|e| e.to_string())?;
     tracing::info!(%subscribe_id, pending_count = chosen.len(), "Transfer 开始");
 
     let added = build_added_input(
@@ -235,20 +262,26 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
     );
 
     let destinations = routed.imported_destinations().map_err(|e| e.to_string())?;
-    let outcome =
-        collect_completed_with_destinations(added, &library::Ffprobe::default(), &destinations)
-            .map_err(|e| e.to_string())?;
+    let outcome = collect_completed_controlled(
+        added,
+        &library::Ffprobe::default(),
+        &destinations,
+        library_lease.control(),
+    )
+    .map_err(|e| e.to_string())?;
     if state.subscribe_is_deleting(subscribe_id) {
         tracing::warn!(subscribe_id = %subscribe_id, "Transfer 完成但订阅已被预留删除，取消提交");
         return Ok(());
     }
 
+    library_lease.control().check().map_err(|e| e.to_string())?;
     if plan.scrape {
         attach_metadata_and_chapters(state, &media, &outcome.ledger);
     }
 
+    library_lease.control().check().map_err(|e| e.to_string())?;
     let ledger_count = outcome.ledger.len();
-    commit_transfer_outcome(state, &subscribe, &outcome)?;
+    commit_transfer_outcome(state, &subscribe, &outcome, &library_lease)?;
 
     crate::http::library::enqueue_probes_for_rows(state, &outcome.ledger);
     if ledger_count > 0 {

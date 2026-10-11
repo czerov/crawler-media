@@ -60,6 +60,8 @@ impl Store {
         let library = self
             .default_library(kind)?
             .ok_or_else(|| StoreError::Missing(format!("default {} library", kind.as_str())))?;
+        self.ensure_library_mutable(&library.id)?;
+        self.ensure_removal_roots_available(&[path])?;
         let sort_order = self.roots_of(&library.id)?.len() as i32;
         self.app.execute(
             "INSERT INTO library_roots (id, kind, path, is_default, library_id, sort_order)
@@ -84,6 +86,11 @@ impl Store {
     }
 
     pub fn delete_extra_library_root(&self, id: &str) -> Result<bool, StoreError> {
+        if let Some(root) = self.get_library_root(id)? {
+            if let Some(owner) = root.library_id {
+                self.ensure_library_mutable(&owner)?;
+            }
+        }
         let n = self.app.execute(
             "DELETE FROM library_roots WHERE id = ?1 AND is_default = 0",
             params![id],

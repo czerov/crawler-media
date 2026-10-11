@@ -71,10 +71,12 @@ export function LibraryManageRow({
   library,
   actions,
   drag,
+  removalBlocked = false,
 }: {
   library: MediaLibrary;
   actions: LibraryRowActions;
   drag: LibraryRowDrag | null;
+  removalBlocked?: boolean;
 }) {
   const status = libraryStatus(library, STATUS_CTX);
   const inventory = inventoryLabel(library);
@@ -179,7 +181,7 @@ export function LibraryManageRow({
 
       {/* 操作：唯一的 ··· 菜单 */}
       <div className="flex justify-end max-md:col-start-2 max-md:row-start-1">
-        <RowMenu library={library} actions={actions} />
+        {!removalBlocked && <RowMenu library={library} actions={actions} />}
       </div>
     </div>
   );
@@ -326,8 +328,7 @@ function RowMenu({
               调整顺序
             </DropdownMenu.Item>
           )}
-          {!library.is_default && (
-            <>
+          <>
               <DropdownMenu.Separator className="my-1 h-px bg-white/[0.07]" />
               <DropdownMenu.Item
                 onSelect={() => actions.onDelete(library)}
@@ -335,8 +336,7 @@ function RowMenu({
               >
                 删除媒体库
               </DropdownMenu.Item>
-            </>
-          )}
+          </>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
