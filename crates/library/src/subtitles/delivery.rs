@@ -1,8 +1,8 @@
 use std::path::Path;
+
+use super::controlled::{ControlledSubtitleRunner, deliver_subtitle_controlled};
 use crate::Tracks;
-use super::conversion::srt_to_vtt;
-use super::extract::extract_embedded_subtitle;
-use super::index::find_subtitle_by_index;
+use crate::WorkControl;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitlePayload {
@@ -19,7 +19,10 @@ pub fn deliver_subtitle(
     deliver_subtitle_with_source(tracks, index, wants_vtt, None, None)
 }
 
-/// 支持外挂字幕和从视频源提取内封字幕的完整交付能力
+/// 支持外挂字幕和从视频源提取内封字幕的完整交付能力。
+///
+/// 兼容 wrapper：委托给受控交付（默认 `WorkControl` + `ControlledSubtitleRunner`），
+/// 对外签名、返回内容与错误变体保持不变。
 pub fn deliver_subtitle_with_source(
     tracks: &Tracks,
     index: u32,
@@ -27,49 +30,15 @@ pub fn deliver_subtitle_with_source(
     source_media_path: Option<&Path>,
     cache_dir: Option<&Path>,
 ) -> Result<SubtitlePayload, DeliveryError> {
-    let sub = find_subtitle_by_index(tracks, index).ok_or(DeliveryError::TrackNotFound)?;
-    if let Some(path) = &sub.path {
-        let bytes = std::fs::read(path).map_err(|e| DeliveryError::Io(e.to_string()))?;
-        let codec = sub.codec.as_deref().unwrap_or("srt").to_lowercase();
-        if codec == "srt" && wants_vtt {
-            let srt_text = String::from_utf8_lossy(&bytes);
-            let vtt_text = srt_to_vtt(&srt_text);
-            return Ok(SubtitlePayload {
-                content_type: "text/vtt; charset=utf-8",
-                bytes: vtt_text.into_bytes(),
-            });
-        }
-        let content_type = match codec.as_str() {
-            "vtt" => "text/vtt; charset=utf-8",
-            "ass" | "ssa" => "text/x-ssa; charset=utf-8",
-            _ => "text/plain; charset=utf-8",
-        };
-        return Ok(SubtitlePayload {
-            content_type,
-            bytes,
-        });
-    }
-
-    // 内封字幕提取
-    let (Some(source_path), Some(cache_path)) = (source_media_path, cache_dir) else {
-        return Err(DeliveryError::FileMissing);
-    };
-
-    let stream_idx = sub.stream_index.unwrap_or(index);
-    let (extracted_file, content_type) = extract_embedded_subtitle(
-        source_path,
-        stream_idx,
-        sub.codec.as_deref(),
+    deliver_subtitle_controlled(
+        tracks,
+        index,
         wants_vtt,
-        cache_path,
+        source_media_path,
+        cache_dir,
+        &WorkControl::default(),
+        &ControlledSubtitleRunner,
     )
-    .map_err(DeliveryError::Extraction)?;
-
-    let bytes = std::fs::read(&extracted_file).map_err(|e| DeliveryError::Io(e.to_string()))?;
-    Ok(SubtitlePayload {
-        content_type,
-        bytes,
-    })
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

@@ -39,8 +39,9 @@ pub use probe_target::{
 };
 pub use scrape::{scrape_beside, scrape_directory};
 pub use subtitles::{
-    DeliveryError, SubtitlePayload, deliver_subtitle, deliver_subtitle_with_source,
-    extract_embedded_subtitle, find_subtitle_by_index, srt_to_vtt, subtitle_index,
+    ControlledSubtitleRunner, DeliveryError, SubtitlePayload, SubtitleRunner, deliver_subtitle,
+    deliver_subtitle_controlled, deliver_subtitle_with_source, extract_embedded_subtitle,
+    find_subtitle_by_index, srt_to_vtt, subtitle_index,
 };
 pub use tracks::{
     AudioTrack, SubtitleTrack, Tracks, VideoTrack, classify_resolution, external_subtitle_tracks,
