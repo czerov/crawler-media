@@ -11,6 +11,7 @@ mod metadata;
 mod file_stats;
 pub(crate) use filters::LibraryFilter;
 use metadata::BrowseMetadata;
+use file_stats::{added_at, total_size};
 
 pub(crate) struct LibrarySelection {
     pub media: Media,
@@ -172,14 +173,6 @@ pub(crate) fn watch_state_for<'a>(
     }
     state.last_played_at = (latest > 0).then_some(latest);
     Ok(state)
-}
-
-fn total_size(rows: &[LedgerRow]) -> Option<u64> {
-    file_stats::total_size(rows)
-}
-
-fn added_at(rows: &[LedgerRow]) -> Option<SystemTime> {
-    file_stats::added_at(rows)
 }
 
 pub(crate) fn resolution_rank(value: &str) -> u32 {

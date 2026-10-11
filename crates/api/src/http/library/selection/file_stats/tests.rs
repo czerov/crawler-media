@@ -84,4 +84,11 @@ fn stats_warn_on_permission_denied() {
     });
     assert!(logs.contains("WARN"), "permission denied must log warning: {logs}");
     assert!(logs.contains("fixture permission denied"));
+
+    // Also assert directly on the public seam (total_size and added_at)
+    let media_id = domain::MediaId::new();
+    let row = test_row(media_id, dummy_path);
+    // Path doesn't exist on disk, returns None without crashing
+    assert_eq!(super::total_size(&[row.clone()]), None);
+    assert_eq!(super::added_at(&[row]), None);
 }

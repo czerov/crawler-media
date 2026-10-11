@@ -26,7 +26,7 @@ fn file_metadata(path: &Path) -> Option<Metadata> {
     classify_metadata(path, std::fs::metadata(path))
 }
 
-pub(super) fn total_size(rows: &[LedgerRow]) -> Option<u64> {
+pub(crate) fn total_size(rows: &[LedgerRow]) -> Option<u64> {
     let mut total = 0u64;
     let mut known = false;
     for row in rows {
@@ -38,7 +38,7 @@ pub(super) fn total_size(rows: &[LedgerRow]) -> Option<u64> {
     known.then_some(total)
 }
 
-pub(super) fn added_at(rows: &[LedgerRow]) -> Option<SystemTime> {
+pub(crate) fn added_at(rows: &[LedgerRow]) -> Option<SystemTime> {
     let mut oldest = None;
     for row in rows {
         if let Some(meta) = file_metadata(Path::new(&row.path)) {

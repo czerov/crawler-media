@@ -52,14 +52,24 @@ impl api::catalog::Catalog for RenameCatalog {
         self.season_details(id, season)
     }
     fn tv_seasons(&self, _tmdb_id: &str) -> Result<Vec<media::TvSeason>, String> {
-        Ok(vec![media::TvSeason {
-            season_number: 1,
-            name: "第 1 季".into(),
-            episode_count: Some(2),
-            air_date: Some("2022-10-10".into()),
-            overview: Some("Season plot".into()),
-            poster_path: None,
-        }])
+        Ok(vec![
+            media::TvSeason {
+                season_number: 1,
+                name: "第 1 季".into(),
+                episode_count: Some(2),
+                air_date: Some("2022-10-10".into()),
+                overview: Some("Season plot".into()),
+                poster_path: None,
+            },
+            media::TvSeason {
+                season_number: 2,
+                name: "第 2 季".into(),
+                episode_count: Some(2),
+                air_date: Some("2023-10-10".into()),
+                overview: Some("Season 2 plot".into()),
+                poster_path: None,
+            },
+        ])
     }
     fn episode_stills(&self, _id: &str, _season: u32, episode: u32) -> Result<Vec<String>, String> {
         Ok(vec![format!("/ep{episode}.jpg")])
@@ -136,13 +146,6 @@ impl RenameFixture {
         let old_root = tv_root.join("动灵守护者 (2022)");
         let live_root = tv_root.join("动灵守护者1 (2022)");
 
-        let old_episode_dir = if layout.is_empty() {
-            old_root.clone()
-        } else {
-            old_root.join(layout)
-        };
-        std::fs::create_dir_all(&old_episode_dir).unwrap();
-
         let media_id = domain::MediaId::new();
         let media = domain::Media {
             id: media_id,
@@ -158,24 +161,83 @@ impl RenameFixture {
         };
         store.insert_media(&media).unwrap();
 
-        for ep in 1..=2 {
-            let p = old_episode_dir.join(format!("Spirit.Rangers.S01E{ep:02}.strm"));
-            std::fs::write(&p, b"https://example.com/stream").unwrap();
-            store.insert_ledger(&row(media_id, &p, ep)).unwrap();
-        }
-
-        // Rename old_root -> live_root on disk
-        std::fs::rename(&old_root, &live_root).unwrap();
-
-        let live_episode_dir = if layout.is_empty() {
-            live_root.clone()
+        let (old_episode_dir, live_episode_dir) = if layout == "two_seasons" {
+            let old_s1 = old_root.join("Season 01");
+            let old_s2 = old_root.join("Season 02");
+            std::fs::create_dir_all(&old_s1).unwrap();
+            std::fs::create_dir_all(&old_s2).unwrap();
+            for ep in 1..=2 {
+                let p1 = old_s1.join(format!("Spirit.Rangers.S01E{ep:02}.strm"));
+                let p2 = old_s2.join(format!("Spirit.Rangers.S02E{ep:02}.strm"));
+                std::fs::write(&p1, b"https://example.com/stream").unwrap();
+                std::fs::write(&p2, b"https://example.com/stream").unwrap();
+                store.insert_ledger(&row(media_id, &p1, ep)).unwrap();
+                store.insert_ledger(&domain::LedgerRow {
+                    id: domain::LedgerId::new(),
+                    media_id,
+                    path: p2.display().to_string(),
+                    season: Some(2),
+                    episode: Some(ep),
+                    resolution: Some("1080p".into()),
+                    codec: None,
+                    hdr: None,
+                    quality_source: domain::QualitySource::Release,
+                    confidence: domain::Confidence::High,
+                    filter_score: None,
+                }).unwrap();
+            }
+            std::fs::rename(&old_root, &live_root).unwrap();
+            let live_s1 = live_root.join("Season 01");
+            let live_s2 = live_root.join("Season 02");
+            for ep in 1..=2 {
+                let p1 = live_s1.join(format!("Spirit.Rangers.S01E{ep:02}.strm"));
+                let p2 = live_s2.join(format!("Spirit.Rangers.S02E{ep:02}.strm"));
+                store.insert_ledger(&row(media_id, &p1, ep)).unwrap();
+                store.insert_ledger(&domain::LedgerRow {
+                    id: domain::LedgerId::new(),
+                    media_id,
+                    path: p2.display().to_string(),
+                    season: Some(2),
+                    episode: Some(ep),
+                    resolution: Some("1080p".into()),
+                    codec: None,
+                    hdr: None,
+                    quality_source: domain::QualitySource::Release,
+                    confidence: domain::Confidence::High,
+                    filter_score: None,
+                }).unwrap();
+            }
+            (old_s1, live_s1)
         } else {
-            live_root.join(layout)
+            let old_dir = if layout.is_empty() {
+                old_root.clone()
+            } else {
+                old_root.join(layout)
+            };
+            std::fs::create_dir_all(&old_dir).unwrap();
+            for ep in 1..=2 {
+                let p = old_dir.join(format!("Spirit.Rangers.S01E{ep:02}.strm"));
+                std::fs::write(&p, b"https://example.com/stream").unwrap();
+                store.insert_ledger(&row(media_id, &p, ep)).unwrap();
+            }
+
+            // Rename old_root -> live_root on disk
+            std::fs::rename(&old_root, &live_root).unwrap();
+
+            let live_dir = if layout.is_empty() {
+                live_root.clone()
+            } else {
+                live_root.join(layout)
+            };
+            for ep in 1..=2 {
+                let p = live_dir.join(format!("Spirit.Rangers.S01E{ep:02}.strm"));
+                store.insert_ledger(&row(media_id, &p, ep)).unwrap();
+            }
+            (old_dir, live_dir)
         };
-        for ep in 1..=2 {
-            let p = live_episode_dir.join(format!("Spirit.Rangers.S01E{ep:02}.strm"));
-            store.insert_ledger(&row(media_id, &p, ep)).unwrap();
-        }
+        let _ = (old_episode_dir, live_episode_dir);
+
+        let media_clone = media.clone();
 
         drop(store);
         drop(store_guard);
@@ -184,7 +246,7 @@ impl RenameFixture {
             _tmp: tmp,
             state: api_state,
             app,
-            media,
+            media: media_clone,
             library_id,
             old_root,
             live_root,
