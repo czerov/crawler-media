@@ -31,8 +31,89 @@ pub(super) fn filter_items_except_played(
                 && matches_user_marks(item, query.filters.as_deref())
                 && matches_bool(item.metadata.is_favorite, query.is_favorite)
                 && matches_include_item_types(item, query.include_item_types.as_deref())
+                && matches_is_folder(item, query.is_folder)
+                && matches_search_term(item, query.search_term.as_deref())
+                && matches_genres(item, query.genres.as_deref(), query.genre_ids.as_deref())
+                && matches_studios(item, query.studio_ids.as_deref())
         })
         .collect()
+}
+
+fn matches_is_folder(item: &MediaItemSnapshot, is_folder: Option<bool>) -> bool {
+    let Some(expected) = is_folder else {
+        return true;
+    };
+    item.is_series == expected
+}
+
+fn matches_search_term(item: &MediaItemSnapshot, search_term: Option<&str>) -> bool {
+    let Some(term) = search_term.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    let term_lower = term.to_lowercase();
+    if item.media.title.to_lowercase().contains(&term_lower) {
+        return true;
+    }
+    if let Some(orig) = &item.metadata.original_title {
+        if orig.to_lowercase().contains(&term_lower) {
+            return true;
+        }
+    }
+    if let Some(overview) = &item.metadata.overview {
+        if overview.to_lowercase().contains(&term_lower) {
+            return true;
+        }
+    }
+    false
+}
+
+fn matches_genres(item: &MediaItemSnapshot, genres: Option<&str>, genre_ids: Option<&str>) -> bool {
+    let mut target_genres: Vec<&str> = Vec::new();
+    if let Some(g) = genres {
+        target_genres.extend(g.split(|c| c == ',' || c == '|').map(str::trim).filter(|s| !s.is_empty()));
+    }
+    if let Some(gid) = genre_ids {
+        target_genres.extend(gid.split(|c| c == ',' || c == '|').map(str::trim).filter(|s| !s.is_empty()));
+    }
+    if target_genres.is_empty() {
+        return true;
+    }
+    target_genres.iter().any(|tg| {
+        item.metadata
+            .genres
+            .iter()
+            .any(|g| {
+                if g.eq_ignore_ascii_case(tg) {
+                    return true;
+                }
+                let simple_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).simple().to_string();
+                let hyphen_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).hyphenated().to_string();
+                let prefixed = format!("genre_{simple_id}");
+                tg.eq_ignore_ascii_case(&simple_id)
+                    || tg.eq_ignore_ascii_case(&hyphen_id)
+                    || tg.eq_ignore_ascii_case(&prefixed)
+            })
+    })
+}
+
+fn matches_studios(item: &MediaItemSnapshot, studio_ids: Option<&str>) -> bool {
+    let Some(studios) = studio_ids.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    let targets: Vec<&str> = studios
+        .split(|c| c == ',' || c == '|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if targets.is_empty() {
+        return true;
+    }
+    targets.iter().any(|ts| {
+        item.metadata
+            .studios
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(ts))
+    })
 }
 
 pub(super) fn sort_items(

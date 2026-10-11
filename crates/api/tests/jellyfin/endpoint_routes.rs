@@ -59,6 +59,9 @@ async fn assert_user_endpoint_methods(app: &axum::Router, user_id: &str, item_id
         ("GET", format!("/Users/{user_id}/Items/Resume")),
         ("GET", format!("/Users/{user_id}/Items/Latest")),
         ("GET", "/Shows/NextUp".to_string()),
+        ("GET", "/Genres".to_string()),
+        ("GET", "/Studios".to_string()),
+        ("GET", "/Search/Hints?SearchTerm=test".to_string()),
     ] {
         let response = app
             .clone()

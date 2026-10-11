@@ -109,14 +109,13 @@ pub fn item_dto_json(snapshot: MediaItemSnapshot) -> Value {
     });
 
     if snapshot.media.kind == domain::MediaKind::Tv && !snapshot.is_series {
+        let season_num = snapshot.row.season.unwrap_or(1);
         value["SeriesId"] = json!(series_id);
         value["SeriesName"] = json!(snapshot.media.title);
+        value["SeasonId"] = json!(format!("{series_id}{season_num:02}"));
         value["IndexNumber"] = json!(snapshot.row.episode);
         value["ParentIndexNumber"] = json!(snapshot.row.season);
-        value["SeasonName"] = json!(format!(
-            "Season {}",
-            snapshot.row.season.unwrap_or_default()
-        ));
+        value["SeasonName"] = json!(format!("第 {} 季", season_num));
         value["ParentBackdropImageTags"] = json!(
             snapshot
                 .metadata
@@ -125,11 +124,18 @@ pub fn item_dto_json(snapshot: MediaItemSnapshot) -> Value {
                 .into_iter()
                 .collect::<Vec<_>>()
         );
+        value["SeriesPrimaryImageTag"] = json!(snapshot.metadata.primary_image_tag.as_deref().unwrap_or("poster"));
+        value["PrimaryImageAspectRatio"] = json!(1.7777777777777777);
     } else if snapshot.is_series {
-        value["ChildCount"] = json!(snapshot.metadata.child_count);
-        value["RecursiveItemCount"] = json!(snapshot.metadata.child_count);
-        value["NumberOfSeasons"] = json!(snapshot.metadata.season_count);
-        value["NumberOfEpisodes"] = json!(snapshot.metadata.number_of_episodes);
+        let season_count = snapshot
+            .metadata
+            .season_count
+            .or_else(|| snapshot.metadata.season_count)
+            .unwrap_or(1);
+        value["ChildCount"] = json!(season_count);
+        value["RecursiveItemCount"] = json!(snapshot.metadata.child_count.unwrap_or(0));
+        value["NumberOfSeasons"] = json!(snapshot.metadata.season_count.unwrap_or(season_count));
+        value["NumberOfEpisodes"] = json!(snapshot.metadata.number_of_episodes.map(|n| n as usize).or(snapshot.metadata.child_count).unwrap_or(0));
     }
 
     if let Some(date_created) = snapshot.metadata.date_created.as_ref() {

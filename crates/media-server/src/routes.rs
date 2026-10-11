@@ -68,6 +68,18 @@ pub struct ItemsQuery {
     pub sort_order: Option<String>,
     #[serde(default, rename = "IncludeItemTypes", alias = "includeItemTypes")]
     pub include_item_types: Option<String>,
+    #[serde(default, rename = "Recursive", alias = "recursive")]
+    pub recursive: Option<bool>,
+    #[serde(default, rename = "IsFolder", alias = "isFolder")]
+    pub is_folder: Option<bool>,
+    #[serde(default, rename = "SearchTerm", alias = "searchTerm")]
+    pub search_term: Option<String>,
+    #[serde(default, rename = "Genres", alias = "genres", alias = "Genre", alias = "genre")]
+    pub genres: Option<String>,
+    #[serde(default, rename = "GenreIds", alias = "genreIds", alias = "GenreId", alias = "genreId")]
+    pub genre_ids: Option<String>,
+    #[serde(default, rename = "StudioIds", alias = "studioIds", alias = "Studios", alias = "studios")]
+    pub studio_ids: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -122,6 +134,8 @@ pub fn routes(provider: Arc<dyn MediaServerProvider>) -> Router {
     let protected = Router::new()
         .route("/UserViews", get(user_views))
         .route("/Users/{user_id}/Views", get(user_views))
+        .route("/Library/MediaFolders", get(media_folders))
+        .route("/Library/VirtualFolders", get(virtual_folders))
         .route("/Users/{user_id}", get(user_profile))
         .route("/Users/Me", get(user_profile))
         .route("/Items/Counts", get(item_counts))
@@ -129,6 +143,11 @@ pub fn routes(provider: Arc<dyn MediaServerProvider>) -> Router {
         .route("/Items", get(items))
         .route("/socket", get(websocket::connect))
         .route("/Persons/{name}", get(people::person_by_name))
+        .route("/Genres", get(genres))
+        .route("/Genres/{name}", get(genre_by_name))
+        .route("/Studios", get(studios))
+        .route("/Studios/{name}", get(studio_by_name))
+        .route("/Search/Hints", get(search_hints))
         .route("/Users/{user_id}/Items", get(items))
         .route("/Users/{user_id}/Items/Resume", get(resume_items))
         .route("/Users/{user_id}/Items/Latest", get(latest_items))
@@ -267,6 +286,59 @@ async fn user_views(
         "TotalRecordCount": total,
     })))
 }
+async fn media_folders(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Value>, StatusCode> {
+    let libraries = state
+        .provider
+        .list_visible_libraries(user.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let server_id = state.provider.server_id();
+    let views: Vec<Value> = libraries
+        .iter()
+        .map(|lib| {
+            let mut val = library_view_json(lib, &server_id);
+            val["Type"] = json!("Folder");
+            val["IsFolder"] = json!(true);
+            val
+        })
+        .collect();
+    let total = views.len();
+    Ok(Json(json!({
+        "Items": views,
+        "TotalRecordCount": total,
+    })))
+}
+
+async fn virtual_folders(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Value>, StatusCode> {
+    let libraries = state
+        .provider
+        .list_visible_libraries(user.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let views: Vec<Value> = libraries
+        .iter()
+        .map(|lib| {
+            json!({
+                "Name": lib.name,
+                "ItemId": lib.id,
+                "Id": lib.id,
+                "Locations": lib.root_paths,
+                "CollectionType": match lib.kind {
+                    domain::MediaKind::Movie => "movies",
+                    domain::MediaKind::Tv => "tvshows",
+                    domain::MediaKind::Video => "homevideos",
+                },
+            })
+        })
+        .collect();
+    Ok(Json(json!(views)))
+}
 
 async fn item_counts(
     State(state): State<AppState>,
@@ -307,14 +379,123 @@ async fn item_counts(
 async fn items(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
-    Query(query): Query<ItemsQuery>,
+    Query(mut query): Query<ItemsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let parent_id = query.parent_id.as_deref().or(query.series_id.as_deref());
+    let libraries = state.provider.list_visible_libraries(user.id).await.unwrap_or_default();
+    let is_folder_id = query.parent_id.as_deref().map(|pid| pid.starts_with("folder_")).unwrap_or(false);
+    let is_library_parent = query.parent_id.as_deref().map(|pid| libraries.iter().any(|lib| lib.id == pid)).unwrap_or(false);
+    let is_series_parent = query.series_id.is_some() || if let Some(pid) = query.parent_id.as_deref() {
+        if is_library_parent || is_folder_id {
+            false
+        } else {
+            state.provider.resolve_single_item(user.id, pid).await.ok().flatten().map(|it| it.is_series).unwrap_or(false)
+        }
+    } else {
+        false
+    };
+    let parent_id_for_provider = if is_library_parent {
+        query.parent_id.as_deref()
+    } else if is_series_parent {
+        query.parent_id.as_deref().or(query.series_id.as_deref())
+    } else {
+        None
+    };
+    let wants_episodes = query
+        .include_item_types
+        .as_deref()
+        .map(|types| types.split(',').any(|t| t.trim().eq_ignore_ascii_case("Episode")))
+        .unwrap_or(false);
+    let is_folder_query = query.is_folder.unwrap_or(false);
+    let recursive = query.recursive.unwrap_or(true);
     let mut rows = state
         .provider
-        .list_visible_items(user.id, parent_id)
+        .list_visible_items(user.id, parent_id_for_provider)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if is_library_parent && (!recursive || is_folder_query) {
+        if let Some(lib_id) = query.parent_id.as_deref() {
+            if let Some(target_lib) = libraries.iter().find(|l| l.id == lib_id) {
+                let mut folder_items: Vec<Value> = Vec::new();
+                let server_id = state.provider.server_id();
+                for root in &target_lib.root_paths {
+                    let folder_name = root.file_name().and_then(|n| n.to_str()).unwrap_or("folder");
+                    let folder_id = format!("folder_{}", uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, root.to_string_lossy().as_bytes()).simple());
+                    folder_items.push(json!({
+                        "Name": folder_name,
+                        "ServerId": server_id,
+                        "Id": folder_id,
+                        "Type": "Folder",
+                        "IsFolder": true,
+                        "CollectionType": match target_lib.kind {
+                            domain::MediaKind::Movie => "movies",
+                            domain::MediaKind::Tv => "tvshows",
+                            domain::MediaKind::Video => "homevideos",
+                        },
+                    }));
+                }
+                let total = folder_items.len();
+                return Ok(Json(json!({ "Items": folder_items, "TotalRecordCount": total })));
+            }
+        }
+    }
+    if is_folder_id {
+        if let Some(target_folder_id) = query.parent_id.take() {
+            rows.retain(|item| {
+                for lib in &libraries {
+                    for root in &lib.root_paths {
+                        let f_id = format!("folder_{}", uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, root.to_string_lossy().as_bytes()).simple());
+                        if f_id == target_folder_id {
+                            return std::path::Path::new(&item.row.path).starts_with(root);
+                        }
+                    }
+                }
+                false
+            });
+        }
+    }
+    if wants_episodes && rows.iter().any(|r| r.is_series) {
+        let mut expanded = Vec::new();
+        for item in rows {
+            if item.is_series {
+                let series_id = item.media.id.to_string().replace('-', "");
+                if let Ok(episodes) = state.provider.list_visible_items(user.id, Some(&series_id)).await {
+                    expanded.extend(episodes);
+                }
+            } else {
+                expanded.push(item);
+            }
+        }
+        rows = expanded;
+    }
+    let mut query = query;
+    let is_genre_or_studio = !is_library_parent && query.parent_id.as_deref().map(|pid| {
+        rows.iter().any(|item| {
+            item.metadata.genres.iter().any(|g| {
+                let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).hyphenated().to_string();
+                let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).simple().to_string();
+                pid.eq_ignore_ascii_case(&u) || pid.eq_ignore_ascii_case(&s) || g.eq_ignore_ascii_case(pid)
+            }) || item.metadata.studios.iter().any(|st| {
+                let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).hyphenated().to_string();
+                let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).simple().to_string();
+                pid.eq_ignore_ascii_case(&u) || pid.eq_ignore_ascii_case(&s) || st.eq_ignore_ascii_case(pid)
+            })
+        })
+    }).unwrap_or(false);
+    if is_genre_or_studio {
+        if let Some(target_id) = query.parent_id.take() {
+            rows.retain(|item| {
+                item.metadata.genres.iter().any(|g| {
+                    let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).hyphenated().to_string();
+                    let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).simple().to_string();
+                    target_id.eq_ignore_ascii_case(&u) || target_id.eq_ignore_ascii_case(&s) || g.eq_ignore_ascii_case(&target_id)
+                }) || item.metadata.studios.iter().any(|st| {
+                    let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).hyphenated().to_string();
+                    let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).simple().to_string();
+                    target_id.eq_ignore_ascii_case(&u) || target_id.eq_ignore_ascii_case(&s) || st.eq_ignore_ascii_case(&target_id)
+                })
+            });
+        }
+    }
     if query.person_ids.is_some() {
         let mut enriched = Vec::with_capacity(rows.len());
         for row in rows {
@@ -429,6 +610,192 @@ async fn latest_items(
         .collect();
     Ok(Json(json!(listed)))
 }
+async fn genres(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<ItemsQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let libraries = state.provider.list_visible_libraries(user.id).await.unwrap_or_default();
+    let is_library_parent = query.parent_id.as_deref().map(|pid| libraries.iter().any(|lib| lib.id == pid)).unwrap_or(false);
+    let parent_id = if is_library_parent { query.parent_id.as_deref() } else { None };
+    let items = state
+        .provider
+        .list_visible_items(user.id, parent_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut genre_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for it in items {
+        for g in it.metadata.genres {
+            if !g.trim().is_empty() {
+                *genre_counts.entry(g).or_insert(0) += 1;
+            }
+        }
+    }
+    let server_id = state.provider.server_id();
+    let search = query.search_term.as_deref().map(|s| s.to_lowercase());
+    let mut dtos = Vec::new();
+    for (name, count) in genre_counts {
+        if let Some(term) = &search {
+            if !name.to_lowercase().contains(term) {
+                continue;
+            }
+        }
+        dtos.push(json!({
+            "Name": name,
+            "ServerId": server_id,
+            "Id": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, name.as_bytes()).hyphenated().to_string(),
+            "Type": "Genre",
+            "IsFolder": true,
+            "ChildCount": count,
+            "ImageTags": { "Primary": "genre" },
+            "BackdropImageTags": ["genre"],
+        }));
+    }
+    let total = dtos.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let listed: Vec<Value> = dtos.into_iter().skip(start_index).take(limit).collect();
+    Ok(Json(json!({ "Items": listed, "TotalRecordCount": total })))
+}
+
+async fn genre_by_name(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let server_id = state.provider.server_id();
+    Ok(Json(json!({
+        "Name": name,
+        "ServerId": server_id,
+        "Id": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, name.as_bytes()).hyphenated().to_string(),
+        "Type": "Genre",
+        "IsFolder": true,
+        "ImageTags": { "Primary": "genre" },
+        "BackdropImageTags": ["genre"],
+    })))
+}
+
+async fn studios(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<ItemsQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let libraries = state.provider.list_visible_libraries(user.id).await.unwrap_or_default();
+    let is_library_parent = query.parent_id.as_deref().map(|pid| libraries.iter().any(|lib| lib.id == pid)).unwrap_or(false);
+    let parent_id = if is_library_parent { query.parent_id.as_deref() } else { None };
+    let items = state
+        .provider
+        .list_visible_items(user.id, parent_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut studio_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for it in items {
+        for s in it.metadata.studios {
+            if !s.trim().is_empty() {
+                *studio_counts.entry(s).or_insert(0) += 1;
+            }
+        }
+    }
+    let server_id = state.provider.server_id();
+    let search = query.search_term.as_deref().map(|s| s.to_lowercase());
+    let mut dtos = Vec::new();
+    for (name, count) in studio_counts {
+        if let Some(term) = &search {
+            if !name.to_lowercase().contains(term) {
+                continue;
+            }
+        }
+        dtos.push(json!({
+            "Name": name,
+            "ServerId": server_id,
+            "Id": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, name.as_bytes()).hyphenated().to_string(),
+            "Type": "Studio",
+            "IsFolder": true,
+            "ChildCount": count,
+            "ImageTags": { "Primary": "studio" },
+            "BackdropImageTags": ["studio"],
+        }));
+    }
+    let total = dtos.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let listed: Vec<Value> = dtos.into_iter().skip(start_index).take(limit).collect();
+    Ok(Json(json!({ "Items": listed, "TotalRecordCount": total })))
+}
+
+async fn studio_by_name(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let server_id = state.provider.server_id();
+    Ok(Json(json!({
+        "Name": name,
+        "ServerId": server_id,
+        "Id": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, name.as_bytes()).hyphenated().to_string(),
+        "Type": "Studio",
+        "IsFolder": true,
+        "ImageTags": { "Primary": "studio" },
+        "BackdropImageTags": ["studio"],
+    })))
+}
+
+#[derive(Default, Deserialize)]
+struct SearchHintsQuery {
+    #[serde(default, rename = "SearchTerm", alias = "searchTerm")]
+    search_term: Option<String>,
+    #[serde(default, rename = "StartIndex", alias = "startIndex")]
+    start_index: Option<usize>,
+    #[serde(default, rename = "Limit", alias = "limit")]
+    limit: Option<usize>,
+}
+
+async fn search_hints(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<SearchHintsQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let Some(term) = query.search_term.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()) else {
+        return Ok(Json(json!({ "SearchHints": [], "TotalRecordCount": 0 })));
+    };
+    let items = state
+        .provider
+        .list_visible_items(user.id, None)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut hints = Vec::new();
+    for it in items {
+        let title_match = it.media.title.to_lowercase().contains(&term);
+        let orig_match = it.metadata.original_title.as_deref().map(|s| s.to_lowercase().contains(&term)).unwrap_or(false);
+        if title_match || orig_match {
+            let id = if it.is_series {
+                it.media.id.to_string().replace('-', "")
+            } else {
+                it.row.id.to_string().replace('-', "")
+            };
+            let item_type = if it.is_series {
+                "Series"
+            } else if it.media.kind == domain::MediaKind::Tv {
+                "Episode"
+            } else {
+                "Movie"
+            };
+            hints.push(json!({
+                "ItemId": id,
+                "Id": id,
+                "Name": it.media.title,
+                "Type": item_type,
+                "IsFolder": it.is_series,
+                "RunTimeTicks": it.metadata.runtime_ticks,
+                "ProductionYear": it.metadata.production_year,
+                "MatchedTerm": term,
+            }));
+        }
+    }
+    let total = hints.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let listed: Vec<Value> = hints.into_iter().skip(start_index).take(limit).collect();
+    Ok(Json(json!({ "SearchHints": listed, "TotalRecordCount": total })))
+}
 
 async fn shows_next_up(
     State(state): State<AppState>,
@@ -441,12 +808,18 @@ async fn shows_next_up(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let target_series_id = query.series_id.as_deref().map(|s| s.replace('-', ""));
     let mut next_up = Vec::new();
     for show in series
         .iter()
         .filter(|item| item.media.kind == domain::MediaKind::Tv && item.is_series)
     {
         let series_id = show.media.id.to_string().replace('-', "");
+        if let Some(target) = &target_series_id {
+            if !series_id.eq_ignore_ascii_case(target) {
+                continue;
+            }
+        }
         let mut episodes = state
             .provider
             .list_visible_items(user.id, Some(&series_id))
@@ -494,21 +867,42 @@ async fn show_seasons(
         season_numbers.insert(item.row.season.unwrap_or(1));
     }
     let server_id = state.provider.server_id();
-    let seasons_json: Vec<Value> = season_numbers
-        .into_iter()
-        .map(|season_num| {
-            json!({
-                    "Id": format!("{compact_id}{season_num:02}"),
+    let mut seasons_json: Vec<Value> = Vec::new();
+    for season_num in season_numbers {
+        let season_id = format!("{compact_id}{season_num:02}");
+        let user_data = state
+            .provider
+            .resolve_user_item_data(user.id, &season_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|data| data.json_value())
+            .unwrap_or_else(|| {
+                json!({
+                    "PlaybackPositionTicks": 0,
+                    "PlayCount": 0,
+                    "IsFavorite": false,
+                    "Played": false,
+                })
+            });
+        let primary_tag = item.metadata.primary_image_tag.clone();
+        seasons_json.push(json!({
+            "Id": season_id,
             "Name": format!("第 {} 季", season_num),
             "SeriesId": compact_id,
             "SeriesName": item.media.title,
             "IndexNumber": season_num,
             "Type": "Season",
             "IsFolder": true,
-                    "ServerId": server_id,
-                })
-        })
-        .collect();
+            "ServerId": server_id,
+            "UserData": user_data,
+            "SeriesPrimaryImageTag": primary_tag,
+            "ImageTags": {
+                "Primary": primary_tag.unwrap_or_else(|| "poster".to_string())
+            },
+            "BackdropImageTags": [],
+        }));
+    }
     Ok(Json(
         json!({ "Items": seasons_json, "TotalRecordCount": seasons_json.len() }),
     ))
@@ -611,7 +1005,11 @@ async fn mark_favorite(
         return Err(StatusCode::NOT_FOUND);
     }
     tracing::info!(user_id = %user.id, item_id = %id, favorite = true, "updated Jellyfin favorite mark");
-    websocket::publish_user_data_changed(&state, user.id, &id).await;
+    let state_clone = state.clone();
+    let id_clone = id.clone();
+    tokio::spawn(async move {
+        websocket::publish_user_data_changed(&state_clone, user.id, &id_clone).await;
+    });
     user_data_response(&state, user.id, &id).await
 }
 
@@ -630,7 +1028,11 @@ async fn unmark_favorite(
         return Err(StatusCode::NOT_FOUND);
     }
     tracing::info!(user_id = %user.id, item_id = %id, favorite = false, "updated Jellyfin favorite mark");
-    websocket::publish_user_data_changed(&state, user.id, &id).await;
+    let state_clone = state.clone();
+    let id_clone = id.clone();
+    tokio::spawn(async move {
+        websocket::publish_user_data_changed(&state_clone, user.id, &id_clone).await;
+    });
     user_data_response(&state, user.id, &id).await
 }
 
@@ -649,7 +1051,11 @@ async fn mark_played(
         return Err(StatusCode::NOT_FOUND);
     }
     tracing::info!(user_id = %user.id, item_id = %id, played = true, "updated Jellyfin played mark");
-    websocket::publish_user_data_changed(&state, user.id, &id).await;
+    let state_clone = state.clone();
+    let id_clone = id.clone();
+    tokio::spawn(async move {
+        websocket::publish_user_data_changed(&state_clone, user.id, &id_clone).await;
+    });
     user_data_response(&state, user.id, &id).await
 }
 
@@ -668,7 +1074,11 @@ async fn unmark_played(
         return Err(StatusCode::NOT_FOUND);
     }
     tracing::info!(user_id = %user.id, item_id = %id, played = false, "updated Jellyfin played mark");
-    websocket::publish_user_data_changed(&state, user.id, &id).await;
+    let state_clone = state.clone();
+    let id_clone = id.clone();
+    tokio::spawn(async move {
+        websocket::publish_user_data_changed(&state_clone, user.id, &id_clone).await;
+    });
     user_data_response(&state, user.id, &id).await
 }
 

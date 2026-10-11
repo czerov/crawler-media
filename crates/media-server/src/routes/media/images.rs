@@ -22,6 +22,10 @@ pub(super) fn routes(provider: Arc<dyn MediaServerProvider>) -> Router {
             get(backdrop_image_index),
         )
         .route("/Persons/{name}/Images/Primary", get(person_primary_image))
+        .route("/Genres/{name}/Images/Primary", get(genre_primary_image))
+        .route("/Genres/{name}/Images/Backdrop", get(genre_primary_image))
+        .route("/Studios/{name}/Images/Primary", get(studio_primary_image))
+        .route("/Studios/{name}/Images/Backdrop", get(studio_primary_image))
         .route_layer(axum::middleware::from_fn(move |req, next| {
             let provider = image_provider.clone();
             authenticate_optional(provider, req, next)
@@ -48,6 +52,73 @@ async fn person_primary_image(
         }
     }
 }
+async fn genre_primary_image(
+    State(state): State<AppState>,
+    user_id: Option<Extension<Option<domain::UserId>>>,
+    Path(name): Path<String>,
+) -> Result<Response, StatusCode> {
+    let user_id = user_id.and_then(|extension| extension.0).unwrap_or_else(|| domain::UserId::from_uuid(uuid::Uuid::nil()));
+    let items = state
+        .provider
+        .list_visible_items(user_id, None)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    for it in items {
+        let matches_genre = it.metadata.genres.iter().any(|g| {
+            let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).hyphenated().to_string();
+            let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).simple().to_string();
+            g.eq_ignore_ascii_case(&name) || u.eq_ignore_ascii_case(&name) || s.eq_ignore_ascii_case(&name)
+        });
+        if matches_genre {
+            let id = if it.is_series {
+                it.media.id.to_string().replace('-', "")
+            } else {
+                it.row.id.to_string().replace('-', "")
+            };
+            if let Ok(Some(url)) = state.provider.resolve_primary_image_url(Some(user_id), &id).await {
+                return Ok(Redirect::temporary(&url).into_response());
+            }
+            if let Ok(Some(bytes)) = state.provider.resolve_poster_bytes(Some(user_id), &id).await {
+                return Ok(image_response(bytes));
+            }
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
+}
+
+async fn studio_primary_image(
+    State(state): State<AppState>,
+    user_id: Option<Extension<Option<domain::UserId>>>,
+    Path(name): Path<String>,
+) -> Result<Response, StatusCode> {
+    let user_id = user_id.and_then(|extension| extension.0).unwrap_or_else(|| domain::UserId::from_uuid(uuid::Uuid::nil()));
+    let items = state
+        .provider
+        .list_visible_items(user_id, None)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    for it in items {
+        let matches_studio = it.metadata.studios.iter().any(|st| {
+            let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).hyphenated().to_string();
+            let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).simple().to_string();
+            st.eq_ignore_ascii_case(&name) || u.eq_ignore_ascii_case(&name) || s.eq_ignore_ascii_case(&name)
+        });
+        if matches_studio {
+            let id = if it.is_series {
+                it.media.id.to_string().replace('-', "")
+            } else {
+                it.row.id.to_string().replace('-', "")
+            };
+            if let Ok(Some(url)) = state.provider.resolve_primary_image_url(Some(user_id), &id).await {
+                return Ok(Redirect::temporary(&url).into_response());
+            }
+            if let Ok(Some(bytes)) = state.provider.resolve_poster_bytes(Some(user_id), &id).await {
+                return Ok(image_response(bytes));
+            }
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
+}
 
 async fn primary_image(
     State(state): State<AppState>,
@@ -71,6 +142,12 @@ async fn primary_image(
         Err(error) => {
             tracing::warn!(%error, item_id = %id, "failed to read Jellyfin primary image");
         }
+    }
+    if let Ok(res) = genre_primary_image(State(state.clone()), user_id.map(|u| Extension(Some(u))), Path(id.clone())).await {
+        return Ok(res);
+    }
+    if let Ok(res) = studio_primary_image(State(state.clone()), user_id.map(|u| Extension(Some(u))), Path(id.clone())).await {
+        return Ok(res);
     }
     match state.provider.resolve_person_image_url(user_id, &id).await {
         Ok(Some(url)) => Ok(Redirect::temporary(&url).into_response()),
@@ -105,6 +182,9 @@ async fn resolve_backdrop(
     user_id: Option<domain::UserId>,
     id: String,
 ) -> Result<Response, StatusCode> {
+    if let Ok(res) = genre_primary_image(State(state.clone()), user_id.map(|u| Extension(Some(u))), Path(id.clone())).await {
+        return Ok(res);
+    }
     match state.provider.resolve_backdrop_bytes(user_id, &id).await {
         Ok(Some(bytes)) => Ok(image_response(bytes)),
         Ok(None) => Err(StatusCode::NOT_FOUND),

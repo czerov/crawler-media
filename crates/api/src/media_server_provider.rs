@@ -227,7 +227,6 @@ impl MediaServerProvider for ApiServerProvider {
         if let Some(snapshot) = self.resolve_single_item(user_id, id).await? {
             return Ok(Some(snapshot.user_item_data()));
         }
-
         let season_target = {
             let store = self.state.store.lock();
             crate::http::media_visibility::resolve_visible_season(&store, id, Some(user_id))

@@ -23,33 +23,15 @@ fn item_is_favorite(store: &Store, user_id: UserId, row: &domain::LedgerRow) -> 
         .episode
         .map(|value| value as i32)
         .unwrap_or(crate::store::UNIT_WHOLE);
-    let mut units = vec![(season, episode)];
-    if season >= 0 && episode >= 0 {
-        units.push((season, crate::store::UNIT_WHOLE));
-    }
-    if season >= 0 || episode >= 0 {
-        units.push((crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE));
-    }
-    for (unit_season, unit_episode) in units {
-        match store.unit_state(user_id, row.media_id, unit_season, unit_episode) {
-            Ok(Some(state)) => {
-                if state.favorite {
-                    return true;
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(%error, %user_id, media_id = %row.media_id, season = unit_season, episode = unit_episode, "failed to read Jellyfin favorite mark")
-            }
+
+    match store.unit_state(user_id, row.media_id, season, episode) {
+        Ok(Some(state)) => state.favorite,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(%error, %user_id, media_id = %row.media_id, season = season, episode = episode, "failed to read Jellyfin favorite mark");
+            false
         }
     }
-    // 如果名下任一单元被打上 favorite=true，该条目/整剧也判定为收藏
-    if let Ok(rows) = store.unit_rows(user_id, row.media_id) {
-        if rows.iter().any(|r| r.favorite) {
-            return true;
-        }
-    }
-    false
 }
 
 pub(super) fn item_metadata(
