@@ -88,9 +88,12 @@ fn user_id_from(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<UserI
     })
 }
 
+mod log_scope;
 mod logs;
 mod sessions;
 mod units;
+
+pub use log_scope::{PlaybackLogPage, PlaybackLogScope};
 
 impl UnitState {
     /// Shared Web/Jellyfin completion threshold: 90% or the final 30 seconds.

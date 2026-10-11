@@ -48,7 +48,9 @@ pub use fingerprint_samples::{FingerprintSampleQuery, StoredFingerprintSample};
 pub use libraries::Library;
 pub use library::{MarkerResultReplacement, StoredMediaMarker};
 pub use library_ownership::LibraryOwnership;
-pub use playback::{PlayLogRow, SessionRow, UNIT_WHOLE, UnitRow, UnitState};
+pub use playback::{
+    PlayLogRow, PlaybackLogPage, PlaybackLogScope, SessionRow, UNIT_WHOLE, UnitRow, UnitState,
+};
 pub use probe_state::{
     retry_delay_ms, ProbeStage, ProbeStageCompletion, ProbeStageKey, ProbeStageState, ProbeStageStatus,
 };
@@ -134,6 +136,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("missing {0}")]
     Missing(String),
+    #[error("invalid argument: {0}")]
+    Invalid(String),
     #[error("protected: {0}")]
     Protected(String),
     #[error("credential conflict: {0}")]
