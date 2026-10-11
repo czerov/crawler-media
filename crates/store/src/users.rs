@@ -24,6 +24,13 @@ fn map_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
     })
 }
 
+/// 密码校验所需的登录快照：在持有 Store 锁时读取，随后在锁外完成 Argon2 校验。
+/// 不实现 `Debug`/`Serialize`，避免口令材料进入日志或响应。
+pub struct LoginCredential {
+    pub user_id: UserId,
+    pub observed_password: String,
+}
+
 impl Store {
     pub fn insert_user(&self, user: &User) -> Result<(), StoreError> {
         self.app.execute(
@@ -568,6 +575,33 @@ impl Store {
         };
 
         self.finish_verified_login(&uid_str, &stored_pw, new_hash.as_deref())
+    }
+
+    /// 读取密码校验所需的不可变登录快照（用户 id + 当时观察到的 password 列）。
+    /// 校验本身必须在 Store 锁之外执行；之后用 [`Store::finish_verified_login`]
+    /// 以 CAS 语义完成签发。`password` 为 NULL 或用户不存在/被禁用时返回 `None`。
+    ///
+    /// 故意不 derive `Debug`/`Serialize`：快照携带口令材料，不得进入日志。
+    pub fn login_credential(&self, login: &str) -> Result<Option<LoginCredential>, StoreError> {
+        let row = self
+            .app
+            .query_row(
+                "SELECT id, password FROM users WHERE login = ?1 AND enabled = 1",
+                params![login],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((id, Some(observed_password))) = row else {
+            return Ok(None);
+        };
+        // 空口令行（仅 `insert_user` 建立、从未设置密码）没有可校验的凭据。
+        if observed_password.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(LoginCredential {
+            user_id: UserId::from_str(&id)?,
+            observed_password,
+        }))
     }
 
     /// 在同一个事务中完成 CAS 密码升级（若需要）并原子签发会话 token。

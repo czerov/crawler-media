@@ -1,7 +1,9 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use domain::{LedgerId, LedgerRow, Media, MediaId, MediaKind, QualitySource, UserId};
-use media_server::provider::{MediaItemSnapshot, MediaServerProvider, ServerLibrary, ServerUser};
+use media_server::provider::{
+    AuthenticateError, MediaItemSnapshot, MediaServerProvider, ServerLibrary, ServerUser,
+};
 use serde_json::Value;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -31,7 +33,7 @@ impl MediaServerProvider for FakeProvider {
         &self,
         username: &str,
         _password: &str,
-    ) -> Result<Option<(String, ServerUser)>, String> {
+    ) -> Result<Option<(String, ServerUser)>, AuthenticateError> {
         if username == "user_a" {
             Ok(Some((
                 "token_a".into(),

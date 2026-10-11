@@ -56,6 +56,7 @@ pub mod fs_watcher;
 mod fs_watcher_tests;
 pub mod http_agent;
 pub mod obscura_manager;
+pub mod password_login;
 pub mod probe_manager;
 pub mod system_logs;
 pub mod tmdb_http;

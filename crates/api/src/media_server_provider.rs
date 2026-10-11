@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use media_server::provider::{
-    MediaItemSnapshot, MediaPerson, MediaServerProvider, PlaybackClientInfo, PlaybackEvent,
-    ServerLibrary, ServerUser,
+    AuthenticateError, MediaItemSnapshot, MediaPerson, MediaServerProvider, PlaybackClientInfo,
+    PlaybackEvent, ServerLibrary, ServerUser,
 };
 
 use crate::management::ApiState;
@@ -110,24 +110,31 @@ impl MediaServerProvider for ApiServerProvider {
         &self,
         username: &str,
         password: &str,
-    ) -> Result<Option<(String, ServerUser)>, String> {
-        let store = self.state.store.lock();
-        let token_opt = store
-            .verify_user_password(username, password)
-            .map_err(|e| e.to_string())?;
-        let Some(token) = token_opt else {
-            return Ok(None);
+    ) -> Result<Option<(String, ServerUser)>, AuthenticateError> {
+        let authenticated = self
+            .state
+            .password_login
+            .authenticate(
+                self.state.store(),
+                username.to_string(),
+                password.to_string(),
+            )
+            .await;
+        let (token, user) = match authenticated {
+            Ok(Some(authenticated)) => authenticated,
+            Ok(None) => return Ok(None),
+            Err(crate::password_login::LoginError::Busy) => return Err(AuthenticateError::Busy),
+            Err(error) => {
+                tracing::error!(%error, "Jellyfin 密码登录失败");
+                return Err(AuthenticateError::Internal(error.to_string()));
+            }
         };
-        let Some(user) = store.user_by_token(&token).map_err(|e| e.to_string())? else {
-            return Ok(None);
-        };
-        let role = store.user_role(user.id).unwrap_or_else(|_| "member".into());
         Ok(Some((
             token,
             ServerUser {
                 id: user.id,
                 login: user.login,
-                is_admin: role == "admin",
+                is_admin: user.role.as_str() == "admin",
             },
         )))
     }

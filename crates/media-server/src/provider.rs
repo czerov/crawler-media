@@ -162,6 +162,16 @@ pub struct MediaPerson {
     pub primary_image_url: Option<String>,
 }
 
+/// 密码登录失败原因。`Busy` 由协议层映射 503，`Internal` 映射 500；
+/// 内部故障绝不能退化成“密码错误”(401) 返回给客户端。
+#[derive(Debug, thiserror::Error)]
+pub enum AuthenticateError {
+    #[error("authentication service busy")]
+    Busy,
+    #[error("{0}")]
+    Internal(String),
+}
+
 #[async_trait::async_trait]
 pub trait MediaServerProvider: Send + Sync + 'static {
     fn server_id(&self) -> String;
@@ -170,7 +180,7 @@ pub trait MediaServerProvider: Send + Sync + 'static {
         &self,
         username: &str,
         password: &str,
-    ) -> Result<Option<(String, ServerUser)>, String>;
+    ) -> Result<Option<(String, ServerUser)>, AuthenticateError>;
 
     async fn user_id_by_token(&self, token: &str) -> Result<Option<UserId>, String>;
 

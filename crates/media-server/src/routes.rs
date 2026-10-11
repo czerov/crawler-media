@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use crate::auth::{AuthUser, authenticate};
 use crate::dto::{item_dto_json, library_view_json, user_profile_json};
-use crate::provider::MediaServerProvider;
+use crate::provider::{AuthenticateError, MediaServerProvider};
 mod item_filters;
 mod media;
 mod people;
@@ -234,12 +234,19 @@ async fn authenticate_by_name(
     State(state): State<AppState>,
     Json(body): Json<AuthBody>,
 ) -> Result<Json<Value>, StatusCode> {
-    let res = state
+    let res = match state
         .provider
         .authenticate_password(&body.username, &body.pw)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    {
+        Ok(Some(res)) => res,
+        Ok(None) => return Err(StatusCode::UNAUTHORIZED),
+        Err(AuthenticateError::Busy) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(AuthenticateError::Internal(message)) => {
+            tracing::error!(%message, "Jellyfin 密码登录失败");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     Ok(Json(json!({
         "AccessToken": res.0,

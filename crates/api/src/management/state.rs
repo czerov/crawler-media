@@ -17,6 +17,8 @@ use domain::{SubscribeId, UserId};
 #[derive(Clone)]
 pub struct ApiState {
     pub(crate) store: Arc<Mutex<Store>>,
+    /// 两套登录协议共用的 offlock 密码校验与 CAS 签发服务。
+    pub(crate) password_login: Arc<crate::password_login::PasswordLogin>,
     pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
     pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
     /// Job attempts still executing in this process; protects them from timeout recovery.
@@ -178,6 +180,10 @@ impl ApiState {
         probe.set_library_registry(library_work.clone());
         let state = Self {
             store: store.clone(),
+            password_login: Arc::new(crate::password_login::PasswordLogin::new(
+                Arc::new(crate::password_login::Argon2Engine),
+                2,
+            )),
             library_work,
             jobs: Arc::new(Mutex::new(jobs)),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -207,6 +213,15 @@ impl ApiState {
 
     pub fn with_log_buffer(mut self, log_buffer: LogBuffer) -> Self {
         self.log_buffer = log_buffer;
+        self
+    }
+
+    /// 替换密码登录服务（测试注入阻塞/观测引擎；生产默认 Argon2、并发 2）。
+    pub fn with_password_login(
+        mut self,
+        service: Arc<crate::password_login::PasswordLogin>,
+    ) -> Self {
+        self.password_login = service;
         self
     }
 

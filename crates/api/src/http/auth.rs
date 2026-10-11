@@ -26,25 +26,42 @@ pub(crate) async fn login(State(state): State<ApiState>, Json(body): Json<Value>
             "用户名和密码必填",
         );
     }
-    let store = state.store.lock();
-    let verified = store.verify_user_password(username, password);
-    let Ok(Some(token)) = verified else {
-        tracing::warn!(username = %username, "登录失败：用户名或密码不正确");
-        return err(
-            StatusCode::UNAUTHORIZED,
-            "auth.invalid",
-            "用户名或密码不正确",
-        );
+    let authenticated = state
+        .password_login
+        .authenticate(state.store(), username.to_string(), password.to_string())
+        .await;
+    let (token, user) = match authenticated {
+        Ok(Some(authenticated)) => authenticated,
+        Ok(None) => {
+            tracing::warn!(username = %username, "登录失败：用户名或密码不正确");
+            return err(
+                StatusCode::UNAUTHORIZED,
+                "auth.invalid",
+                "用户名或密码不正确",
+            );
+        }
+        Err(crate::password_login::LoginError::Busy) => {
+            tracing::warn!(username = %username, "登录并发已达上限，拒绝请求");
+            let mut response = err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "auth.busy",
+                "登录服务繁忙，请稍后重试",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+        Err(error) => {
+            // DB/worker/hash 故障绝不能被表述成“密码错误”，也不签发 token。
+            tracing::error!(username = %username, error = %error, "登录服务内部错误");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "auth.error",
+                "登录服务暂时不可用",
+            );
+        }
     };
-    let user = store
-        .user_by_token(&token)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| {
-            // Fall back to a minimal view if the token row is missing.
-            let _ = &store;
-            unreachable!("verified token must resolve to a user")
-        });
     tracing::info!(user_id = %user.id, login = %user.login, role = user.role.as_str(), "用户登录成功");
     let mut payload = ok(json!({
         "token": token.clone(),

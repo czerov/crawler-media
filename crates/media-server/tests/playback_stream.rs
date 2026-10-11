@@ -1,7 +1,9 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use domain::UserId;
-use media_server::provider::{MediaItemSnapshot, MediaServerProvider, ServerLibrary, ServerUser};
+use media_server::provider::{
+    AuthenticateError, MediaItemSnapshot, MediaServerProvider, ServerLibrary, ServerUser,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -21,7 +23,7 @@ impl MediaServerProvider for DirectStreamProvider {
         &self,
         _username: &str,
         _password: &str,
-    ) -> Result<Option<(String, ServerUser)>, String> {
+    ) -> Result<Option<(String, ServerUser)>, AuthenticateError> {
         Ok(None)
     }
 
