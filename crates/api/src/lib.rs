@@ -48,6 +48,7 @@ pub mod ui;
 pub use poster_fetch::PosterFetch;
 pub mod anilist_http;
 pub mod bangumi_http;
+pub mod blocking_budget;
 pub mod cli;
 pub mod config;
 pub mod douban_http;

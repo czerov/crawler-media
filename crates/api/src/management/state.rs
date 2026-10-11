@@ -19,6 +19,8 @@ pub struct ApiState {
     pub(crate) store: Arc<Mutex<Store>>,
     /// 两套登录协议共用的 offlock 密码校验与 CAS 签发服务。
     pub(crate) password_login: Arc<crate::password_login::PasswordLogin>,
+    /// 有界 blocking 预算：owned 快照上的 stat/catalog 计算准入（生产默认 8）。
+    pub(crate) http_work: Arc<crate::blocking_budget::BlockingBudget>,
     pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
     pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
     /// Job attempts still executing in this process; protects them from timeout recovery.
@@ -184,6 +186,7 @@ impl ApiState {
                 Arc::new(crate::password_login::Argon2Engine),
                 2,
             )),
+            http_work: Arc::new(crate::blocking_budget::BlockingBudget::new(8)),
             library_work,
             jobs: Arc::new(Mutex::new(jobs)),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -222,6 +225,12 @@ impl ApiState {
         service: Arc<crate::password_login::PasswordLogin>,
     ) -> Self {
         self.password_login = service;
+        self
+    }
+
+    /// 替换 blocking 预算（测试注入小并发以观察准入/超时行为）。
+    pub fn with_http_work(mut self, budget: Arc<crate::blocking_budget::BlockingBudget>) -> Self {
+        self.http_work = budget;
         self
     }
 

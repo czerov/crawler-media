@@ -13,17 +13,17 @@ use domain::Subscribe;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::http::{err, ok, ok_list};
+use crate::http::{err, ok};
 use crate::management::ApiState;
 
 mod activity;
+mod arrivals;
 mod forecast;
 
 pub(crate) use activity::activities;
+pub(crate) use arrivals::today_arrivals;
 
-use super::subscriptions::{
-    coverage_json, remove_torrents_from_client, resolve_subscribe, user_is_admin,
-};
+use super::subscriptions::{remove_torrents_from_client, resolve_subscribe, user_is_admin};
 
 #[derive(Deserialize, Default)]
 pub(crate) struct RunUpgradeInput {
@@ -630,114 +630,4 @@ pub(crate) async fn season_cleanup(
         "removed_from_client": removed.len(),
     }))
     .into_response()
-}
-
-pub(crate) async fn today_arrivals(
-    State(state): State<ApiState>,
-    axum::Extension(user_id): axum::Extension<domain::UserId>,
-) -> Response {
-    let store = state.store.lock();
-    // 用户隔离：成员只看自己订阅的到货/预计入库；admin 看全部。
-    let admin = store
-        .user_role(user_id)
-        .map(|role| role == "admin")
-        .unwrap_or(false);
-    let subscribes = if admin {
-        store.list_all_subscribes()
-    } else {
-        store.list_subscribes_for_user(user_id)
-    }
-    .unwrap_or_default();
-    let now = crate::job_loop::unix_now();
-    let day_secs = 86_400i64;
-    let mut items = Vec::new();
-    for subscribe in subscribes {
-        let Some(media) = store.get_media(subscribe.media_id).ok().flatten() else {
-            continue;
-        };
-        let pending = store.load_pending(subscribe.id).unwrap_or_default();
-        // 在途（grabbing）：有 pending 种子的订阅，status=grabbed。
-        for _ in &pending {
-            items.push(json!({
-                "subscription_id": subscribe.id.to_string(),
-                "title": media.title,
-                "coverage": coverage_json(&subscribe.coverage),
-                "eta": null,
-                "status": "grabbed",
-                "info_hash": Value::Null,
-                "grabbed_at": Value::Null,
-            }));
-        }
-        // 当日入库：ledger 行修改时间在 24h 内的订阅，status=imported。
-        let ledger = store.list_ledger().unwrap_or_default();
-        let imported_today = ledger.iter().any(|row| {
-            row.media_id == subscribe.media_id
-                && std::fs::metadata(&row.path)
-                    .and_then(|m| m.modified())
-                    .map(|m| {
-                        m.duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0)
-                            >= now - day_secs
-                    })
-                    .unwrap_or(false)
-        });
-        if imported_today && pending.is_empty() {
-            items.push(json!({
-                "subscription_id": subscribe.id.to_string(),
-                "title": media.title,
-                "coverage": coverage_json(&subscribe.coverage),
-                "eta": null,
-                "status": "imported",
-                "info_hash": Value::Null,
-                "grabbed_at": Value::Null,
-            }));
-        }
-        // 预计发布（wanted）：TV 订阅中 air_date 落在 [昨天, +7 天] 且未入库的单元，
-        // 带 release_forecast（订阅首页「预计入库/等待资源」时间线消费）。
-        if media.kind == domain::MediaKind::Tv {
-            let Some(tmdb_id) = media.tmdb_id.as_deref() else {
-                continue;
-            };
-            let season = match subscribe.coverage {
-                domain::Coverage::Tv { season, .. } => season,
-                _ => continue,
-            };
-            let facts = store.load_subscribe_facts(subscribe.id).unwrap_or_default();
-            let episodes = state
-                .catalog
-                .season_episodes(tmdb_id, season)
-                .unwrap_or_default();
-            for ep in episodes {
-                if facts.get(Some(season), Some(ep.episode_number)).is_some() {
-                    continue; // 已入库
-                }
-                let Some(air_date) = ep.air_date.as_deref() else {
-                    continue;
-                };
-                let Some(air_unix) = crate::http::subscriptions::parse_upload_time(air_date) else {
-                    continue;
-                };
-                if air_unix < now - day_secs || air_unix > now + 7 * day_secs {
-                    continue;
-                }
-                let forecast = forecast::forecast_for_unit(&subscribe, &pending, air_date)
-                    .unwrap_or(Value::Null);
-                items.push(json!({
-                    "subscription_id": subscribe.id.to_string(),
-                    "title": media.title,
-                    "coverage": coverage_json(&subscribe.coverage),
-                    "eta": null,
-                    "status": "wanted",
-                    "air_date": air_date,
-                    "season": season,
-                    "episode": ep.episode_number,
-                    "info_hash": Value::Null,
-                    "grabbed_at": Value::Null,
-                    "release_forecast": forecast,
-                }));
-            }
-        }
-    }
-    ok_list(items).into_response()
 }
