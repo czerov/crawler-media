@@ -10,8 +10,29 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::str::FromStr;
 
+use crate::blocking_budget::BlockingError;
 use crate::http::{err, ok};
 use crate::management::ApiState;
+
+/// 只读站点请求（验证/上传统计）的等待预算；不替代 adapter 自身的 HTTP 超时。
+const SITE_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Blocking-budget failure → HTTP response（上游错误走各自原有路径）。
+fn blocking_error(error: BlockingError, code: &'static str) -> Response {
+    match error {
+        BlockingError::Busy => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime.busy",
+            "服务繁忙，请重试",
+        ),
+        BlockingError::Timeout => err(StatusCode::GATEWAY_TIMEOUT, code, "站点请求超时"),
+        error => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime.worker",
+            &error.to_string(),
+        ),
+    }
+}
 
 #[derive(Deserialize)]
 pub(crate) struct SiteInput {
@@ -403,12 +424,24 @@ pub(crate) async fn verify_site(State(state): State<ApiState>, Path(id): Path<St
         Ok(id) => id,
         Err(_) => return err(StatusCode::BAD_REQUEST, "site.invalid", "站点 id 无效"),
     };
-    let store = state.store.lock();
-    let Some(site) = store.get_site(id).ok().flatten() else {
-        return err(StatusCode::NOT_FOUND, "site.missing", "站点不存在");
+    let site = {
+        let store = state.store.lock();
+        let Some(site) = store.get_site(id).ok().flatten() else {
+            return err(StatusCode::NOT_FOUND, "site.missing", "站点不存在");
+        };
+        site
     };
-    drop(store);
-    let outcome = state.indexer.search(std::slice::from_ref(&site), " ");
+    let state_for_work = state.clone();
+    let outcome = state
+        .http_work
+        .run(SITE_READ_DEADLINE, move || {
+            state_for_work.indexer.search(std::slice::from_ref(&site), " ")
+        })
+        .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => return blocking_error(error, "site.verify_timeout"),
+    };
     let has_hits = !outcome.torrents.is_empty();
     let error = outcome
         .failures
@@ -432,29 +465,38 @@ pub(crate) async fn site_login(State(state): State<ApiState>, Path(id): Path<Str
     let Some(site) = state.store.lock().get_site(site_id).ok().flatten() else {
         return err(StatusCode::NOT_FOUND, "site.missing", "站点不存在");
     };
-    let policy = match crate::check_in::site_policy(&state, &site) {
-        Ok(policy) => policy,
-        Err(error) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "site.maintenance_unsupported",
-                &error.to_string(),
-            );
-        }
-    };
-    let bus = hooks::Bus::new();
-    let creds = crate::check_in::store_sites(&state.store);
-    let http = crate::check_in::attendance_http();
-    match hooks::LoginPlugin::http(&bus, &creds, &http)
-        .with_policy(&policy)
-        .login(site_id)
-    {
-        Ok(_) => ok(json!({ "ok": true })).into_response(),
-        Err(error) => err(
-            StatusCode::BAD_REQUEST,
-            "site.login_failed",
-            &error.to_string(),
-        ),
+    // 借用 adapter（StoreSites / AttendanceHttp / LoginPlugin）在闭包内构造，
+    // 避免把没有 Send+Sync 约束的 HttpPost trait object 送进 spawn。
+    let state_for_work = state.clone();
+    let result = state
+        .http_work
+        .run_to_completion(move || -> Result<(), (StatusCode, &'static str, String)> {
+            let policy = crate::check_in::site_policy(&state_for_work, &site).map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "site.maintenance_unsupported",
+                    error.to_string(),
+                )
+            })?;
+            let bus = hooks::Bus::new();
+            let creds = crate::check_in::store_sites(&state_for_work.store);
+            let http = crate::check_in::attendance_http();
+            hooks::LoginPlugin::http(&bus, &creds, &http)
+                .with_policy(&policy)
+                .login(site_id)
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "site.login_failed",
+                        error.to_string(),
+                    )
+                })
+        })
+        .await;
+    match result {
+        Ok(Ok(())) => ok(json!({ "ok": true })).into_response(),
+        Ok(Err((status, code, message))) => err(status, code, &message),
+        Err(error) => blocking_error(error, "site.login_timeout"),
     }
 }
 
@@ -469,29 +511,36 @@ pub(crate) async fn site_check_in(
     let Some(site) = state.store.lock().get_site(site_id).ok().flatten() else {
         return err(StatusCode::NOT_FOUND, "site.missing", "站点不存在");
     };
-    let policy = match crate::check_in::site_policy(&state, &site) {
-        Ok(policy) => policy,
-        Err(error) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "site.maintenance_unsupported",
-                &error.to_string(),
-            );
-        }
-    };
-    let bus = hooks::Bus::new();
-    let creds = crate::check_in::store_sites(&state.store);
-    let http = crate::check_in::attendance_http();
-    match hooks::CheckInPlugin::http(&bus, &creds, &http)
-        .with_policy(&policy)
-        .check_in(site_id)
-    {
-        Ok(_) => ok(json!({ "ok": true })).into_response(),
-        Err(error) => err(
-            StatusCode::BAD_REQUEST,
-            "site.check_in_failed",
-            &error.to_string(),
-        ),
+    let state_for_work = state.clone();
+    let result = state
+        .http_work
+        .run_to_completion(move || -> Result<(), (StatusCode, &'static str, String)> {
+            let policy = crate::check_in::site_policy(&state_for_work, &site).map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "site.maintenance_unsupported",
+                    error.to_string(),
+                )
+            })?;
+            let bus = hooks::Bus::new();
+            let creds = crate::check_in::store_sites(&state_for_work.store);
+            let http = crate::check_in::attendance_http();
+            hooks::CheckInPlugin::http(&bus, &creds, &http)
+                .with_policy(&policy)
+                .check_in(site_id)
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "site.check_in_failed",
+                        error.to_string(),
+                    )
+                })
+        })
+        .await;
+    match result {
+        Ok(Ok(())) => ok(json!({ "ok": true })).into_response(),
+        Ok(Err((status, code, message))) => err(status, code, &message),
+        Err(error) => blocking_error(error, "site.check_in_timeout"),
     }
 }
 
@@ -544,45 +593,63 @@ pub(crate) async fn patch_boost(
 }
 
 pub(crate) async fn boost_stats(State(state): State<ApiState>) -> Response {
-    let store = state.store.lock();
-    let sites = match store.list_sites() {
-        Ok(sites) => sites,
+    let (rows, category) = {
+        let store = state.store.lock();
+        let sites = match store.list_sites() {
+            Ok(sites) => sites,
+            Err(error) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "store.error",
+                    &error.to_string(),
+                );
+            }
+        };
+        let rows: Vec<Value> = sites
+            .iter()
+            .map(|site| {
+                let raw = store
+                    .get_setting(&boost_key(&site.id.to_string()))
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .unwrap_or_else(|| json!({ "enabled": false }));
+                json!({
+                    "site_id": site.id.to_string(),
+                    "site_name": site.name,
+                    "boost": raw,
+                })
+            })
+            .collect();
+        // Live upload totals from the configured downloader (best-effort).
+        let category = store
+            .default_downloader()
+            .ok()
+            .flatten()
+            .and_then(|d| d.category)
+            .unwrap_or_default();
+        (rows, category)
+    };
+    // 上传统计是 best-effort telemetry：worker 忙/超时/上游失败都按 0 处理，
+    // 不让 /boost-stats 因为遥测而改变响应契约。
+    let state_for_work = state.clone();
+    let uploaded = match state
+        .http_work
+        .run(SITE_READ_DEADLINE, move || {
+            state_for_work.downloader.uploaded_by_category(&category)
+        })
+        .await
+    {
+        Ok(Ok(uploaded)) => uploaded,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "boost 上传统计读取失败，按 0 处理");
+            0
+        }
         Err(error) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "store.error",
-                &error.to_string(),
-            );
+            tracing::warn!(%error, "boost 上传统计 worker 未完成，按 0 处理");
+            0
         }
     };
-    let rows: Vec<Value> = sites
-        .iter()
-        .map(|site| {
-            let raw = store
-                .get_setting(&boost_key(&site.id.to_string()))
-                .ok()
-                .flatten()
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .unwrap_or_else(|| json!({ "enabled": false }));
-            json!({
-                "site_id": site.id.to_string(),
-                "site_name": site.name,
-                "boost": raw,
-            })
-        })
-        .collect();
-    // Live upload totals from the configured downloader (best-effort).
-    let category = store
-        .default_downloader()
-        .ok()
-        .flatten()
-        .and_then(|d| d.category)
-        .unwrap_or_default();
-    drop(store);
-    let uploaded = state
-        .downloader
-        .uploaded_by_category(&category)
-        .unwrap_or(0);
     let mut out = rows;
     for row in &mut out {
         row["uploaded_bytes"] = json!(uploaded);

@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
 
+use crate::blocking_budget::BlockingError;
 use crate::http::library::{
     library_for_row, preferred_row, require_visible_library, rows_in_library,
 };
@@ -18,6 +19,26 @@ use crate::management::ApiState;
 use crate::scrape_store::ScrapeStoreExt;
 
 use super::library::missing_library;
+
+/// 只读整理预览/放宽建议/相似推荐的等待预算。
+const ORGANIZE_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Blocking-budget failure → HTTP response（上游/存储错误走各自原有路径）。
+fn blocking_error(error: BlockingError, code: &'static str) -> Response {
+    match error {
+        BlockingError::Busy => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime.busy",
+            "服务繁忙，请重试",
+        ),
+        BlockingError::Timeout => err(StatusCode::GATEWAY_TIMEOUT, code, "整理请求超时"),
+        error => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime.worker",
+            &error.to_string(),
+        ),
+    }
+}
 
 fn release_for(row: &domain::LedgerRow) -> domain::Release {
     let name = FsPath::new(&row.path)
@@ -37,8 +58,22 @@ pub(crate) async fn preview_organize(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Response {
+    let state_for_work = state.clone();
+    let work = state
+        .http_work
+        .run(ORGANIZE_READ_DEADLINE, move || {
+            preview_organize_inner(&state_for_work, &id)
+        })
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => blocking_error(error, "organize.timeout"),
+    }
+}
+
+fn preview_organize_inner(state: &ApiState, id: &str) -> Response {
     let store = state.store.lock();
-    let Some(library) = store.get_library(&id).ok().flatten() else {
+    let Some(library) = store.get_library(id).ok().flatten() else {
         return missing_library();
     };
     let pattern = match store.naming_pattern(library.kind) {
@@ -100,12 +135,26 @@ pub(crate) async fn organize(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let lease = match state.acquire_library_work(&id) {
+    let state_for_work = state.clone();
+    let work = state
+        .http_work
+        .run_to_completion(move || organize_inner(&state_for_work, &id, &body))
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => blocking_error(error, "organize.worker"),
+    }
+}
+
+/// 整个同步整理用例（lease → 校验 → 落盘）都在 blocking 闭包内，
+/// LibraryLease 持有到真实工作结束。
+fn organize_inner(state: &ApiState, id: &str, body: &Value) -> Response {
+    let lease = match state.acquire_library_work(id) {
         Ok(lease) => lease,
         Err(error) => return err(StatusCode::CONFLICT, "library.frozen", &error),
     };
     let store = state.store.lock();
-    let Some(library) = store.get_library(&id).ok().flatten() else {
+    let Some(library) = store.get_library(id).ok().flatten() else {
         return missing_library();
     };
     let Some(renames) = body["renames"].as_array() else {
@@ -243,15 +292,31 @@ pub(crate) async fn refresh_item_metadata(
     State(state): State<ApiState>,
     Path((id, item_id)): Path<(String, String)>,
 ) -> Response {
-    let lease = match state.acquire_library_work(&id) {
+    let state_for_work = state.clone();
+    let work = state
+        .http_work
+        .run_to_completion(move || {
+            refresh_item_metadata_inner(&state_for_work, &id, &item_id)
+        })
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => blocking_error(error, "organize.worker"),
+    }
+}
+
+/// 整个同步刷新用例（lease → TMDB 抓取 → 海报/NFO 落盘）在 blocking 闭包内，
+/// LibraryLease 持有到真实工作结束。
+fn refresh_item_metadata_inner(state: &ApiState, id: &str, item_id: &str) -> Response {
+    let lease = match state.acquire_library_work(id) {
         Ok(lease) => lease,
         Err(error) => return err(StatusCode::CONFLICT, "library.frozen", &error),
     };
     let store = state.store.lock();
-    let Some(library) = store.get_library(&id).ok().flatten() else {
+    let Some(library) = store.get_library(id).ok().flatten() else {
         return missing_library();
     };
-    let media_id = match domain::MediaId::from_str(&item_id) {
+    let media_id = match domain::MediaId::from_str(item_id) {
         Ok(id) => id,
         Err(_) => return err(StatusCode::BAD_REQUEST, "library.invalid", "条目 id 无效"),
     };
@@ -331,8 +396,22 @@ pub(crate) async fn relax_filter(
     Path(id): Path<String>,
     axum::Json(body): axum::Json<Value>,
 ) -> Response {
+    let state_for_work = state.clone();
+    let work = state
+        .http_work
+        .run(ORGANIZE_READ_DEADLINE, move || {
+            relax_filter_inner(&state_for_work, &id, &body)
+        })
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => blocking_error(error, "organize.timeout"),
+    }
+}
+
+fn relax_filter_inner(state: &ApiState, id: &str, body: &Value) -> Response {
     let store = state.store.lock();
-    let Some(library) = store.get_library(&id).ok().flatten() else {
+    let Some(library) = store.get_library(id).ok().flatten() else {
         return missing_library();
     };
     let resolutions: Vec<String> = body["resolutions"]
@@ -411,12 +490,31 @@ pub(crate) async fn similar(
     axum::Extension(user_id): axum::Extension<Option<domain::UserId>>,
     Path((id, item_id)): Path<(String, String)>,
 ) -> Response {
+    let state_for_work = state.clone();
+    let work = state
+        .http_work
+        .run(ORGANIZE_READ_DEADLINE, move || {
+            similar_inner(&state_for_work, &id, &item_id, user_id)
+        })
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => blocking_error(error, "organize.timeout"),
+    }
+}
+
+fn similar_inner(
+    state: &ApiState,
+    id: &str,
+    item_id: &str,
+    user_id: Option<domain::UserId>,
+) -> Response {
     let store = state.store.lock();
-    let library = match require_visible_library(&store, &id, user_id) {
+    let library = match require_visible_library(&store, id, user_id) {
         Ok(library) => library,
         Err(response) => return response,
     };
-    let media_id = match domain::MediaId::from_str(&item_id) {
+    let media_id = match domain::MediaId::from_str(item_id) {
         Ok(id) => id,
         Err(_) => return err(StatusCode::BAD_REQUEST, "library.invalid", "条目 id 无效"),
     };

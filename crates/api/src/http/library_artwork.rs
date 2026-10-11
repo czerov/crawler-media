@@ -11,6 +11,7 @@ use domain::MediaId;
 use serde_json::{Value, json};
 use std::str::FromStr;
 
+use crate::blocking_budget::BlockingError;
 use crate::http::{err, ok};
 use crate::management::ApiState;
 
@@ -383,10 +384,31 @@ pub(crate) async fn fanart(
     let fanart = match fanart {
         Some(f) => Some(f),
         None => {
-            // 本地尚无背景图时，尝试即时从 TMDB 拉取并落地
+            // 本地尚无背景图时，尝试即时从 TMDB 拉取并落地。抓取+落盘是副作用，
+            // 放在 blocking worker 上跑到结束，async worker 不再被占用。
             let media = state.store.lock().get_media(row.media_id).ok().flatten();
             if let Some(m) = media {
-                crate::poster_fetch::attach_backdrop(&state, &m, std::path::Path::new(&row.path));
+                let state_for_work = state.clone();
+                let path = std::path::Path::new(&row.path).to_path_buf();
+                let fetched = state
+                    .http_work
+                    .run_to_completion(move || {
+                        crate::poster_fetch::attach_backdrop(&state_for_work, &m, &path)
+                    })
+                    .await;
+                match fetched {
+                    Ok(_) => {}
+                    Err(BlockingError::Busy) => {
+                        return err(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "runtime.busy",
+                            "服务繁忙，请重试",
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "fanart 即时抓取 worker 未完成");
+                    }
+                }
             }
             file_dir.and_then(|dir| {
                 let here = dir.join("fanart.jpg");

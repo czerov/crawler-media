@@ -2,6 +2,7 @@
 //! powers the discover-page detail view (overview / rating / cast / backdrops /
 //! related / in-library links). Douban ids fall back to TMDB detail by lookup.
 
+use crate::blocking_budget::BlockingError;
 use crate::catalog::Catalog;
 use crate::http::{err, ok};
 use crate::management::ApiState;
@@ -14,43 +15,83 @@ use serde_json::{Value, json};
 const TMDB_POSTER: &str = "https://image.tmdb.org/t/p/w342";
 const TMDB_BACKDROP_SIZE: &str = "w1280";
 
+/// 只读 catalog 详情/影人请求的等待预算；不替代 catalog 自身的 HTTP 超时。
+const MEDIA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Blocking-budget failure → HTTP response（上游错误走各自原有路径）。
+fn blocking_error(error: BlockingError, code: &'static str) -> Response {
+    match error {
+        BlockingError::Busy => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime.busy",
+            "服务繁忙，请重试",
+        ),
+        BlockingError::Timeout => err(StatusCode::GATEWAY_TIMEOUT, code, "媒体请求超时"),
+        error => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime.worker",
+            &error.to_string(),
+        ),
+    }
+}
+
 pub(crate) async fn media_detail(
     State(state): State<ApiState>,
     Path((kind, id)): Path<(String, String)>,
 ) -> Response {
-    media_detail_inner(&state, &kind, &id)
+    let state_for_work = state.clone();
+    let work = state
+        .http_work
+        .run(MEDIA_DEADLINE, move || {
+            media_detail_inner(&state_for_work, &kind, &id)
+        })
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => blocking_error(error, "media.timeout"),
+    }
 }
 
 pub(crate) async fn season_detail(
     State(state): State<ApiState>,
     Path((id, season)): Path<(String, u32)>,
 ) -> Response {
-    let catalog: &dyn Catalog = state.catalog.as_ref();
-    let tmdb_id = match tmdb_id_for(&state, catalog, domain::MediaKind::Tv, &id) {
-        Ok(Some(tid)) => tid,
-        Ok(None) => return err(StatusCode::NOT_FOUND, "media.missing", "条目不存在"),
-        Err(response) => return response,
-    };
-    let meta_episodes = catalog.season_details(&tmdb_id, season).unwrap_or_default();
-    match catalog.season_episodes(&tmdb_id, season) {
-        Ok(episodes) => {
-            let items: Vec<Value> = episodes
-                .into_iter()
-                .map(|ep| {
-                    let ep_num = ep.episode_number;
-                    let meta = meta_episodes.iter().find(|m| m.episode_number == ep_num);
-                    json!({
-                        "episode_number": ep_num,
-                        "name": meta.and_then(|m| m.name.clone()),
-                        "overview": meta.and_then(|m| m.overview.clone()),
-                        "still_url": meta.and_then(|m| m.still_path.as_deref().map(|p| format!("https://image.tmdb.org/t/p/w300{p}"))),
-                        "air_date": ep.air_date,
-                    })
-                })
-                .collect();
-            ok(json!({ "episodes": items })).into_response()
-        }
-        Err(error) => err(StatusCode::BAD_GATEWAY, "media.upstream", &error),
+    let state_for_work = state.clone();
+    let work = state
+        .http_work
+        .run(MEDIA_DEADLINE, move || -> Response {
+            let catalog: &dyn Catalog = state_for_work.catalog.as_ref();
+            let tmdb_id = match tmdb_id_for(&state_for_work, catalog, domain::MediaKind::Tv, &id) {
+                Ok(Some(tid)) => tid,
+                Ok(None) => return err(StatusCode::NOT_FOUND, "media.missing", "条目不存在"),
+                Err(response) => return response,
+            };
+            let meta_episodes = catalog.season_details(&tmdb_id, season).unwrap_or_default();
+            match catalog.season_episodes(&tmdb_id, season) {
+                Ok(episodes) => {
+                    let items: Vec<Value> = episodes
+                        .into_iter()
+                        .map(|ep| {
+                            let ep_num = ep.episode_number;
+                            let meta = meta_episodes.iter().find(|m| m.episode_number == ep_num);
+                            json!({
+                                "episode_number": ep_num,
+                                "name": meta.and_then(|m| m.name.clone()),
+                                "overview": meta.and_then(|m| m.overview.clone()),
+                                "still_url": meta.and_then(|m| m.still_path.as_deref().map(|p| format!("https://image.tmdb.org/t/p/w300{p}"))),
+                                "air_date": ep.air_date,
+                            })
+                        })
+                        .collect();
+                    ok(json!({ "episodes": items })).into_response()
+                }
+                Err(error) => err(StatusCode::BAD_GATEWAY, "media.upstream", &error),
+            }
+        })
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => blocking_error(error, "media.timeout"),
     }
 }
 
@@ -387,16 +428,18 @@ pub(crate) async fn person_detail(
 ) -> Response {
     let state_clone = state.clone();
     let id_clone = id.clone();
-    let person_handle = tokio::task::spawn_blocking(move || {
-        let catalog: &dyn Catalog = state_clone.catalog.as_ref();
-        catalog.person_details(&id_clone)
-    })
-    .await;
+    let person_handle = state
+        .http_work
+        .run(MEDIA_DEADLINE, move || {
+            let catalog: &dyn Catalog = state_clone.catalog.as_ref();
+            catalog.person_details(&id_clone)
+        })
+        .await;
     let details = match person_handle {
         Ok(Ok(Some(details))) => details,
         Ok(Ok(None)) => return err(StatusCode::NOT_FOUND, "media.person_missing", "影人不存在"),
         Ok(Err(error)) => return err(StatusCode::BAD_GATEWAY, "media.upstream", &error),
-        Err(_) => return err(StatusCode::BAD_GATEWAY, "media.upstream", "影人请求被中断"),
+        Err(error) => return blocking_error(error, "media.timeout"),
     };
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(40).clamp(10, 100);
@@ -448,15 +491,15 @@ pub(crate) async fn douban_detail(
 ) -> Response {
     let state_clone = state.clone();
     let id_clone = id.clone();
-    let res =
-        tokio::task::spawn_blocking(move || douban_detail_blocking(&state_clone, &id_clone)).await;
+    let res = state
+        .http_work
+        .run(MEDIA_DEADLINE, move || {
+            douban_detail_blocking(&state_clone, &id_clone)
+        })
+        .await;
     match res {
         Ok(resp) => resp,
-        Err(_) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "media.error",
-            "请求被中断",
-        ),
+        Err(error) => blocking_error(error, "media.timeout"),
     }
 }
 

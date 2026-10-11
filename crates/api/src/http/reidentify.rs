@@ -11,10 +11,27 @@ use std::collections::HashSet;
 use std::path::Path as FsPath;
 use std::str::FromStr;
 
+use crate::blocking_budget::BlockingError;
 use crate::http::library::{poster_path, preferred_row};
 use crate::http::title_ref::resolve_title;
 use crate::http::{err, ok};
 use crate::management::ApiState;
+
+/// Blocking-budget failure → HTTP response（上游/存储错误走各自原有路径）。
+fn blocking_error(error: BlockingError) -> Response {
+    match error {
+        BlockingError::Busy => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime.busy",
+            "服务繁忙，请重试",
+        ),
+        error => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime.worker",
+            &error.to_string(),
+        ),
+    }
+}
 
 fn review_item(media: &domain::Media, poster_url: Option<String>) -> Value {
     json!({
@@ -101,6 +118,20 @@ pub(crate) async fn preview(
 /// POST /libraries/{id}/items/{item_id}/reidentifications —
 /// 把条目身份改挂到 `title_ref` 指向的作品并重刷元数据。
 pub(crate) async fn reidentify(State(state): State<ApiState>, Json(body): Json<Value>) -> Response {
+    let state_for_work = state.clone();
+    let work = state
+        .http_work
+        .run_to_completion(move || reidentify_inner(&state_for_work, &body))
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => blocking_error(error),
+    }
+}
+
+/// 整个同步重识别用例（解析 → lease → 改身份 → 抓海报/NFO）都在 blocking
+/// 闭包内，LibraryLease 持有到真实工作结束。
+fn reidentify_inner(state: &ApiState, body: &Value) -> Response {
     let store = state.store.lock();
     let Some(title_ref) = body["title_ref"].as_str() else {
         return err(
@@ -150,7 +181,7 @@ pub(crate) async fn reidentify(State(state): State<ApiState>, Json(body): Json<V
         Err(error) => return err(StatusCode::CONFLICT, "library.frozen", &error),
     };
     let cancelled = || leases.iter().any(|lease| lease.control().is_cancelled());
-    let target = resolve_title(&state, title_ref);
+    let target = resolve_title(state, title_ref);
     match target {
         Ok(Some(target)) => {
             // 更新 media 身份。
@@ -184,10 +215,10 @@ pub(crate) async fn reidentify(State(state): State<ApiState>, Json(body): Json<V
                         "Library work cancelled",
                     );
                 }
-                let _ = crate::poster_fetch::attach_poster(&state, &target, &path);
-                let _ = crate::poster_fetch::attach_backdrop(&state, &target, &path);
+                let _ = crate::poster_fetch::attach_poster(state, &target, &path);
+                let _ = crate::poster_fetch::attach_backdrop(state, &target, &path);
                 if let Some(tmdb_id) = target.tmdb_id.clone() {
-                    match crate::scrape_metadata::fetch_tmdb_metadata(&state, target.kind, &tmdb_id)
+                    match crate::scrape_metadata::fetch_tmdb_metadata(state, target.kind, &tmdb_id)
                     {
                         Ok(Some(meta)) => {
                             if cancelled() {
@@ -200,7 +231,7 @@ pub(crate) async fn reidentify(State(state): State<ApiState>, Json(body): Json<V
                             let nfo = crate::scrape_metadata::nfo_from_tmdb(&target, &meta);
                             if target.kind == MediaKind::Tv {
                                 crate::scrape_metadata::scrape_tv_sidecars(
-                                    &state,
+                                    state,
                                     &target,
                                     &crate::scrape_metadata::show_root(&path, row),
                                     &rows,
@@ -224,7 +255,7 @@ pub(crate) async fn reidentify(State(state): State<ApiState>, Json(body): Json<V
                                     });
                                 }
                                 let movie_root = path.parent().unwrap_or(&path);
-                                crate::scrape_metadata::scrape_movie_fanart(&state, &target, movie_root);
+                                crate::scrape_metadata::scrape_movie_fanart(state, &target, movie_root);
                             }
                         }
                         Ok(None) => {

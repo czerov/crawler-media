@@ -7,6 +7,7 @@ use domain::{FetchMode, Filter, Media, Site, Subscribe, SubscribeId, UserId};
 use serde_json::{Value, json};
 use subscribe::RunInput;
 
+use crate::blocking_budget::BlockingError;
 use crate::delivery::RoutedDownloader;
 use crate::http::subscriptions::ensure_subscribe_owner;
 use crate::management::{ApiError, ApiState};
@@ -25,11 +26,36 @@ pub(crate) async fn run_subscribe(
     axum::Extension(user_id): axum::Extension<UserId>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let id = parse_subscribe_id(&id)?;
-    let search_context = load_search_context(&state, id, user_id)?;
-    reject_if_inactive(&state, id, &search_context.subscribe)?;
-    let (torrents, search_keywords) = fetch_torrents(&state, id, &search_context)?;
-    let admitted = admit_after_search(&state, id, user_id, torrents, search_keywords)?;
+    let state_for_work = state.clone();
+    // 整段同步业务 pipeline（搜索 → 准入 → 海报）都在 blocking worker 上跑到
+    // 结束：订阅 guard / LibraryLease 在闭包内持有，响应语义不变（不是排队返回）。
+    let work = state
+        .http_work
+        .run_to_completion(move || {
+            let id = parse_subscribe_id(&id)?;
+            run_subscribe_inner(&state_for_work, id, user_id)
+        })
+        .await;
+    match work {
+        Ok(result) => result,
+        Err(BlockingError::Busy) => Err(ApiError::with(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime.busy",
+            "服务繁忙，请重试".into(),
+        )),
+        Err(error) => Err(ApiError::internal(error.to_string())),
+    }
+}
+
+fn run_subscribe_inner(
+    state: &ApiState,
+    id: SubscribeId,
+    user_id: UserId,
+) -> Result<Json<Value>, ApiError> {
+    let search_context = load_search_context(state, id, user_id)?;
+    reject_if_inactive(state, id, &search_context.subscribe)?;
+    let (torrents, search_keywords) = fetch_torrents(state, id, &search_context)?;
+    let admitted = admit_after_search(state, id, user_id, torrents, search_keywords)?;
     if admitted.scrape {
         for row in &admitted.ledger {
             admitted
@@ -38,12 +64,12 @@ pub(crate) async fn run_subscribe(
                 .check()
                 .map_err(|e| ApiError::internal(e.to_string()))?;
             crate::poster_fetch::attach_poster(
-                &state,
+                state,
                 &admitted.media,
                 std::path::Path::new(&row.path),
             );
             crate::poster_fetch::attach_backdrop(
-                &state,
+                state,
                 &admitted.media,
                 std::path::Path::new(&row.path),
             );
