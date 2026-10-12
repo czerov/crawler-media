@@ -24,6 +24,7 @@ use crate::store::Library;
 
 mod assets;
 mod cover;
+pub(crate) mod facets;
 pub(crate) mod page;
 pub(crate) mod selection;
 pub(crate) use assets::{library_json, poster_path, preferred_row, rows_in_library};

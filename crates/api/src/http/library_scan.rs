@@ -13,7 +13,7 @@ use crate::management::ApiState;
 use crate::scrape_store::ScrapeStoreExt;
 
 use super::library::{
-    missing_library, preferred_row, require_visible_library, rows_in_library, selection,
+    facets, missing_library, preferred_row, require_visible_library, rows_in_library, selection,
 };
 
 /// POST /libraries/{id}/scan — walk every root of the library and ledger
@@ -727,7 +727,7 @@ pub(crate) async fn facets(
         .http_work
         .run(selection::BROWSE_DEADLINE, move || {
             let items = selection::select_all_for_facets(snapshot, files.as_ref());
-            let facets = match selection::facets::build_facets(&items, &query, tier) {
+            let facets = match facets::build_facets(&items, &query, tier) {
                 Ok(facets) => facets,
                 Err(message) => {
                     tracing::error!(%message, "Library facets query rejected");

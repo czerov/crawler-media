@@ -6,10 +6,6 @@ use domain::{LedgerRow, Media, MediaId, UserId};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-// facets.rs 是本模块的兄弟文件；`http/library.rs`（模块根）不在本次写范围内，
-// 因此用 `#[path]` 从这里注册。
-#[path = "facets.rs"]
-pub(crate) mod facets;
 mod file_stats;
 mod filters;
 mod metadata;

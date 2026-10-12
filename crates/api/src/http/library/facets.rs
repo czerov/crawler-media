@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use super::{LibraryFilter, LibrarySelection};
+use super::selection::{LibraryFilter, LibrarySelection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum FacetDimension {
