@@ -52,24 +52,6 @@ pub(crate) fn browse_work_error(error: crate::blocking_budget::BlockingError) ->
     }
 }
 
-/// 兼容 wrapper：锁内取一次快照，再在**锁外**做 NFO/stat/过滤/排序。
-///
-/// 新的浏览 handler 应直接用 [`load_browse_snapshot`] + [`select_snapshot`]，
-/// 并把后者放进 blocking 预算；这个 wrapper 只是让尚未改造的调用点行为不变。
-pub(crate) fn select(
-    store: &Store,
-    library: &Library,
-    user: Option<UserId>,
-    query: &HashMap<String, String>,
-) -> Result<Vec<LibrarySelection>, Response> {
-    let snapshot = load_browse_snapshot(store, library, user)?;
-    select_snapshot(
-        snapshot,
-        query,
-        &crate::browse_file_read::LocalBrowseFileRead,
-    )
-}
-
 /// 一部作品的观看状态。首页库行/收藏行的「未看优先」分级、筛选条的「未观看 / 在看 /
 /// 已看完」三档，都读这一份，避免同一部作品在两个地方被分成不同的档。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -94,13 +94,6 @@ pub(super) fn visible_media_ids(
     )
 }
 
-pub(super) fn media_visible(
-    visible_media: Option<&std::collections::HashSet<domain::MediaId>>,
-    media_id: domain::MediaId,
-) -> bool {
-    visible_media.is_none_or(|ids| ids.contains(&media_id))
-}
-
 /// GET /playback/history?limit&before&days&member_id&scope — cursor-paginated.
 pub(crate) async fn history(
     State(state): State<ApiState>,
