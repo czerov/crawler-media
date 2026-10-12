@@ -5,8 +5,8 @@ use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use crate::http::library::{preferred_row, require_visible_library, selection};
-use crate::http::ok_list;
+use crate::http::library::{page, preferred_row, require_visible_library, selection};
+use crate::http::{err, ok_list};
 use crate::management::ApiState;
 
 pub(crate) async fn gallery(
@@ -15,11 +15,17 @@ pub(crate) async fn gallery(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let limit = query.get("limit").and_then(|v| v.parse::<usize>().ok());
-    let offset = query
-        .get("offset")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
+    // 显式分页参数先校验：越界直接 400；省略 limit 仍是"返回全部"。
+    let page = match page::PageWindow::parse(&query) {
+        Ok(page) => page,
+        Err(message) => {
+            return err(
+                axum::http::StatusCode::BAD_REQUEST,
+                "library.invalid",
+                &message,
+            );
+        }
+    };
     // 锁内只取 owned 快照；NFO/stat/过滤/排序/渲染都在锁外的 blocking 预算内。
     let snapshot = {
         let store = state.store.lock();
@@ -55,17 +61,9 @@ pub(crate) async fn gallery(
                     "images": images,
                 }));
             }
-            // 空图组已在上面剔除，分页必须发生在剔除之后。
-            let sliced = if offset >= groups.len() {
-                Vec::new()
-            } else {
-                let end = match limit {
-                    Some(limit) => (offset + limit).min(groups.len()),
-                    None => groups.len(),
-                };
-                groups[offset..end].to_vec()
-            };
-            ok_list(sliced).into_response()
+            // 空图组已在上面剔除，分页必须发生在剔除之后；bounds 对 offset+limit 溢出免疫。
+            let bounds = page.bounds(groups.len());
+            ok_list(groups[bounds].to_vec()).into_response()
         })
         .await;
     match work {

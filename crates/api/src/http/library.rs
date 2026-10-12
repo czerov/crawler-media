@@ -24,6 +24,7 @@ use crate::store::Library;
 
 mod assets;
 mod cover;
+pub(crate) mod page;
 pub(crate) mod selection;
 pub(crate) use assets::{library_json, poster_path, preferred_row, rows_in_library};
 pub(crate) use cover::{default_cover_options, is_legacy_fanart_copy, render_cover_jpeg};
@@ -218,6 +219,11 @@ pub(crate) async fn list_items(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    // 显式分页参数先校验：越界直接 400，不静默 clamp；省略 limit 仍是"返回全部"。
+    let page = match page::PageWindow::parse(&query) {
+        Ok(page) => page,
+        Err(message) => return err(StatusCode::BAD_REQUEST, "library.invalid", &message),
+    };
     // 锁内只取 owned 快照；NFO/stat/过滤/排序/渲染都在锁外的 blocking 预算内。
     let snapshot = {
         let store = state.store.lock();
@@ -230,11 +236,6 @@ pub(crate) async fn list_items(
             Err(response) => return response,
         }
     };
-    let offset = query
-        .get("offset")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let limit = query.get("limit").and_then(|v| v.parse::<usize>().ok());
     let files = state.browse_files.clone();
     let work = state
         .http_work
@@ -245,11 +246,10 @@ pub(crate) async fn list_items(
                 Err(response) => return response,
             };
             // 过滤与排序已在 select_snapshot 内完成，分页发生在其后。
-            let paged: Vec<_> = selected
-                .into_iter()
-                .skip(offset)
-                .take(limit.unwrap_or(usize::MAX))
-                .map(|item| wall_item_json(&library_id, &item))
+            let bounds = page.bounds(selected.len());
+            let paged: Vec<_> = selected[bounds]
+                .iter()
+                .map(|item| wall_item_json(&library_id, item))
                 .collect();
             ok_list(paged).into_response()
         })
