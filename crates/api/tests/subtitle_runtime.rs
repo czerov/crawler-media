@@ -1,5 +1,9 @@
 //! 共享 single-flight 字幕交付回归：同 key 只跑一次、取消语义、warm cache 与
 //! 发布前 source_version 复核。FakeRunner 只写 fixture bytes，不启动任何进程。
+//!
+//! 等待顺序一律用**确定性握手**，不用 sleep 猜测调度：第二个请求由测试自己
+//! poll 一次推进到「已加入同一 in-flight 任务」，worker 结束用 fake runner 的
+//! finished 计数观察。
 
 #![cfg(unix)]
 
@@ -7,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use api::subtitle_delivery::{SubtitleDelivery, SubtitleRequest, SubtitleServiceError};
@@ -72,9 +77,30 @@ fn exit_status(code: i32) -> ExitStatus {
 struct FakeRunner {
     gate: Option<Arc<Gate>>,
     body: Vec<u8>,
+    /// `output` 被调用次数。
     calls: Arc<AtomicUsize>,
+    /// `output` 返回次数：用于确认提取工作真的结束过，再断言没有残留文件。
+    finished: Arc<AtomicUsize>,
     /// 模拟外部工具在提取后替换同路径源文件。
     mutate_source: Option<PathBuf>,
+}
+
+impl FakeRunner {
+    fn new(
+        gate: Option<Arc<Gate>>,
+        body: &[u8],
+        calls: Arc<AtomicUsize>,
+        finished: Arc<AtomicUsize>,
+        mutate_source: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            gate,
+            body: body.to_vec(),
+            calls,
+            finished,
+            mutate_source,
+        }
+    }
 }
 
 impl SubtitleRunner for FakeRunner {
@@ -94,6 +120,7 @@ impl SubtitleRunner for FakeRunner {
         if let Some(source) = &self.mutate_source {
             std::fs::write(source, b"externally-replaced-source-bytes").unwrap();
         }
+        self.finished.fetch_add(1, Ordering::SeqCst);
         if control.is_cancelled() {
             return Err(LibraryError::Cancelled);
         }
@@ -158,38 +185,71 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn fixture(root: &Path) -> (PathBuf, Arc<AtomicUsize>) {
+fn fixture(root: &Path) -> (PathBuf, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let source = root.join("movie.mkv");
     std::fs::write(&source, b"fake video bytes").unwrap();
-    (source, Arc::new(AtomicUsize::new(0)))
+    (
+        source,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    )
+}
+
+/// 手动 poll 一次：确定性推进到「已加入同一 in-flight 任务」的等待点。
+///
+/// 不依赖 sleep：`deliver` 的第一次 poll 会同步完成 fast-path join 并停在
+/// `waiter.wait()`，因此这里返回 Pending 就证明第二个请求已经共享同一任务。
+async fn poll_once_joined<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+    let mut future = future;
+    std::future::poll_fn(|cx| {
+        assert!(
+            matches!(future.as_mut().poll(cx), Poll::Pending),
+            "第一次 poll 应当停在等待共享结果上（而不是已经完成或 panic）"
+        );
+        Poll::Ready(())
+    })
+    .await;
+}
+
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool, what: &str) {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        assert!(Instant::now() < deadline, "等待超时：{what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_identical_requests_run_once_and_survivor_gets_bytes() {
     let tmp = tempfile::tempdir().unwrap();
-    let (source, calls) = fixture(tmp.path());
+    let (source, calls, finished) = fixture(tmp.path());
     let gate = Arc::new(Gate::new());
-    let runner = Arc::new(FakeRunner {
-        gate: Some(gate.clone()),
-        body: b"SUBTITLE-BYTES".to_vec(),
-        calls: calls.clone(),
-        mutate_source: None,
-    });
+    let runner = Arc::new(FakeRunner::new(
+        Some(gate.clone()),
+        b"SUBTITLE-BYTES",
+        calls.clone(),
+        finished.clone(),
+        None,
+    ));
     let (state, service) = make_state(tmp.path(), runner, 2);
     let ledger = LedgerId::new();
 
-    let spawn = |service: Arc<SubtitleDelivery>, state: ApiState, request: SubtitleRequest| {
-        tokio::spawn(async move { service.deliver(&state, request).await })
-    };
-    let first = spawn(service.clone(), state.clone(), request(ledger, &source));
+    let first = tokio::spawn({
+        let service = service.clone();
+        let state = state.clone();
+        let request = request(ledger, &source);
+        async move { service.deliver(&state, request).await }
+    });
     gate.wait_entered();
-    let second = spawn(service.clone(), state.clone(), request(ledger, &source));
-    // 让第二个请求加入同一 in-flight 任务（纯内存 map join）。
-    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 第二个请求由测试自己推进到 join 完成（确定性，不 sleep）。
+    let mut second = Box::pin(service.deliver(&state, request(ledger, &source)));
+    poll_once_joined(second.as_mut()).await;
+
     first.abort();
     gate.release();
 
-    let payload = second.await.unwrap().unwrap();
+    let payload = second.await.unwrap();
     assert_eq!(payload.bytes, b"SUBTITLE-BYTES");
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -201,58 +261,65 @@ async fn two_identical_requests_run_once_and_survivor_gets_bytes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn both_waiters_cancelled_cancels_job_and_cleans_staging() {
     let tmp = tempfile::tempdir().unwrap();
-    let (source, calls) = fixture(tmp.path());
+    let (source, calls, finished) = fixture(tmp.path());
     let gate = Arc::new(Gate::new());
-    let runner = Arc::new(FakeRunner {
-        gate: Some(gate.clone()),
-        body: b"SHOULD-NOT-PUBLISH".to_vec(),
-        calls: calls.clone(),
-        mutate_source: None,
-    });
+    let runner = Arc::new(FakeRunner::new(
+        Some(gate.clone()),
+        b"SHOULD-NOT-PUBLISH",
+        calls.clone(),
+        finished.clone(),
+        None,
+    ));
     let (state, service) = make_state(tmp.path(), runner, 2);
     let ledger = LedgerId::new();
     let dir = cache_dir(ledger, &source);
 
-    let spawn = |service: Arc<SubtitleDelivery>, state: ApiState, request: SubtitleRequest| {
-        tokio::spawn(async move { service.deliver(&state, request).await })
-    };
-    let first = spawn(service.clone(), state.clone(), request(ledger, &source));
+    let first = tokio::spawn({
+        let service = service.clone();
+        let state = state.clone();
+        let request = request(ledger, &source);
+        async move { service.deliver(&state, request).await }
+    });
     gate.wait_entered();
-    let second = spawn(service.clone(), state.clone(), request(ledger, &source));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut second = Box::pin(service.deliver(&state, request(ledger, &source)));
+    poll_once_joined(second.as_mut()).await;
+
     first.abort();
-    second.abort();
-    // 让 abort 真正 drop waiter（最后一个 waiter 离开才取消任务）。
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // 最后一个 waiter 离开才取消任务：直接 drop 第二个请求是确定性的。
+    drop(second);
     gate.release();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !entries(&dir).is_empty() {
-        assert!(
-            Instant::now() < deadline,
-            "cancelled job left files behind: {:?}",
-            entries(&dir)
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // 先等提取真的结束过，再断言没有残留——否则 runner 还没写 staging 时
+    // 「目录为空」会假通过。
+    wait_until(
+        Duration::from_secs(5),
+        || finished.load(Ordering::SeqCst) == 1,
+        "fake runner 应当返回一次",
+    );
+    wait_until(
+        Duration::from_secs(5),
+        || entries(&dir).is_empty(),
+        "取消后不得留下 staging/final",
+    );
     assert!(!dir.join("sub_2.vtt").exists());
 }
 
 #[tokio::test]
 async fn warm_cache_does_not_run_runner() {
     let tmp = tempfile::tempdir().unwrap();
-    let (source, calls) = fixture(tmp.path());
+    let (source, calls, finished) = fixture(tmp.path());
     let ledger = LedgerId::new();
     let dir = cache_dir(ledger, &source);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("sub_2.vtt"), b"WARM-CACHE-BYTES").unwrap();
 
-    let runner = Arc::new(FakeRunner {
-        gate: None,
-        body: b"COLD".to_vec(),
-        calls: calls.clone(),
-        mutate_source: None,
-    });
+    let runner = Arc::new(FakeRunner::new(
+        None,
+        b"COLD",
+        calls.clone(),
+        finished.clone(),
+        None,
+    ));
     let (state, service) = make_state(tmp.path(), runner, 2);
 
     let payload = service
@@ -268,19 +335,70 @@ async fn warm_cache_does_not_run_runner() {
     );
 }
 
+/// R3 回归：key 捕获之后源文件被替换，不得返回旧版本的暖缓存。
+///
+/// current_thread runtime 下第一次 poll 只把 worker 入队（尚未执行），因此
+/// 在继续之前替换源文件是确定性的，不依赖调度运气。旧实现只在 `publish_file`
+/// 校验版本，暖缓存命中会直接返回旧 bytes。
+#[tokio::test]
+async fn source_replaced_after_key_capture_does_not_return_stale_warm_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (source, calls, finished) = fixture(tmp.path());
+    let ledger = LedgerId::new();
+    let dir = cache_dir(ledger, &source);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("sub_2.vtt"), b"OLD-VERSION-A-SUBTITLE").unwrap();
+
+    let runner = Arc::new(FakeRunner::new(
+        None,
+        b"COLD",
+        calls.clone(),
+        finished.clone(),
+        None,
+    ));
+    let (state, service) = make_state(tmp.path(), runner, 2);
+    let version_a = api::fingerprint_job::current_source_version(&source);
+
+    let mut delivery = Box::pin(service.deliver(&state, request(ledger, &source)));
+    std::future::poll_fn(|cx| {
+        assert!(matches!(delivery.as_mut().poll(cx), Poll::Pending));
+        Poll::Ready(())
+    })
+    .await;
+
+    std::fs::write(&source, b"version-B-with-a-different-length").unwrap();
+    assert_ne!(
+        version_a,
+        api::fingerprint_job::current_source_version(&source),
+        "替换必须真的改变 source_version"
+    );
+
+    let result = delivery.await;
+    assert!(
+        matches!(result, Err(SubtitleServiceError::Cancelled)),
+        "源文件已变时必须取消，而不是返回旧暖缓存: {result:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "暖缓存路径不应触发提取"
+    );
+}
+
 #[tokio::test]
 async fn source_version_change_before_publish_does_not_publish_late_cache() {
     let tmp = tempfile::tempdir().unwrap();
-    let (source, calls) = fixture(tmp.path());
+    let (source, calls, finished) = fixture(tmp.path());
     let ledger = LedgerId::new();
     let dir = cache_dir(ledger, &source);
 
-    let runner = Arc::new(FakeRunner {
-        gate: None,
-        body: b"STALE-BYTES".to_vec(),
-        calls: calls.clone(),
-        mutate_source: Some(source.clone()),
-    });
+    let runner = Arc::new(FakeRunner::new(
+        None,
+        b"STALE-BYTES",
+        calls.clone(),
+        finished.clone(),
+        Some(source.clone()),
+    ));
     let (state, service) = make_state(tmp.path(), runner, 2);
 
     let result = service.deliver(&state, request(ledger, &source)).await;
@@ -302,14 +420,15 @@ async fn source_version_change_before_publish_does_not_publish_late_cache() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn different_keys_exhaust_concurrency_and_report_busy() {
     let tmp = tempfile::tempdir().unwrap();
-    let (source, calls) = fixture(tmp.path());
+    let (source, calls, finished) = fixture(tmp.path());
     let gate = Arc::new(Gate::new());
-    let runner = Arc::new(FakeRunner {
-        gate: Some(gate.clone()),
-        body: b"FIRST".to_vec(),
-        calls: calls.clone(),
-        mutate_source: None,
-    });
+    let runner = Arc::new(FakeRunner::new(
+        Some(gate.clone()),
+        b"FIRST",
+        calls.clone(),
+        finished.clone(),
+        None,
+    ));
     let (state, service) = make_state(tmp.path(), runner, 1);
 
     let first = tokio::spawn({
