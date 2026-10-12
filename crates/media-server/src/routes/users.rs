@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use crate::auth::AuthUser;
 use crate::dto::{library_view_json, user_profile_json};
 
-use super::AppState;
+use super::parent_scope::require_user_path;
+use super::{AppState, UserPath};
 
 #[derive(Default, Deserialize)]
 pub(super) struct ViewsQuery {
@@ -20,7 +21,9 @@ pub(super) struct ViewsQuery {
 pub(super) async fn user_profile(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Path(path): Path<UserPath>,
 ) -> Result<Json<Value>, StatusCode> {
+    require_user_path(state.provider.as_ref(), user.id, path.user_id.as_deref()).await?;
     let user_row = state
         .provider
         .get_user(user.id)
@@ -36,8 +39,10 @@ pub(super) async fn user_profile(
 pub(super) async fn user_views(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Path(path): Path<UserPath>,
     Query(query): Query<ViewsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    require_user_path(state.provider.as_ref(), user.id, path.user_id.as_deref()).await?;
     let libraries = state
         .provider
         .list_visible_libraries(user.id)
@@ -113,7 +118,9 @@ pub(super) async fn virtual_folders(
 pub(super) async fn item_counts(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Path(path): Path<UserPath>,
 ) -> Result<Json<Value>, StatusCode> {
+    require_user_path(state.provider.as_ref(), user.id, path.user_id.as_deref()).await?;
     let items = state
         .provider
         .list_visible_items(user.id, None)

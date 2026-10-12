@@ -10,32 +10,41 @@ use crate::auth::AuthUser;
 use crate::dto::item_dto_json;
 
 use super::item_filters::{self, filter_items};
-use super::{AppState, ItemsQuery, UserItemPath, item_id_for_user};
+use super::parent_scope::{
+    ParentScope, classify_genre_or_studio, library_parent, require_user_path, resolve_parent_scope,
+};
+use super::{AppState, ItemsQuery, UserItemPath, UserPath, item_id_for_user};
 
 pub(super) async fn items(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
-    Query(mut query): Query<ItemsQuery>,
+    Path(path): Path<UserPath>,
+    Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let libraries = state.provider.list_visible_libraries(user.id).await.unwrap_or_default();
-    let is_folder_id = query.parent_id.as_deref().map(|pid| pid.starts_with("folder_")).unwrap_or(false);
-    let is_library_parent = query.parent_id.as_deref().map(|pid| libraries.iter().any(|lib| lib.id == pid)).unwrap_or(false);
-    let is_series_parent = query.series_id.is_some() || if let Some(pid) = query.parent_id.as_deref() {
-        if is_library_parent || is_folder_id {
-            false
-        } else {
-            state.provider.resolve_single_item(user.id, pid).await.ok().flatten().map(|it| it.is_series).unwrap_or(false)
-        }
-    } else {
-        false
+    require_user_path(state.provider.as_ref(), user.id, path.user_id.as_deref()).await?;
+    let libraries = state
+        .provider
+        .list_visible_libraries(user.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let parent = query.parent_id.as_deref();
+    let series = query.series_id.as_deref();
+    let scope =
+        resolve_parent_scope(state.provider.as_ref(), user.id, parent, series, &libraries).await?;
+    // Genre / Studio 只能靠 item metadata 判断（既有行为是在拿到 items 之后判定），
+    // 所以这里先按廉价分类取 items，稍后再升级 scope。
+    let needs_items = matches!(scope, ParentScope::Unknown);
+    let parent_id_for_provider = match &scope {
+        ParentScope::Library(id) | ParentScope::Series(id) => Some(id.as_str()),
+        _ => None,
     };
-    let parent_id_for_provider = if is_library_parent {
-        query.parent_id.as_deref()
-    } else if is_series_parent {
-        query.parent_id.as_deref().or(query.series_id.as_deref())
-    } else {
-        None
-    };
+    let mut rows = state
+        .provider
+        .list_visible_items(user.id, parent_id_for_provider)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let is_library_parent = matches!(scope, ParentScope::Library(_));
+    let is_folder_id = parent.map(|pid| pid.starts_with("folder_")).unwrap_or(false);
     let wants_episodes = query
         .include_item_types
         .as_deref()
@@ -43,11 +52,6 @@ pub(super) async fn items(
         .unwrap_or(false);
     let is_folder_query = query.is_folder.unwrap_or(false);
     let recursive = query.recursive.unwrap_or(true);
-    let mut rows = state
-        .provider
-        .list_visible_items(user.id, parent_id_for_provider)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if is_library_parent && (!recursive || is_folder_query) {
         if let Some(lib_id) = query.parent_id.as_deref() {
             if let Some(target_lib) = libraries.iter().find(|l| l.id == lib_id) {
@@ -75,17 +79,15 @@ pub(super) async fn items(
         }
     }
     if is_folder_id {
-        if let Some(target_folder_id) = query.parent_id.take() {
-            rows.retain(|item| {
-                for lib in &libraries {
-                    for root in &lib.root_paths {
-                        let f_id = format!("folder_{}", uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, root.to_string_lossy().as_bytes()).simple());
-                        if f_id == target_folder_id {
-                            return std::path::Path::new(&item.row.path).starts_with(root);
-                        }
-                    }
+        if let Some(target_folder_id) = query.parent_id.as_deref() {
+            rows.retain(|item| match &scope {
+                // scope 已经解析出该 folder_ id 对应的库根。
+                ParentScope::Folder(root) => {
+                    std::path::Path::new(&item.row.path).starts_with(root)
                 }
-                false
+                // folder_ + SeriesId 的既有组合：provider 收到的是 folder id，
+                // 这里按原逻辑兜底（结果同样是空）。
+                _ => folder_id_matches(&libraries, &target_folder_id, &item.row.path),
             });
         }
     }
@@ -103,34 +105,30 @@ pub(super) async fn items(
         }
         rows = expanded;
     }
-    let mut query = query;
-    let is_genre_or_studio = !is_library_parent && query.parent_id.as_deref().map(|pid| {
-        rows.iter().any(|item| {
+    // genre/studio 判定保持既有位置（folder 过滤与分集展开之后）。认不出 genre/studio
+    // 的 parent 一律返回空集合，绝不退化成整库。
+    let genre_target = if needs_items {
+        match classify_genre_or_studio(parent.unwrap_or_default(), &rows) {
+            ParentScope::Genre(id) | ParentScope::Studio(id) => Some(id),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(target_id) = genre_target {
+        rows.retain(|item| {
             item.metadata.genres.iter().any(|g| {
                 let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).hyphenated().to_string();
                 let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).simple().to_string();
-                pid.eq_ignore_ascii_case(&u) || pid.eq_ignore_ascii_case(&s) || g.eq_ignore_ascii_case(pid)
+                target_id.eq_ignore_ascii_case(&u) || target_id.eq_ignore_ascii_case(&s) || g.eq_ignore_ascii_case(&target_id)
             }) || item.metadata.studios.iter().any(|st| {
                 let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).hyphenated().to_string();
                 let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).simple().to_string();
-                pid.eq_ignore_ascii_case(&u) || pid.eq_ignore_ascii_case(&s) || st.eq_ignore_ascii_case(pid)
+                target_id.eq_ignore_ascii_case(&u) || target_id.eq_ignore_ascii_case(&s) || st.eq_ignore_ascii_case(&target_id)
             })
-        })
-    }).unwrap_or(false);
-    if is_genre_or_studio {
-        if let Some(target_id) = query.parent_id.take() {
-            rows.retain(|item| {
-                item.metadata.genres.iter().any(|g| {
-                    let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).hyphenated().to_string();
-                    let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).simple().to_string();
-                    target_id.eq_ignore_ascii_case(&u) || target_id.eq_ignore_ascii_case(&s) || g.eq_ignore_ascii_case(&target_id)
-                }) || item.metadata.studios.iter().any(|st| {
-                    let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).hyphenated().to_string();
-                    let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).simple().to_string();
-                    target_id.eq_ignore_ascii_case(&u) || target_id.eq_ignore_ascii_case(&s) || st.eq_ignore_ascii_case(&target_id)
-                })
-            });
-        }
+        });
+    } else if needs_items {
+        return Ok(Json(json!({ "Items": [], "TotalRecordCount": 0 })));
     }
     if query.person_ids.is_some() {
         let mut enriched = Vec::with_capacity(rows.len());
@@ -168,8 +166,10 @@ pub(super) async fn items(
 pub(super) async fn resume_items(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Path(path): Path<UserPath>,
     Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    require_user_path(state.provider.as_ref(), user.id, path.user_id.as_deref()).await?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let mut rows = if query.parent_id.is_none() {
         state.provider.list_resumable_items(user.id, limit).await.unwrap_or_default()
@@ -203,8 +203,10 @@ pub(super) async fn resume_items(
 pub(super) async fn latest_items(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Path(path): Path<UserPath>,
     Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    require_user_path(state.provider.as_ref(), user.id, path.user_id.as_deref()).await?;
     let rows = state
         .provider
         .list_visible_items(user.id, query.parent_id.as_deref())
@@ -239,9 +241,12 @@ pub(super) async fn genres(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let libraries = state.provider.list_visible_libraries(user.id).await.unwrap_or_default();
-    let is_library_parent = query.parent_id.as_deref().map(|pid| libraries.iter().any(|lib| lib.id == pid)).unwrap_or(false);
-    let parent_id = if is_library_parent { query.parent_id.as_deref() } else { None };
+    let libraries = state
+        .provider
+        .list_visible_libraries(user.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let parent_id = library_parent(query.parent_id.as_deref(), &libraries);
     let items = state
         .provider
         .list_visible_items(user.id, parent_id)
@@ -301,9 +306,12 @@ pub(super) async fn studios(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let libraries = state.provider.list_visible_libraries(user.id).await.unwrap_or_default();
-    let is_library_parent = query.parent_id.as_deref().map(|pid| libraries.iter().any(|lib| lib.id == pid)).unwrap_or(false);
-    let parent_id = if is_library_parent { query.parent_id.as_deref() } else { None };
+    let libraries = state
+        .provider
+        .list_visible_libraries(user.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let parent_id = library_parent(query.parent_id.as_deref(), &libraries);
     let items = state
         .provider
         .list_visible_items(user.id, parent_id)
@@ -428,4 +436,22 @@ pub(super) async fn item_by_id(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(item_dto_json(snapshot)))
+}
+
+/// `folder_<uuid5(root)>` 形式的历史兜底匹配（folder_ + SeriesId 组合走这条路径）。
+fn folder_id_matches(
+    libraries: &[crate::provider::ServerLibrary],
+    target: &str,
+    path: &str,
+) -> bool {
+    libraries.iter().any(|lib| {
+        lib.root_paths.iter().any(|root| {
+            let f_id = format!(
+                "folder_{}",
+                uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, root.to_string_lossy().as_bytes())
+                    .simple()
+            );
+            f_id == target && std::path::Path::new(path).starts_with(root)
+        })
+    })
 }

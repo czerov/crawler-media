@@ -12,6 +12,7 @@ use crate::provider::MediaServerProvider;
 mod catalog;
 mod item_filters;
 mod media;
+mod parent_scope;
 mod people;
 mod sessions;
 mod shows;
@@ -99,6 +100,11 @@ pub struct ItemsQuery {
     pub studio_ids: Option<String>,
 }
 #[derive(Deserialize)]
+pub(super) struct UserPath {
+    #[serde(default)]
+    pub(super) user_id: Option<String>,
+}
+#[derive(Deserialize)]
 struct UserItemPath {
     user_id: Option<String>,
     id: String,
@@ -108,24 +114,7 @@ async fn item_id_for_user(
     path: UserItemPath,
     user_id: domain::UserId,
 ) -> Result<String, StatusCode> {
-    if let Some(path_user) = path.user_id {
-        let matches_id = path_user
-            .replace('-', "")
-            .eq_ignore_ascii_case(&user_id.to_string().replace('-', ""));
-        if !matches_id && !path_user.eq_ignore_ascii_case("me") {
-            let user = provider
-                .get_user(user_id)
-                .await
-                .map_err(|error| {
-                    tracing::error!(%error, %user_id, "failed to resolve Jellyfin user path");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
-                .ok_or(StatusCode::NOT_FOUND)?;
-            if !user.login.eq_ignore_ascii_case(&path_user) {
-                return Err(StatusCode::NOT_FOUND);
-            }
-        }
-    }
+    parent_scope::require_user_path(provider, user_id, path.user_id.as_deref()).await?;
     Ok(path.id)
 }
 pub fn routes(provider: Arc<dyn MediaServerProvider>) -> Router {
