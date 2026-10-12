@@ -8,16 +8,15 @@ use crate::http::{err, ok};
 use crate::management::ApiState;
 use crate::settings_keys;
 
+/// Mask the password in a proxy URL before returning it to the UI.
+///
+/// Delegates to [`domain::mask_proxy_url`] — the single implementation shared
+/// with `http_agent`'s log lines and the `Debug` of `ServerConfig`/`ProxyEnv`/
+/// `Site`. The previous local copy only masked URLs containing `://`, so a
+/// schemeless `user:pass@host` was echoed verbatim by `GET`/`PUT
+/// /settings/proxy` while `diagnose_proxy` already masked it.
 pub(crate) fn mask_proxy_url(url: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://") {
-        if let Some((creds, host)) = rest.split_once('@') {
-            if let Some((user, _pass)) = creds.split_once(':') {
-                return format!("{scheme}://{user}:***@{host}");
-            }
-            return format!("{scheme}://{creds}@{host}");
-        }
-    }
-    url.to_string()
+    domain::mask_proxy_url(url)
 }
 
 /// GET /settings/proxy — Read current metadata proxy configuration.

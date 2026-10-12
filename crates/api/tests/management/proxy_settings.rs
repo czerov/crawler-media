@@ -149,6 +149,66 @@ async fn proxy_settings_with_auth_and_masking() {
     assert_eq!(data["active_proxy"], "http://myadmin:***@127.0.0.1:8888");
 }
 
+/// 没有 scheme 的 `user:pass@host` 也必须脱敏。
+///
+/// 旧实现（`http/proxy_settings.rs` 里的本地副本）只在含 `://` 时才脱敏，遇到
+/// 无 scheme 的输入会**原样返回**——`GET/PUT /settings/proxy` 的 `active_proxy`
+/// 就会把明文口令回给前端。这条回归钉住"与 diagnose/domain 同一套渲染"。
+#[tokio::test]
+async fn proxy_settings_mask_schemeless_credentials() {
+    let _guard = PROXY_TEST_MUTEX.lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app(&tmp);
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            "/api/v1/settings/proxy",
+            Some("management-secret"),
+            json!({
+                "proxy_url": "127.0.0.1:8888",
+                "username": "myadmin",
+                "password": "supersecretpassword",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let put_active = body["data"]["active_proxy"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !put_active.contains("supersecretpassword"),
+        "PUT 响应不得输出明文口令: {put_active}"
+    );
+    assert_eq!(put_active, "myadmin:***@127.0.0.1:8888");
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/api/v1/settings/proxy",
+            Some("management-secret"),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let get_active = body["data"]["active_proxy"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !get_active.contains("supersecretpassword"),
+        "GET 响应不得输出明文口令: {get_active}"
+    );
+    assert_eq!(get_active, "myadmin:***@127.0.0.1:8888");
+}
+
 #[test]
 fn format_proxy_url_supports_embedded_and_separate_credentials() {
     use api::http_agent::format_proxy_url;
