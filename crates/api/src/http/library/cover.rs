@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::io::Cursor;
 use std::path::Path;
 
-use crate::store::{Library, Store};
+use crate::store::Library;
 
 /// Old releases copied a single `fanart.jpg` into the generated-cover path.
 /// Detect that exact byte-for-byte shape so upgrading preserves manual covers
@@ -18,36 +18,36 @@ pub(crate) fn is_legacy_fanart_copy(rows: &[domain::LedgerRow], cover: &Path) ->
         .any(|fanart| std::fs::read(fanart).is_ok_and(|bytes| bytes == cover_bytes))
 }
 
-/// Build one landscape cover from poster art for up to six different works.
-/// `None` means this Library has no readable local poster yet.
-pub(crate) fn generate_library_cover(
-    store: &Store,
-    library: &Library,
-    target: &Path,
-) -> Result<Option<std::path::PathBuf>, String> {
-    let rows = super::rows_in_library(store, library);
-    generate_library_cover_from_rows(library, target, &rows)
+/// 自动封面默认选项（标题取库名、多海报拼贴）。
+pub(crate) fn default_cover_options(library: &Library) -> CoverOptions {
+    CoverOptions {
+        title_zh: library.name.clone(),
+        title_en: None,
+        width: 1920,
+        height: 1080,
+        style: CoverStyle::MultiPosterPile,
+        background: BackgroundOption::default(),
+    }
 }
 
-pub(crate) fn generate_library_cover_from_rows(
+/// 锁外渲染：读取本地海报并合成 JPEG 字节，**不写盘**（发布由 cover service 负责）。
+/// `None` means this Library has no readable local poster yet.
+pub(crate) fn render_cover_jpeg(
     library: &Library,
-    target: &Path,
     rows: &[domain::LedgerRow],
-) -> Result<Option<std::path::PathBuf>, String> {
+    options: &CoverOptions,
+) -> Result<Option<Vec<u8>>, String> {
     let posters = collect_posters(rows);
     if posters.is_empty() {
         return Ok(None);
     }
-
-    let jpeg = render_library_cover(library, &posters)?;
-    write_cover(target, &jpeg)?;
+    let jpeg = render_library_cover(&posters, options)?;
     tracing::info!(
         library_id = %library.id,
         poster_count = posters.len(),
-        cover_path = %target.display(),
-        "generated library cover from distinct media posters"
+        "rendered library cover bytes from distinct media posters"
     );
-    Ok(Some(target.to_path_buf()))
+    Ok(Some(jpeg))
 }
 
 fn collect_posters(rows: &[domain::LedgerRow]) -> Vec<DynamicImage> {
@@ -81,40 +81,16 @@ fn collect_posters(rows: &[domain::LedgerRow]) -> Vec<DynamicImage> {
     posters
 }
 
-fn render_library_cover(library: &Library, posters: &[DynamicImage]) -> Result<Vec<u8>, String> {
-    let options = CoverOptions {
-        title_zh: library.name.clone(),
-        title_en: None,
-        width: 1920,
-        height: 1080,
-        style: CoverStyle::MultiPosterPile,
-        background: BackgroundOption::default(),
-    };
+fn render_library_cover(
+    posters: &[DynamicImage],
+    options: &CoverOptions,
+) -> Result<Vec<u8>, String> {
     let font = include_bytes!("../../../../cover-generator/assets/fonts/chaohei.ttf");
-    let generated = generate_cover(&posters, &options, font, None)
+    let generated = generate_cover(posters, options, font, None)
         .map_err(|error| format!("cover.generate: {error}"))?;
     let mut jpeg = Vec::new();
     generated
         .write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
         .map_err(|error| format!("cover.encode: {error}"))?;
     Ok(jpeg)
-}
-
-fn write_cover(target: &Path, jpeg: &[u8]) -> Result<(), String> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| format!("cover target has no parent directory: {}", target.display()))?;
-    std::fs::create_dir_all(parent).map_err(|error| {
-        format!(
-            "failed to create cover directory {}: {error}",
-            parent.display()
-        )
-    })?;
-    std::fs::write(target, jpeg).map_err(|error| {
-        format!(
-            "failed to write library cover {}: {error}",
-            target.display()
-        )
-    })?;
-    Ok(())
 }

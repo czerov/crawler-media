@@ -493,7 +493,7 @@ pub(crate) async fn library_cover(
     Path(id): Path<String>,
 ) -> Response {
     let user_id = extract_user_id(&state.store, user_id, &headers);
-    let (store_lock, cover_path, kind) = {
+    let (library_id, kind) = {
         let store = state.store.lock();
         let Some(library) = store.get_library(&id).ok().flatten() else {
             return err(StatusCode::NOT_FOUND, "library.missing", "媒体库不存在");
@@ -501,11 +501,25 @@ pub(crate) async fn library_cover(
         if !crate::http::library::library_visible(&store, &library, user_id) {
             return err(StatusCode::NOT_FOUND, "library.missing", "媒体库不存在");
         }
-        let cover = crate::http::library::library_cover_path(&store, &library);
-        let kind = library.kind;
-        (drop(store), cover, kind)
+        (library.id, library.kind)
     };
-    let _ = store_lock;
+    // 自动生成/legacy 升级统一走 service（渲染在锁外、CAS 发布）。
+    let cover_path = match state
+        .cover_service()
+        .ensure_cover(&state, &library_id)
+        .await
+    {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, library_id = %library_id, "failed to ensure library cover");
+            let store = state.store.lock();
+            store
+                .get_library(&library_id)
+                .ok()
+                .flatten()
+                .and_then(|library| crate::http::library::library_cover_path(&store, &library))
+        }
+    };
     let Some(cover) = cover_path else {
         return match crate::media_server_provider::default_library_cover(kind) {
             Ok(bytes) => {
@@ -529,7 +543,7 @@ pub(crate) async fn upload_library_cover(
     Json(body): Json<Value>,
 ) -> Response {
     use base64::Engine;
-    let (covers_dir, library_id) = {
+    let library_id = {
         let store = state.store.lock();
         let Some(library) = store.get_library(&id).ok().flatten() else {
             return err(StatusCode::NOT_FOUND, "library.missing", "媒体库不存在");
@@ -537,7 +551,7 @@ pub(crate) async fn upload_library_cover(
         if !crate::http::library::library_visible(&store, &library, user_id) {
             return err(StatusCode::NOT_FOUND, "library.missing", "媒体库不存在");
         }
-        (store.library_covers_dir(), library.id)
+        library.id
     };
 
     let data_url = body["data_url"].as_str().unwrap_or_default();
@@ -557,31 +571,22 @@ pub(crate) async fn upload_library_cover(
         Err(_) => return err(StatusCode::BAD_REQUEST, "cover.upload", "图片编码无效"),
     };
 
-    let _ = std::fs::create_dir_all(&covers_dir);
-    let cover_target = covers_dir.join(format!("library-{}.jpg", library_id));
-    let write_target = cover_target.clone();
-    let write_bytes = bytes.clone();
-    let write =
-        tokio::task::spawn_blocking(move || std::fs::write(write_target, write_bytes)).await;
-    if let Err(error) = write.unwrap_or_else(|error| Err(std::io::Error::other(error.to_string())))
+    let published = match state
+        .cover_service
+        .replace_cover(&state, &library_id, bytes.clone())
+        .await
     {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "cover.write",
-            &error.to_string(),
-        );
-    }
-
-    {
-        let store = state.store.lock();
-        if let Err(error) =
-            store.set_library_cover_path(&library_id, Some(&cover_target.display().to_string()))
-        {
-            tracing::warn!(%error, library_id, "failed to persist uploaded library cover path");
+        Ok(path) => path,
+        Err(error) => {
+            let status = if error.starts_with("cover.stale") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return err(status, "cover.write", &error);
         }
-        crate::http::library::mark_library_cover_manual(&store, &library_id);
-    }
-    ok(json!({ "bytes": bytes.len(), "path": cover_target.display().to_string() })).into_response()
+    };
+    ok(json!({ "bytes": bytes.len(), "path": published.display().to_string() })).into_response()
 }
 
 /// DELETE /libraries/{id}/cover — 删除/清空媒体库自定义封面
@@ -590,7 +595,7 @@ pub(crate) async fn delete_library_cover(
     axum::Extension(user_id): axum::Extension<Option<domain::UserId>>,
     Path(id): Path<String>,
 ) -> Response {
-    let (cover_path_opt, covers_dir, library_id) = {
+    let library_id = {
         let store = state.store.lock();
         let Some(library) = store.get_library(&id).ok().flatten() else {
             return err(StatusCode::NOT_FOUND, "library.missing", "媒体库不存在");
@@ -598,25 +603,20 @@ pub(crate) async fn delete_library_cover(
         if !crate::http::library::library_visible(&store, &library, user_id) {
             return err(StatusCode::NOT_FOUND, "library.missing", "媒体库不存在");
         }
-        (
-            library.cover_path.clone(),
-            store.library_covers_dir(),
-            library.id,
-        )
+        library.id
     };
 
-    // 删除物理文件
-    if let Some(cp) = cover_path_opt {
-        let _ = std::fs::remove_file(cp);
+    match state.cover_service.remove_cover(&state, &library_id).await {
+        Ok(()) => {}
+        Err(error) => {
+            let status = if error.starts_with("cover.stale") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return err(status, "cover.delete", &error);
+        }
     }
-    let default_file = covers_dir.join(format!("library-{}.jpg", library_id));
-    let _ = std::fs::remove_file(default_file);
-
-    // 设置 cover_path 为特殊标记 "none"，避免再次被自动填充唤醒
-    let _ = state
-        .store
-        .lock()
-        .set_library_cover_path(&library_id, Some("none"));
     ok(json!({ "deleted": true })).into_response()
 }
 
@@ -628,10 +628,9 @@ pub(crate) async fn generate_library_cover(
     Json(body): Json<Value>,
 ) -> Response {
     use base64::Engine;
-    use cover_generator::{BackgroundOption, CoverOptions, CoverStyle, generate_cover};
-    use std::io::Cursor;
+    use cover_generator::{BackgroundOption, CoverOptions, CoverStyle};
 
-    let (covers_dir, library, sample_posters) = {
+    let library = {
         let store = state.store.lock();
         let Some(library) = store.get_library(&id).ok().flatten() else {
             return err(StatusCode::NOT_FOUND, "library.missing", "媒体库不存在");
@@ -639,62 +638,21 @@ pub(crate) async fn generate_library_cover(
         if !crate::http::library::library_visible(&store, &library, user_id) {
             return err(StatusCode::NOT_FOUND, "library.missing", "媒体库不存在");
         }
-
-        // 收集该库下多部不同作品的海报（按条目去重，避免同一部剧的多个分集重复提取同一张海报）
-        let rows = store.list_ledger().unwrap_or_default();
-        let mut posters = Vec::new();
-        let mut seen_media_ids = std::collections::HashSet::new();
-        for row in rows.iter() {
-            if seen_media_ids.contains(&row.media_id) {
-                continue;
-            }
-            let media = store.get_media(row.media_id).ok().flatten();
-            let is_in_lib = media
-                .as_ref()
-                .and_then(|m| crate::http::library::library_for_row(&store, row, m))
-                .is_some_and(|l| l.id == library.id);
-
-            if is_in_lib {
-                if let Some(poster_file) = crate::http::library::poster_path(row) {
-                    if let Ok(bytes) = std::fs::read(&poster_file) {
-                        if let Ok(dyn_img) = image::load_from_memory(&bytes) {
-                            posters.push(dyn_img);
-                            seen_media_ids.insert(row.media_id);
-                            if posters.len() >= 6 {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        (store.library_covers_dir(), library, posters)
+        library
     };
-
-    if sample_posters.is_empty() {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "cover.empty",
-            "媒体库内无可用海报图片",
-        );
-    }
 
     let title_zh = body["title_zh"]
         .as_str()
-        .map(|s| s.to_string())
+        .map(str::to_string)
         .unwrap_or_else(|| library.name.clone());
-    let title_en = body["title_en"].as_str().map(|s| s.to_string());
+    let title_en = body["title_en"].as_str().map(str::to_string);
     let preview_only = body["preview_only"].as_bool().unwrap_or(false);
-
-    // 解析背景与风格
     let style = match body["style"].as_str() {
         Some("multi_poster_pile") | Some("multi") => CoverStyle::MultiPosterPile,
         _ => CoverStyle::MacaronCardSingle,
     };
-
     let background: BackgroundOption =
         serde_json::from_value(body["background"].clone()).unwrap_or_default();
-
     let options = CoverOptions {
         title_zh,
         title_en,
@@ -704,68 +662,32 @@ pub(crate) async fn generate_library_cover(
         background,
     };
 
-    // 优先使用内置的 MoviePilot 超黑精选字体 (chaohei.ttf)，兜底本地系统粗体
-    const EMBEDDED_CHAOHEI: &[u8] =
-        include_bytes!("../../../cover-generator/assets/fonts/chaohei.ttf");
-    let font_bytes: Vec<u8> = if !EMBEDDED_CHAOHEI.is_empty() {
-        EMBEDDED_CHAOHEI.to_vec()
-    } else {
-        std::fs::read("/System/Library/Fonts/STHeiti Medium.ttc")
-            .or_else(|_| std::fs::read("/System/Library/Fonts/Hiragino Sans GB.ttc"))
-            .or_else(|_| std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"))
-            .unwrap_or_default()
-    };
-
-    let library_id = library.id.clone();
-    let (res, write_target, bytes) = tokio::task::spawn_blocking(move || {
-        let gen_result = generate_cover(&sample_posters, &options, &font_bytes, None);
-        let mut jpeg = Vec::new();
-        match gen_result {
-            Ok(img) => {
-                if let Err(e) = img.write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
-                {
-                    (Err(format!("cover.encode: {e}")), None, Vec::new())
-                } else {
-                    let target = if !preview_only {
-                        let _ = std::fs::create_dir_all(&covers_dir);
-                        let file = covers_dir.join(format!("library-{}.jpg", library_id));
-                        let _ = std::fs::write(&file, &jpeg);
-                        Some(file)
-                    } else {
-                        None
-                    };
-                    (Ok(()), target, jpeg)
-                }
-            }
-            Err(e) => (Err(format!("cover.generate: {e}")), None, Vec::new()),
+    let generated = match state
+        .cover_service
+        .generate(&state, &library.id, options, preview_only)
+        .await
+    {
+        Ok(generated) => generated,
+        Err(error) if error.starts_with("cover.empty") => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "cover.empty",
+                "媒体库内无可用海报图片",
+            );
         }
-    })
-    .await
-    .unwrap_or_else(|e| (Err(e.to_string()), None, Vec::new()));
-
-    if let Err(err_msg) = res {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "cover.error", &err_msg);
-    }
+        Err(error) if error.starts_with("cover.stale") => {
+            return err(StatusCode::CONFLICT, "cover.stale", &error);
+        }
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cover.error", &error),
+    };
 
     let data_url = format!(
         "data:image/jpeg;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(&bytes)
+        base64::engine::general_purpose::STANDARD.encode(&generated.bytes)
     );
-
     if preview_only {
         return ok(json!({ "data_url": data_url, "preview": true })).into_response();
     }
-
-    if let Some(target) = write_target {
-        let store = state.store.lock();
-        if let Err(error) =
-            store.set_library_cover_path(&library.id, Some(&target.display().to_string()))
-        {
-            tracing::warn!(%error, library_id = %library.id, "failed to persist generated library cover path");
-        }
-        crate::http::library::mark_library_cover_manual(&store, &library.id);
-    }
-
     ok(json!({
         "success": true,
         "cover_url": format!("/libraries/{}/cover", library.id),

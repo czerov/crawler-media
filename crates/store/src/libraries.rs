@@ -34,6 +34,8 @@ pub struct Library {
     pub enable_fingerprint: bool,
     /// Custom or auto-filled library cover image path.
     pub cover_path: Option<String>,
+    /// Cover pointer revision for CAS publication (`cover_path` changes bump it).
+    pub cover_revision: i64,
     /// Match rules for automated routing (`genres` and/or `origin_countries`).
     pub match_rules: Vec<serde_json::Value>,
     /// Default filter rule ID associated with this library (inherits for subscriptions).
@@ -56,7 +58,8 @@ const LIBRARY_COLS: &str = "id, kind, name, is_default, sort_order, access_mode,
         cover_path, COALESCE(match_rules_json, '[]'), default_filter_id,
         COALESCE(realtime_watch, 1), COALESCE(generate_thumbnails, 1),
         COALESCE(extract_chapter_images, 1), COALESCE(exclude_from_home, 0),
-        COALESCE(auto_series_collections, 1)";
+        COALESCE(auto_series_collections, 1),
+        COALESCE(cover_revision, 0)";
 
 /// Raw `libraries` row; roots are attached separately so list/get/snapshot can
 /// share one row mapping.
@@ -79,6 +82,7 @@ struct LibraryRow {
     extract_chapter_images: bool,
     exclude_from_home: bool,
     auto_series_collections: bool,
+    cover_revision: i64,
 }
 
 fn map_library_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryRow> {
@@ -105,6 +109,7 @@ fn map_library_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryRow> {
         extract_chapter_images: row.get::<_, i64>(15)? != 0,
         exclude_from_home: row.get::<_, i64>(16)? != 0,
         auto_series_collections: row.get::<_, i64>(17)? != 0,
+        cover_revision: row.get(18)?,
     })
 }
 
@@ -127,6 +132,7 @@ impl LibraryRow {
             detect_intros: self.detect_intros,
             enable_fingerprint: self.enable_fingerprint,
             cover_path: self.cover_path,
+            cover_revision: self.cover_revision,
             match_rules: self.match_rules,
             default_filter_id: self.default_filter_id,
             realtime_watch: self.realtime_watch,
@@ -184,7 +190,10 @@ impl Store {
         let mut roots: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for row in rows {
             let (library_id, path) = row?;
-            roots.entry(library_id).or_default().push(PathBuf::from(path));
+            roots
+                .entry(library_id)
+                .or_default()
+                .push(PathBuf::from(path));
         }
         Ok(roots)
     }
@@ -193,7 +202,9 @@ impl Store {
     /// `succeeded`) — matching `library_accepts_work`, which does not filter
     /// on state.
     fn blocked_library_ids(&self) -> Result<HashSet<String>, StoreError> {
-        let mut stmt = self.app.prepare("SELECT library_id FROM library_removals")?;
+        let mut stmt = self
+            .app
+            .prepare("SELECT library_id FROM library_removals")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut blocked = HashSet::new();
         for row in rows {
@@ -452,7 +463,8 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.ensure_library_mutable(id)?;
         self.app.execute(
-            "UPDATE libraries SET cover_path = ?1 WHERE id = ?2",
+            "UPDATE libraries SET cover_path = ?1, cover_revision = cover_revision + 1
+             WHERE id = ?2",
             params![cover_path, id],
         )?;
         Ok(())

@@ -15,6 +15,7 @@ mod ledger_quality;
 mod legacy_recycle;
 mod libraries;
 mod library;
+mod library_covers;
 mod library_deletion;
 pub use library_deletion::LibraryRemoval;
 pub mod library_defaults;

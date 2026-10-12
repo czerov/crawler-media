@@ -176,7 +176,22 @@ async fn assert_cover_crud(app: &axum::Router, lib_id: &str, cover_file: &std::p
         .await
         .unwrap();
     assert_eq!(upload_res.status(), StatusCode::OK);
-    assert_eq!(std::fs::read(cover_file).unwrap(), b"hello custom cover");
+    // C2b：手动封面发布为新的不可变版本文件；legacy 固定路径只读保留。
+    let after_upload = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/api/v1/libraries/{lib_id}/cover"),
+            Some("management-secret"),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(after_upload.status(), StatusCode::OK);
+    let uploaded = axum::body::to_bytes(after_upload.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(uploaded.as_ref(), b"hello custom cover");
 
     // 5. 用户删除封面 (DELETE /cover)
     let delete_res = app
@@ -190,7 +205,11 @@ async fn assert_cover_crud(app: &axum::Router, lib_id: &str, cover_file: &std::p
         .await
         .unwrap();
     assert_eq!(delete_res.status(), StatusCode::OK);
-    assert!(!cover_file.is_file(), "cover.jpg 文件已被删除");
+    // C2b：legacy 固定路径仅读、不预先 unlink；删除通过 revision CAS 到 none。
+    assert!(
+        cover_file.is_file(),
+        "legacy 固定路径不被 DELETE 预先 unlink"
+    );
 
     let cover_res4 = app
         .clone()
@@ -207,6 +226,7 @@ async fn assert_cover_crud(app: &axum::Router, lib_id: &str, cover_file: &std::p
         .await
         .unwrap();
     assert!(fallback_after_delete.starts_with(b"\xff\xd8\xff"));
+    assert_ne!(fallback_after_delete.as_ref(), b"hello custom cover");
 }
 
 #[tokio::test]

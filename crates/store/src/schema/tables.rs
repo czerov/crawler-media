@@ -92,7 +92,8 @@ pub(super) const APP_TABLES: &str = r#"
             generate_thumbnails INTEGER NOT NULL DEFAULT 1,
             extract_chapter_images INTEGER NOT NULL DEFAULT 1,
             exclude_from_home INTEGER NOT NULL DEFAULT 0,
-            auto_series_collections INTEGER NOT NULL DEFAULT 1
+            auto_series_collections INTEGER NOT NULL DEFAULT 1,
+            cover_revision INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS naming_templates (
             kind TEXT PRIMARY KEY,

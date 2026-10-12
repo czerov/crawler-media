@@ -29,6 +29,8 @@ pub struct ApiState {
     pub(crate) browse_files: Arc<dyn crate::browse_file_read::BrowseFileRead>,
     /// 进程内共享的任务计数 watcher（所有 SSE 连接共用一个 poller）。
     pub(crate) job_updates: Arc<crate::job_updates::JobUpdates>,
+    /// Library 封面渲染与版本化发布（生产默认真实渲染器，测试可注入）。
+    pub(crate) cover_service: Arc<crate::library_cover_service::LibraryCoverService>,
     pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
     pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
     /// Job attempts still executing in this process; protects them from timeout recovery.
@@ -202,6 +204,7 @@ impl ApiState {
             )),
             browse_files: Arc::new(crate::browse_file_read::LocalBrowseFileRead),
             job_updates: Arc::new(crate::job_updates::JobUpdates::new()),
+            cover_service: Arc::new(crate::library_cover_service::LibraryCoverService::local()),
             library_work,
             jobs: Arc::new(Mutex::new(jobs)),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -279,6 +282,20 @@ impl ApiState {
         self
     }
 
+    /// 封面服务（渲染 + revision CAS 发布）。
+    pub fn cover_service(&self) -> &Arc<crate::library_cover_service::LibraryCoverService> {
+        &self.cover_service
+    }
+
+    /// 替换封面服务（测试注入 gate 渲染器以验证 CAS 发布协议）。
+    pub fn with_cover_service(
+        mut self,
+        service: Arc<crate::library_cover_service::LibraryCoverService>,
+    ) -> Self {
+        self.cover_service = service;
+        self
+    }
+
     pub fn jellyfin_server_id(&self) -> &str {
         self.jellyfin_server_id.as_str()
     }
@@ -324,7 +341,10 @@ impl ApiState {
         self
     }
 
-    pub fn with_media_posters(mut self, media_posters: Arc<dyn crate::media_posters::MediaPosterSource>) -> Self {
+    pub fn with_media_posters(
+        mut self,
+        media_posters: Arc<dyn crate::media_posters::MediaPosterSource>,
+    ) -> Self {
         self.media_posters = media_posters;
         self
     }

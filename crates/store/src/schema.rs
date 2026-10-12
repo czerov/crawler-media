@@ -9,7 +9,7 @@ mod tables;
 
 /// Schema version constants. Bump when adding new migrations.
 /// The version is stored via `PRAGMA user_version` on each database file.
-pub const APP_SCHEMA_VERSION: i64 = 4;
+pub const APP_SCHEMA_VERSION: i64 = 5;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 pub const LIBRARY_SCHEMA_VERSION: i64 = 7;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 3;
@@ -120,6 +120,12 @@ fn migrate_app_library_columns(conn: &Connection) -> Result<(), StoreError> {
     ensure_column(conn, "libraries", "detect_intros", "INTEGER")?;
     ensure_column(conn, "libraries", "enable_fingerprint", "INTEGER")?;
     ensure_column(conn, "libraries", "cover_path", "TEXT")?;
+    ensure_column(
+        conn,
+        "libraries",
+        "cover_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(
         conn,
         "libraries",
