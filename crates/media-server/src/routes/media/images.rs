@@ -1,7 +1,7 @@
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use std::sync::Arc;
@@ -10,6 +10,12 @@ use crate::auth::authenticate_optional;
 use crate::provider::MediaServerProvider;
 
 use super::super::AppState;
+
+// 从 images.rs 注册兄弟文件模块，避免改动本任务写范围之外的 `lib.rs`。
+#[path = "../../image_cache.rs"]
+pub(crate) mod image_cache;
+
+use image_cache::conditional_image;
 
 pub(super) fn routes(provider: Arc<dyn MediaServerProvider>) -> Router {
     let image_provider = provider.clone();
@@ -35,6 +41,7 @@ pub(super) fn routes(provider: Arc<dyn MediaServerProvider>) -> Router {
 
 async fn person_primary_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     user_id: Option<Extension<Option<domain::UserId>>>,
     Path(name): Path<String>,
 ) -> Result<Response, StatusCode> {
@@ -54,10 +61,13 @@ async fn person_primary_image(
 }
 async fn genre_primary_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     user_id: Option<Extension<Option<domain::UserId>>>,
     Path(name): Path<String>,
 ) -> Result<Response, StatusCode> {
-    let user_id = user_id.and_then(|extension| extension.0).unwrap_or_else(|| domain::UserId::from_uuid(uuid::Uuid::nil()));
+    let user_id = user_id
+        .and_then(|extension| extension.0)
+        .unwrap_or_else(|| domain::UserId::from_uuid(uuid::Uuid::nil()));
     let items = state
         .provider
         .list_visible_items(user_id, None)
@@ -65,9 +75,15 @@ async fn genre_primary_image(
         .map_err(|_| StatusCode::NOT_FOUND)?;
     for it in items {
         let matches_genre = it.metadata.genres.iter().any(|g| {
-            let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).hyphenated().to_string();
-            let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).simple().to_string();
-            g.eq_ignore_ascii_case(&name) || u.eq_ignore_ascii_case(&name) || s.eq_ignore_ascii_case(&name)
+            let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes())
+                .hyphenated()
+                .to_string();
+            let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes())
+                .simple()
+                .to_string();
+            g.eq_ignore_ascii_case(&name)
+                || u.eq_ignore_ascii_case(&name)
+                || s.eq_ignore_ascii_case(&name)
         });
         if matches_genre {
             let id = if it.is_series {
@@ -75,11 +91,19 @@ async fn genre_primary_image(
             } else {
                 it.row.id.to_string().replace('-', "")
             };
-            if let Ok(Some(url)) = state.provider.resolve_primary_image_url(Some(user_id), &id).await {
+            if let Ok(Some(url)) = state
+                .provider
+                .resolve_primary_image_url(Some(user_id), &id)
+                .await
+            {
                 return Ok(Redirect::temporary(&url).into_response());
             }
-            if let Ok(Some(bytes)) = state.provider.resolve_poster_bytes(Some(user_id), &id).await {
-                return Ok(image_response(bytes));
+            if let Ok(Some(bytes)) = state
+                .provider
+                .resolve_poster_bytes(Some(user_id), &id)
+                .await
+            {
+                return Ok(image_response(&headers, bytes));
             }
         }
     }
@@ -88,10 +112,13 @@ async fn genre_primary_image(
 
 async fn studio_primary_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     user_id: Option<Extension<Option<domain::UserId>>>,
     Path(name): Path<String>,
 ) -> Result<Response, StatusCode> {
-    let user_id = user_id.and_then(|extension| extension.0).unwrap_or_else(|| domain::UserId::from_uuid(uuid::Uuid::nil()));
+    let user_id = user_id
+        .and_then(|extension| extension.0)
+        .unwrap_or_else(|| domain::UserId::from_uuid(uuid::Uuid::nil()));
     let items = state
         .provider
         .list_visible_items(user_id, None)
@@ -99,9 +126,15 @@ async fn studio_primary_image(
         .map_err(|_| StatusCode::NOT_FOUND)?;
     for it in items {
         let matches_studio = it.metadata.studios.iter().any(|st| {
-            let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).hyphenated().to_string();
-            let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).simple().to_string();
-            st.eq_ignore_ascii_case(&name) || u.eq_ignore_ascii_case(&name) || s.eq_ignore_ascii_case(&name)
+            let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes())
+                .hyphenated()
+                .to_string();
+            let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes())
+                .simple()
+                .to_string();
+            st.eq_ignore_ascii_case(&name)
+                || u.eq_ignore_ascii_case(&name)
+                || s.eq_ignore_ascii_case(&name)
         });
         if matches_studio {
             let id = if it.is_series {
@@ -109,11 +142,19 @@ async fn studio_primary_image(
             } else {
                 it.row.id.to_string().replace('-', "")
             };
-            if let Ok(Some(url)) = state.provider.resolve_primary_image_url(Some(user_id), &id).await {
+            if let Ok(Some(url)) = state
+                .provider
+                .resolve_primary_image_url(Some(user_id), &id)
+                .await
+            {
                 return Ok(Redirect::temporary(&url).into_response());
             }
-            if let Ok(Some(bytes)) = state.provider.resolve_poster_bytes(Some(user_id), &id).await {
-                return Ok(image_response(bytes));
+            if let Ok(Some(bytes)) = state
+                .provider
+                .resolve_poster_bytes(Some(user_id), &id)
+                .await
+            {
+                return Ok(image_response(&headers, bytes));
             }
         }
     }
@@ -122,6 +163,7 @@ async fn studio_primary_image(
 
 async fn primary_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     user_id: Option<Extension<Option<domain::UserId>>>,
     Path(id): Path<String>,
 ) -> Result<Response, StatusCode> {
@@ -134,19 +176,33 @@ async fn primary_image(
         }
     }
     if let Ok(Some(bytes)) = state.provider.resolve_cover_bytes(user_id, &id).await {
-        return Ok(image_response(bytes));
+        return Ok(image_response(&headers, bytes));
     }
     match state.provider.resolve_poster_bytes(user_id, &id).await {
-        Ok(Some(bytes)) => return Ok(image_response(bytes)),
+        Ok(Some(bytes)) => return Ok(image_response(&headers, bytes)),
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(%error, item_id = %id, "failed to read Jellyfin primary image");
         }
     }
-    if let Ok(res) = genre_primary_image(State(state.clone()), user_id.map(|u| Extension(Some(u))), Path(id.clone())).await {
+    if let Ok(res) = genre_primary_image(
+        State(state.clone()),
+        headers.clone(),
+        user_id.map(|u| Extension(Some(u))),
+        Path(id.clone()),
+    )
+    .await
+    {
         return Ok(res);
     }
-    if let Ok(res) = studio_primary_image(State(state.clone()), user_id.map(|u| Extension(Some(u))), Path(id.clone())).await {
+    if let Ok(res) = studio_primary_image(
+        State(state.clone()),
+        headers.clone(),
+        user_id.map(|u| Extension(Some(u))),
+        Path(id.clone()),
+    )
+    .await
+    {
         return Ok(res);
     }
     match state.provider.resolve_person_image_url(user_id, &id).await {
@@ -161,47 +217,56 @@ async fn primary_image(
 
 async fn backdrop_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     user_id: Option<Extension<Option<domain::UserId>>>,
     Path(id): Path<String>,
 ) -> Result<Response, StatusCode> {
     let user_id = user_id.and_then(|extension| extension.0);
-    resolve_backdrop(state, user_id, id).await
+    resolve_backdrop(state, headers, user_id, id).await
 }
 
 async fn backdrop_image_index(
     State(state): State<AppState>,
+    headers: HeaderMap,
     user_id: Option<Extension<Option<domain::UserId>>>,
     Path((id, _index)): Path<(String, u32)>,
 ) -> Result<Response, StatusCode> {
     let user_id = user_id.and_then(|extension| extension.0);
-    resolve_backdrop(state, user_id, id).await
+    resolve_backdrop(state, headers, user_id, id).await
 }
 
 async fn resolve_backdrop(
     state: AppState,
+    headers: HeaderMap,
     user_id: Option<domain::UserId>,
     id: String,
 ) -> Result<Response, StatusCode> {
-    if let Ok(res) = genre_primary_image(State(state.clone()), user_id.map(|u| Extension(Some(u))), Path(id.clone())).await {
-        return Ok(res);
-    }
+    // 先取目标条目自身的 backdrop：自身通常就有图，避免为了拿图枚举整库。
     match state.provider.resolve_backdrop_bytes(user_id, &id).await {
-        Ok(Some(bytes)) => Ok(image_response(bytes)),
-        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Ok(Some(bytes)) => return Ok(image_response(&headers, bytes)),
+        Ok(None) => {}
         Err(error) => {
-            tracing::warn!(%error, item_id = %id, "failed to read Jellyfin backdrop image");
-            Err(StatusCode::NOT_FOUND)
+            tracing::warn!(%error, item_id = %id, "failed to read Jellyfin backdrop image")
         }
     }
+    // 只有自身没有图时才回落到 genre/studio 扫描（fallback 能力保留）。
+    if let Ok(res) = genre_primary_image(
+        State(state.clone()),
+        headers.clone(),
+        user_id.map(|u| Extension(Some(u))),
+        Path(id.clone()),
+    )
+    .await
+    {
+        return Ok(res);
+    }
+    Err(StatusCode::NOT_FOUND)
 }
 
-fn image_response(bytes: Vec<u8>) -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, image_content_type(&bytes))],
-        Body::from(bytes),
-    )
-        .into_response()
+/// 授权/可见性判定已在调用方完成；这里只做 validator 比较与响应组装。
+fn image_response(headers: &HeaderMap, bytes: Vec<u8>) -> Response {
+    let content_type = image_content_type(&bytes);
+    conditional_image(headers, bytes, content_type, true)
 }
 
 fn image_content_type(bytes: &[u8]) -> &'static str {

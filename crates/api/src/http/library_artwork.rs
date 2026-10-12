@@ -7,7 +7,13 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+
+// 从 library_artwork.rs 注册兄弟文件模块，避免改动本任务写范围之外的 `http/mod.rs`。
+#[path = "image_response.rs"]
+pub(crate) mod image_response;
+
 use domain::MediaId;
+use image_response::conditional_image;
 use serde_json::{Value, json};
 use std::str::FromStr;
 
@@ -158,15 +164,16 @@ fn artwork_target(
 
 async fn jpeg_response(
     path: std::path::PathBuf,
+    headers: &axum::http::HeaderMap,
     code: &'static str,
     message: &'static str,
 ) -> Response {
     match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
-        Ok(Ok(bytes)) => (
-            [(axum::http::header::CONTENT_TYPE, image_content_type(&bytes))],
-            bytes,
-        )
-            .into_response(),
+        // 可见性判定已在上游完成；这里才做 validator 比较（隐藏资源不会走到 304）。
+        Ok(Ok(bytes)) => {
+            let content_type = image_content_type(&bytes);
+            conditional_image(headers, bytes, content_type, true)
+        }
         _ => err(StatusCode::NOT_FOUND, code, message),
     }
 }
@@ -262,12 +269,10 @@ pub(crate) async fn select_artwork(
                     }
                 }
             };
-            if let Err(error) = lease.publish(|| std::fs::write(&target, &bytes).map_err(|e| e.to_string())) {
-                return err(
-                    StatusCode::CONFLICT,
-                    "library.deleting",
-                    &error,
-                );
+            if let Err(error) =
+                lease.publish(|| std::fs::write(&target, &bytes).map_err(|e| e.to_string()))
+            {
+                return err(StatusCode::CONFLICT, "library.deleting", &error);
             }
             let store = state.store.lock();
             let _ = store.put_setting(
@@ -321,17 +326,12 @@ pub(crate) async fn upload_artwork(
     };
     let write_target = target.clone();
     let write_bytes = bytes.clone();
-    let write =
-        tokio::task::spawn_blocking(move || {
-            lease.publish(|| std::fs::write(write_target, write_bytes).map_err(|e| e.to_string()))
-        }).await;
-    if let Err(error) = write.unwrap_or_else(|error| Err(error.to_string()))
-    {
-        return err(
-            StatusCode::CONFLICT,
-            "library.deleting",
-            &error,
-        );
+    let write = tokio::task::spawn_blocking(move || {
+        lease.publish(|| std::fs::write(write_target, write_bytes).map_err(|e| e.to_string()))
+    })
+    .await;
+    if let Err(error) = write.unwrap_or_else(|error| Err(error.to_string())) {
+        return err(StatusCode::CONFLICT, "library.deleting", &error);
     }
     let _ = state.store.lock().put_setting(
         &artwork_key(media_id),
@@ -420,7 +420,7 @@ pub(crate) async fn fanart(
     let Some(fanart) = fanart else {
         return err(StatusCode::NOT_FOUND, "poster.missing", "背景图不存在");
     };
-    jpeg_response(fanart, "poster.missing", "背景图不存在").await
+    jpeg_response(fanart, &headers, "poster.missing", "背景图不存在").await
 }
 
 /// GET /stills/{ledger_id} — the episode-specific still beside a ledger file.
@@ -455,7 +455,7 @@ pub(crate) async fn stills(
     let Some(still) = still else {
         return err(StatusCode::NOT_FOUND, "poster.missing", "剧照不存在");
     };
-    jpeg_response(still, "poster.missing", "剧照不存在").await
+    jpeg_response(still, &headers, "poster.missing", "剧照不存在").await
 }
 
 /// GET /posters/{ledger_id} — the poster.jpg bytes beside a ledger file.
@@ -482,7 +482,7 @@ pub(crate) async fn poster(
     let Some(poster) = poster else {
         return err(StatusCode::NOT_FOUND, "poster.missing", "海报不存在");
     };
-    jpeg_response(poster, "poster.missing", "海报不存在").await
+    jpeg_response(poster, &headers, "poster.missing", "海报不存在").await
 }
 
 /// GET /libraries/{id}/cover — visible library cover.
@@ -508,18 +508,17 @@ pub(crate) async fn library_cover(
     let _ = store_lock;
     let Some(cover) = cover_path else {
         return match crate::media_server_provider::default_library_cover(kind) {
-            Ok(bytes) => (
-                [(axum::http::header::CONTENT_TYPE, image_content_type(&bytes))],
-                bytes,
-            )
-                .into_response(),
+            Ok(bytes) => {
+                let content_type = image_content_type(&bytes);
+                conditional_image(&headers, bytes, content_type, true)
+            }
             Err(error) => {
                 tracing::error!(%error, library_id = %id, "failed to generate default library cover");
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         };
     };
-    jpeg_response(cover, "cover.missing", "封面读取失败").await
+    jpeg_response(cover, &headers, "cover.missing", "封面读取失败").await
 }
 
 /// POST /libraries/{id}/cover — 用户主动上传/更换媒体库封面（JPEG/PNG/WebP base64 data URL）
