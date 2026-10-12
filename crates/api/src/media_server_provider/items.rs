@@ -60,7 +60,9 @@ pub(super) fn fallback_snapshot(
                 .unwrap_or(crate::store::UNIT_WHOLE),
         );
         let facts = item_metadata::item_db_facts(&store, user_id, &row, is_series);
-        (marker, chapters, ticks, played, play_count, parent_id, facts)
+        (
+            marker, chapters, ticks, played, play_count, parent_id, facts,
+        )
     };
     // 锁外：NFO / stat / 外部字幕 IO。
     let metadata = with_date_created(
@@ -97,67 +99,195 @@ pub(super) fn list_visible_items(
     user_id: UserId,
     parent_id: Option<&str>,
 ) -> Result<Vec<MediaItemSnapshot>, String> {
-    let store = provider.state.store.lock();
-    let mut visible = Vec::new();
-    let mut seen_series = std::collections::HashSet::new();
+    // 锁内只收集 owned 的 DB 事实；NFO/stat/外部字幕 IO 全部留到锁外。
+    let (pending, ingest_paths) = {
+        let store = provider.state.store.lock();
+        collect_pending(&store, user_id, parent_id)?
+    };
+    let browse = provider.state.browse_files.as_ref();
+    let latest_ingest = latest_ingest_by_media(browse, &ingest_paths);
+    let mut visible = Vec::with_capacity(pending.len());
+    for item in pending {
+        let date_created = match &item.stat_path {
+            Some(path) => file_date_created(browse, path),
+            None => latest_ingest.get(&item.media.id).copied(),
+        };
+        visible.push(item.into_snapshot(browse, date_created));
+    }
+    Ok(visible)
+}
+
+/// 锁内：只做 DB 读取，产出 owned 事实与「待 stat 的 path」。
+fn collect_pending(
+    store: &crate::Store,
+    user_id: UserId,
+    parent_id: Option<&str>,
+) -> Result<(Vec<PendingSnapshot>, Vec<(domain::MediaId, String)>), String> {
     let ledger_rows = store.list_ledger().map_err(|error| error.to_string())?;
     let mut show_episodes: HashMap<domain::MediaId, HashSet<(u32, u32)>> = HashMap::new();
     let mut show_seasons: HashMap<domain::MediaId, HashSet<u32>> = HashMap::new();
-    let latest_ingest_by_media =
-        latest_visible_ingest_by_media(&store, provider.state.browse_files.as_ref(), user_id, &ledger_rows);
     collect_visible_units(
-        &store,
+        store,
         user_id,
         &ledger_rows,
         &mut show_episodes,
         &mut show_seasons,
     );
 
+    let ingest_paths = visible_ingest_paths(store, user_id, &ledger_rows);
+
+    let mut seen_series = HashSet::new();
+    let mut pending = Vec::new();
     for row in ledger_rows {
         let Some(media) = store.get_media(row.media_id).ok().flatten() else {
             continue;
         };
-        let Some(owner) = crate::http::playback::library_id_for(&store, &media, &[&row]) else {
+        let Some(owner) = crate::http::playback::library_id_for(store, &media, &[&row]) else {
             continue;
         };
         let series_id = media.id.to_string().replace('-', "");
         let requested_series = media.kind == MediaKind::Tv
             && parent_id.is_some_and(|id| id == series_id || id == media.id.to_string());
-
         if let Some(parent_id) = parent_id {
             if parent_id != owner && !requested_series {
                 continue;
             }
         }
-
-        if !crate::http::library::row_visible_to_user(&store, &row, &media, Some(user_id)) {
+        if !crate::http::library::row_visible_to_user(store, &row, &media, Some(user_id)) {
             continue;
         }
-
         let is_series = media.kind == MediaKind::Tv && !requested_series;
         if is_series && !seen_series.insert(media.id) {
             continue;
         }
-
-        let date_created = if is_series {
-            latest_ingest_by_media.get(&media.id).copied()
-        } else {
-            file_date_created(provider.state.browse_files.as_ref(), &row.path)
-        };
-        visible.push(visible_snapshot(
-            &store,
-            provider.state.browse_files.as_ref(),
-            user_id,
+        let marker = store
+            .get_media_marker(row.media_id, row.season, row.episode)
+            .ok()
+            .flatten();
+        let chapters = store
+            .get_cached_chapters(&row.id.to_string())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let (played, play_count, unplayed_item_count) =
+            unit_counts(store, user_id, &row, &media, is_series, &show_episodes);
+        let child_counts = is_series.then(|| {
+            (
+                show_episodes.get(&media.id).map(HashSet::len).unwrap_or(0),
+                show_seasons.get(&media.id).map(HashSet::len).unwrap_or(0),
+            )
+        });
+        let facts = item_metadata::item_db_facts(store, user_id, &row, is_series);
+        let stat_path = (!is_series).then(|| row.path.clone());
+        pending.push(PendingSnapshot {
+            parent_id: if requested_series { series_id } else { owner },
+            ticks: playback_ticks(store, user_id, &row, &media),
+            intro_start_ms: marker.as_ref().and_then(|item| item.intro_start_ms),
+            intro_end_ms: marker.as_ref().and_then(|item| item.intro_end_ms),
+            outro_start_ms: marker.as_ref().and_then(|item| item.outro_start_ms),
+            outro_end_ms: marker.as_ref().and_then(|item| item.outro_end_ms),
             row,
             media,
             is_series,
-            if requested_series { series_id } else { owner },
-            &show_episodes,
-            &show_seasons,
-            date_created,
-        ));
+            play_count,
+            played,
+            unplayed_item_count,
+            chapters,
+            facts,
+            child_counts,
+            stat_path,
+        });
     }
-    Ok(visible)
+    Ok((pending, ingest_paths))
+}
+
+/// series 的 DateCreated 取「该 Media 全部可见行的 ingest 最大值」；这里只收集
+/// path，stat 放到锁外做，语义（同一批 path 取 max）与旧的逐行 stat 完全一致。
+fn visible_ingest_paths(
+    store: &crate::Store,
+    user_id: UserId,
+    ledger_rows: &[domain::LedgerRow],
+) -> Vec<(domain::MediaId, String)> {
+    let mut paths = Vec::new();
+    for row in ledger_rows {
+        let Some(media) = store.get_media(row.media_id).ok().flatten() else {
+            continue;
+        };
+        if !crate::http::library::row_visible_to_user(store, row, &media, Some(user_id)) {
+            continue;
+        }
+        paths.push((media.id, row.path.clone()));
+    }
+    paths
+}
+
+/// 锁内收集的 owned DB 事实；文件 IO 全部留到锁外。
+struct PendingSnapshot {
+    row: domain::LedgerRow,
+    media: domain::Media,
+    is_series: bool,
+    parent_id: String,
+    ticks: i64,
+    play_count: i64,
+    played: bool,
+    unplayed_item_count: Option<usize>,
+    chapters: Vec<library::ChapterMarker>,
+    intro_start_ms: Option<i64>,
+    intro_end_ms: Option<i64>,
+    outro_start_ms: Option<i64>,
+    outro_end_ms: Option<i64>,
+    facts: item_metadata::ItemDbFacts,
+    child_counts: Option<(usize, usize)>,
+    /// 非 series：DateCreated 需要 stat 这个路径；series：用 ingest 映射。
+    stat_path: Option<String>,
+}
+
+impl PendingSnapshot {
+    /// 锁外：NFO/stat/外部字幕 IO + 组装。
+    fn into_snapshot(
+        self,
+        browse: &dyn crate::browse_file_read::BrowseFileRead,
+        date_created: Option<SystemTime>,
+    ) -> MediaItemSnapshot {
+        let Self {
+            row,
+            media,
+            is_series,
+            parent_id,
+            ticks,
+            play_count,
+            played,
+            unplayed_item_count,
+            chapters,
+            intro_start_ms,
+            intro_end_ms,
+            outro_start_ms,
+            outro_end_ms,
+            facts,
+            child_counts,
+            stat_path: _,
+        } = self;
+        let metadata = with_date_created(
+            item_metadata(facts, browse, &row, &media, is_series, child_counts),
+            date_created,
+        );
+        MediaItemSnapshot {
+            row,
+            media,
+            ticks,
+            play_count,
+            played,
+            unplayed_item_count,
+            parent_id,
+            is_series,
+            chapters,
+            intro_start_ms,
+            intro_end_ms,
+            outro_start_ms,
+            outro_end_ms,
+            metadata,
+        }
+    }
 }
 
 fn playback_ticks(
@@ -184,86 +314,18 @@ fn playback_ticks(
         * 10_000
 }
 
-fn visible_snapshot(
-    store: &crate::Store,
+/// 锁外：把「可见行的 ingest 时间」按 Media 取最大值。
+fn latest_ingest_by_media(
     browse: &dyn crate::browse_file_read::BrowseFileRead,
-    user_id: UserId,
-    row: domain::LedgerRow,
-    media: domain::Media,
-    is_series: bool,
-    parent_id: String,
-    show_episodes: &HashMap<domain::MediaId, HashSet<(u32, u32)>>,
-    show_seasons: &HashMap<domain::MediaId, HashSet<u32>>,
-    date_created: Option<SystemTime>,
-) -> MediaItemSnapshot {
-    let ticks = playback_ticks(&store, user_id, &row, &media);
-
-    let marker = store
-        .get_media_marker(row.media_id, row.season, row.episode)
-        .ok()
-        .flatten();
-    let chapters = store
-        .get_cached_chapters(&row.id.to_string())
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let (played, play_count, unplayed_item_count) =
-        unit_counts(store, user_id, &row, &media, is_series, show_episodes);
-    let child_counts = is_series.then(|| {
-        (
-            show_episodes.get(&media.id).map(HashSet::len).unwrap_or(0),
-            show_seasons.get(&media.id).map(HashSet::len).unwrap_or(0),
-        )
-    });
-    let metadata = with_date_created(
-        item_metadata(
-            item_metadata::item_db_facts(&store, user_id, &row, is_series),
-            browse,
-            &row,
-            &media,
-            is_series,
-            child_counts,
-        ),
-        date_created,
-    );
-
-    MediaItemSnapshot {
-        row,
-        media,
-        ticks,
-        play_count,
-        played,
-        unplayed_item_count,
-        parent_id,
-        is_series,
-        chapters,
-        intro_start_ms: marker.as_ref().and_then(|m| m.intro_start_ms),
-        intro_end_ms: marker.as_ref().and_then(|m| m.intro_end_ms),
-        outro_start_ms: marker.as_ref().and_then(|m| m.outro_start_ms),
-        outro_end_ms: marker.as_ref().and_then(|m| m.outro_end_ms),
-        metadata,
-    }
-}
-
-fn latest_visible_ingest_by_media(
-    store: &crate::Store,
-    browse: &dyn crate::browse_file_read::BrowseFileRead,
-    user_id: UserId,
-    rows: &[domain::LedgerRow],
+    paths: &[(domain::MediaId, String)],
 ) -> HashMap<domain::MediaId, SystemTime> {
     let mut latest = HashMap::new();
-    for row in rows {
-        let Some(media) = store.get_media(row.media_id).ok().flatten() else {
-            continue;
-        };
-        if !crate::http::library::row_visible_to_user(store, row, &media, Some(user_id)) {
-            continue;
-        }
-        let Some(created) = file_date_created(browse, &row.path) else {
+    for (media_id, path) in paths {
+        let Some(created) = file_date_created(browse, path) else {
             continue;
         };
         latest
-            .entry(media.id)
+            .entry(*media_id)
             .and_modify(|current: &mut SystemTime| *current = (*current).max(created))
             .or_insert(created);
     }
