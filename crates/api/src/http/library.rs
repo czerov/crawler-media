@@ -336,27 +336,46 @@ pub(crate) async fn list_items(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let store = state.store.lock();
-    let library = match require_visible_library(&store, &id, user_id) {
-        Ok(library) => library,
-        Err(response) => return response,
-    };
-    let selected = match selection::select(&store, &library, user_id, &query) {
-        Ok(items) => items,
-        Err(response) => return response,
+    // 锁内只取 owned 快照；NFO/stat/过滤/排序/渲染都在锁外的 blocking 预算内。
+    let snapshot = {
+        let store = state.store.lock();
+        let library = match require_visible_library(&store, &id, user_id) {
+            Ok(library) => library,
+            Err(response) => return response,
+        };
+        match selection::load_browse_snapshot(&store, &library, user_id) {
+            Ok(snapshot) => snapshot,
+            Err(response) => return response,
+        }
     };
     let offset = query
         .get("offset")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     let limit = query.get("limit").and_then(|v| v.parse::<usize>().ok());
-    let paged: Vec<_> = selected
-        .into_iter()
-        .skip(offset)
-        .take(limit.unwrap_or(usize::MAX))
-        .map(|item| wall_item_json(&library.id, &item))
-        .collect();
-    ok_list(paged).into_response()
+    let files = state.browse_files.clone();
+    let work = state
+        .http_work
+        .run(selection::BROWSE_DEADLINE, move || {
+            let library_id = snapshot.library_id.clone();
+            let selected = match selection::select_snapshot(snapshot, &query, files.as_ref()) {
+                Ok(items) => items,
+                Err(response) => return response,
+            };
+            // 过滤与排序已在 select_snapshot 内完成，分页发生在其后。
+            let paged: Vec<_> = selected
+                .into_iter()
+                .skip(offset)
+                .take(limit.unwrap_or(usize::MAX))
+                .map(|item| wall_item_json(&library_id, &item))
+                .collect();
+            ok_list(paged).into_response()
+        })
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => selection::browse_work_error(error),
+    }
 }
 
 fn wall_item_json(library_id: &str, item: &selection::LibrarySelection) -> Value {
@@ -428,11 +447,11 @@ fn load_owned_rows(
             "条目不存在",
         ));
     };
+    // 已知 MediaId 时走定向读取，不再全表扫 ledger 后过滤。
     let rows: Vec<domain::LedgerRow> = store
-        .list_ledger()
+        .ledger_for_media(media_id)
         .unwrap_or_default()
         .into_iter()
-        .filter(|row| row.media_id == media_id)
         .filter(|row| {
             library_for_row(store, row, &media).is_some_and(|owner| owner.id == library.id)
         })

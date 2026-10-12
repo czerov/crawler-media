@@ -4,6 +4,8 @@ use std::path::Path;
 use std::time::SystemTime;
 use domain::LedgerRow;
 
+use crate::browse_file_read::BrowseFileRead;
+
 fn classify_metadata(path: &Path, result: io::Result<Metadata>) -> Option<Metadata> {
     match result {
         Ok(metadata) if metadata.is_file() => Some(metadata),
@@ -22,12 +24,12 @@ fn classify_metadata(path: &Path, result: io::Result<Metadata>) -> Option<Metada
     }
 }
 
-fn file_metadata(path: &Path) -> Option<Metadata> {
-    classify_metadata(path, std::fs::metadata(path))
+fn file_metadata(path: &Path, files: &dyn BrowseFileRead) -> Option<Metadata> {
+    classify_metadata(path, files.metadata(path))
 }
 
-pub(crate) fn total_size(rows: &[LedgerRow]) -> Option<u64> {
-    aggregate_size(rows, file_metadata)
+pub(crate) fn total_size(rows: &[LedgerRow], files: &dyn BrowseFileRead) -> Option<u64> {
+    aggregate_size(rows, |path| file_metadata(path, files))
 }
 
 #[cfg(test)]
@@ -38,8 +40,8 @@ pub(crate) fn total_size_with(
     aggregate_size(rows, metadata)
 }
 
-pub(crate) fn added_at(rows: &[LedgerRow]) -> Option<SystemTime> {
-    aggregate_added_at(rows, file_metadata)
+pub(crate) fn added_at(rows: &[LedgerRow], files: &dyn BrowseFileRead) -> Option<SystemTime> {
+    aggregate_added_at(rows, |path| file_metadata(path, files))
 }
 
 #[cfg(test)]

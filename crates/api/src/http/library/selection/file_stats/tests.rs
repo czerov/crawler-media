@@ -63,10 +63,11 @@ fn rename_grace_stats_ignore_not_found_without_warn() {
     let expected_time = metadata.created().or_else(|_| metadata.modified()).unwrap();
 
     let logs = capture(|| {
-        assert_eq!(super::total_size(&rows), Some(7));
-        assert_eq!(super::added_at(&rows), Some(expected_time));
-        assert_eq!(super::total_size(&rows[1..]), None);
-        assert_eq!(super::added_at(&rows[1..]), None);
+        let files = crate::browse_file_read::LocalBrowseFileRead;
+        assert_eq!(super::total_size(&rows, &files), Some(7));
+        assert_eq!(super::added_at(&rows, &files), Some(expected_time));
+        assert_eq!(super::total_size(&rows[1..], &files), None);
+        assert_eq!(super::added_at(&rows[1..], &files), None);
     });
     assert!(!logs.contains("WARN"), "expected no warnings, got: {logs}");
     assert!(logs.contains("DEBUG"), "expected debug log for not found");

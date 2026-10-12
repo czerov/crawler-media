@@ -617,29 +617,54 @@ pub(crate) async fn item_index(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let store = state.store.lock();
-    let library = match require_visible_library(&store, &id, user_id) {
-        Ok(library) => library,
-        Err(response) => return response,
+    // 锁内只取 owned 快照；NFO/stat/过滤/排序都在锁外的 blocking 预算内。
+    let snapshot = {
+        let store = state.store.lock();
+        let library = match require_visible_library(&store, &id, user_id) {
+            Ok(library) => library,
+            Err(response) => return response,
+        };
+        match selection::load_browse_snapshot(&store, &library, user_id) {
+            Ok(snapshot) => snapshot,
+            Err(response) => return response,
+        }
     };
-    let selected = match selection::select(&store, &library, user_id, &query) {
-        Ok(items) => items,
-        Err(response) => return response,
-    };
-    let mut buckets: Vec<Value> = Vec::new();
-    let mut current_initial = String::new();
-    let mut current_offset = 0usize;
-    let mut current_count = 0usize;
+    let files = state.browse_files.clone();
+    let work = state
+        .http_work
+        .run(selection::BROWSE_DEADLINE, move || {
+            let selected = match selection::select_snapshot(snapshot, &query, files.as_ref()) {
+                Ok(items) => items,
+                Err(response) => return response,
+            };
+            let mut buckets: Vec<Value> = Vec::new();
+            let mut current_initial = String::new();
+            let mut current_offset = 0usize;
+            let mut current_count = 0usize;
 
-    for (i, item) in selected.iter().enumerate() {
-        let initial = item
-            .media
-            .title
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "#".into());
-        if initial != current_initial {
+            for (i, item) in selected.iter().enumerate() {
+                let initial = item
+                    .media
+                    .title
+                    .chars()
+                    .next()
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "#".into());
+                if initial != current_initial {
+                    if current_count > 0 {
+                        buckets.push(json!({
+                            "initial": current_initial,
+                            "count": current_count,
+                            "offset": current_offset,
+                        }));
+                    }
+                    current_initial = initial;
+                    current_offset = i;
+                    current_count = 1;
+                } else {
+                    current_count += 1;
+                }
+            }
             if current_count > 0 {
                 buckets.push(json!({
                     "initial": current_initial,
@@ -647,21 +672,13 @@ pub(crate) async fn item_index(
                     "offset": current_offset,
                 }));
             }
-            current_initial = initial;
-            current_offset = i;
-            current_count = 1;
-        } else {
-            current_count += 1;
-        }
+            ok_list(buckets).into_response()
+        })
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => selection::browse_work_error(error),
     }
-    if current_count > 0 {
-        buckets.push(json!({
-            "initial": current_initial,
-            "count": current_count,
-            "offset": current_offset,
-        }));
-    }
-    ok_list(buckets).into_response()
 }
 
 /// GET /libraries/{id}/facets — filter dimensions.

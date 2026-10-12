@@ -20,39 +20,58 @@ pub(crate) async fn gallery(
         .get("offset")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
-    let store = state.store.lock();
-    let library = match require_visible_library(&store, &id, user_id) {
-        Ok(library) => library,
-        Err(response) => return response,
-    };
-    let selected = match selection::select(&store, &library, user_id, &query) {
-        Ok(items) => items,
-        Err(response) => return response,
-    };
-    let mut groups = Vec::new();
-    for item in selected {
-        let images = gallery_images(&library.id, &item.media, &item.rows);
-        if images.is_empty() {
-            continue;
-        }
-        groups.push(json!({
-            "library_id": library.id,
-            "media_item_id": item.media.id.to_string(),
-            "title": item.media.title,
-            "is_favorite": item.favorite,
-            "images": images,
-        }));
-    }
-    let sliced = if offset >= groups.len() {
-        Vec::new()
-    } else {
-        let end = match limit {
-            Some(limit) => (offset + limit).min(groups.len()),
-            None => groups.len(),
+    // 锁内只取 owned 快照；NFO/stat/过滤/排序/渲染都在锁外的 blocking 预算内。
+    let snapshot = {
+        let store = state.store.lock();
+        let library = match require_visible_library(&store, &id, user_id) {
+            Ok(library) => library,
+            Err(response) => return response,
         };
-        groups[offset..end].to_vec()
+        match selection::load_browse_snapshot(&store, &library, user_id) {
+            Ok(snapshot) => snapshot,
+            Err(response) => return response,
+        }
     };
-    ok_list(sliced).into_response()
+    let files = state.browse_files.clone();
+    let work = state
+        .http_work
+        .run(selection::BROWSE_DEADLINE, move || {
+            let library_id = snapshot.library_id.clone();
+            let selected = match selection::select_snapshot(snapshot, &query, files.as_ref()) {
+                Ok(items) => items,
+                Err(response) => return response,
+            };
+            let mut groups = Vec::new();
+            for item in selected {
+                let images = gallery_images(&library_id, &item.media, &item.rows);
+                if images.is_empty() {
+                    continue;
+                }
+                groups.push(json!({
+                    "library_id": library_id,
+                    "media_item_id": item.media.id.to_string(),
+                    "title": item.media.title,
+                    "is_favorite": item.favorite,
+                    "images": images,
+                }));
+            }
+            // 空图组已在上面剔除，分页必须发生在剔除之后。
+            let sliced = if offset >= groups.len() {
+                Vec::new()
+            } else {
+                let end = match limit {
+                    Some(limit) => (offset + limit).min(groups.len()),
+                    None => groups.len(),
+                };
+                groups[offset..end].to_vec()
+            };
+            ok_list(sliced).into_response()
+        })
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => selection::browse_work_error(error),
+    }
 }
 
 /// 图组里的一类图片。每类自带 URL 前缀、宽高比与展示名，调用方不必再传一

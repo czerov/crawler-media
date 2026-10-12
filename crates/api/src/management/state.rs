@@ -25,6 +25,8 @@ pub struct ApiState {
     pub(crate) notify_transport: Arc<dyn crate::NotifyTransport>,
     /// 共享 single-flight 字幕交付（生产默认并发 2、受控 ffmpeg runner）。
     pub(crate) subtitle_delivery: Arc<crate::subtitle_delivery::SubtitleDelivery>,
+    /// 浏览路径的只读文件访问（NFO / stat）；生产直接读磁盘，测试可注入阻塞实现。
+    pub(crate) browse_files: Arc<dyn crate::browse_file_read::BrowseFileRead>,
     pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
     pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
     /// Job attempts still executing in this process; protects them from timeout recovery.
@@ -196,6 +198,7 @@ impl ApiState {
                 Arc::new(library::ControlledSubtitleRunner),
                 2,
             )),
+            browse_files: Arc::new(crate::browse_file_read::LocalBrowseFileRead),
             library_work,
             jobs: Arc::new(Mutex::new(jobs)),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -240,6 +243,15 @@ impl ApiState {
     /// 替换 blocking 预算（测试注入小并发以观察准入/超时行为）。
     pub fn with_http_work(mut self, budget: Arc<crate::blocking_budget::BlockingBudget>) -> Self {
         self.http_work = budget;
+        self
+    }
+
+    /// 替换浏览文件访问 seam（测试注入阻塞实现以证明 NFO/stat 不在 Store 锁内）。
+    pub fn with_browse_file_read(
+        mut self,
+        files: Arc<dyn crate::browse_file_read::BrowseFileRead>,
+    ) -> Self {
+        self.browse_files = files;
         self
     }
 

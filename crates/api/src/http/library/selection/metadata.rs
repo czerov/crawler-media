@@ -1,8 +1,39 @@
 use super::super::preferred_row;
+use crate::browse_file_read::BrowseFileRead;
 use crate::store::CatalogCacheRow;
 use domain::{LedgerRow, Media};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
+
+/// 目录缓存的前缀索引。
+///
+/// `list_catalog_cache()` 按 `fetched_at DESC` 返回，因此原实现的「第一条命中」
+/// 就是最新一条；构建索引时保持同样的优先顺序（先到者胜），避免语义漂移。
+/// 原实现每个 Media 都线性扫整个 cache（含 7.6MB body），这里改为一次建索引。
+pub(crate) struct CacheIndex<'a> {
+    by_prefix: HashMap<String, &'a CatalogCacheRow>,
+}
+
+impl<'a> CacheIndex<'a> {
+    pub(crate) fn build(cache: &'a [CatalogCacheRow]) -> Self {
+        let mut by_prefix: HashMap<String, &'a CatalogCacheRow> = HashMap::new();
+        for row in cache {
+            if row.source != "tmdb" {
+                continue;
+            }
+            let Some(base) = row.cache_key.split('?').next() else {
+                continue;
+            };
+            by_prefix.entry(base.to_string()).or_insert(row);
+        }
+        Self { by_prefix }
+    }
+
+    fn get(&self, base: &str) -> Option<&'a CatalogCacheRow> {
+        self.by_prefix.get(base).copied()
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct BrowseMetadata {
@@ -15,13 +46,25 @@ pub(crate) struct BrowseMetadata {
     pub scraped: bool,
 }
 
-pub(crate) fn load(media: &Media, rows: &[LedgerRow], cache: &[CatalogCacheRow]) -> BrowseMetadata {
+/// NFO 读取与文件 stat 走注入的 [`BrowseFileRead`]：调用方在 Store 锁之外执行。
+pub(crate) fn load(
+    media: &Media,
+    rows: &[LedgerRow],
+    cache: &CacheIndex<'_>,
+    files: &dyn BrowseFileRead,
+) -> BrowseMetadata {
     let mut out = BrowseMetadata::default();
     if let Some(row) = preferred_row(rows) {
         let path = Path::new(&row.path);
         let candidates = crate::scrape_metadata::nfo_candidates(path, row, media.kind);
-        if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
-            if let Some(nfo) = library::read_nfo(&path) {
+        let existing = candidates.into_iter().find(|path| {
+            files
+                .metadata(path)
+                .map(|meta| meta.is_file())
+                .unwrap_or(false)
+        });
+        if let Some(path) = existing {
+            if let Some(nfo) = files.read_nfo(&path) {
                 out.scraped = true;
                 out.genres = nfo.genres.into_iter().map(|g| genre_id(&g)).collect();
                 out.countries = nfo
@@ -40,10 +83,7 @@ pub(crate) fn load(media: &Media, rows: &[LedgerRow], cache: &[CatalogCacheRow])
     }
     if let Some(id) = &media.tmdb_id {
         let prefix = format!("/{}/{id}", media.kind.as_str());
-        let entry = cache.iter().find(|row| {
-            row.source == "tmdb" && row.cache_key.split('?').next() == Some(prefix.as_str())
-        });
-        if let Some(entry) = entry {
+        if let Some(entry) = cache.get(&prefix) {
             match serde_json::from_str::<Value>(&entry.body) {
                 Ok(value) => supplement(&mut out, &value),
                 Err(error) => {

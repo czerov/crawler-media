@@ -6,12 +6,13 @@ use domain::{LedgerRow, Media, MediaId, UserId};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+mod file_stats;
 mod filters;
 mod metadata;
-mod file_stats;
+mod snapshot;
 pub(crate) use filters::LibraryFilter;
+pub(crate) use snapshot::{load_browse_snapshot, select_snapshot};
 use metadata::BrowseMetadata;
-use file_stats::{added_at, total_size};
 
 pub(crate) struct LibrarySelection {
     pub media: Media,
@@ -26,96 +27,47 @@ pub(crate) struct LibrarySelection {
     pub last_played_at: Option<i64>,
 }
 
+/// 浏览路径的等待预算：NFO/stat 可能落在网络存储上，给足余量但不无限等待。
+pub(crate) const BROWSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// blocking 预算失败 → HTTP 响应（只读浏览路径）。
+pub(crate) fn browse_work_error(error: crate::blocking_budget::BlockingError) -> Response {
+    use crate::blocking_budget::BlockingError;
+    match error {
+        BlockingError::Busy => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime.busy",
+            "服务繁忙，请重试",
+        ),
+        BlockingError::Timeout => err(
+            StatusCode::GATEWAY_TIMEOUT,
+            "library.timeout",
+            "浏览请求超时",
+        ),
+        error => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime.worker",
+            &error.to_string(),
+        ),
+    }
+}
+
+/// 兼容 wrapper：锁内取一次快照，再在**锁外**做 NFO/stat/过滤/排序。
+///
+/// 新的浏览 handler 应直接用 [`load_browse_snapshot`] + [`select_snapshot`]，
+/// 并把后者放进 blocking 预算；这个 wrapper 只是让尚未改造的调用点行为不变。
 pub(crate) fn select(
     store: &Store,
     library: &Library,
     user: Option<UserId>,
     query: &HashMap<String, String>,
 ) -> Result<Vec<LibrarySelection>, Response> {
-    let filter = LibraryFilter::parse(query).map_err(|message| {
-        tracing::error!(%message, "Library browse query rejected");
-        err(StatusCode::BAD_REQUEST, "library.invalid", &message)
-    })?;
-    let mut grouped: HashMap<MediaId, Vec<LedgerRow>> = HashMap::new();
-    for row in store.list_ledger().map_err(store_error)? {
-        grouped.entry(row.media_id).or_default().push(row);
-    }
-    let missing = store.missing_at_by_path().map_err(store_error)?;
-    let cache = store.list_catalog_cache().map_err(store_error)?;
-    let mut items = Vec::new();
-    for (id, rows) in grouped {
-        let Some(media) = store.get_media(id).map_err(store_error)? else {
-            continue;
-        };
-        let mut owned = Vec::new();
-        for row in rows {
-            if store
-                .library_for_path(std::path::Path::new(&row.path), media.kind)
-                .map_err(store_error)?
-                .is_some_and(|owner| owner.id == library.id)
-            {
-                owned.push(row);
-            }
-        }
-        if owned.is_empty() {
-            continue;
-        }
-        let metadata = metadata::load(&media, &owned, &cache);
-        let mut item = LibrarySelection {
-            media,
-            metadata,
-            missing: owned.iter().any(|r| missing.contains_key(&r.path)),
-            added_at: None,
-            size_bytes: None,
-            last_played_at: None,
-            rows: owned,
-            favorite: false,
-            played: false,
-            seen: false,
-        };
-        if filter.sort == "added_at" {
-            item.added_at = added_at(&item.rows);
-        }
-        if filter.sort == "size" {
-            item.size_bytes = total_size(&item.rows);
-        }
-        if let Some(user) = user {
-            match store.unit_state(
-                user,
-                item.media.id,
-                crate::store::UNIT_WHOLE,
-                crate::store::UNIT_WHOLE,
-            ) {
-                Ok(Some(whole)) => item.favorite = whole.favorite,
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::error!(%error, media_id = %item.media.id, "Library favorite state read failed");
-                    return Err(store_error(error));
-                }
-            }
-        }
-        // Detailed watch state (played/seen/last_played per episode) costs extra queries;
-        // only read it when the request actually depends on it.
-        if filter.needs_watch_state() {
-            if let Some(user) = user {
-                let state = watch_state_for(store, user, &item.media, &item.rows).map_err(
-                    |message| {
-                        tracing::error!(%message, "Library watch state read failed");
-                        err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &message)
-                    },
-                )?;
-                item.favorite = state.favorite;
-                item.played = state.played;
-                item.seen = state.seen;
-                item.last_played_at = state.last_played_at;
-            }
-        }
-        if filter.matches(&item) {
-            items.push(item);
-        }
-    }
-    items.sort_by(|a, b| filter.compare(a, b));
-    Ok(items)
+    let snapshot = load_browse_snapshot(store, library, user)?;
+    select_snapshot(
+        snapshot,
+        query,
+        &crate::browse_file_read::LocalBrowseFileRead,
+    )
 }
 
 /// 一部作品的观看状态。首页库行/收藏行的「未看优先」分级、筛选条的「未观看 / 在看 /
@@ -173,6 +125,48 @@ pub(crate) fn watch_state_for<'a>(
     }
     state.last_played_at = (latest > 0).then_some(latest);
     Ok(state)
+}
+
+/// 与 [`watch_state_for`] 同一套语义，但读的是请求级快照里的 unit map，
+/// 不再每个 episode 打一次数据库。
+///
+/// 必须逐字保留：whole `(-1,-1)` 优先、TV 每集 OR、movie legacy `(0,0)` 兜底、
+/// `latest` 取最大 `updated_at`、`last_played_at` 仅在 > 0 时给出。
+pub(crate) fn watch_state_from_units(
+    media: &Media,
+    rows: &[LedgerRow],
+    units: &HashMap<(MediaId, i32, i32), crate::store::UnitState>,
+) -> WatchState {
+    let mut state = WatchState::default();
+    let mut latest = 0i64;
+    let whole = units.get(&(media.id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE));
+    state.favorite = whole.is_some_and(|u| u.favorite);
+    state.played = whole.is_some_and(|u| u.played);
+    state.seen = whole.is_some_and(|u| u.played || u.position_ms > 0 || u.play_count > 0);
+    if let Some(unit) = whole {
+        latest = latest.max(unit.updated_at);
+    }
+    for row in rows {
+        if let (Some(season), Some(episode)) = (row.season, row.episode) {
+            let unit = units.get(&(media.id, season as i32, episode as i32));
+            state.seen |= unit.is_some_and(|u| u.played || u.position_ms > 0 || u.play_count > 0);
+            if let Some(unit) = unit {
+                state.favorite |= unit.favorite;
+                latest = latest.max(unit.updated_at);
+            }
+        }
+    }
+    if media.kind == domain::MediaKind::Movie && !state.favorite {
+        if let Some(legacy_unit) = units.get(&(media.id, 0, 0)) {
+            state.favorite |= legacy_unit.favorite;
+            state.played |= legacy_unit.played;
+            state.seen |=
+                legacy_unit.played || legacy_unit.position_ms > 0 || legacy_unit.play_count > 0;
+            latest = latest.max(legacy_unit.updated_at);
+        }
+    }
+    state.last_played_at = (latest > 0).then_some(latest);
+    state
 }
 
 pub(crate) fn resolution_rank(value: &str) -> u32 {

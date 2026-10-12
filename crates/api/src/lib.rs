@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod browse_file_read;
 pub mod compact_time;
 mod http_fetcher;
 pub mod password;
