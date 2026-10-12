@@ -188,3 +188,68 @@ cd - && git worktree remove /tmp/crawler-media-baseline
 
 `PERF_SIZES` / `PERF_MODES` / `PERF_SAMPLES` 可在迭代时收窄矩阵；第 4 节的表格使用默认值
 （sizes 100/500/2000/10000，modes movie+tv，samples 5）。
+
+## 9. B4b 追加：facets movie/tv 差距定位与单趟累积
+
+> 本节由 task-32（B4b）追加。**上文第 1–8 节的表格与结论一字未改**；本节只新增测量与结论。
+> 本轮 before/after 使用 `PERF_SIZES=10000 PERF_MODES=movie,tv PERF_SAMPLES=3`（C5b 表格用默认 samples=5，故绝对数值不可逐位对比，只做同轮相对比较）。
+
+### 9.1 假设验证：候选数 × Media 对不上
+
+在 10k fixture 上临时打印 `build_facets` 的每维候选数与两种实现的耗时（release）：
+
+| mode | items | 每维候选数 (c/d/g/hdr/lang/rating_gte/rt/res/stock/w) | 朴素逐候选 `build_ms` | 单趟 `build_ms` | facets 端到端 median |
+|---|---|---|---|---|---|
+| movie | 6666 | 0 / 3 / 0 / 1 / 0 / 0 / 0 / 1 / **0** / 1 | 4.78–6.53 | 5.24–7.04 | 478.48ms |
+| tv | 6666 | 0 / 3 / 0 / 1 / 0 / 0 / 0 / 1 / **1** / 1 | 5.63–6.53 | 6.05–7.04 | 138.63ms |
+
+原始输出（节选，完整见本轮 run log）：
+
+```
+FACETS_DEBUG items=6666 tier=all query={} total=6666 dims=[("c",0),("d",3),("g",0),("hdr",1),("lang",0),("rating_gte",0),("res",1),("rt",0),("stock",0),("w",1)] new_ms=5.343 naive_ms=4.778
+FACETS_DEBUG items=6666 tier=all query={} total=6666 dims=[("c",0),("d",3),("g",0),("hdr",1),("lang",0),("rating_gte",0),("res",1),("rt",0),("stock",1),("w",1)] new_ms=7.041 naive_ms=6.529
+```
+
+- 两个 mode 的候选数**几乎相同**（每维 0–3 个，合计 5–7 个），movie 并没有比 tv 更多的候选维度/取值。
+- 逐候选计数（改动前的实现）在 10k 上只花 **约 5–7ms**，占 movie 478ms 的 ~1%、tv 139ms 的 ~4%，**无法解释 3.4×**。
+- **假设证伪**：差距不在 `build_facets` 的候选循环里。
+
+### 9.2 真实原因：fixture 的 NFO 候选在两个 mode 上不对称
+
+`crates/api/src/scrape_metadata.rs::nfo_candidates` 按 kind 给出不同候选路径：
+
+- **movie**：`[<file>.nfo, <dir>/movie.nfo]` —— fixture 写了 `file-N.nfo`，**第一个候选就存在** → 每个 Media 都真的 `read_nfo`（XML 解析 + 一次 stat）。
+- **tv**：`[<show_root>/tvshow.nfo]` —— fixture 只写 `file-N.nfo`，**候选不存在** → 从不解析 NFO。
+
+同一轮数据自证：`stock` 候选 movie = **0**（NFO 读到 → `scraped=true`），tv = **1**（`unscraped`，因为从未刮到档案）。
+
+旁证（同一轮、同一进程）：
+
+```
+movie  10000  items   200  7844  592.140ms   (facets 478.481ms)
+tv     10000  items   200  7796  136.062ms   (facets 138.631ms)
+```
+
+**`items` 端点完全不调用 `build_facets`，却出现同样的 3.4×**，且 facets ≈ items（同 mode）。差距属于两个端点共用的浏览路径（`load_browse_snapshot` + `collect_items` → `metadata::load` 的 NFO 读取/解析），与 facets 计数无关。
+
+### 9.3 单趟累积改造与复测
+
+`build_facets` 改为：每个 Media 只算一次各维取值 → 每维一次「其余维过滤 + 该维分组」扫描，复杂度 `O(维数 × Media + 候选值数)`；计数语义（排除自身维、distinct Media、含 count 0 候选、`total`）逐字不变。等价性由单元测试 `facets::tests::single_pass_matches_the_naive_reference` 保证——同一 fixture、14 组 query×tier 下与 `#[cfg(test)]` 保留的朴素逐候选实现输出完全一致。
+
+| 端点 | mode | C5b after（10k，本次改动前） | B4b after（干净复测） | 说明 |
+|---|---|---|---|---|
+| facets | movie | 462.32ms | **454.79ms** | 同负载；候选仅 5–7 个，计数改造在此 fixture 上**中性**（±2% 噪声） |
+| facets | tv | 135.60ms | **138.60ms** | 同上 |
+
+（带临时双路计时的那一轮读数是 movie 478.48ms / tv 138.63ms，其中多算了已删除的朴素参照实现约 5–7ms/请求；上表是移除测量代码后的干净复测。）
+
+同轮旁证（干净复测）：
+
+```
+movie  10000  items   200  7844  467.691ms   (facets 454.789ms)
+tv     10000  items   200  7796  142.833ms   (facets 138.602ms)
+```
+
+**movie/tv 的 3.4× 差距修完仍在**——因为它不在 facets 计数里（9.2）。要消除它需要让 tv fixture 也命中 NFO（或让浏览路径缓存/跳过 NFO 解析），属于 fixture 与 `metadata::load` 的 IO 问题，不在本任务范围。
+
+单趟累积的价值不在这个 fixture（候选太少，两种实现都只有几毫秒），而在真实库：候选值数随 genres/countries/languages/ratings 增长时，旧实现是 `候选数 × Media` 次全量匹配，新实现只随维数与 Media 线性增长。
