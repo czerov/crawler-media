@@ -9,11 +9,48 @@ use std::sync::Arc;
 
 use crate::provider::MediaServerProvider;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AuthUser {
     pub id: UserId,
     pub token: String,
     pub device_id: Option<String>,
+}
+
+/// 手写 `Debug`：`token` 是会话凭证，绝不能进日志。
+///
+/// 之前这里是 `#[derive(Debug)]`，任何一句 `debug!(?user)` 都会把 Bearer token
+/// 打进日志与前端"系统日志"。`device_id` 是客户端标识、不是凭证，保留原样，
+/// 但调用方仍应优先只记录 `id`。
+impl std::fmt::Debug for AuthUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthUser")
+            .field("id", &self.id)
+            .field("token", &"<redacted>")
+            .field("device_id", &self.device_id)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::AuthUser;
+    use domain::UserId;
+
+    #[test]
+    fn debug_never_prints_the_session_token() {
+        let user = AuthUser {
+            id: UserId::new(),
+            token: "session-token-secret".into(),
+            device_id: Some("device-1".into()),
+        };
+        let rendered = format!("{user:?}");
+        assert!(
+            !rendered.contains("session-token-secret"),
+            "Debug 不得输出 token: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("device-1"));
+    }
 }
 
 pub async fn authenticate(
