@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::{Downloader, DownloaderError, PathMap, agent_for_url, apply_maps};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct QbitConfig {
     pub url: String,
     pub username: String,
@@ -13,6 +13,46 @@ pub struct QbitConfig {
     pub category: Option<String>,
     /// Save-path prefix mappings (container path -> host path).
     pub path_maps: Vec<PathMap>,
+}
+
+/// 手写 `Debug`：`password` 是下载器凭证，绝不能进日志。
+///
+/// 之前这里是 `#[derive(Debug)]`，任何一句 `debug!(?config)` 都会把 qBittorrent
+/// 口令打进日志与前端"系统日志"。其余字段保留原样，便于诊断。
+impl std::fmt::Debug for QbitConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QbitConfig")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("category", &self.category)
+            .field("path_maps", &self.path_maps)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::QbitConfig;
+
+    #[test]
+    fn debug_never_prints_the_password() {
+        let config = QbitConfig {
+            url: "http://127.0.0.1:8080".into(),
+            username: "admin".into(),
+            password: "qbit-password-secret".into(),
+            category: Some("movies".into()),
+            path_maps: Vec::new(),
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("qbit-password-secret"),
+            "Debug 不得输出 password: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("127.0.0.1:8080"), "{rendered}");
+        assert!(rendered.contains("admin"), "{rendered}");
+    }
 }
 
 pub struct QbitDownloader {

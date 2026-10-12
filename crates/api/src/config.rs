@@ -294,11 +294,56 @@ const PROXY_URL_ENV_VARS: &[&str] = &[
 ///
 /// `url` is the only field that counts as an "env override" in the settings UI:
 /// the store always wins for all three, so the credentials are plain fallbacks.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ProxyEnv {
     pub url: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
+}
+
+/// 手写 `Debug`：`password` 是代理凭证，`url` 可能内嵌 `user:pass@`，
+/// 因此与 [`ServerConfig`] 用同一套脱敏（`mask_proxy_url`）。`username`
+/// 不是凭证，原样保留，便于诊断。
+impl std::fmt::Debug for ProxyEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyEnv")
+            .field(
+                "url",
+                &self
+                    .url
+                    .as_deref()
+                    .map(crate::http_agent::mask_proxy_url),
+            )
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod proxy_env_debug_tests {
+    use super::ProxyEnv;
+
+    #[test]
+    fn debug_never_prints_proxy_credentials() {
+        let env = ProxyEnv {
+            url: Some("socks5://bob:url-password-secret@127.0.0.1:1080".into()),
+            username: Some("bob".into()),
+            password: Some("env-password-secret".into()),
+        };
+        let rendered = format!("{env:?}");
+        assert!(
+            !rendered.contains("url-password-secret"),
+            "Debug 不得输出 url 内嵌的口令: {rendered}"
+        );
+        assert!(
+            !rendered.contains("env-password-secret"),
+            "Debug 不得输出 password: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("127.0.0.1:1080"), "{rendered}");
+        assert!(rendered.contains("bob"), "{rendered}");
+    }
 }
 
 /// Resolve proxy fallbacks from `source`. See [`PROXY_URL_ENV_VARS`].

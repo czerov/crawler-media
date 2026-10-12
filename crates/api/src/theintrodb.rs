@@ -25,10 +25,46 @@ pub struct MarkerResult {
 }
 
 /// TheIntroDB API Client
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TheIntroDbClient {
     api_key: Option<String>,
     base_url: String,
+}
+
+/// 手写 `Debug`：`api_key` 是第三方 API 凭证，绝不能进日志。
+///
+/// 之前这里是 `#[derive(Debug)]`，任何一句 `debug!(?client)` 都会把 key
+/// 打进日志与前端"系统日志"。`base_url` 保留原样，便于诊断。
+impl std::fmt::Debug for TheIntroDbClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TheIntroDbClient")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::TheIntroDbClient;
+
+    #[test]
+    fn debug_never_prints_the_api_key() {
+        let client = TheIntroDbClient::new(Some("theintrodb-key-secret".into()));
+        let rendered = format!("{client:?}");
+        assert!(
+            !rendered.contains("theintrodb-key-secret"),
+            "Debug 不得输出 api_key: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("api.theintrodb.org"), "{rendered}");
+
+        let unconfigured = TheIntroDbClient::default();
+        assert!(
+            format!("{unconfigured:?}").contains("None"),
+            "未配置 key 应可诊断"
+        );
+    }
 }
 
 impl Default for TheIntroDbClient {

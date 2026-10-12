@@ -4,7 +4,7 @@ use rusqlite::{OptionalExtension, params};
 
 use super::{Store, StoreError};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DownloaderRow {
     pub id: DownloaderId,
     pub name: String,
@@ -17,6 +17,59 @@ pub struct DownloaderRow {
     pub is_default: bool,
     /// Disabled downloaders are skipped for automatic delivery.
     pub enabled: bool,
+}
+
+/// 手写 `Debug`：`password` 是下载器凭证，绝不能进日志。
+///
+/// 之前这里是 `#[derive(Debug)]`，任何一句 `debug!(?row)` 都会把口令打进日志与
+/// 前端"系统日志"。`None`/`Some("<redacted>")` 仍能看出是否配置了口令，
+/// 其余字段保留原样，便于诊断。`DownloaderRow` 没有 serde 派生，这里只影响
+/// `Debug`。
+impl std::fmt::Debug for DownloaderRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloaderRow")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("category", &self.category)
+            .field("path_maps", &self.path_maps)
+            .field("is_default", &self.is_default)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::DownloaderRow;
+    use domain::DownloaderId;
+
+    #[test]
+    fn debug_never_prints_the_password() {
+        let row = DownloaderRow {
+            id: DownloaderId::new(),
+            name: "qbit".into(),
+            kind: "qbittorrent".into(),
+            url: "http://127.0.0.1:8080".into(),
+            username: Some("admin".into()),
+            password: Some("downloader-password-secret".into()),
+            category: Some("movies".into()),
+            path_maps: Vec::new(),
+            is_default: true,
+            enabled: true,
+        };
+        let rendered = format!("{row:?}");
+        assert!(
+            !rendered.contains("downloader-password-secret"),
+            "Debug 不得输出 password: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("127.0.0.1:8080"), "{rendered}");
+        assert!(rendered.contains("qbit"), "{rendered}");
+    }
 }
 
 const COLS: &str =

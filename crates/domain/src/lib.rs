@@ -130,7 +130,7 @@ pub struct User {
     pub role: UserRole,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Site {
     pub id: SiteId,
     pub name: String,
@@ -144,6 +144,66 @@ pub struct Site {
     pub cdp_url: Option<String>,
     pub downloader_id: Option<DownloaderId>,
     pub enabled: bool,
+}
+
+/// 手写 `Debug`：`cookie` 是站点会话凭证、`api_key` 是站点 API 凭证，
+/// 两者都绝不能进日志。
+///
+/// 之前这里是 `#[derive(Debug)]`，任何一句 `debug!(?site)` 都会把凭证明文打进
+/// 日志与前端"系统日志"。`Site` 本身没有 serde 派生（UI 载荷由 api 层单独
+/// 构造），因此这里只影响 `Debug`。其余字段保留原样，便于诊断。
+impl std::fmt::Debug for Site {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Site")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("profile_id", &self.profile_id)
+            .field("cookie", &self.cookie.as_ref().map(|_| "<redacted>"))
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("rss_url", &self.rss_url)
+            .field("proxy", &self.proxy)
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .field("cdp_url", &self.cdp_url)
+            .field("downloader_id", &self.downloader_id)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::{Site, SiteId};
+
+    #[test]
+    fn debug_never_prints_site_credentials() {
+        let site = Site {
+            id: SiteId::new(),
+            name: "demo".into(),
+            url: "https://pt.example/".into(),
+            profile_id: "demo".into(),
+            cookie: Some("uid=1; pass=cookie-secret".into()),
+            api_key: Some("site-api-key-secret".into()),
+            rss_url: None,
+            proxy: None,
+            rate_limit_per_minute: None,
+            cdp_url: None,
+            downloader_id: None,
+            enabled: true,
+        };
+        let rendered = format!("{site:?}");
+        assert!(
+            !rendered.contains("cookie-secret"),
+            "Debug 不得输出 cookie: {rendered}"
+        );
+        assert!(
+            !rendered.contains("site-api-key-secret"),
+            "Debug 不得输出 api_key: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("pt.example"), "{rendered}");
+        assert!(rendered.contains("demo"), "{rendered}");
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
