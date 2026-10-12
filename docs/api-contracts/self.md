@@ -67,6 +67,18 @@ HTTP 路径是 `/rule-sets`；表名仍是 `filters`。这是有意的 API 别�
 
 每种 `kind` 可以有多个库（多根、可见性、刮削开关等）。完整字段见 `crates/api/src/store/libraries.rs` 与 `GET /libraries`。
 
+### LibraryFacets
+
+`GET /libraries/{id}/facets`（筛选面板的唯一数据源；前端 `web/lib/api/libraries.ts` 的 `LibraryFacets`）：
+
+`{total, genres, countries, decades, watch, ratings, runtimes, languages, resolutions, hdr, stock, years: []}`，每项 `{value, label, count}`。
+
+- **计数**：维度 D 的值 v 的 `count` = 满足「**除 D 以外**全部已选条件」且 D 取 v 的 **distinct Media** 数；`total` = 满足全部条件的 distinct Media 数（不是 ledger 行数）。候选全集来自该库全部可见 Media，含 `count: 0`（前端置灰）。
+- **查询键**（与 items 接口共用 `filterQuery`，维内 OR、维间 AND）：`g`(TMDB genre id) `c`(ISO 3166-1 二字码) `d`(`2020s|2010s|2000s|1990s|earlier`) `w`(`unwatched|watching|played|favorite`) `rating_gte`(6|7|8|9) `rt`(`lte60|60to90|90to120|gt120`) `lang` `res` `hdr`(true|false) `stock`(`missing|unscraped`)。
+- **`tier`**：`primary` 只填 `genres/countries/decades/watch`，其余空数组；`all` 十维全填；**缺失或空串按 `all`**；其他非空值 → 400 `library.invalid`。
+- `years` 是历史遗留的空数组键，保留以免破坏未知消费者。
+- 未知年份与 `>=2030` 不归入任何 `decades` 档。
+
 ### JobDef / Job
 
 `JobDef` = `{id, kind, name, enabled, schedule?: {interval_secs} | null, payload, concurrency_key?, last_status?, last_finished_at?, next_run_after?}`

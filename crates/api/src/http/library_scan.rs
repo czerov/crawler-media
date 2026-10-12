@@ -143,7 +143,10 @@ fn scan_video_subdir(
     walk_video_files(target_dir, &mut files);
     let inserted = {
         let store = state.store.lock();
-        lease.control().check().map_err(|e: library::LibraryError| e.to_string())?;
+        lease
+            .control()
+            .check()
+            .map_err(|e: library::LibraryError| e.to_string())?;
         if !store
             .library_accepts_work(library_id)
             .map_err(|e| e.to_string())?
@@ -174,7 +177,10 @@ fn resolve_and_scrape_subdir(
     lease: &crate::library_lifecycle::LibraryWorkLease,
 ) -> Result<(), String> {
     for (_, (media, path)) in scan_media {
-        lease.control().check().map_err(|e: library::LibraryError| e.to_string())?;
+        lease
+            .control()
+            .check()
+            .map_err(|e: library::LibraryError| e.to_string())?;
         if crate::auto_resolve::has_local_scan_metadata(state, &media, &path) {
             continue;
         }
@@ -194,7 +200,8 @@ fn resolve_and_scrape_subdir(
         };
 
         if let Some(resolved_media) = resolved.as_ref()
-            && let Err(error) = crate::auto_resolve::rebind_scan_rows(state, media.id, resolved_media.id, inserted)
+            && let Err(error) =
+                crate::auto_resolve::rebind_scan_rows(state, media.id, resolved_media.id, inserted)
         {
             return Err(error);
         }
@@ -348,7 +355,9 @@ fn resolve_scan_metadata(
         }
         let resolved = crate::auto_resolve::resolve_scanned_media(state, &media, path)
             .unwrap_or_else(|| media.clone());
-        if let Err(error) = crate::auto_resolve::rebind_scan_rows(state, media.id, resolved.id, &inserted) {
+        if let Err(error) =
+            crate::auto_resolve::rebind_scan_rows(state, media.id, resolved.id, &inserted)
+        {
             return Err(err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "store.error",
@@ -534,12 +543,7 @@ fn scrape_library_metadata(
             .filter(|episode| episode.media_id == media.id)
             .cloned()
             .collect::<Vec<_>>();
-        crate::scrape_metadata::scrape_tv_sidecars(
-            state,
-            media,
-            &show_root,
-            &episodes,
-        );
+        crate::scrape_metadata::scrape_tv_sidecars(state, media, &show_root, &episodes);
         return;
     }
     match crate::scrape_metadata::fetch_tmdb_metadata(state, media.kind, tmdb_id) {
@@ -553,8 +557,14 @@ fn scrape_library_metadata(
             let nfo = crate::scrape_metadata::nfo_from_tmdb(media, &metadata);
             if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
                 let target = path.with_file_name(format!("{stem}.nfo"));
-                let write = || { crate::scrape_metadata::write_nfo(&target, media, &nfo); Ok(()) };
-                let _ = match &lease { Some(lease) => lease.publish(write), None => write() };
+                let write = || {
+                    crate::scrape_metadata::write_nfo(&target, media, &nfo);
+                    Ok(())
+                };
+                let _ = match &lease {
+                    Some(lease) => lease.publish(write),
+                    None => write(),
+                };
                 let movie_root = path.parent().unwrap_or(path);
                 crate::scrape_metadata::scrape_movie_fanart(state, media, movie_root);
             }
@@ -681,68 +691,64 @@ pub(crate) async fn item_index(
     }
 }
 
-/// GET /libraries/{id}/facets — filter dimensions.
+/// GET /libraries/{id}/facets — 十维筛选候选与「排除自身维」计数。
 pub(crate) async fn facets(
     State(state): State<ApiState>,
     axum::Extension(user_id): axum::Extension<Option<domain::UserId>>,
     Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let store = state.store.lock();
-    let library = match require_visible_library(&store, &id, user_id) {
-        Ok(library) => library,
-        Err(response) => return response,
-    };
-    let mut res_counts: HashMap<String, usize> = HashMap::new();
-    let genre_counts: HashMap<String, usize> = HashMap::new();
-    let mut total = 0usize;
-
-    for row in rows_in_library(&store, &library) {
-        total += 1;
-        if let Some(r) = &row.resolution {
-            *res_counts.entry(r.clone()).or_default() += 1;
+    // tier：缺失/空串按 all（向后兼容旧调用方仍能拿到 resolutions）；其余非法值 400。
+    let tier = match query.get("tier").map(String::as_str) {
+        None | Some("") | Some("all") => "all",
+        Some("primary") => "primary",
+        Some(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "library.invalid",
+                "tier 必须是 primary 或 all",
+            );
         }
-    }
-    let mut resolutions: Vec<Value> = res_counts
-        .into_iter()
-        .map(|(res, count)| {
-            json!({
-                "value": res.clone(),
-                "label": res,
-                "count": count,
-            })
+    };
+    // 锁内只取 owned 快照；NFO/stat/匹配/计数全部在锁外的 blocking 预算内。
+    let snapshot = {
+        let store = state.store.lock();
+        let library = match require_visible_library(&store, &id, user_id) {
+            Ok(library) => library,
+            Err(response) => return response,
+        };
+        match selection::load_browse_snapshot(&store, &library, user_id) {
+            Ok(snapshot) => snapshot,
+            Err(response) => return response,
+        }
+    };
+    let files = state.browse_files.clone();
+    let work = state
+        .http_work
+        .run(selection::BROWSE_DEADLINE, move || {
+            let items = selection::select_all_for_facets(snapshot, files.as_ref());
+            let facets = match selection::facets::build_facets(&items, &query, tier) {
+                Ok(facets) => facets,
+                Err(message) => {
+                    tracing::error!(%message, "Library facets query rejected");
+                    return err(StatusCode::BAD_REQUEST, "library.invalid", &message);
+                }
+            };
+            match serde_json::to_value(&facets) {
+                Ok(value) => ok(value).into_response(),
+                Err(error) => {
+                    tracing::error!(%error, "failed to serialize library facets");
+                    err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "store.error",
+                        &error.to_string(),
+                    )
+                }
+            }
         })
-        .collect();
-    resolutions.sort_by(|a, b| {
-        let a_str = a["value"].as_str().unwrap_or_default();
-        let b_str = b["value"].as_str().unwrap_or_default();
-        resolution_rank(b_str).cmp(&resolution_rank(a_str))
-    });
-
-    let genres: Vec<Value> = genre_counts
-        .into_iter()
-        .map(|(g, count)| {
-            json!({
-                "value": g.clone(),
-                "label": g,
-                "count": count,
-            })
-        })
-        .collect();
-
-    ok(json!({
-        "total": total,
-        "genres": genres,
-        "resolutions": resolutions,
-        "years": [],
-    }))
-    .into_response()
-}
-
-fn resolution_rank(resolution: &str) -> u32 {
-    match resolution {
-        "2160p" => 4,
-        "1080p" => 3,
-        "720p" => 2,
-        _ => 1,
+        .await;
+    match work {
+        Ok(response) => response,
+        Err(error) => selection::browse_work_error(error),
     }
 }

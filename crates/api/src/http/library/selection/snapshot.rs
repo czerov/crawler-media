@@ -15,7 +15,7 @@ use crate::http::err;
 use crate::store::{CatalogCacheRow, LibraryOwnership, Store, UnitState};
 
 use super::metadata::{self, CacheIndex};
-use super::{file_stats, watch_state_from_units, LibraryFilter, LibrarySelection};
+use super::{LibraryFilter, LibrarySelection, file_stats, watch_state_from_units};
 
 /// 一个 Media 及其在**当前 Library** 名下的 ledger 行。
 pub(crate) struct BrowseGroup {
@@ -94,6 +94,35 @@ pub(crate) fn select_snapshot(
         tracing::error!(%message, "Library browse query rejected");
         err(StatusCode::BAD_REQUEST, "library.invalid", &message)
     })?;
+    let mut items = collect_items(
+        snapshot,
+        files,
+        filter.sort == "added_at",
+        filter.sort == "size",
+        filter.needs_watch_state(),
+    );
+    items.retain(|item| filter.matches(item));
+    items.sort_by(|a, b| filter.compare(a, b));
+    Ok(items)
+}
+
+/// facets 用：不做筛选（候选全集是整库可见 Media），但**强制**计算 watch state——
+/// 默认 filter 不会触发它，而候选与计数都要 `played`/`seen`/`favorite`。
+pub(crate) fn select_all_for_facets(
+    snapshot: BrowseSnapshot,
+    files: &dyn BrowseFileRead,
+) -> Vec<LibrarySelection> {
+    collect_items(snapshot, files, false, false, true)
+}
+
+/// 锁外组装：NFO/stat 与观看状态都只在这里发生。
+fn collect_items(
+    snapshot: BrowseSnapshot,
+    files: &dyn BrowseFileRead,
+    needs_added_at: bool,
+    needs_size: bool,
+    needs_watch_state: bool,
+) -> Vec<LibrarySelection> {
     let cache = CacheIndex::build(&snapshot.cache);
     let BrowseSnapshot {
         groups,
@@ -118,10 +147,10 @@ pub(crate) fn select_snapshot(
             played: false,
             seen: false,
         };
-        if filter.sort == "added_at" {
+        if needs_added_at {
             item.added_at = file_stats::added_at(&item.rows, files);
         }
-        if filter.sort == "size" {
+        if needs_size {
             item.size_bytes = file_stats::total_size(&item.rows, files);
         }
         if let Some(_user) = user {
@@ -132,7 +161,7 @@ pub(crate) fn select_snapshot(
                 crate::store::UNIT_WHOLE,
             ));
             item.favorite = whole.is_some_and(|unit| unit.favorite);
-            if filter.needs_watch_state() {
+            if needs_watch_state {
                 let state = watch_state_from_units(&item.media, &item.rows, &units);
                 item.favorite = state.favorite;
                 item.played = state.played;
@@ -140,10 +169,7 @@ pub(crate) fn select_snapshot(
                 item.last_played_at = state.last_played_at;
             }
         }
-        if filter.matches(&item) {
-            items.push(item);
-        }
+        items.push(item);
     }
-    items.sort_by(|a, b| filter.compare(a, b));
-    Ok(items)
+    items
 }

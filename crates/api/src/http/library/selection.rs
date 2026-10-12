@@ -6,13 +6,17 @@ use domain::{LedgerRow, Media, MediaId, UserId};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+// facets.rs 是本模块的兄弟文件；`http/library.rs`（模块根）不在本次写范围内，
+// 因此用 `#[path]` 从这里注册。
+#[path = "facets.rs"]
+pub(crate) mod facets;
 mod file_stats;
 mod filters;
 mod metadata;
 mod snapshot;
 pub(crate) use filters::LibraryFilter;
-pub(crate) use snapshot::{load_browse_snapshot, select_snapshot};
 use metadata::BrowseMetadata;
+pub(crate) use snapshot::{load_browse_snapshot, select_all_for_facets, select_snapshot};
 
 pub(crate) struct LibrarySelection {
     pub media: Media,
@@ -72,7 +76,12 @@ pub(crate) fn watch_state_for<'a>(
     let mut state = WatchState::default();
     let mut latest = 0i64;
     let whole = store
-        .unit_state(user, media.id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)
+        .unit_state(
+            user,
+            media.id,
+            crate::store::UNIT_WHOLE,
+            crate::store::UNIT_WHOLE,
+        )
         .map_err(|e| e.to_string())?;
     state.favorite = whole.as_ref().is_some_and(|u| u.favorite);
     state.played = whole.as_ref().is_some_and(|u| u.played);
