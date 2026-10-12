@@ -4,6 +4,7 @@ use domain::{JobDefId, JobId};
 use rusqlite::Connection;
 
 use crate::kinds::{JobKind, Schedule};
+use crate::retention::RetentionBatch;
 use crate::store;
 use crate::types::{Job, JobDef, JobError, JobStatus};
 
@@ -222,6 +223,16 @@ impl Queue {
 
     pub fn get_last_child(&self, def_id: JobDefId) -> Result<Option<Job>, JobError> {
         crate::schedule::get_last_child(&self.conn, def_id)
+    }
+
+    /// 终止态 Jobs 历史的按龄分批清理（DB8 Task 2）。每批一个事务；`dry_run` 零写入。
+    pub fn prune_terminal_jobs(
+        &self,
+        cutoff: i64,
+        batch_size: usize,
+        dry_run: bool,
+    ) -> Result<RetentionBatch, JobError> {
+        crate::retention::prune_terminal_jobs(&self.conn, cutoff, batch_size, dry_run)
     }
 
     /// 批量取每个 def 的 live/last child（≤500 分块），规则与逐个查询一致。
