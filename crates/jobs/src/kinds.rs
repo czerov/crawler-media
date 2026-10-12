@@ -9,6 +9,22 @@ pub enum JobKind {
     CheckIn,
     CatalogRefresh,
     WatchIntake,
+    /// 数据库维护（optimize / 受控 VACUUM）。见 DB8 方案。
+    DatabaseMaintenance,
+    /// 终止态任务历史清理。
+    JobsRetention,
+    /// 播放历史清理。
+    PlaybackHistoryRetention,
+}
+
+impl JobKind {
+    /// 维护类任务：由 `api::maintenance` 提供策略与执行器，不参与订阅/下载路径。
+    pub fn is_maintenance(self) -> bool {
+        matches!(
+            self,
+            Self::DatabaseMaintenance | Self::JobsRetention | Self::PlaybackHistoryRetention
+        )
+    }
 }
 
 impl JobKind {
@@ -21,6 +37,9 @@ impl JobKind {
             Self::CheckIn => "check_in",
             Self::CatalogRefresh => "catalog_refresh",
             Self::WatchIntake => "watch_intake",
+            Self::DatabaseMaintenance => "database_maintenance",
+            Self::JobsRetention => "jobs_retention",
+            Self::PlaybackHistoryRetention => "playback_history_retention",
         }
     }
 }
@@ -37,6 +56,9 @@ impl FromStr for JobKind {
             "check_in" => Ok(Self::CheckIn),
             "catalog_refresh" => Ok(Self::CatalogRefresh),
             "watch_intake" => Ok(Self::WatchIntake),
+            "database_maintenance" => Ok(Self::DatabaseMaintenance),
+            "jobs_retention" => Ok(Self::JobsRetention),
+            "playback_history_retention" => Ok(Self::PlaybackHistoryRetention),
             other => Err(other.to_string()),
         }
     }

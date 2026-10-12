@@ -65,6 +65,14 @@ impl Runner for StateRunner {
             JobKind::Scrape => crate::watch_scrape::run(&self.state),
             JobKind::CheckIn => crate::check_in::run(&self.state),
             JobKind::CatalogRefresh => crate::catalog_refresh::run(&self.state, &job.payload),
+            // 维护任务执行器由 Task 4 接入（`crate::maintenance::run`）。在此之前
+            // 这些 def 不会被注册（`seed_maintenance_defs` 尚未在启动时调用），
+            // 因此这条分支在生产中不可达；显式报错而不是静默成功。
+            JobKind::DatabaseMaintenance
+            | JobKind::JobsRetention
+            | JobKind::PlaybackHistoryRetention => {
+                Err(format!("维护任务执行器尚未接线: {}", job.kind.as_str()))
+            }
         }
     }
 }
