@@ -42,8 +42,7 @@ impl Store {
         ])?;
         // Enable WAL mode and set busy timeout for all connections.
         for conn in [&app, &catalog, &library, &subscribe] {
-            conn.pragma_update(None, "journal_mode", "WAL")?;
-            conn.pragma_update(None, "busy_timeout", "5000")?;
+            apply_connection_policy(conn)?;
         }
         let store = Self {
             data_dir,
@@ -185,5 +184,38 @@ impl Store {
     pub fn clear_search_snapshots(&self) -> Result<(), StoreError> {
         self.app.execute("DELETE FROM search_snapshots", [])?;
         Ok(())
+    }
+}
+
+/// 所有 Store 连接统一的**连接级**策略。
+///
+/// `busy_timeout` 与 `foreign_keys` 是连接级设置：bundled SQLite 构建的默认值
+/// 恰好是 5000ms / ON，显式设置是为了不依赖构建默认值。`journal_mode=WAL`
+/// 是持久属性，写在数据库文件头里。
+fn apply_connection_policy(conn: &Connection) -> Result<(), StoreError> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "busy_timeout", "5000")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::apply_connection_policy;
+
+    /// 连接级 pragma 只能在**我们自己打开的连接**上断言：外部重开连接只会看到
+    /// bundled 构建的默认值，证明不了策略被应用。
+    #[test]
+    fn connection_policy_sets_timeout_and_foreign_keys() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_connection_policy(&conn).unwrap();
+        let timeout: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+        assert_eq!(foreign_keys, 1);
     }
 }

@@ -32,7 +32,7 @@ impl Queue {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        apply_connection_policy(&conn)?;
         store::migrate(&conn)?;
         Ok(Self { conn })
     }
@@ -244,5 +244,36 @@ impl Queue {
             }
         }
         Ok(finished)
+    }
+}
+
+/// jobs 队列连接的**连接级**策略，与 Store 的四个库保持一致。
+///
+/// `busy_timeout`/`foreign_keys` 是连接级设置（bundled 构建默认 5000ms/ON），
+/// 显式设置是为了不依赖构建默认值；`journal_mode=WAL` 是持久属性。
+fn apply_connection_policy(conn: &Connection) -> Result<(), JobError> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "busy_timeout", "5000")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::apply_connection_policy;
+
+    /// 连接级 pragma 必须在**我们自己打开的连接**上断言。
+    #[test]
+    fn queue_connection_policy_sets_timeout_and_foreign_keys() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_connection_policy(&conn).unwrap();
+        let timeout: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+        assert_eq!(foreign_keys, 1);
     }
 }

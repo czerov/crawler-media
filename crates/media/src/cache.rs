@@ -41,6 +41,7 @@ impl CatalogCache {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        apply_connection_policy(&conn)?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS catalog_cache (
@@ -159,5 +160,36 @@ impl CatalogCache {
             }
         }
         Ok(Some(body))
+    }
+}
+
+/// 所有 `CatalogCache` 连接（含 fanart 缓存使用的同一个 `open_source`）统一的
+/// **连接级**策略。`busy_timeout`/`foreign_keys` 是连接级设置，bundled 构建默认
+/// 5000ms/ON，显式设置是为了不依赖构建默认值；`journal_mode=WAL` 是持久属性。
+fn apply_connection_policy(conn: &Connection) -> Result<(), TmdbError> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "busy_timeout", "5000")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::apply_connection_policy;
+
+    /// 连接级 pragma 必须在**我们自己打开的连接**上断言：外部重开连接只会看到
+    /// bundled 构建的默认值，证明不了策略被应用。
+    #[test]
+    fn catalog_cache_connection_policy_sets_timeout_and_foreign_keys() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_connection_policy(&conn).unwrap();
+        let timeout: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+        assert_eq!(foreign_keys, 1);
     }
 }

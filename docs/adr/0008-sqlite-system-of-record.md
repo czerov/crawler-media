@@ -102,3 +102,16 @@ TMDB 缓存为文件：已实现；无查询、无 TTL、无来源列。否决�
 Jinja 模板：MoviePilot 的能力。v1 否决——封闭占位符集合对两种默认布局足够，也让 `library` 免于脚本运行时（ADR-0002）。
 
 按 **Subscribe** 命名：对一台 NAS 媒体库来说布局太多。按类型的实例全局。以后可以在 **Library** 根上挂 overlay，如果两块磁盘需要不同目录树。
+
+## 后记：四个权威库之外的两个文件（2026-10-12）
+
+本 ADR 的"四个文件"指的是**权威** Store 库。实现里还有两个派生库，它们不在上表内，但同样由 SQLite 持有：
+
+| 文件 | 性质 | 可清空？ | 连接策略 |
+|---|---|---|---|
+| `jobs.db` | **Job** 队列（`job_defs` + `jobs`）。`CON` 里 **Job** 是实例级队列，不是任何权威域的一部分 | 否（丢了会丢调度与重试历史） | WAL + 5000ms busy_timeout + `foreign_keys=ON`（`jobs::Queue::open`） |
+| `fanart.db` | fanart.tv 图片元数据缓存，复用与 `catalog.db` **相同**的 `catalog_cache` 表结构 | **是**（纯缓存） | WAL + 5000ms busy_timeout + `foreign_keys=ON`（`media::CatalogCache::open_source`） |
+
+两者都不是第二个事实来源：删掉 `fanart.db` 只会让 fanart 重新抓取，删掉 `jobs.db` 只会丢调度历史（不丢 **Media** / **Library** / **Subscribe** 事实）。连接策略由各 crate 内的 `apply_connection_policy` 显式设置，不依赖 bundled SQLite 的构建默认值；`journal_mode` 是文件头属性（`crates/*/tests/connection_policy.rs` 从外部连接断言），`busy_timeout`/`foreign_keys` 是连接级设置（各 crate 的单元测试在**自己打开的连接**上断言）。
+
+跨文件仍然没有外键，也没有跨文件事务：这一点对这两个库同样成立。
