@@ -18,6 +18,15 @@ impl ApiState {
     pub fn acquire_library_work(&self, library_id: &str) -> Result<LibraryWorkLease, String> {
         self.library_work.acquire(&self.store, library_id)
     }
+
+    /// 等该库当前在跑的后台工作全部结束（建库自动扫描、显式扫描、重导入共用同一
+    /// registry；由 lease drop 的 `notify_waiters` 唤醒，不是定时轮询）。
+    ///
+    /// 调用方负责加超时。存在的理由：建库会自动调度首次扫描，与显式 `POST /scan`
+    /// 并发，先返回的那次可能还没做完身份重绑，观察者需要一个确定性同步点。
+    pub async fn wait_library_idle(&self, library_id: &str) {
+        self.library_work.wait_idle(library_id).await;
+    }
 }
 
 pub fn start_library_removal(state: &ApiState, library_id: &str)

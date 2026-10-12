@@ -559,6 +559,16 @@ fn online_identity_rebind_succeeds_when_reimported_library_reuses_removed_root()
             ).await;
             let library_id = created["id"].as_str().unwrap();
             call(&app, "POST", &format!("/api/v1/libraries/{library_id}/scan"), Value::Null, StatusCode::OK).await;
+            // 建库会自动调度首次扫描（见 library_config::create_library），它与这次
+            // 显式扫描并发：先返回的那次看到 ledger 行已存在（inserted=0），不会重绑，
+            // 而真正做重绑的那次可能还没跑完 —— 之前就是在这里读到临时 MediaId 而假失败。
+            // 等该库的后台工作全部结束再断言；断言本身不放宽。
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                fixture.state.wait_library_idle(library_id),
+            )
+            .await
+            .expect("library reimport work did not settle");
             assert!(!online_catalog.requests.lock().is_empty(), "必须真正走到在线搜索");
             let shared = fixture.state.store();
             let store = shared.lock();
