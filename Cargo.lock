@@ -50,6 +50,7 @@ dependencies = [
  "image",
  "indexer",
  "jobs",
+ "libc",
  "library",
  "marker",
  "media",

@@ -180,7 +180,14 @@ async fn active_only_returns_only_defs_with_live_children() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
-    let target = all["data"].as_array().unwrap().last().unwrap()["id"]
+    // 取最后一个**启用**的 def：维护任务会注册一个默认关闭的 def，且顺序在实例 def 之后。
+    let target = all["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|row| row["enabled"] == true)
+        .expect("至少有一个启用的 def")["id"]
         .as_str()
         .unwrap();
     let run = app

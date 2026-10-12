@@ -31,9 +31,12 @@ pub fn spawn_job_loop_with(
             let state_clone = state.clone();
             let completion_clock = Arc::clone(&clock);
             tokio::task::spawn_blocking(move || {
-                if let Err(error) =
-                    run_pending_jobs_with_clock(&state_clone, now, || read_clock(&completion_clock))
-                {
+                if let Err(error) = run_pending_jobs_with_clock(
+                    &state_clone,
+                    now,
+                    || read_clock(&completion_clock),
+                    TickSource::Background,
+                ) {
                     tracing::error!(%error, now, "后台任务轮询失败");
                 }
                 // 播放会话心跳超时回收：停止上报的会话落成播放记录。
@@ -47,6 +50,22 @@ pub fn spawn_job_loop_with(
     })
 }
 
+/// 一轮 tick 的来源：决定维护任务是否参与本轮调度。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TickSource {
+    /// 正式后台 job_loop：维护任务正常执行。
+    Background,
+    /// `/jobs/tick` 开发入口：维护任务需要自己的 Queue 短锁，而该入口的 runner 调用
+    /// 约定是持锁调用（`Queue::tick`），因此本轮不执行、只报告。
+    DevHttp,
+}
+
+pub(crate) struct TickRun {
+    pub finished: Vec<Job>,
+    /// 仅开发入口非空：本轮被跳过的维护任务 kind。
+    pub skipped_maintenance: Vec<String>,
+}
+
 /// Claim work while holding the queue lock, execute it without the lock, then
 /// briefly reacquire the queue to persist each outcome. Network-bound runners
 /// must never make `/jobs` readers wait for the full Job duration.
@@ -54,8 +73,9 @@ pub(crate) fn run_pending_jobs_with_clock(
     state: &ApiState,
     now: i64,
     completion_clock: impl Fn() -> i64,
-) -> Result<Vec<Job>, JobError> {
-    let claimed = claim_pending_jobs(state, now)?;
+    source: TickSource,
+) -> Result<TickRun, JobError> {
+    let (claimed, skipped_maintenance) = claim_pending_jobs(state, now, source)?;
     let runner = StateRunner {
         state: state.clone(),
     };
@@ -79,20 +99,66 @@ pub(crate) fn run_pending_jobs_with_clock(
             tracing::warn!(job_id = %job.id, attempt = job.attempt, "忽略超时后旧执行实例的完成结果");
         }
     }
-    Ok(finished)
+    Ok(TickRun {
+        finished,
+        skipped_maintenance,
+    })
 }
 
-fn claim_pending_jobs(state: &ApiState, now: i64) -> Result<Vec<Job>, JobError> {
+fn claim_pending_jobs(
+    state: &ApiState,
+    now: i64,
+    source: TickSource,
+) -> Result<(Vec<Job>, Vec<String>), JobError> {
     let mut active = state.active_job_attempts.lock();
     let queue = state.jobs.lock();
     let active_attempts: Vec<_> = active.values().cloned().collect();
     queue.recover_except(now, &active_attempts)?;
-    queue.ensure_scheduled(now)?;
+    let skipped_maintenance = schedule_due(&queue, now, source)?;
     let claimed = queue.claim(now, 2)?;
     for job in &claimed {
         active.insert(job.id, job.clone());
     }
-    Ok(claimed)
+    Ok((claimed, skipped_maintenance))
+}
+
+/// 按 tick 来源排期。
+///
+/// 开发入口**不为维护 def 生成子任务**，并取消后台已经排到的维护子任务：否则
+/// `claim` 会把它们拿走并在持锁约定下执行 runner。返回被跳过的维护 kind。
+fn schedule_due(
+    queue: &jobs::Queue,
+    now: i64,
+    source: TickSource,
+) -> Result<Vec<String>, JobError> {
+    if source == TickSource::Background {
+        queue.ensure_scheduled(now)?;
+        return Ok(Vec::new());
+    }
+    let mut skipped = Vec::new();
+    for def in queue.list_defs()? {
+        if !def.enabled {
+            continue;
+        }
+        if !def.kind.is_maintenance() {
+            queue.ensure_scheduled_for(now, def.id)?;
+            continue;
+        }
+        // 该入口一律不执行维护任务：报告出来（不区分本轮是否到期），并取消后台已经排到
+        // 的 queued 子任务，避免 `claim` 把它们拿走。
+        skipped.push(def.kind.as_str().to_string());
+        let queued = queue
+            .get_live_child(def.id)?
+            .is_some_and(|live| live.status == jobs::JobStatus::Queued);
+        if queued {
+            queue.cancel_def_children(def.id)?;
+        }
+        tracing::warn!(
+            kind = def.kind.as_str(),
+            "开发入口 /jobs/tick 不执行维护任务，交给后台 job_loop"
+        );
+    }
+    Ok(skipped)
 }
 
 fn persist_job_result(

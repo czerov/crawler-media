@@ -49,6 +49,8 @@ serde_json = "1"
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 ureq = { version = "3.0", default-features = false, features = ["json"] }
 parking_lot = "0.12"
+# 数据库维护的 VACUUM 磁盘准入需要可用空间；std 没有跨平台 API（已在依赖树中）。
+libc = "0.2"
 base64 = "0.22"
 tokio-stream = { version = "0.1", features = ["sync"] }
 notify-debouncer-mini = "0.5"

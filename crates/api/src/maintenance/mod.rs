@@ -1,18 +1,29 @@
-//! DB8 维护任务：版本化策略与默认注册。
+//! DB8 维护任务：版本化策略、默认注册、数据库执行器与 runner。
 //!
-//! 调度/开关继续由现有 `job_defs` 承担，本模块只负责"默认长什么样"与
-//! "payload 怎么解析"。执行器见 Task 4（`maintenance::run`）。
+//! 调度/开关继续由现有 `job_defs` 承担，本模块负责"默认长什么样"、"payload 怎么
+//! 解析"以及"一轮执行怎么做、怎么报告"。
 
 pub mod policy;
 
-pub use policy::{
-    BATCH_SIZE, DatabaseMaintenancePolicy, DEFAULT_DATABASE_INTERVAL_SECS, DEFAULT_JOBS_INTERVAL_SECS,
-    DEFAULT_PLAYBACK_INTERVAL_SECS, DEFAULT_RETENTION_DAYS, JobsRetentionPolicy,
-    MAINTENANCE_TIMEOUT_SECS, MAX_BATCHES, MAX_MAINTENANCE_INTERVAL_SECS, MAX_RETENTION_DAYS,
-    MIN_MAINTENANCE_INTERVAL_SECS, MIN_RETENTION_DAYS, MaintenancePolicy, POLICY_VERSION,
-    PlaybackHistoryRetentionPolicy, VACUUM_MIN_FREE_BYTES, VACUUM_MIN_FREE_RATIO_PERCENT,
-    VACUUM_MIN_INTERVAL_SECS, validate_maintenance_interval, validate_retention_days,
+mod database;
+mod report;
+mod runner;
+
+pub use database::{
+    ConfiguredSqliteExecutor, DatabaseExecutor, DatabaseName, DatabaseTarget, MaintenanceContext,
+    PER_DATABASE_LIMIT, SqliteExecutor, SqliteLimits, VACUUM_DISK_HEADROOM_BYTES, database_targets,
 };
+pub use policy::{
+    BATCH_SIZE, DEFAULT_DATABASE_INTERVAL_SECS, DEFAULT_JOBS_INTERVAL_SECS,
+    DEFAULT_PLAYBACK_INTERVAL_SECS, DEFAULT_RETENTION_DAYS, DatabaseMaintenancePolicy,
+    JobsRetentionPolicy, MAINTENANCE_TIMEOUT_SECS, MAX_BATCHES, MAX_MAINTENANCE_INTERVAL_SECS,
+    MAX_RETENTION_DAYS, MIN_MAINTENANCE_INTERVAL_SECS, MIN_RETENTION_DAYS, MaintenancePolicy,
+    POLICY_VERSION, PlaybackHistoryRetentionPolicy, VACUUM_MIN_FREE_BYTES,
+    VACUUM_MIN_FREE_RATIO_PERCENT, VACUUM_MIN_INTERVAL_SECS, validate_maintenance_interval,
+    validate_retention_days,
+};
+pub use report::{DatabaseOutcome, DatabaseReport, MaintenanceReport};
+pub use runner::run;
 
 use jobs::{JobKind, NewDef, Queue, Schedule};
 

@@ -33,6 +33,10 @@ pub struct ApiState {
     pub(crate) cover_service: Arc<crate::library_cover_service::LibraryCoverService>,
     pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
     pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
+    /// 数据库维护执行器（生产为真实 SQLite；测试可注入阻塞/报错的假实现）。
+    pub(crate) maintenance_executor: Arc<dyn crate::maintenance::DatabaseExecutor>,
+    /// 进程内维护互斥：`concurrency_key` 只防同一 def 重叠，这里覆盖不同维护 def。
+    pub(crate) maintenance_lock: Arc<Mutex<()>>,
     /// Job attempts still executing in this process; protects them from timeout recovery.
     pub(crate) active_job_attempts: Arc<Mutex<HashMap<domain::JobId, jobs::Job>>>,
     /// Serializes a Subscribe pause/update against a worker's final add step.
@@ -184,6 +188,9 @@ impl ApiState {
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         crate::jobs_api::seed_instance_defs(&jobs)
             .map_err(|err| std::io::Error::other(err.to_string()))?;
+        // 维护任务默认 def：幂等注册，用户改过的开关/频率/payload 原样保留。
+        crate::maintenance::seed_maintenance_defs(&jobs)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
         let data_dir = store.lock().data_dir().to_path_buf();
         // 异步探测队列：ApiState 创建时启动 worker（生产在 Tokio main 内，
         // 有 runtime 才真正 spawn；测试路径仅创建队列不启动）。
@@ -207,6 +214,8 @@ impl ApiState {
             cover_service: Arc::new(crate::library_cover_service::LibraryCoverService::local()),
             library_work,
             jobs: Arc::new(Mutex::new(jobs)),
+            maintenance_executor: Arc::new(crate::maintenance::SqliteExecutor),
+            maintenance_lock: Arc::new(Mutex::new(())),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
             subscribe_guards: Arc::new(Mutex::new(HashMap::new())),
             deleting_subscribes: Arc::new(Mutex::new(HashSet::new())),
@@ -306,6 +315,20 @@ impl ApiState {
 
     pub fn jobs(&self) -> Arc<Mutex<jobs::Queue>> {
         self.jobs.clone()
+    }
+
+    /// 替换数据库维护执行器（测试注入阻塞/报 busy/磁盘不足的假实现）。
+    pub fn with_maintenance_executor(
+        mut self,
+        executor: Arc<dyn crate::maintenance::DatabaseExecutor>,
+    ) -> Self {
+        self.maintenance_executor = executor;
+        self
+    }
+
+    /// Library 工作注册表：测试用它取得/释放 lease 以观察重型维护避让。
+    pub fn library_work(&self) -> Arc<crate::library_lifecycle::LibraryWorkRegistry> {
+        self.library_work.clone()
     }
 
     pub fn subscribe_guard(&self, id: SubscribeId) -> Arc<Mutex<()>> {

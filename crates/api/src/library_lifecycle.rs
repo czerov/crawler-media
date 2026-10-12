@@ -189,6 +189,17 @@ impl LibraryWorkRegistry {
         self.entries.lock().get(library_id).and_then(|entry| entry.controls.values().next().cloned())
     }
 
+    /// 是否有任何 Library 工作正在进行（维护任务据此跳过重型操作）。
+    ///
+    /// 这只是**降低冲突**：返回 false 不代表之后不会被新扫描抢到锁，SQLite
+    /// busy 处理与有界执行仍然必须存在。
+    pub fn has_active_work(&self) -> bool {
+        self.entries
+            .lock()
+            .values()
+            .any(|entry| !entry.controls.is_empty())
+    }
+
     pub fn cancel(&self, library_id: &str) {
         let mut entries = self.entries.lock();
         let entry = entries.entry(library_id.into()).or_default();

@@ -461,15 +461,21 @@ pub(crate) async fn tick_jobs(
     let requested_now = query.now;
     let now = requested_now.unwrap_or_else(crate::job_loop::unix_now);
     let outcome = tokio::task::spawn_blocking(move || {
-        crate::job_loop::run_pending_jobs_with_clock(&state, now, || {
-            requested_now.unwrap_or_else(crate::job_loop::unix_now)
-        })
+        crate::job_loop::run_pending_jobs_with_clock(
+            &state,
+            now,
+            || requested_now.unwrap_or_else(crate::job_loop::unix_now),
+            crate::job_loop::TickSource::DevHttp,
+        )
     })
     .await;
     match outcome {
-        Ok(Ok(ran)) => ok(json!({
-            "ran": ran.len(),
-            "kinds": ran.iter().map(|job| job.kind.as_str()).collect::<Vec<_>>(),
+        Ok(Ok(run)) => ok(json!({
+            "ran": run.finished.len(),
+            "kinds": run.finished.iter().map(|job| job.kind.as_str()).collect::<Vec<_>>(),
+            // 维护任务不在这个开发入口执行（它需要自己的 Queue 短锁）；这里显式报告
+            // 本轮被跳过的维护 kind，交给后台 job_loop。
+            "skipped_maintenance": run.skipped_maintenance,
         }))
         .into_response(),
         Ok(Err(error)) => err(

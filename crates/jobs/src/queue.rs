@@ -240,6 +240,19 @@ impl Queue {
         crate::read::children_for_defs(&self.conn, ids)
     }
 
+    /// 只写 `progress` 列（单次执行的汇总报告 JSON）。终态持久化不覆盖该列，
+    /// 因此执行结束后仍可读；不影响调度/重试语义。
+    pub fn set_job_progress(&self, id: JobId, progress: &str) -> Result<(), JobError> {
+        let changed = self.conn.execute(
+            "UPDATE jobs SET progress = ?2 WHERE id = ?1",
+            rusqlite::params![id.to_string(), progress],
+        )?;
+        if changed == 0 {
+            return Err(JobError::UnknownJob(id));
+        }
+        Ok(())
+    }
+
     pub fn tick(&self, now: i64, runner: &dyn Runner) -> Result<Vec<Job>, JobError> {
         self.recover(now)?;
         self.ensure_scheduled(now)?;

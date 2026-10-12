@@ -69,6 +69,12 @@ impl Store {
         &self.app_path
     }
 
+    /// app 库的**真实**路径。`open_at` 允许自定义，因此维护任务不能假定
+    /// `data_dir/app.db`（DB8 第 5.2 节的 allowlist 由内部事实产生）。
+    pub fn app_db_path(&self) -> &Path {
+        &self.app_path
+    }
+
     pub fn db_paths(&self) -> Vec<PathBuf> {
         ["app.db", "catalog.db", "library.db", "subscribe.db"]
             .into_iter()
