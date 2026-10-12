@@ -92,8 +92,12 @@ mod log_scope;
 mod logs;
 mod sessions;
 mod units;
+mod watch_aggregate;
 
 pub use log_scope::{PlaybackLogPage, PlaybackLogScope};
+pub use watch_aggregate::{
+    WatchClient, WatchDay, WatchMedia, WatchMember, WatchReport, WatchTotals, WatchWindow,
+};
 
 impl UnitState {
     /// Shared Web/Jellyfin completion threshold: 90% or the final 30 seconds.
