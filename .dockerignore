@@ -6,3 +6,17 @@ web/public/jassub
 data
 .git
 .test-logs
+
+# 本地 secret：Dockerfile 的 `COPY web/ ./` 与 `COPY . .` 会把构建上下文里的
+# .env 带进镜像层，Vite 还可能把 VITE_* 烘进生产 bundle。根与任意层级都排除，
+# 只显式保留示例文件（web/.env.example 是仓库里被跟踪的模板）。
+.env
+.env.*
+**/.env
+**/.env.*
+secrets
+**/secrets
+.secrets
+**/.secrets
+!.env.example
+!**/.env.example

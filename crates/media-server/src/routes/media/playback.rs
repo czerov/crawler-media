@@ -31,32 +31,67 @@ pub(super) fn routes(provider: Arc<dyn MediaServerProvider>) -> Router {
         .with_state(AppState::new(provider))
 }
 
+/// 会话 token 的日志占位：日志里永不出现 token 原文。
+const SESSION_TOKEN_PLACEHOLDER: &str = "<session-token>";
+
+/// 撤销检查用的真实 device id：user 字段优先，其次请求头，最后回退会话 token。
+/// 鉴权必须使用真实值，只有日志走 [`log_device_id`]。
+fn resolve_device_id<'a>(
+    user_device_id: Option<&'a str>,
+    header_device_id: Option<&'a str>,
+    token: &'a str,
+) -> &'a str {
+    user_device_id.or(header_device_id).unwrap_or(token)
+}
+
+/// 日志用的 device id：解析结果就是会话 token 时返回固定占位，避免
+/// 「没有 DeviceId 时回退到 token」的兜底值把会话凭证写进日志。
+fn log_device_id(
+    user_device_id: Option<&str>,
+    header_device_id: Option<&str>,
+    token: &str,
+) -> String {
+    let device_id = resolve_device_id(user_device_id, header_device_id, token);
+    if device_id == token {
+        SESSION_TOKEN_PLACEHOLDER.to_string()
+    } else {
+        device_id.to_string()
+    }
+}
+
 async fn check_device_revocation(
     provider: &dyn MediaServerProvider,
     user: &AuthUser,
     headers: &HeaderMap,
     action: &str,
 ) -> Result<(), StatusCode> {
-    let device_id = user
-        .device_id
-        .as_deref()
-        .or_else(|| {
-            headers
-                .get("X-Emby-Device-Id")
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-        })
-        .unwrap_or(&user.token);
+    let header_device_id = headers
+        .get("X-Emby-Device-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let user_device_id = user.device_id.as_deref();
+    // 鉴权用真实值；日志用脱敏值（两者只有「兜底到 token」这一种情况不同）。
+    let device_id = resolve_device_id(user_device_id, header_device_id, &user.token);
+    let device_id_for_log = log_device_id(user_device_id, header_device_id, &user.token);
 
     match provider.is_device_revoked(user.id, device_id).await {
         Ok(true) => {
-            tracing::warn!(user_id = %user.id, device_id, "{action}请求被阻断：设备已撤销");
+            tracing::warn!(
+                user_id = %user.id,
+                device_id = %device_id_for_log,
+                "{action}请求被阻断：设备已撤销"
+            );
             return Err(StatusCode::FORBIDDEN);
         }
         Ok(false) => {}
         Err(err) => {
-            tracing::error!(user_id = %user.id, device_id, error = %err, "检查设备撤销状态失败");
+            tracing::error!(
+                user_id = %user.id,
+                device_id = %device_id_for_log,
+                error = %err,
+                "检查设备撤销状态失败"
+            );
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
@@ -64,12 +99,12 @@ async fn check_device_revocation(
     if device_id != user.token.as_str() {
         match provider.is_device_revoked(user.id, &user.token).await {
             Ok(true) => {
-                tracing::warn!(user_id = %user.id, token = %user.token, "{action}请求被阻断：会话Token关联设备已撤销");
+                tracing::warn!(user_id = %user.id, "{action}请求被阻断：会话Token关联设备已撤销");
                 return Err(StatusCode::FORBIDDEN);
             }
             Ok(false) => {}
             Err(err) => {
-                tracing::error!(user_id = %user.id, token = %user.token, error = %err, "检查Token撤销状态失败");
+                tracing::error!(user_id = %user.id, error = %err, "检查Token撤销状态失败");
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
@@ -276,4 +311,40 @@ pub async fn playback_info(
         "PlaySessionId": uuid::Uuid::new_v4().to_string(),
         "Chapters": dto::render_chapters_json(&snapshot),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SESSION_TOKEN_PLACEHOLDER, log_device_id, resolve_device_id};
+
+    const TOKEN: &str = "session-token-secret";
+
+    #[test]
+    fn log_device_id_keeps_a_real_user_device_id() {
+        assert_eq!(log_device_id(Some("living-room-tv"), None, TOKEN), "living-room-tv");
+    }
+
+    #[test]
+    fn log_device_id_keeps_a_real_header_device_id() {
+        assert_eq!(log_device_id(None, Some("phone-1"), TOKEN), "phone-1");
+    }
+
+    #[test]
+    fn log_device_id_masks_the_token_fallback() {
+        // 没有 DeviceId 时撤销检查回退到 token：日志必须脱敏。
+        assert_eq!(log_device_id(None, None, TOKEN), SESSION_TOKEN_PLACEHOLDER);
+        assert_ne!(log_device_id(None, None, TOKEN), TOKEN);
+        assert_eq!(log_device_id(Some(TOKEN), None, TOKEN), SESSION_TOKEN_PLACEHOLDER);
+        assert_eq!(log_device_id(None, Some(TOKEN), TOKEN), SESSION_TOKEN_PLACEHOLDER);
+    }
+
+    #[test]
+    fn resolve_device_id_still_returns_the_real_value_for_auth() {
+        // 鉴权路径不得被脱敏影响：兜底就是 token 原文。
+        assert_eq!(resolve_device_id(None, None, TOKEN), TOKEN);
+        assert_eq!(resolve_device_id(Some("tv"), Some("phone"), TOKEN), "tv");
+        assert_eq!(resolve_device_id(None, Some("phone"), TOKEN), "phone");
+        // user 字段为空串时仍按原语义优先（不回退 header）。
+        assert_eq!(resolve_device_id(Some(""), Some("phone"), TOKEN), "");
+    }
 }
