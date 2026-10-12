@@ -32,6 +32,14 @@ impl Store {
         let catalog = Connection::open(data_dir.join("catalog.db"))?;
         let library = Connection::open(data_dir.join("library.db"))?;
         let subscribe = Connection::open(data_dir.join("subscribe.db"))?;
+        // 降级保护：在任何迁移 / seed / 连接模式改动之前先做只读预检。只要有一个
+        // 库比本程序新就整体拒绝，四个库都不会被改动（也不写 user_version）。
+        schema::ensure_supported_versions(&[
+            ("app", &app, schema::APP_SCHEMA_VERSION),
+            ("catalog", &catalog, schema::CATALOG_SCHEMA_VERSION),
+            ("library", &library, schema::LIBRARY_SCHEMA_VERSION),
+            ("subscribe", &subscribe, schema::SUBSCRIBE_SCHEMA_VERSION),
+        ])?;
         // Enable WAL mode and set busy timeout for all connections.
         for conn in [&app, &catalog, &library, &subscribe] {
             conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -79,9 +87,9 @@ impl Store {
         ]
         .into_iter()
         .map(|(name, conn)| {
-            let version = conn
-                .pragma_query_value(None, "user_version", |row| row.get(0))
-                .unwrap_or(0);
+            // 诊断用途的只读访问器：读取失败时报告 0。打开时的降级保护走
+            // `schema::ensure_supported_versions`，读取失败会直接返回错误。
+            let version = schema::read_schema_version(conn).unwrap_or(0);
             (name, version)
         })
         .collect()

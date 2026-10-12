@@ -22,6 +22,23 @@ pub(crate) fn wanted_key(season: Option<u32>, episode: Option<u32>) -> (i64, i64
 }
 
 impl Store {
+    /// 批量 wanted 更新的事务 seam：在 subscribe 单连接上包一个事务，
+    /// 让「24 集」只有一次提交、失败时整体回滚。调用方已经在事务里时
+    /// （`!is_autocommit()`）直接执行——与 `playback_write` 同一约定，
+    /// 不嵌套开事务。
+    fn wanted_write<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        if !self.subscribe.is_autocommit() {
+            return operation(self);
+        }
+        let transaction = self.subscribe.unchecked_transaction()?;
+        let result = operation(self)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     /// 一轮搜索后：对每个还在追踪的单元累加 search_attempts 并刷新 last_search_at。
     /// 已入库（imported）的单元不在轮次里，不动。
     pub fn touch_wanted_searches(
@@ -30,17 +47,19 @@ impl Store {
         units: &[(Option<u32>, Option<u32>)],
         now: i64,
     ) -> Result<(), StoreError> {
-        let mut statement = self.subscribe.prepare(
-            "INSERT INTO subscribe_wanted (subscribe_id, season, episode, search_attempts, last_search_at)
-             VALUES (?1, ?2, ?3, 1, ?4)
-             ON CONFLICT(subscribe_id, season, episode) DO UPDATE SET
-               search_attempts = search_attempts + 1, last_search_at = excluded.last_search_at",
-        )?;
-        for (season, episode) in units {
-            let (s, e) = wanted_key(*season, *episode);
-            statement.execute(params![subscribe_id.to_string(), s, e, now])?;
-        }
-        Ok(())
+        self.wanted_write(|store| {
+            let mut statement = store.subscribe.prepare(
+                "INSERT INTO subscribe_wanted (subscribe_id, season, episode, search_attempts, last_search_at)
+                 VALUES (?1, ?2, ?3, 1, ?4)
+                 ON CONFLICT(subscribe_id, season, episode) DO UPDATE SET
+                   search_attempts = search_attempts + 1, last_search_at = excluded.last_search_at",
+            )?;
+            for (season, episode) in units {
+                let (s, e) = wanted_key(*season, *episode);
+                statement.execute(params![subscribe_id.to_string(), s, e, now])?;
+            }
+            Ok(())
+        })
     }
 
     /// Clear retry cooldown fields only for the supplied still-missing units.
@@ -49,18 +68,20 @@ impl Store {
         subscribe_id: SubscribeId,
         units: &[(Option<u32>, Option<u32>)],
     ) -> Result<usize, StoreError> {
-        let mut statement = self.subscribe.prepare(
-            "UPDATE subscribe_wanted
-             SET search_attempts = 0, last_search_at = NULL
-             WHERE subscribe_id = ?1 AND season = ?2 AND episode = ?3
-               AND (search_attempts <> 0 OR last_search_at IS NOT NULL)",
-        )?;
-        let mut reset = 0;
-        for (season, episode) in units {
-            let (s, e) = wanted_key(*season, *episode);
-            reset += statement.execute(params![subscribe_id.to_string(), s, e])?;
-        }
-        Ok(reset)
+        self.wanted_write(|store| {
+            let mut statement = store.subscribe.prepare(
+                "UPDATE subscribe_wanted
+                 SET search_attempts = 0, last_search_at = NULL
+                 WHERE subscribe_id = ?1 AND season = ?2 AND episode = ?3
+                   AND (search_attempts <> 0 OR last_search_at IS NOT NULL)",
+            )?;
+            let mut reset = 0;
+            for (season, episode) in units {
+                let (s, e) = wanted_key(*season, *episode);
+                reset += statement.execute(params![subscribe_id.to_string(), s, e])?;
+            }
+            Ok(reset)
+        })
     }
 
     /// 候选被规则组拒绝：记录最近一次拒绝原因（站点 · 种子名）。

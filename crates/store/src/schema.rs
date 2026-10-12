@@ -15,9 +15,35 @@ pub const LIBRARY_SCHEMA_VERSION: i64 = 7;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 3;
 
 /// Read the current schema version from a database file.
-fn schema_version(conn: &Connection) -> i64 {
-    conn.pragma_query_value(None, "user_version", |row| row.get(0))
-        .unwrap_or(0)
+///
+/// 读取失败必须向上报错：版本判定决定是否允许迁移，吞成 0 会把「读不出来」
+/// 伪装成「空库」。
+pub(crate) fn read_schema_version(conn: &Connection) -> Result<i64, StoreError> {
+    Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
+}
+
+/// 降级保护：任一库的 `user_version` 高于本程序支持的版本就拒绝打开。
+///
+/// 纯只读预检：不写 `user_version`、不建表、不 seed、不改连接模式，
+/// 因此命中时不会改动任何数据库文件。
+pub(crate) fn ensure_supported_versions(
+    databases: &[(&str, &Connection, i64)],
+) -> Result<(), StoreError> {
+    for (name, conn, supported) in databases {
+        let found = read_schema_version(conn)?;
+        if found > *supported {
+            tracing::error!(
+                database = name,
+                found,
+                supported,
+                "数据库 schema 版本高于本程序，拒绝降级打开"
+            );
+            return Err(StoreError::Invalid(format!(
+                "{name} database schema version {found} is newer than supported {supported}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Set the schema version after successful migration.
@@ -27,7 +53,7 @@ fn set_schema_version(conn: &Connection, version: i64) -> Result<(), StoreError>
 }
 
 pub fn migrate_app(conn: &Connection) -> Result<(), StoreError> {
-    let _current = schema_version(conn);
+    ensure_supported_versions(&[("app", conn, APP_SCHEMA_VERSION)])?;
     conn.execute_batch(tables::APP_TABLES)?;
     conn.execute_batch(library_deletion::TABLES)?;
     ensure_column(conn, "downloaders", "path_maps", "TEXT")?;
@@ -172,7 +198,7 @@ fn ensure_column(
 }
 
 pub fn migrate_catalog(conn: &Connection) -> Result<(), StoreError> {
-    let _current = schema_version(conn);
+    ensure_supported_versions(&[("catalog", conn, CATALOG_SCHEMA_VERSION)])?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS catalog_cache (
@@ -190,7 +216,7 @@ pub fn migrate_catalog(conn: &Connection) -> Result<(), StoreError> {
 }
 
 pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
-    let _current = schema_version(conn);
+    ensure_supported_versions(&[("library", conn, LIBRARY_SCHEMA_VERSION)])?;
     conn.execute_batch(tables::LIBRARY_TABLES)?;
     // ledger.missing_at：文件核验标记（老库补列，幂等）。
     ensure_column(conn, "ledger", "missing_at", "INTEGER")?;
@@ -222,7 +248,7 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
 }
 
 pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
-    let _current = schema_version(conn);
+    ensure_supported_versions(&[("subscribe", conn, SUBSCRIBE_SCHEMA_VERSION)])?;
     conn.execute_batch(tables::SUBSCRIBE_TABLES)?;
     migrate_playback_session_key(conn)?;
     // Old logs have no trustworthy device identity and remain nonrevocable.
