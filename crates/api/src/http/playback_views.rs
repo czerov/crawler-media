@@ -507,6 +507,8 @@ fn favorite_tier(
 
 /// 排序。`unwatched_first` 开着时先按观看分级（未看 → 在看 → 已看完），段内仍是这一档
 /// 自己的排序；关掉时与加这个开关之前逐字相同。末位一律用 id 兜底，保证翻页不重不漏。
+///
+/// title/year 比较键在排序前一次物化，比较器内不再查库。
 fn sort_favorite_entries(
     store: &crate::Store,
     list: &mut [FavoriteEntry],
@@ -514,26 +516,27 @@ fn sort_favorite_entries(
     is_desc: bool,
     unwatched_first: bool,
 ) {
+    let keys: HashMap<domain::MediaId, (String, Option<u16>)> = list
+        .iter()
+        .map(|entry| {
+            let media = store.get_media(entry.media_id).ok().flatten();
+            let title = media
+                .as_ref()
+                .map(|media| media.title.clone())
+                .unwrap_or_default();
+            let year = media.and_then(|media| media.year);
+            (entry.media_id, (title, year))
+        })
+        .collect();
     let title = |id: &domain::MediaId| {
-        store
-            .get_media(*id)
-            .ok()
-            .flatten()
-            .map(|media| media.title)
+        keys.get(id)
+            .map(|(title, _)| title.clone())
             .unwrap_or_default()
     };
-    let year = |id: &domain::MediaId| {
-        store
-            .get_media(*id)
-            .ok()
-            .flatten()
-            .and_then(|media| media.year)
-    };
+    let year = |id: &domain::MediaId| keys.get(id).and_then(|(_, year)| *year);
     list.sort_by(|a, b| {
         let tier = if unwatched_first {
-            a.tier
-                .unwrap_or_default()
-                .cmp(&b.tier.unwrap_or_default())
+            a.tier.unwrap_or_default().cmp(&b.tier.unwrap_or_default())
         } else {
             std::cmp::Ordering::Equal
         };

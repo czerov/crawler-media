@@ -7,14 +7,13 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use crate::http::playback::media_target_json;
 use crate::http::{err, ok};
 use crate::job_loop::unix_now;
 use crate::management::ApiState;
 use crate::store::PlayLogRow;
 
-fn log_json(store: &crate::Store, log: &PlayLogRow, member_name: &str) -> Value {
-    let media = media_target_json(store, log.media_id, log.season, log.episode);
+/// 渲染一条历史：`media` target 由调用方批量物化后传入（本函数不再查库）。
+fn log_json(media: Value, log: &PlayLogRow, member_name: &str) -> Value {
     let progress = log
         .duration_ms
         .filter(|d| *d > 0)
@@ -159,10 +158,26 @@ pub(crate) async fn history(
             }
         }
     };
+    // 本页所有 entry 的 media/成员名一次物化；渲染阶段不再查库。
+    let media_ids: Vec<domain::MediaId> = page.entries.iter().map(|log| log.media_id).collect();
+    let user_ids: Vec<domain::UserId> = page.entries.iter().map(|log| log.user_id).collect();
+    let read = crate::playback_read::PlaybackRead::load(&store, &media_ids, &user_ids).ok();
     let entries: Vec<Value> = page
         .entries
         .iter()
-        .map(|log| log_json(&store, log, &member_name(&store, log.user_id)))
+        .map(|log| {
+            let (media, name) = match &read {
+                Some(read) => (
+                    crate::playback_read::media_target(read, log.media_id, log.season, log.episode),
+                    read.member_name(log.user_id),
+                ),
+                None => (
+                    json!({ "media_item_id": log.media_id.to_string(), "title": "", "kind": "movie" }),
+                    member_name(&store, log.user_id),
+                ),
+            };
+            log_json(media, log, &name)
+        })
         .collect();
     // Composite cursor: encode both started_at (ms) and id to avoid
     // skipping same-second records at the page boundary.

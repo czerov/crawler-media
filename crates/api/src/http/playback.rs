@@ -108,39 +108,21 @@ fn visible_rows_for_media<'a>(
 }
 
 /// The activity view's media target block for a session/log row.
+///
+/// 薄 wrapper：一次物化 `PlaybackRead` 后交给纯函数渲染；调用点签名保持不变。
 pub(crate) fn media_target_json(
     store: &crate::Store,
     media_id: domain::MediaId,
     season: Option<i32>,
     episode: Option<i32>,
 ) -> Value {
-    let Some(media) = store.get_media(media_id).ok().flatten() else {
-        return json!({ "media_item_id": media_id.to_string(), "title": "", "kind": "movie" });
-    };
-    let all_rows = store.list_ledger().unwrap_or_default();
-    let rows: Vec<&domain::LedgerRow> = all_rows
-        .iter()
-        .filter(|row| row.media_id == media_id)
-        .collect();
-    let library_id = library_id_for(store, &media, &rows);
-    let poster_url = crate::http::library::preferred_row(&rows)
-        .and_then(crate::http::library::poster_path)
-        .map(|_| {
-            let row = crate::http::library::preferred_row(&rows).expect("just checked");
-            crate::http::library::artwork_url("posters", row.id)
-        });
-    json!({
-        "media_item_id": media.id.to_string(),
-        "library_id": library_id,
-        "browsable": true,
-        "kind": media.kind.as_str(),
-        "title": media.title,
-        "year": media.year,
-        "poster_url": poster_url,
-        "season_number": season.unwrap_or(0),
-        "episode_number": episode.unwrap_or(0),
-        "episode_title": null,
-    })
+    match crate::playback_read::PlaybackRead::load(store, &[media_id], &[]) {
+        Ok(read) => crate::playback_read::media_target(&read, media_id, season, episode),
+        Err(error) => {
+            tracing::error!(%error, %media_id, "读取播放目标失败");
+            json!({ "media_item_id": media_id.to_string(), "title": "", "kind": "movie" })
+        }
+    }
 }
 
 pub(crate) fn unit_json(unit: &UnitState) -> Value {

@@ -324,13 +324,24 @@ pub(crate) async fn collection_gallery(
                     }
                 }
             }
+            // 真实收藏态：whole unit；movie 沿用既有 legacy (0,0) 兜底。
+            let is_favorite = crate::http::playback::movie_compatible_state(
+                &store,
+                user_id,
+                item.media.id,
+                crate::store::UNIT_WHOLE,
+                crate::store::UNIT_WHOLE,
+            )
+            .ok()
+            .flatten()
+            .is_some_and(|unit| unit.favorite);
             json!({
                 "media_item_id": item.media.id.to_string(),
                 "library_id": item.library_id,
                 "kind": item.media.kind.as_str(),
                 "title": item.media.title,
                 "year": item.media.year,
-                "is_favorite": true,
+                "is_favorite": is_favorite,
                 "images": images,
             })
         })

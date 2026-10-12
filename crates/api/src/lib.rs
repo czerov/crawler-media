@@ -59,6 +59,7 @@ mod fs_watcher_tests;
 pub mod http_agent;
 pub mod obscura_manager;
 pub mod password_login;
+mod playback_read;
 pub mod probe_manager;
 pub mod subtitle_delivery;
 pub mod system_logs;

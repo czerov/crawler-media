@@ -203,6 +203,32 @@ impl Store {
         let rows = stmt.query_map(rusqlite::params![media_id.to_string()], map_ledger)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    /// 一次取多个 Media 的 ledger 行（≤500 个 id 一块，复用 `ledger.media_id` 索引）。
+    /// 重复 id 只查询一次，输出行不保证顺序。
+    pub fn ledger_for_media_batch(
+        &self,
+        ids: &[domain::MediaId],
+    ) -> Result<Vec<LedgerRow>, StoreError> {
+        let unique: std::collections::HashSet<domain::MediaId> = ids.iter().copied().collect();
+        let mut out = Vec::new();
+        let ids: Vec<domain::MediaId> = unique.into_iter().collect();
+        for chunk in ids.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT id, media_id, path, season, episode, resolution, codec, hdr,
+                        quality_source, confidence, filter_score
+                 FROM ledger WHERE media_id IN ({placeholders})"
+            );
+            let mut stmt = self.library.prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(chunk.iter().map(domain::MediaId::to_string)),
+                map_ledger,
+            )?;
+            out.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+        Ok(out)
+    }
     pub fn get_ledger_by_unit(
         &self,
         media_id: domain::MediaId,
@@ -279,5 +305,50 @@ impl Store {
             .list_ledger()?
             .into_iter()
             .find(|row| row.id.to_string().replace('-', "") == compact_id))
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use domain::{Confidence, LedgerId, MediaId, QualitySource};
+
+    fn seed_row(store: &Store, media_id: MediaId, index: usize) -> LedgerRow {
+        let row = LedgerRow {
+            id: LedgerId::new(),
+            media_id,
+            path: format!("/tmp/batch-{index}.mkv"),
+            season: None,
+            episode: None,
+            resolution: None,
+            codec: None,
+            hdr: None,
+            quality_source: QualitySource::Probe,
+            confidence: Confidence::High,
+            filter_score: None,
+        };
+        store.insert_ledger(&row).unwrap();
+        row
+    }
+
+    #[test]
+    fn ledger_for_media_batch_covers_chunk_boundary_and_dedups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ids: Vec<MediaId> = (0..501).map(|_| MediaId::new()).collect();
+        for (index, media_id) in ids.iter().enumerate() {
+            seed_row(&store, *media_id, index);
+        }
+
+        assert_eq!(store.ledger_for_media_batch(&ids).unwrap().len(), 501);
+        assert!(store.ledger_for_media_batch(&[]).unwrap().is_empty());
+
+        // 重复 id 只查询一次，不产生重复行。
+        let mut duplicated = ids.clone();
+        duplicated.extend(ids.iter().take(10).copied());
+        assert_eq!(
+            store.ledger_for_media_batch(&duplicated).unwrap().len(),
+            501
+        );
     }
 }
