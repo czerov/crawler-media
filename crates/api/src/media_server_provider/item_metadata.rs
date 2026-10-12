@@ -34,31 +34,31 @@ fn item_is_favorite(store: &Store, user_id: UserId, row: &domain::LedgerRow) -> 
     }
 }
 
-pub(super) fn item_metadata(
+/// 锁内只取的 owned DB 事实：进度与已探测轨道。
+pub(super) struct ItemDbFacts {
+    resume_state: Option<crate::store::UnitState>,
+    tracks: library::Tracks,
+    is_favorite: bool,
+}
+
+/// 必须在 Store 锁内调用；只做 DB 读取，不做任何文件 IO。
+pub(super) fn item_db_facts(
     store: &Store,
     user_id: UserId,
     row: &domain::LedgerRow,
-    media: &Media,
     is_series: bool,
-    child_counts: Option<(usize, usize)>,
-) -> MediaItemMetadata {
-    let nfo = row_nfo_metadata(row, media, is_series);
-    let (has_primary_image, primary_image_url) = primary_image_metadata(row, media, is_series);
-    let primary_image_tag = series_primary_image_tag(row, media, is_series);
+) -> ItemDbFacts {
     let resume_state = row.season.zip(row.episode).and_then(|(season, episode)| {
         store
             .unit_state(user_id, row.media_id, season as i32, episode as i32)
             .ok()
             .flatten()
     });
-    let (child_count, local_season_count) = child_counts
-        .map(|(episodes, seasons)| (Some(episodes), Some(seasons)))
-        .unwrap_or((None, None));
-    let season_count = nfo
-        .as_ref()
-        .and_then(|metadata| metadata.number_of_seasons)
-        .map(|count| count as usize)
-        .or(local_season_count);
+    let tracks = store
+        .get_file_meta(&row.id.to_string())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let favorite_row = if is_series {
         domain::LedgerRow {
             season: None,
@@ -68,12 +68,39 @@ pub(super) fn item_metadata(
     } else {
         row.clone()
     };
-    let mut tracks = store
-        .get_file_meta(&row.id.to_string())
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    match library::external_subtitle_tracks(std::path::Path::new(&row.path)) {
+    ItemDbFacts {
+        resume_state,
+        tracks,
+        is_favorite: item_is_favorite(store, user_id, &favorite_row),
+    }
+}
+
+/// 锁外渲染：NFO/stat/外部字幕 IO 都在这里，调用方必须先释放 Store 锁。
+pub(super) fn item_metadata(
+    facts: ItemDbFacts,
+    browse: &dyn crate::browse_file_read::BrowseFileRead,
+    row: &domain::LedgerRow,
+    media: &Media,
+    is_series: bool,
+    child_counts: Option<(usize, usize)>,
+) -> MediaItemMetadata {
+    let ItemDbFacts {
+        resume_state,
+        mut tracks,
+        is_favorite,
+    } = facts;
+    let nfo = row_nfo_metadata(row, media, is_series);
+    let (has_primary_image, primary_image_url) = primary_image_metadata(row, media, is_series);
+    let primary_image_tag = series_primary_image_tag(row, media, is_series);
+    let (child_count, local_season_count) = child_counts
+        .map(|(episodes, seasons)| (Some(episodes), Some(seasons)))
+        .unwrap_or((None, None));
+    let season_count = nfo
+        .as_ref()
+        .and_then(|metadata| metadata.number_of_seasons)
+        .map(|count| count as usize)
+        .or(local_season_count);
+    match browse.external_subtitles(std::path::Path::new(&row.path)) {
         Ok(sidecars) => {
             for sidecar in sidecars {
                 let already_present = tracks
@@ -153,7 +180,7 @@ pub(super) fn item_metadata(
             .then(|| nfo.as_ref().and_then(|metadata| metadata.title.clone()))
             .flatten(),
         people: people_from_nfo(nfo.as_ref()),
-        is_favorite: item_is_favorite(store, user_id, &favorite_row),
+        is_favorite,
         resume_updated_at: resume_state
             .map(|state| state.updated_at)
             .unwrap_or_default(),

@@ -15,37 +15,41 @@ pub(super) fn resolve_fallback_item(
         return None;
     }
     let media = store.get_media(row.media_id).ok().flatten()?;
-    Some(fallback_snapshot(&store, user_id, row, media, false))
+    drop(store);
+    Some(fallback_snapshot(state, user_id, row, media, false))
 }
 
 pub(super) fn fallback_snapshot(
-    store: &crate::Store,
+    state: &ApiState,
     user_id: UserId,
     row: domain::LedgerRow,
     media: domain::Media,
     is_series: bool,
 ) -> MediaItemSnapshot {
-    let marker = store
-        .get_media_marker(row.media_id, row.season, row.episode)
-        .ok()
-        .flatten();
-    let chapters = store
-        .get_cached_chapters(&row.id.to_string())
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let ticks = playback_ticks(store, user_id, &row, &media);
-    let is_episode = media.kind == MediaKind::Tv && row.season.is_some() && row.episode.is_some();
-    let parent_id = if is_episode {
-        media.id.to_string().replace('-', "")
-    } else {
-        crate::http::playback::library_id_for(store, &media, &[&row])
-            .unwrap_or_else(|| media.id.to_string().replace('-', ""))
-    };
-    MediaItemSnapshot {
-        played: item_is_played(store, user_id, &row),
-        play_count: unit_play_count(
-            store,
+    // 锁内只取 owned DB 事实。
+    let (marker, chapters, ticks, played, play_count, parent_id, facts) = {
+        let store = state.store.lock();
+        let marker = store
+            .get_media_marker(row.media_id, row.season, row.episode)
+            .ok()
+            .flatten();
+        let chapters = store
+            .get_cached_chapters(&row.id.to_string())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let ticks = playback_ticks(&store, user_id, &row, &media);
+        let is_episode =
+            media.kind == MediaKind::Tv && row.season.is_some() && row.episode.is_some();
+        let parent_id = if is_episode {
+            media.id.to_string().replace('-', "")
+        } else {
+            crate::http::playback::library_id_for(&store, &media, &[&row])
+                .unwrap_or_else(|| media.id.to_string().replace('-', ""))
+        };
+        let played = item_is_played(&store, user_id, &row);
+        let play_count = unit_play_count(
+            &store,
             user_id,
             row.media_id,
             row.season
@@ -54,12 +58,27 @@ pub(super) fn fallback_snapshot(
             row.episode
                 .map(|value| value as i32)
                 .unwrap_or(crate::store::UNIT_WHOLE),
+        );
+        let facts = item_metadata::item_db_facts(&store, user_id, &row, is_series);
+        (marker, chapters, ticks, played, play_count, parent_id, facts)
+    };
+    // 锁外：NFO / stat / 外部字幕 IO。
+    let metadata = with_date_created(
+        item_metadata(
+            facts,
+            state.browse_files.as_ref(),
+            &row,
+            &media,
+            is_series,
+            None,
         ),
+        file_date_created(state.browse_files.as_ref(), &row.path),
+    );
+    MediaItemSnapshot {
+        played,
+        play_count,
         unplayed_item_count: None,
-        metadata: with_date_created(
-            item_metadata(store, user_id, &row, &media, is_series, None),
-            file_date_created(&row.path),
-        ),
+        metadata,
         row,
         media,
         ticks,
@@ -84,7 +103,8 @@ pub(super) fn list_visible_items(
     let ledger_rows = store.list_ledger().map_err(|error| error.to_string())?;
     let mut show_episodes: HashMap<domain::MediaId, HashSet<(u32, u32)>> = HashMap::new();
     let mut show_seasons: HashMap<domain::MediaId, HashSet<u32>> = HashMap::new();
-    let latest_ingest_by_media = latest_visible_ingest_by_media(&store, user_id, &ledger_rows);
+    let latest_ingest_by_media =
+        latest_visible_ingest_by_media(&store, provider.state.browse_files.as_ref(), user_id, &ledger_rows);
     collect_visible_units(
         &store,
         user_id,
@@ -122,10 +142,11 @@ pub(super) fn list_visible_items(
         let date_created = if is_series {
             latest_ingest_by_media.get(&media.id).copied()
         } else {
-            file_date_created(&row.path)
+            file_date_created(provider.state.browse_files.as_ref(), &row.path)
         };
         visible.push(visible_snapshot(
             &store,
+            provider.state.browse_files.as_ref(),
             user_id,
             row,
             media,
@@ -165,6 +186,7 @@ fn playback_ticks(
 
 fn visible_snapshot(
     store: &crate::Store,
+    browse: &dyn crate::browse_file_read::BrowseFileRead,
     user_id: UserId,
     row: domain::LedgerRow,
     media: domain::Media,
@@ -194,7 +216,14 @@ fn visible_snapshot(
         )
     });
     let metadata = with_date_created(
-        item_metadata(&store, user_id, &row, &media, is_series, child_counts),
+        item_metadata(
+            item_metadata::item_db_facts(&store, user_id, &row, is_series),
+            browse,
+            &row,
+            &media,
+            is_series,
+            child_counts,
+        ),
         date_created,
     );
 
@@ -218,6 +247,7 @@ fn visible_snapshot(
 
 fn latest_visible_ingest_by_media(
     store: &crate::Store,
+    browse: &dyn crate::browse_file_read::BrowseFileRead,
     user_id: UserId,
     rows: &[domain::LedgerRow],
 ) -> HashMap<domain::MediaId, SystemTime> {
@@ -229,7 +259,7 @@ fn latest_visible_ingest_by_media(
         if !crate::http::library::row_visible_to_user(store, row, &media, Some(user_id)) {
             continue;
         }
-        let Some(created) = file_date_created(&row.path) else {
+        let Some(created) = file_date_created(browse, &row.path) else {
             continue;
         };
         latest
@@ -240,8 +270,11 @@ fn latest_visible_ingest_by_media(
     latest
 }
 
-fn file_date_created(path: &str) -> Option<SystemTime> {
-    let metadata = match std::fs::metadata(path) {
+fn file_date_created(
+    browse: &dyn crate::browse_file_read::BrowseFileRead,
+    path: &str,
+) -> Option<SystemTime> {
+    let metadata = match browse.metadata(std::path::Path::new(path)) {
         Ok(metadata) => metadata,
         Err(error) => {
             tracing::warn!(path, %error, "Jellyfin DateCreated unavailable for media file");

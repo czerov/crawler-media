@@ -266,22 +266,25 @@ impl MediaServerProvider for ApiServerProvider {
             }
             let s_opt = if season < 0 { None } else { Some(season as u32) };
             let e_opt = if episode < 0 { None } else { Some(episode as u32) };
-            let snapshot = {
+            // 锁内只取 owned DB 事实；锁外才做 NFO/stat/字幕 IO。
+            let found = {
                 let store = self.state.store.lock();
-                if let Ok(Some(row)) = store.get_ledger_by_unit(media_id, s_opt, e_opt) {
-                    if let Ok(Some(media)) = store.get_media(media_id) {
-                        if crate::http::library::row_visible_to_user(&store, &row, &media, Some(user_id)) {
-                            Some(items::fallback_snapshot(&store, user_id, row, media, false))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                match store.get_ledger_by_unit(media_id, s_opt, e_opt) {
+                    Ok(Some(row)) => match store.get_media(media_id) {
+                        Ok(Some(media)) => crate::http::library::row_visible_to_user(
+                            &store,
+                            &row,
+                            &media,
+                            Some(user_id),
+                        )
+                        .then_some((row, media)),
+                        _ => None,
+                    },
+                    _ => None,
                 }
             };
+            let snapshot = found
+                .map(|(row, media)| items::fallback_snapshot(&self.state, user_id, row, media, false));
             if let Some(sn) = snapshot {
                 results.push(sn);
                 if results.len() >= limit {
@@ -297,22 +300,24 @@ impl MediaServerProvider for ApiServerProvider {
         id: &str,
     ) -> Result<Option<MediaItemSnapshot>, String> {
         let compact_id = id.replace('-', "");
-        let direct = {
+        let found = {
             let store = self.state.store.lock();
             let row = crate::http::media_visibility::resolve_visible_row(&store, id, Some(user_id));
-            if let Some(row) = row {
-                if let Ok(Some(media)) = store.get_media(row.media_id) {
-                    let is_series = media.kind == MediaKind::Tv
-                        && (compact_id == media.id.to_string().replace('-', "")
-                            || id == media.id.to_string());
-                    Some(items::fallback_snapshot(&store, user_id, row, media, is_series))
-                } else {
-                    None
-                }
-            } else {
-                None
+            match row {
+                Some(row) => store
+                    .get_media(row.media_id)
+                    .ok()
+                    .flatten()
+                    .map(|media| (row, media)),
+                None => None,
             }
         };
+        let direct = found.map(|(row, media)| {
+            let is_series = media.kind == MediaKind::Tv
+                && (compact_id == media.id.to_string().replace('-', "")
+                    || id == media.id.to_string());
+            items::fallback_snapshot(&self.state, user_id, row, media, is_series)
+        });
 
         if let Some(snapshot) = direct {
             return Ok(Some(self.enrich_single_item(snapshot).await));

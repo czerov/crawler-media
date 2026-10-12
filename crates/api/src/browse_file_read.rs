@@ -13,6 +13,9 @@ pub trait BrowseFileRead: Send + Sync {
 
     /// 文件元数据（排序用的 added_at / size）。
     fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata>;
+
+    /// 发现视频旁的 external 字幕轨（文件系统 IO）。
+    fn external_subtitles(&self, path: &Path) -> Result<Vec<library::SubtitleTrack>, String>;
 }
 
 /// 生产实现：直接访问磁盘。
@@ -25,5 +28,9 @@ impl BrowseFileRead for LocalBrowseFileRead {
 
     fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
         std::fs::metadata(path)
+    }
+
+    fn external_subtitles(&self, path: &Path) -> Result<Vec<library::SubtitleTrack>, String> {
+        library::external_subtitle_tracks(path).map_err(|error| error.to_string())
     }
 }

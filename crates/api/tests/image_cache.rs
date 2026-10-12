@@ -202,3 +202,162 @@ async fn conditional_get_requires_authorization_before_validator() {
     assert_ne!(new_etag, etag, "changed bytes must change the ETag");
     assert_eq!(body_bytes(refreshed).await, second_bytes);
 }
+
+// ---------------------------------------------------------------------------
+// C2a：本地元数据 IO 必须在 Store 锁之外（注入阻塞 BrowseFileRead 证明）。
+// ---------------------------------------------------------------------------
+
+struct BlockingBrowse {
+    gate: Arc<Gate>,
+}
+
+impl api::browse_file_read::BrowseFileRead for BlockingBrowse {
+    fn read_nfo(&self, _path: &Path) -> Option<library::NfoMeta> {
+        None
+    }
+
+    fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        std::fs::metadata(path)
+    }
+
+    fn external_subtitles(
+        &self,
+        _path: &Path,
+    ) -> Result<Vec<library::SubtitleTrack>, String> {
+        self.gate.enter_and_wait();
+        Ok(Vec::new())
+    }
+}
+
+struct Gate {
+    entered: std::sync::Mutex<bool>,
+    entered_cv: std::sync::Condvar,
+    open: std::sync::Mutex<bool>,
+    open_cv: std::sync::Condvar,
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            entered: std::sync::Mutex::new(false),
+            entered_cv: std::sync::Condvar::new(),
+            open: std::sync::Mutex::new(false),
+            open_cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn enter_and_wait(&self) {
+        *self.entered.lock().unwrap() = true;
+        self.entered_cv.notify_all();
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.open_cv.wait(open).unwrap();
+        }
+    }
+
+    fn entered(&self) -> bool {
+        *self.entered.lock().unwrap()
+    }
+
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.open_cv.notify_all();
+    }
+}
+
+struct ReleaseOnDrop(Arc<Gate>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_file_io_runs_off_the_store_lock() {
+    use media_server::provider::MediaServerProvider;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Gate::new());
+    let state = make_state(tmp.path()).with_browse_file_read(Arc::new(BlockingBrowse {
+        gate: gate.clone(),
+    }));
+    let (user_id, ledger_id) = {
+        let library_root = tmp.path().join("visible");
+        std::fs::create_dir_all(&library_root).unwrap();
+        let file = library_root.join("Movie.mkv");
+        std::fs::write(&file, b"video").unwrap();
+        let store = state.store();
+        let guard = store.lock();
+        guard
+            .create_library(
+                MediaKind::Movie,
+                "Visible",
+                &[library_root.to_str().unwrap()],
+                "everyone",
+                true,
+                &[],
+            )
+            .unwrap();
+        let media = Media {
+            id: MediaId::new(),
+            kind: MediaKind::Movie,
+            title: "Lock Test".into(),
+            year: None,
+            original_title: None,
+            tmdb_id: None,
+            douban_id: None,
+            tvdb_id: None,
+            bangumi_id: None,
+            anilist_id: None,
+        };
+        guard.insert_media(&media).unwrap();
+        let ledger_id = LedgerId::new();
+        guard
+            .insert_ledger(&LedgerRow {
+                id: ledger_id,
+                media_id: media.id,
+                path: file.display().to_string(),
+                season: None,
+                episode: None,
+                resolution: None,
+                codec: None,
+                hdr: None,
+                quality_source: QualitySource::Probe,
+                confidence: Confidence::High,
+                filter_score: None,
+            })
+            .unwrap();
+        let user_id = guard.user_id_by_token("management-secret").unwrap().unwrap();
+        (user_id, ledger_id)
+    };
+
+    let provider = api::media_server_provider::ApiServerProvider::new(state.clone());
+    let handle = tokio::spawn(async move {
+        provider
+            .resolve_single_item(user_id, &ledger_id.to_string())
+            .await
+    });
+    // 有界等待：基线没有走 BrowseFileRead seam，这里会干净地失败而不是挂死。
+    let entered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !gate.entered() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        entered.is_ok(),
+        "metadata file IO never went through BrowseFileRead"
+    );
+    let _release = ReleaseOnDrop(gate.clone());
+    {
+        let store = state.store();
+        assert!(
+            store.try_lock().is_some(),
+            "NFO/stat/subtitle IO must not run while the Store lock is held"
+        );
+    }
+    gate.release();
+    let snapshot = handle.await.unwrap().unwrap().expect("snapshot must resolve");
+    assert_eq!(snapshot.media.title, "Lock Test");
+}
