@@ -59,11 +59,13 @@ pub(super) enum DownloaderWorkError {
     Timeout,
     Busy,
     Worker(String),
+    /// RPC 已完成，但本地 finalization（如删除 pending 行）失败。
+    Finalize(String),
 }
 
 impl DownloaderWorkError {
-    /// Resolve→502、Operation/Worker→500、Timeout→504、Busy→503
-    /// （remove_task 另行映射 Resolve）。
+    /// Resolve→502、Operation/Worker→500、Timeout→504、Busy→503、
+    /// Finalize→500 store.error（remove_task 另行映射 Resolve）。
     pub(super) fn response(self) -> Response {
         match self {
             Self::Resolve(message) => err(StatusCode::BAD_GATEWAY, "downloader.error", &message),
@@ -82,6 +84,9 @@ impl DownloaderWorkError {
                 "runtime.busy",
                 "服务繁忙，请重试",
             ),
+            Self::Finalize(message) => {
+                err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &message)
+            }
         }
     }
 }
@@ -146,6 +151,41 @@ where
         + 'static,
 {
     run_downloader(state, downloader_id, None, work).await
+}
+
+/// 有副作用动作 + 本地 finalization 必须同属一个 owned 作业。
+///
+/// 请求 future 被 drop 时，blocking 闭包仍会跑完 RPC 并执行 `finalize`，
+/// 避免“外部任务已删、本地 pending 还在”的不一致。Store 错误单独成
+/// [`DownloaderWorkError::Finalize`]，不塞进 `DownloaderError`。
+pub(super) async fn run_downloader_action_then<T, F, G>(
+    state: &ApiState,
+    downloader_id: Option<domain::DownloaderId>,
+    work: F,
+    finalize: G,
+) -> Result<T, DownloaderWorkError>
+where
+    T: Send + 'static,
+    F: FnOnce(&dyn downloader::Downloader) -> Result<T, downloader::DownloaderError>
+        + Send
+        + 'static,
+    G: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    let state_for_work = state.clone();
+    let job = move || -> Result<T, DownloaderWorkError> {
+        let client = crate::delivery::client_for_id(&state_for_work, downloader_id)
+            .map_err(|error| DownloaderWorkError::Resolve(error.to_string()))?;
+        let value = work(client.as_ref())
+            .map_err(|error| DownloaderWorkError::Operation(error.to_string()))?;
+        finalize().map_err(DownloaderWorkError::Finalize)?;
+        Ok(value)
+    };
+    match state.http_work.run_to_completion(job).await {
+        Ok(result) => result,
+        Err(BlockingError::Busy) => Err(DownloaderWorkError::Busy),
+        Err(BlockingError::Timeout) => Err(DownloaderWorkError::Timeout),
+        Err(other) => Err(DownloaderWorkError::Worker(other.to_string())),
+    }
 }
 
 /// 只解析 query 里的 downloader_id（纯字符串处理，不触碰 Store/网络）。
@@ -306,10 +346,23 @@ pub(crate) async fn remove_task(
     };
     let delete_files = body.delete_files;
     let torrent_for_remove = pending.torrent.clone();
-    // 有副作用：等到 remove_owned 真正结束；解析与调用同在一个 owned 闭包内。
-    match run_downloader_action(&state, pending.downloader_id, move |client| {
-        client.remove_owned(&torrent_for_remove, delete_files)
-    })
+    let enclosure = pending.torrent.enclosure.clone();
+    let state_for_finalize = state.clone();
+    // RPC 与本地 pending finalization 同属一个 owned 作业：请求 future 被 drop
+    // 时 blocking 闭包仍会跑完 remove_owned 并删除这条 pending（身份=subscribe+enclosure）。
+    match run_downloader_action_then(
+        &state,
+        pending.downloader_id,
+        move |client| client.remove_owned(&torrent_for_remove, delete_files),
+        move || {
+            state_for_finalize
+                .store
+                .lock()
+                .delete_pending(subscribe_id, &enclosure)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+    )
     .await
     {
         Ok(()) => {}
@@ -322,17 +375,6 @@ pub(crate) async fn remove_task(
             );
         }
         Err(error) => return error.response(),
-    }
-    if let Err(error) = state
-        .store
-        .lock()
-        .delete_pending(subscribe_id, &pending.torrent.enclosure)
-    {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store.error",
-            &error.to_string(),
-        );
     }
     ok(json!({
         "ok": true,
