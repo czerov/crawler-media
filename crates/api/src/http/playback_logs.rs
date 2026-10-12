@@ -108,7 +108,7 @@ pub(crate) async fn history(
     axum::Extension(user_id): axum::Extension<domain::UserId>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let limit = query
+    let limit: usize = query
         .get("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(30)
@@ -117,8 +117,7 @@ pub(crate) async fn history(
         .get("before")
         .and_then(|v| v.parse::<i128>().ok())
         .map(|ms| (ms / 1000) as i64);
-    let before_id = query.get("before_id").map(String::as_str);
-    let days = query.get("days").and_then(|v| v.parse().ok());
+    let days: Option<i64> = query.get("days").and_then(|v| v.parse().ok());
     let now = unix_now();
     let store = state.store.lock();
     let admin = store
@@ -136,33 +135,44 @@ pub(crate) async fn history(
         "visible"
     };
     let visible_media = visible_media_ids(&store, user_id, scope);
-    let all_logs = store
-        .list_logs(200_000, before, before_id, days, now, target_user)
-        .unwrap_or_default();
-    let hidden_count = all_logs
-        .iter()
-        .filter(|log| !media_visible(visible_media.as_ref(), log.media_id))
-        .count();
-    let mut logs: Vec<PlayLogRow> = all_logs
-        .into_iter()
-        .filter(|log| media_visible(visible_media.as_ref(), log.media_id))
-        .collect();
-    let has_more = logs.len() > limit;
-    logs.truncate(limit);
-    let entries: Vec<Value> = logs
+    // SQL 侧做 keyset 分页 + 可见集合过滤 + hidden 计数：不再把整个表读进内存。
+    let log_scope = crate::store::PlaybackLogScope {
+        before,
+        // Store 对「只有 before_id 没有 before」返回 Invalid；旧实现忽略，保持一致。
+        before_id: if before.is_some() {
+            query.get("before_id").map(String::clone)
+        } else {
+            None
+        },
+        since: days.map(|days| now - days * 86_400),
+        user_id: target_user,
+        visible_media: visible_media.map(|ids| ids.into_iter().collect()),
+    };
+    let page = match store.playback_log_page(&log_scope, limit) {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::error!(%error, "播放历史分页失败");
+            crate::store::PlaybackLogPage {
+                entries: Vec::new(),
+                has_more: false,
+                hidden_count: 0,
+            }
+        }
+    };
+    let entries: Vec<Value> = page
+        .entries
         .iter()
         .map(|log| log_json(&store, log, &member_name(&store, log.user_id)))
         .collect();
-    let last = logs.last();
     // Composite cursor: encode both started_at (ms) and id to avoid
     // skipping same-second records at the page boundary.
-    let cursor_log = last.filter(|_| has_more);
+    let cursor_log = page.entries.last().filter(|_| page.has_more);
     let next_cursor = cursor_log.map(|log| (log.started_at as i128 * 1000).to_string());
     let next_cursor_id = cursor_log.map(|log| log.id.clone());
     ok(json!({
         "entries": entries,
-        "hidden_count": hidden_count,
-        "has_more": has_more,
+        "hidden_count": page.hidden_count,
+        "has_more": page.has_more,
         "next_cursor": next_cursor,
         "next_cursor_id": next_cursor_id,
     }))
