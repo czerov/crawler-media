@@ -90,11 +90,13 @@ fn user_id_from(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<UserI
 
 mod log_scope;
 mod logs;
+mod retention;
 mod sessions;
 mod units;
 mod watch_aggregate;
 
 pub use log_scope::{PlaybackLogPage, PlaybackLogScope};
+pub use retention::PlaybackRetentionBatch;
 pub use watch_aggregate::{
     WatchClient, WatchDay, WatchMedia, WatchMember, WatchReport, WatchTotals, WatchWindow,
 };
