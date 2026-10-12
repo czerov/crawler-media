@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 
+use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -8,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use futures_core::Stream;
 use serde_json::json;
 use tokio_stream::StreamExt;
+use tokio_util::io::ReaderStream;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::http::ok;
@@ -43,48 +45,83 @@ pub(crate) async fn clear_logs(State(state): State<ApiState>) -> Response {
     ok(json!({ "cleared": true })).into_response()
 }
 
-/// Export logs as plain text
+/// Export logs as plain text.
+///
+/// 目录选择放在 blocking 线程（保持既有「最新日志文件 + 缓冲回退」语义），
+/// 命中的文件用流式读取返回，不再把整个文件读进内存。
 pub(crate) async fn export_logs(State(state): State<ApiState>) -> Response {
     let data_dir = {
         let store = state.store.lock();
         store.data_dir().to_path_buf()
     };
     let logs_dir = data_dir.join("logs");
-    // 支持直接匹配 crawler-media.log 或 tracing-appender 生成的 daily 文件 crawler-media.log.YYYY-MM-DD
-    let mut file_content = None;
-    if logs_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
-            let mut log_files: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.starts_with("crawler-media.log"))
-                        .unwrap_or(false)
-                })
-                .collect();
-            log_files.sort();
-            if let Some(latest) = log_files.last() {
-                file_content = std::fs::read_to_string(latest).ok();
-            }
-        }
-    }
-    let content = file_content.unwrap_or_else(|| export_from_buffer(&state));
-
+    let selected = tokio::task::spawn_blocking(move || latest_log_file(&logs_dir))
+        .await
+        .unwrap_or(None);
     let filename = format!("crawler-media-logs-{}.txt", chrono_like_timestamp());
+    let Some(path) = selected else {
+        return buffer_export(&state, &filename);
+    };
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "打开日志文件失败，回退内存缓冲");
+            return buffer_export(&state, &filename);
+        }
+    };
+    let length = file.metadata().await.ok().map(|meta| meta.len());
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&content_disposition(&filename)) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    if let Some(length) = length {
+        headers.insert(header::CONTENT_LENGTH, axum::http::HeaderValue::from(length));
+    }
+    response
+}
 
-    (
-        [
-            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-            (
-                header::CONTENT_DISPOSITION,
-                &format!(r#"attachment; filename="{filename}""#),
-            ),
-        ],
-        content,
-    )
-        .into_response()
+/// 既有语义：`logs/` 下 `crawler-media.log*` 里字典序最大的文件。
+fn latest_log_file(logs_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !logs_dir.is_dir() {
+        return None;
+    }
+    let mut files: Vec<_> = std::fs::read_dir(logs_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("crawler-media.log"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    files.pop()
+}
+
+fn content_disposition(filename: &str) -> String {
+    format!(r#"attachment; filename="{filename}""#)
+}
+
+/// 内存缓冲回退（≤3000 条，行为保持原样）。
+fn buffer_export(state: &ApiState, filename: &str) -> Response {
+    let content = export_from_buffer(state);
+    let mut response = content.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&content_disposition(filename)) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
 }
 
 fn export_from_buffer(state: &ApiState) -> String {

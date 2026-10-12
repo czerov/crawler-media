@@ -25,6 +25,7 @@ pub const KNOWN_ENV_VARS: &[&str] = &[
     "CRAWLER_MEDIA_TMDB_KEY",
     "CRAWLER_MEDIA_TVDB_KEY",
     "CRAWLER_MEDIA_BROWSER",
+    "CRAWLER_MEDIA_SLOW_REQUEST_MS",
     "CRAWLER_MEDIA_QB_URL",
     "CRAWLER_MEDIA_QB_USER",
     "CRAWLER_MEDIA_QB_PASS",
@@ -113,6 +114,10 @@ pub struct ServerConfig {
     /// Metadata proxy password.
     /// Env: `CRAWLER_MEDIA_METADATA_PROXY_PASS` (or `_FILE`).
     pub metadata_proxy_pass: Option<String>,
+
+    /// HTTP request slower than this (milliseconds) escalates to `warn`.
+    /// Env: `CRAWLER_MEDIA_SLOW_REQUEST_MS`, default 1000; `0` disables.
+    pub slow_request_ms: u64,
 }
 
 /// Hand-written so `debug!(?config)` cannot leak credentials. Secret fields are
@@ -147,6 +152,7 @@ impl std::fmt::Debug for ServerConfig {
             )
             .field("metadata_proxy_user", &self.metadata_proxy_user)
             .field("metadata_proxy_pass", &redacted(&self.metadata_proxy_pass))
+            .field("slow_request_ms", &self.slow_request_ms)
             .finish()
     }
 }
@@ -185,8 +191,27 @@ impl ServerConfig {
             metadata_proxy: nonempty("CRAWLER_MEDIA_METADATA_PROXY"),
             metadata_proxy_user: nonempty("CRAWLER_MEDIA_METADATA_PROXY_USER"),
             metadata_proxy_pass: secret("CRAWLER_MEDIA_METADATA_PROXY_PASS"),
+            slow_request_ms: slow_request_ms(),
         }
     }
+}
+
+/// Default slow-request threshold in milliseconds.
+pub const DEFAULT_SLOW_REQUEST_MS: u64 = 1_000;
+
+/// Pure parse of `CRAWLER_MEDIA_SLOW_REQUEST_MS`: checked `u64`, missing or
+/// malformed values fall back to the default. `0` disables the escalation.
+pub fn parse_slow_request_ms(raw: Option<&str>) -> u64 {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SLOW_REQUEST_MS)
+}
+
+/// Read the slow-request threshold once at startup. The HTTP middleware takes
+/// it as injected layer state and never reads the environment itself.
+pub fn slow_request_ms() -> u64 {
+    parse_slow_request_ms(std::env::var("CRAWLER_MEDIA_SLOW_REQUEST_MS").ok().as_deref())
 }
 
 /// Environment lookup seam.

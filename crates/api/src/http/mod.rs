@@ -39,6 +39,7 @@ pub(crate) mod playback_stats;
 pub(crate) mod playback_views;
 pub(crate) mod proxy_settings;
 pub(crate) mod reidentify;
+pub(crate) mod request_observation;
 pub(crate) mod routing_preview;
 pub(crate) mod rule_sets;
 pub(crate) mod scrape_settings;
@@ -97,6 +98,16 @@ pub(crate) async fn health() -> Response {
 }
 
 pub(crate) fn router(state: ApiState) -> Router {
+    // 生产路径：阈值在启动时从 `ServerConfig` 读一次，再作为 layer state 注入。
+    router_with_slow_after(
+        state,
+        std::time::Duration::from_millis(crate::config::slow_request_ms()),
+    )
+}
+
+/// Router with an injected slow-request threshold. Tests pass an explicit value
+/// instead of mutating the process environment (which would race).
+pub fn router_with_slow_after(state: ApiState, slow_after: std::time::Duration) -> Router {
     let public = public_routes();
     let member = member_routes();
     let admin = admin_routes(&state);
@@ -109,8 +120,11 @@ pub(crate) fn router(state: ApiState) -> Router {
         ));
 
     let base = public.merge(protected).with_state(state);
-    base.layer(axum::middleware::from_fn(request_logger))
-        .layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024))
+    base.layer(axum::middleware::from_fn_with_state(
+        slow_after,
+        request_logger,
+    ))
+    .layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024))
 }
 
 fn public_routes() -> Router<ApiState> {
@@ -634,86 +648,55 @@ fn admin_ops_routes() -> Router<ApiState> {
         .route("/system/logs/export", get(system_logs::export_logs))
 }
 
-fn redact_query(query: &str) -> String {
-    query
-        .split('&')
-        .map(|pair| {
-            let Some((key, _)) = pair.split_once('=') else {
-                return pair.to_string();
-            };
-            if matches!(
-                key.to_ascii_lowercase().as_str(),
-                "api_key" | "apikey" | "token" | "access_token"
-            ) {
-                format!("{key}=[redacted]")
-            } else {
-                pair.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-async fn request_logger(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+/// 请求观测中间件。
+///
+/// `headers_latency_ms` 只覆盖到**响应头就绪**为止，不包含 body / SSE / 视频流的
+/// 完整传输时间。慢阈值由 layer state 注入，中间件本身不读 env。
+pub async fn request_logger(
+    axum::extract::State(slow_after): axum::extract::State<std::time::Duration>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
     let method = request.method().clone();
-    let uri = request.uri().clone();
-    let path = uri.path().to_string();
-    let query = uri.query().map(redact_query).filter(|q| !q.is_empty());
+    let path = request.uri().path().to_string();
+    let query = request
+        .uri()
+        .query()
+        .map(request_observation::redact_query)
+        .filter(|query| !query.is_empty());
+    // `MatchedPath` 由路由层在匹配后写入 extensions；未匹配时退回 raw path。
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str().to_string())
+        .unwrap_or_else(|| path.clone());
+    let request_id = request_observation::request_id_from(request.headers());
     let user_agent = request
         .headers()
         .get(axum::http::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string());
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let start = std::time::Instant::now();
 
-    let response = next.run(request).await;
+    let mut response = next.run(request).await;
     let elapsed = start.elapsed();
     let status = response.status();
-
-    if !path.starts_with("/system/logs") && !path.ends_with("/stream") && path != "/health" {
-        if status.is_server_error() {
-            tracing::error!(
-                method = %method,
-                path = %path,
-                query,
-                user_agent,
-                status = %status.as_u16(),
-                latency_ms = %elapsed.as_millis(),
-                "HTTP 请求失败（5xx）"
-            );
-        } else if status.is_client_error() {
-            // 404 Not Found 对于可选图片静态资源（如未配封面的媒体库、无剧照的分集等）
-            // 属于预期探测行为，打 debug 即可，避免在正常浏览时刷出误导性的 WARN 日志。
-            if status == axum::http::StatusCode::NOT_FOUND && path.ends_with("/cover") {
-                tracing::debug!(
-                    method = %method,
-                    path = %path,
-                    query,
-                    status = %status.as_u16(),
-                    latency_ms = %elapsed.as_millis(),
-                    "可选封面不存在"
-                );
-            } else {
-                tracing::warn!(
-                    method = %method,
-                    path = %path,
-                    query,
-                    status = %status.as_u16(),
-                    latency_ms = %elapsed.as_millis(),
-                    "HTTP 请求异常（4xx）"
-                );
-            }
-        } else {
-            tracing::trace!(
-                method = %method,
-                path = %path,
-                query,
-                status = %status.as_u16(),
-                latency_ms = %elapsed.as_millis(),
-                "HTTP 请求"
-            );
-        }
+    let observation = request_observation::observe(
+        method.as_str(),
+        &route,
+        &request_id,
+        status.as_u16(),
+        elapsed,
+        slow_after,
+    );
+    request_observation::log_request(
+        &observation,
+        &path,
+        query.as_deref(),
+        user_agent.as_deref(),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&observation.request_id) {
+        response.headers_mut().insert("x-request-id", value);
     }
-
     response
 }
