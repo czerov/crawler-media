@@ -42,16 +42,17 @@ pub(crate) async fn get_proxy(State(state): State<ApiState>) -> Response {
         .get_setting(settings_keys::PROXY_DOUBAN_BYPASS)
         .ok()
         .flatten()
-        .map(|v| v == "1" || v == "true")
+        .and_then(|v| crate::config::parse_bool(&v))
         .unwrap_or(true);
     let allowed_domains = store
         .get_setting(settings_keys::PROXY_ALLOWED_DOMAINS)
         .ok()
         .flatten()
         .unwrap_or_default();
-    let env_override = std::env::var("CRAWLER_MEDIA_METADATA_PROXY").is_ok()
-        || std::env::var("ALL_PROXY").is_ok()
-        || std::env::var("HTTP_PROXY").is_ok();
+    // 非空才算 override，且与 http_agent 用同一组 env 变量（空串不生效）。
+    let env_override = crate::config::proxy_env(&crate::config::ProcessEnv)
+        .url
+        .is_some();
 
     let active_masked = crate::http_agent::current_proxy().map(|p| mask_proxy_url(&p));
 
@@ -68,7 +69,21 @@ pub(crate) async fn get_proxy(State(state): State<ApiState>) -> Response {
 }
 
 /// PUT /settings/proxy — Save metadata proxy configuration and reload immediately.
+///
+/// Fields pinned by the environment are rejected with 409: the startup seed
+/// would overwrite them on the next restart.
 pub(crate) async fn put_proxy(State(state): State<ApiState>, Json(body): Json<Value>) -> Response {
+    for (field, key) in [
+        ("proxy_url", settings_keys::PROXY_METADATA),
+        ("username", settings_keys::PROXY_USERNAME),
+        ("password", settings_keys::PROXY_PASSWORD),
+    ] {
+        if body[field].as_str().is_some() {
+            if let Some(message) = crate::config::env_pinned_message(key) {
+                return err(StatusCode::CONFLICT, "settings.env_pinned", &message);
+            }
+        }
+    }
     let store = state.store.lock();
     if let Some(proxy_url) = body["proxy_url"].as_str() {
         if let Err(error) = store.put_setting(settings_keys::PROXY_METADATA, proxy_url.trim()) {
@@ -139,7 +154,7 @@ pub(crate) async fn put_proxy(State(state): State<ApiState>, Json(body): Json<Va
         .get_setting(settings_keys::PROXY_DOUBAN_BYPASS)
         .ok()
         .flatten()
-        .map(|v| v == "1" || v == "true")
+        .and_then(|v| crate::config::parse_bool(&v))
         .unwrap_or(true);
 
     let active_masked = crate::http_agent::current_proxy().map(|p| mask_proxy_url(&p));

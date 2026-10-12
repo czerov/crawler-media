@@ -206,12 +206,14 @@ fn create_api_state(
 }
 
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ServerConfig::from_env();
-    let data_dir = &config.data_dir;
+    // 先只按 env 定位数据目录并起日志，再解析完整配置：这样 `from_env` 里
+    // 未识别变量的 warning 才经过 tracing，而不是丢在没有 subscriber 的空档里。
+    let data_dir = api::config::data_dir_from_env();
     let logs_dir = data_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
 
     let (log_buffer, _guard) = init_logging(&logs_dir);
+    let config = ServerConfig::from_env();
     tracing::info!("crawler-media 服务启动中...");
 
     let overlay_dir = data_dir.join("indexers");
@@ -224,7 +226,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
 
-    let store = std::sync::Arc::new(parking_lot::Mutex::new(Store::open(data_dir)?));
+    let store = std::sync::Arc::new(parking_lot::Mutex::new(Store::open(&data_dir)?));
     seed_store_settings(&store, &config);
 
     let action = api::bootstrap_credentials::prepare_admin_credentials(
@@ -243,7 +245,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = create_api_state(
         &config,
-        data_dir,
+        &data_dir,
         &overlay_dir,
         store.clone(),
         action,

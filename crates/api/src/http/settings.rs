@@ -44,6 +44,7 @@ pub(crate) async fn get_metadata(State(state): State<ApiState>) -> Response {
         "tvdb": {
             "configured": tvdb.as_deref().is_some_and(|k| !k.is_empty()),
             "api_key_hint": masked(tvdb.clone()),
+            "env_override": crate::config::is_env_pinned(settings_keys::TVDB_API_KEY),
         },
         "sources": [
             { "id": "tmdb", "name": "TMDB", "needs_key": true, "configured": tmdb.as_deref().is_some_and(|k| !k.is_empty()) },
@@ -57,10 +58,24 @@ pub(crate) async fn get_metadata(State(state): State<ApiState>) -> Response {
 }
 
 /// Save metadata source keys (empty string clears).
+///
+/// Keys pinned by the environment (`CRAWLER_MEDIA_TMDB_KEY` / `_TVDB_KEY`) are
+/// rejected with 409: they are re-seeded from env on every start, so accepting
+/// the write would silently lose it at the next restart.
 pub(crate) async fn put_metadata(
     State(state): State<ApiState>,
     Json(body): Json<Value>,
 ) -> Response {
+    for (field, key) in [
+        ("tmdb_api_key", settings_keys::TMDB_API_KEY),
+        ("tvdb_api_key", settings_keys::TVDB_API_KEY),
+    ] {
+        if body[field].as_str().is_some() {
+            if let Some(message) = crate::config::env_pinned_message(key) {
+                return err(StatusCode::CONFLICT, "settings.env_pinned", &message);
+            }
+        }
+    }
     let (tmdb, tvdb) = {
         let store = state.store.lock();
         if let Some(key) = body["tmdb_api_key"].as_str() {
@@ -214,7 +229,7 @@ pub(crate) async fn sync_cdp_cookies(State(state): State<ApiState>) -> Response 
             .get_setting(settings_keys::CDP_SYNC_ENABLED)
             .ok()
             .flatten()
-            .map(|v| v == "1" || v == "true")
+            .and_then(|v| crate::config::parse_bool(&v))
             .unwrap_or(false);
         let url = store
             .get_setting(settings_keys::CDP_URL)

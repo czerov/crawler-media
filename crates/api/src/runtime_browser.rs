@@ -154,11 +154,15 @@ fn invalid(message: &str) -> BrowserSettingsError {
     BrowserSettingsError::Invalid(message.to_owned())
 }
 
+/// Settings-KV flag (`1`/`true`/`yes`/`on`, case-insensitive). An unknown value
+/// is an error rather than a silent "off", so a typo cannot disable a route.
 fn enabled(value: Option<String>) -> Result<bool, BrowserSettingsError> {
     match value.as_deref() {
-        Some("1" | "true") => Ok(true),
-        None | Some("0" | "false" | "") => Ok(false),
-        Some(_) => Err(invalid("invalid Browser enabled flag")),
+        None => Ok(false),
+        Some(raw) if raw.trim().is_empty() => Ok(false),
+        Some(raw) => {
+            crate::config::parse_bool(raw).ok_or_else(|| invalid("invalid Browser enabled flag"))
+        }
     }
 }
 

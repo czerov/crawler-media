@@ -168,10 +168,8 @@ pub fn parse_directory(args: &[&str]) -> Result<Command, String> {
     })
 }
 
+/// Shares the workspace boolean vocabulary (`1`/`true`/`yes`/`on` and
+/// `0`/`false`/`no`/`off`) with env flags and settings KV.
 fn parse_on_off(value: &str) -> Result<bool, String> {
-    match value {
-        "on" | "true" | "1" => Ok(true),
-        "off" | "false" | "0" => Ok(false),
-        _ => Err("scrape must be on or off".into()),
-    }
+    crate::config::parse_bool(value).ok_or_else(|| "scrape must be on or off".into())
 }

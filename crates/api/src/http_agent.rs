@@ -52,43 +52,32 @@ pub fn format_proxy_url(raw_url: &str, username: Option<&str>, password: Option<
 }
 
 /// Sync proxy configuration from Store settings into memory for hot reloading.
+///
+/// Store values win; the environment only fills the gaps. The env side uses the
+/// same parser as [`crate::config::ServerConfig`], so `_FILE` secret variants
+/// resolve here too.
 pub fn sync_from_store(store: &Store) {
+    let env = crate::config::proxy_env(&crate::config::ProcessEnv);
     let raw_proxy = store
         .get_setting(settings_keys::PROXY_METADATA)
         .ok()
         .flatten()
         .filter(|p| !p.trim().is_empty())
-        .or_else(|| {
-            std::env::var("CRAWLER_MEDIA_METADATA_PROXY")
-                .or_else(|_| std::env::var("ALL_PROXY"))
-                .or_else(|_| std::env::var("all_proxy"))
-                .or_else(|_| std::env::var("HTTP_PROXY"))
-                .or_else(|_| std::env::var("http_proxy"))
-                .ok()
-                .filter(|p| !p.trim().is_empty())
-        });
+        .or(env.url);
 
     let username = store
         .get_setting(settings_keys::PROXY_USERNAME)
         .ok()
         .flatten()
         .filter(|u| !u.trim().is_empty())
-        .or_else(|| {
-            std::env::var("CRAWLER_MEDIA_METADATA_PROXY_USER")
-                .ok()
-                .filter(|u| !u.trim().is_empty())
-        });
+        .or(env.username);
 
     let password = store
         .get_setting(settings_keys::PROXY_PASSWORD)
         .ok()
         .flatten()
         .filter(|p| !p.trim().is_empty())
-        .or_else(|| {
-            std::env::var("CRAWLER_MEDIA_METADATA_PROXY_PASS")
-                .ok()
-                .filter(|p| !p.trim().is_empty())
-        });
+        .or(env.password);
 
     let proxy =
         raw_proxy.map(|url| format_proxy_url(&url, username.as_deref(), password.as_deref()));
@@ -98,7 +87,7 @@ pub fn sync_from_store(store: &Store) {
         .get_setting(settings_keys::PROXY_DOUBAN_BYPASS)
         .ok()
         .flatten()
-        .map(|v| v == "1" || v == "true")
+        .and_then(|v| crate::config::parse_bool(&v))
         .unwrap_or(true);
     *DOUBAN_BYPASS.write() = bypass;
 
