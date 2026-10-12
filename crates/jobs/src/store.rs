@@ -46,6 +46,19 @@ pub fn migrate(conn: &Connection) -> Result<(), JobError> {
         CREATE INDEX IF NOT EXISTS jobs_payload_idx ON jobs(payload);
         CREATE INDEX IF NOT EXISTS jobs_finished_idx ON jobs(finished_at)
             WHERE finished_at IS NOT NULL;
+        -- DB5：热查询索引。20 万行合成数据 + ANALYZE 的 before/after EQP 与耗时见
+        -- docs/audits/2026-10-12-remediation-review-repro/jobs-query-plans.md。
+        -- 现有 jobs_running_def/jobs_queued_def 是部分**唯一**索引，status IN (...)
+        -- 不蕴含 status='queued'，帮不上 live/last child；两者都必须保留。
+        CREATE INDEX IF NOT EXISTS jobs_running_status_idx
+            ON jobs(status) WHERE status = 'running';
+        CREATE INDEX IF NOT EXISTS jobs_running_key_idx
+            ON jobs(concurrency_key) WHERE status = 'running';
+        CREATE INDEX IF NOT EXISTS jobs_live_def_idx
+            ON jobs(def_id, status, run_after) WHERE status IN ('queued','running');
+        CREATE INDEX IF NOT EXISTS jobs_last_def_idx
+            ON jobs(def_id, finished_at DESC, run_after DESC)
+            WHERE status IN ('succeeded','failed','cancelled');
         "#,
     )?;
     Ok(())
@@ -183,22 +196,42 @@ fn next_claimable(conn: &Connection, now: i64) -> Result<Option<Job>, JobError> 
     Ok(None)
 }
 
+/// 该 job 的 concurrency_key / def_id 是否已被别的 running job 占用。
+///
+/// 拆成两次索引探测（原来是单条 OR 查询；before/after EQP 与耗时见
+/// `docs/audits/2026-10-12-remediation-review-repro/jobs-query-plans.md`）。
+/// 布尔语义与原式 `(?1 IS NOT NULL AND …) OR (?2 IS NOT NULL AND …)` 完全一致：
+/// key 为 NULL 时只看 def_id，def_id 为 NULL 时只看 key，两者都为 NULL 时永远不忙。
 fn key_busy(
     conn: &Connection,
     key: Option<&str>,
     def_id: Option<JobDefId>,
     except: JobId,
 ) -> Result<bool, JobError> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM jobs
-         WHERE status = 'running' AND id != ?3 AND (
-             (?1 IS NOT NULL AND concurrency_key = ?1) OR
-             (?2 IS NOT NULL AND def_id = ?2)
-         )",
-        params![key, def_id.map(|id| id.to_string()), except.to_string()],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
+    let except = except.to_string();
+    if let Some(key) = key {
+        let busy: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs
+             WHERE status = 'running' AND id != ?1 AND concurrency_key = ?2)",
+            params![except, key],
+            |row| row.get(0),
+        )?;
+        if busy {
+            return Ok(true);
+        }
+    }
+    if let Some(def_id) = def_id {
+        let busy: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs
+             WHERE status = 'running' AND id != ?1 AND def_id = ?2)",
+            params![except, def_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if busy {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn get_job(conn: &Connection, id: JobId) -> Result<Option<Job>, JobError> {
