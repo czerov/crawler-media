@@ -224,6 +224,11 @@ impl Queue {
         crate::schedule::get_last_child(&self.conn, def_id)
     }
 
+    /// 批量取每个 def 的 live/last child（≤500 分块），规则与逐个查询一致。
+    pub fn children_for_defs(&self, ids: &[JobDefId]) -> Result<Vec<crate::JobChildren>, JobError> {
+        crate::read::children_for_defs(&self.conn, ids)
+    }
+
     pub fn tick(&self, now: i64, runner: &dyn Runner) -> Result<Vec<Job>, JobError> {
         self.recover(now)?;
         self.ensure_scheduled(now)?;

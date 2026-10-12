@@ -27,6 +27,8 @@ pub struct ApiState {
     pub(crate) subtitle_delivery: Arc<crate::subtitle_delivery::SubtitleDelivery>,
     /// 浏览路径的只读文件访问（NFO / stat）；生产直接读磁盘，测试可注入阻塞实现。
     pub(crate) browse_files: Arc<dyn crate::browse_file_read::BrowseFileRead>,
+    /// 进程内共享的任务计数 watcher（所有 SSE 连接共用一个 poller）。
+    pub(crate) job_updates: Arc<crate::job_updates::JobUpdates>,
     pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
     pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
     /// Job attempts still executing in this process; protects them from timeout recovery.
@@ -199,6 +201,7 @@ impl ApiState {
                 2,
             )),
             browse_files: Arc::new(crate::browse_file_read::LocalBrowseFileRead),
+            job_updates: Arc::new(crate::job_updates::JobUpdates::new()),
             library_work,
             jobs: Arc::new(Mutex::new(jobs)),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -267,6 +270,12 @@ impl ApiState {
         service: Arc<crate::subtitle_delivery::SubtitleDelivery>,
     ) -> Self {
         self.subtitle_delivery = service;
+        self
+    }
+
+    /// 替换任务计数 watcher（测试注入以观察共享 poller 生命周期）。
+    pub fn with_job_updates(mut self, updates: Arc<crate::job_updates::JobUpdates>) -> Self {
+        self.job_updates = updates;
         self
     }
 

@@ -76,15 +76,21 @@ fn job_last_status<'a>(
     }
 }
 
-fn def_json_with_store(
+/// 渲染 def 需要的 media title（payload → subscribe/media → store）。
+fn def_media_title(def: &jobs::JobDef, store: &crate::Store) -> Option<String> {
+    let payload_val: Value = serde_json::from_str(&def.payload).unwrap_or_else(|_| json!({}));
+    job_media_title(&payload_val, store)
+}
+
+/// 纯渲染：调用方在锁外传入预先取好的 media title。
+fn def_json(
     def: &jobs::JobDef,
     live: Option<&jobs::Job>,
     last: Option<&jobs::Job>,
-    store: &crate::Store,
+    media_title: Option<&str>,
 ) -> Value {
     let payload_val: Value = serde_json::from_str(&def.payload).unwrap_or_else(|_| json!({}));
-    let media_title = job_media_title(&payload_val, store);
-    let friendly_name = job_friendly_name(&def.name, media_title.as_deref());
+    let friendly_name = job_friendly_name(&def.name, media_title);
 
     json!({
         "id": def.id.to_string(),
@@ -111,6 +117,16 @@ fn def_json_with_store(
             })
         },
     })
+}
+
+/// 单个 def 的渲染便捷入口（仍需 Store 取 media title）。
+fn def_json_with_store(
+    def: &jobs::JobDef,
+    live: Option<&jobs::Job>,
+    last: Option<&jobs::Job>,
+    store: &crate::Store,
+) -> Value {
+    def_json(def, live, last, def_media_title(def, store).as_deref())
 }
 
 #[derive(Deserialize)]
@@ -155,6 +171,7 @@ pub(crate) async fn list_jobs(
     Extension(user_id): Extension<UserId>,
     Query(query): Query<ListJobsQuery>,
 ) -> Response {
+    // 1) Queue 快照：defs（单独加锁，不与 Store 嵌套）。
     let defs = {
         let queue = state.jobs.lock();
         match queue.list_defs() {
@@ -168,51 +185,76 @@ pub(crate) async fn list_jobs(
             }
         }
     };
-    let visible_defs = {
+    // 2) Store 快照：可见性与 scope 过滤（都在 limit 之前）。
+    let visible_defs: Vec<jobs::JobDef> = {
         let store = state.store.lock();
         let admin = store
             .user_role(user_id)
             .map(|role| role == "admin")
             .unwrap_or(false);
-        let mut visible = Vec::with_capacity(defs.len());
-        for def in defs {
-            if def_visible_to_user(&def, &store, user_id, admin) {
-                // scope 过滤：scope=system 仅保留系统级任务，排除条目级任务（subscribe_search / catalog_refresh）
+        defs.into_iter()
+            .filter(|def| {
+                if !def_visible_to_user(def, &store, user_id, admin) {
+                    return false;
+                }
+                // scope=system 仅保留系统级任务，排除条目级任务
+                // （subscribe_search / catalog_refresh）。
                 if query.scope.as_deref() == Some("system") {
                     let is_individual = def.kind == JobKind::SubscribeSearch
                         || def.kind == JobKind::CatalogRefresh
                         || def.name.starts_with("search ")
                         || def.name.starts_with("catalog ");
                     if is_individual {
-                        continue;
+                        return false;
                     }
                 }
-                visible.push(def);
-            }
-        }
-        visible
+                true
+            })
+            .collect()
     };
-    let queue = state.jobs.lock();
-    let store = state.store.lock();
-    let mut listed = Vec::with_capacity(visible_defs.len());
+    // 3) Queue 快照：一次批量取所有 live/last child（不再逐 def 查询）。
+    let children = {
+        let queue = state.jobs.lock();
+        let ids: Vec<JobDefId> = visible_defs.iter().map(|def| def.id).collect();
+        queue.children_for_defs(&ids).unwrap_or_default()
+    };
+    let mut by_def: std::collections::HashMap<JobDefId, jobs::JobChildren> = children
+        .into_iter()
+        .map(|child| (child.def_id, child))
+        .collect();
+    let mut selected = Vec::with_capacity(visible_defs.len());
     for def in visible_defs {
-        let live = queue.get_live_child(def.id).ok().flatten();
+        let child = by_def.remove(&def.id);
+        let (live, last) = match child {
+            Some(child) => (child.live, child.last),
+            None => (None, None),
+        };
         if query.active_only == Some(true) && live.is_none() {
             continue;
         }
-        let last = queue.get_last_child(def.id).ok().flatten();
-        listed.push(def_json_with_store(
-            &def,
-            live.as_ref(),
-            last.as_ref(),
-            &store,
-        ));
+        selected.push((def, live, last));
         if let Some(limit) = query.limit {
-            if listed.len() >= limit {
+            if selected.len() >= limit {
                 break;
             }
         }
     }
+    // 4) Store 快照：只取渲染所需的 media title，锁内不渲染 JSON。
+    let titles: Vec<Option<String>> = {
+        let store = state.store.lock();
+        selected
+            .iter()
+            .map(|(def, _, _)| def_media_title(def, &store))
+            .collect()
+    };
+    // 5) 锁外渲染。
+    let listed: Vec<Value> = selected
+        .into_iter()
+        .zip(titles)
+        .map(|((def, live, last), title)| {
+            def_json(&def, live.as_ref(), last.as_ref(), title.as_deref())
+        })
+        .collect();
     ok_list(listed).into_response()
 }
 
@@ -443,14 +485,20 @@ pub(crate) async fn tick_jobs(
     }
 }
 
-/// SSE stream the activity view subscribes to: emits `ready` on connect and
-/// a `job` event whenever a job finishes (polled cheaply every 2s).
-pub(crate) async fn job_stream(
-    State(state): State<ApiState>,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+/// SSE stream the activity view subscribes to: emits `ready` on connect and a
+/// `job` event whenever the shared count changes.
+///
+/// 所有连接共用 `JobUpdates` 的单个 2 秒 poller；客户端断开即结束本连接任务。
+pub(crate) async fn job_stream(State(state): State<ApiState>) -> Response {
     use tokio_stream::wrappers::ReceiverStream;
+    let mut updates = match state.job_updates.subscribe(state.jobs.clone()).await {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            tracing::error!(%error, "任务计数订阅失败");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &error);
+        }
+    };
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
-    let state = state.clone();
     tokio::spawn(async move {
         if tx
             .send(Ok(Event::default().event("ready").data("{}")))
@@ -460,38 +508,44 @@ pub(crate) async fn job_stream(
             return;
         }
 
-        // 连上后立即下发当前任务计数，不强制让首个事件空等 2 秒
-        let initial_count = state.jobs.lock().count_finished_since(0).unwrap_or(0);
+        // 订阅时已持有真实当前计数：立即下发，不空等 2 秒。
+        let mut last = (*updates.borrow()).clone();
         if tx
             .send(Ok(Event::default()
                 .event("job")
-                .data(format!(r#"{{"count":{initial_count}}}"#))))
+                .data(format!(r#"{{"count":{}}}"#, last.count))))
             .await
             .is_err()
         {
             return;
         }
-        let mut last_count = Some(initial_count);
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if tx.is_closed() {
-                break;
-            }
-            let count = state.jobs.lock().count_finished_since(0).unwrap_or(0);
-            if last_count != Some(count) {
-                if tx
-                    .send(Ok(Event::default()
-                        .event("job")
-                        .data(format!(r#"{{"count":{count}}}"#))))
-                    .await
-                    .is_err()
-                {
-                    break;
+            tokio::select! {
+                changed = updates.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let current = (*updates.borrow()).clone();
+                    if current == last {
+                        continue;
+                    }
+                    if tx
+                        .send(Ok(Event::default()
+                            .event("job")
+                            .data(format!(r#"{{"count":{}}}"#, current.count))))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    last = current;
                 }
-                last_count = Some(count);
+                _ = tx.closed() => break,
             }
         }
     });
-    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
+    Sse::new(ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }

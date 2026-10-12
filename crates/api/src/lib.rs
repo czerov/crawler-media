@@ -57,6 +57,7 @@ pub mod fs_watcher;
 #[cfg(test)]
 mod fs_watcher_tests;
 pub mod http_agent;
+pub mod job_updates;
 pub mod obscura_manager;
 pub mod password_login;
 mod playback_read;
