@@ -150,6 +150,28 @@ fn recording_ffmpeg(dir: &std::path::Path) -> (std::path::PathBuf, std::path::Pa
     (ffmpeg, args)
 }
 
+/// 后台章节抓帧工作的**完成同步点**：等 registry 上该 library 的 lease 全部归还。
+///
+/// 这里不用固定 sleep / 重试：`wait_idle` 由 lease drop 时的 `notify_waiters`
+/// 唤醒，属于确定性同步；超时只是"真卡死时不要挂住测试"的失败检测，
+/// 不是同步手段（负载下 2s 太紧会把正常的慢完成误判成失败，DB16）。
+const WORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn wait_for_idle(
+    registry: &std::sync::Arc<crate::library_lifecycle::LibraryWorkRegistry>,
+    library_id: &str,
+) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        tokio::time::timeout(WORK_TIMEOUT, registry.wait_idle(library_id))
+            .await
+            .expect("background chapter frame work did not finish");
+    });
+}
+
 #[test]
 fn fingerprint_marker_extracts_scene_frames_when_library_enables_them() {
     let tmp = tempfile::tempdir().unwrap();
@@ -171,10 +193,9 @@ fn fingerprint_marker_extracts_scene_frames_when_library_enables_them() {
     crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
         &updates, &store, &registry,
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline && !args.is_file() {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // 必须等抓帧工作**做完**再读参数文件：`args` 由 shell 的 `>>` 重定向先建后写，
+    // 只等"文件出现"会读到还没写入内容的空文件，断言就会假失败（DB16）。
+    wait_for_idle(&registry, &library.id);
     let recorded = std::fs::read_to_string(&args).unwrap_or_default();
     assert!(
         recorded.contains("-frames:v"),
@@ -250,20 +271,18 @@ async fn cancelling_detached_chapter_frames_reaps_child_and_preserves_sidecars()
     crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
         &updates, &store, &registry,
     );
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    // 条件等待（子进程写出 ready 文件）+ 明确超时；不用固定 sleep 当同步手段。
+    tokio::time::timeout(WORK_TIMEOUT, async {
         while !started.exists() {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("fake ffmpeg did not start");
     registry.freeze(&store, &owner.id).unwrap();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        registry.wait_idle(&owner.id),
-    )
-    .await
-    .unwrap();
+    tokio::time::timeout(WORK_TIMEOUT, registry.wait_idle(&owner.id))
+        .await
+        .expect("chapter frame work did not stop after freeze");
     let image = std::path::Path::new(&row.path).with_file_name("episode-chapter_0.jpg");
     assert!(!image.exists());
     assert_eq!(
