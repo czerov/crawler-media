@@ -243,16 +243,13 @@ pub fn call_douban<T>(
 }
 
 /// Mask password in a proxy url for safe logging.
+///
+/// The single implementation lives in [`domain::mask_proxy_url`] so every
+/// renderer (api logs, `ServerConfig`/`ProxyEnv` `Debug`, `Site` `Debug`) uses
+/// the same `user:***@host` form. Kept here as the api-side name the existing
+/// call sites use.
 pub fn mask_proxy_url(url: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://") {
-        if let Some((creds, host)) = rest.split_once('@') {
-            if let Some((user, _pass)) = creds.split_once(':') {
-                return format!("{scheme}://{user}:***@{host}");
-            }
-            return format!("{scheme}://{creds}@{host}");
-        }
-    }
-    url.to_string()
+    domain::mask_proxy_url(url)
 }
 
 /// Run an outbound request with an explicitly specified proxy (or None for direct).
@@ -279,5 +276,27 @@ pub fn call_with_proxy<T>(
             Ok(res) => Ok(res),
             Err(v4_err) => build(&v6).map_err(|_| v4_err),
         }
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::mask_proxy_url;
+
+    /// api 侧只剩委托：渲染与 domain 的唯一实现逐字一致。
+    #[test]
+    fn mask_proxy_url_delegates_to_domain() {
+        assert_eq!(
+            mask_proxy_url("http://bob:pw@host:1"),
+            domain::mask_proxy_url("http://bob:pw@host:1")
+        );
+        assert_eq!(mask_proxy_url("http://bob:pw@host:1"), "http://bob:***@host:1");
+    }
+
+    /// 旧 api 实现遇到没有 scheme 的 `user:pass@host` 会原样返回（等于把口令
+    /// 写进日志）；统一到 domain 后必须脱敏。
+    #[test]
+    fn mask_proxy_url_masks_schemeless_credentials() {
+        assert_eq!(mask_proxy_url("bob:pw@host:1"), "bob:***@host:1");
     }
 }
