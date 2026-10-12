@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct CdpCookie {
     pub name: String,
     pub value: String,
@@ -18,12 +18,91 @@ pub struct CdpCookie {
     pub secure: Option<bool>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// 手写 `Debug`：`value` 是 cookie 明文（站点会话凭证），绝不能进日志。
+///
+/// 之前这里是 `#[derive(Debug)]`，任何一句 `debug!(?cookie)` 都会把 cookie 明文
+/// 打进日志与前端"系统日志"。`Serialize`/`Deserialize` 逐字保留（CDP 原始
+/// 响应要能往返），其余字段原样，便于诊断。
+impl std::fmt::Debug for CdpCookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CdpCookie")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("expires", &self.expires)
+            .field("http_only", &self.http_only)
+            .field("secure", &self.secure)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DiscoveredSiteCookie {
     pub profile_id: String,
     pub domain: String,
     pub cookie_header: String,
     pub cookie_count: usize,
+}
+
+/// 手写 `Debug`：`cookie_header` 是站点会话凭证，绝不能进日志。
+///
+/// 之前这里是 `#[derive(Debug)]`，任何一句 `debug!(?discovered)` 都会把 cookie
+/// 明文打进日志与前端"系统日志"。`Serialize`/`Deserialize` 逐字保留（CDP 同步
+/// 结果要给前端），其余字段原样，便于诊断。
+impl std::fmt::Debug for DiscoveredSiteCookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscoveredSiteCookie")
+            .field("profile_id", &self.profile_id)
+            .field("domain", &self.domain)
+            .field("cookie_header", &"<redacted>")
+            .field("cookie_count", &self.cookie_count)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::{CdpCookie, DiscoveredSiteCookie};
+
+    #[test]
+    fn debug_never_prints_the_cdp_cookie_value() {
+        let cookie = CdpCookie {
+            name: "c_secure_pass".into(),
+            value: "cdp-cookie-value-secret".into(),
+            domain: ".pt.example".into(),
+            path: Some("/".into()),
+            expires: None,
+            http_only: Some(true),
+            secure: Some(true),
+        };
+        let rendered = format!("{cookie:?}");
+        assert!(
+            !rendered.contains("cdp-cookie-value-secret"),
+            "Debug 不得输出 cookie value: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("c_secure_pass"), "{rendered}");
+        assert!(rendered.contains("pt.example"), "{rendered}");
+    }
+
+    #[test]
+    fn debug_never_prints_the_discovered_cookie_header() {
+        let discovered = DiscoveredSiteCookie {
+            profile_id: "pterclub".into(),
+            domain: "pterclub.net".into(),
+            cookie_header: "uid=1; pass=cookie-header-secret".into(),
+            cookie_count: 2,
+        };
+        let rendered = format!("{discovered:?}");
+        assert!(
+            !rendered.contains("cookie-header-secret"),
+            "Debug 不得输出 cookie_header: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("pterclub"), "{rendered}");
+        assert!(rendered.contains("cookie_count: 2"), "非凭证字段保留: {rendered}");
+    }
 }
 
 fn cdp_http_agent() -> ureq::Agent {

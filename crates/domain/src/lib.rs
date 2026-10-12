@@ -147,7 +147,8 @@ pub struct Site {
 }
 
 /// 手写 `Debug`：`cookie` 是站点会话凭证、`api_key` 是站点 API 凭证，
-/// 两者都绝不能进日志。
+/// 两者都绝不能进日志；`proxy` 可能内嵌 `user:pass@`，因此把 userinfo
+/// 整段脱敏。
 ///
 /// 之前这里是 `#[derive(Debug)]`，任何一句 `debug!(?site)` 都会把凭证明文打进
 /// 日志与前端"系统日志"。`Site` 本身没有 serde 派生（UI 载荷由 api 层单独
@@ -162,7 +163,10 @@ impl std::fmt::Debug for Site {
             .field("cookie", &self.cookie.as_ref().map(|_| "<redacted>"))
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("rss_url", &self.rss_url)
-            .field("proxy", &self.proxy)
+            .field(
+                "proxy",
+                &self.proxy.as_deref().map(redact_proxy_userinfo),
+            )
             .field("rate_limit_per_minute", &self.rate_limit_per_minute)
             .field("cdp_url", &self.cdp_url)
             .field("downloader_id", &self.downloader_id)
@@ -171,9 +175,30 @@ impl std::fmt::Debug for Site {
     }
 }
 
+/// 只用于 `Debug` 的代理 URL 脱敏：把 authority 里的 userinfo
+/// （`user:pass@` 或裸 `user@`）整段换成 `<redacted>`，保留
+/// `scheme://host:port` 与 path，便于诊断。
+///
+/// 刻意在 `domain` 内就地实现、不引入跨 crate 依赖：`domain` 是 types-only
+/// crate，不能反向依赖 api 的 `mask_proxy_url`（那会违反 AGENTS.md 的分层）。
+/// 也刻意比它更严格（连 username 都不保留），因为这里的验收要求是
+/// "Debug 不含 userinfo"。只影响 `Debug`，不碰任何序列化行为。
+fn redact_proxy_userinfo(raw: &str) -> String {
+    let (prefix, rest) = match raw.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), raw),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.split_once('@') {
+        Some((_userinfo, host)) => format!("{prefix}<redacted>@{host}{tail}"),
+        None => raw.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod debug_tests {
-    use super::{Site, SiteId};
+    use super::{Site, SiteId, redact_proxy_userinfo};
 
     #[test]
     fn debug_never_prints_site_credentials() {
@@ -203,6 +228,61 @@ mod debug_tests {
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(rendered.contains("pt.example"), "{rendered}");
         assert!(rendered.contains("demo"), "{rendered}");
+    }
+
+    #[test]
+    fn debug_never_prints_site_proxy_userinfo() {
+        let site = Site {
+            id: SiteId::new(),
+            name: "demo".into(),
+            url: "https://pt.example/".into(),
+            profile_id: "demo".into(),
+            cookie: None,
+            api_key: None,
+            rss_url: None,
+            proxy: Some("http://bob:proxy-password-secret@127.0.0.1:7890".into()),
+            rate_limit_per_minute: None,
+            cdp_url: None,
+            downloader_id: None,
+            enabled: true,
+        };
+        let rendered = format!("{site:?}");
+        assert!(
+            !rendered.contains("proxy-password-secret"),
+            "Debug 不得输出 proxy 口令: {rendered}"
+        );
+        assert!(
+            !rendered.contains("bob"),
+            "Debug 不得输出 proxy userinfo: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>@127.0.0.1:7890"),
+            "scheme/host/port 必须保留: {rendered}"
+        );
+    }
+
+    #[test]
+    fn proxy_userinfo_redaction_keeps_scheme_host_and_path() {
+        assert_eq!(
+            redact_proxy_userinfo("http://bob:pw@127.0.0.1:7890"),
+            "http://<redacted>@127.0.0.1:7890"
+        );
+        assert_eq!(
+            redact_proxy_userinfo("bob:pw@127.0.0.1:7890"),
+            "<redacted>@127.0.0.1:7890",
+            "无 scheme 的 userinfo 同样要脱敏"
+        );
+        assert_eq!(
+            redact_proxy_userinfo("socks5://127.0.0.1:1080"),
+            "socks5://127.0.0.1:1080",
+            "无 userinfo 时原样返回"
+        );
+        assert_eq!(
+            redact_proxy_userinfo("http://bob:pw@host:1/path@x"),
+            "http://<redacted>@host:1/path@x",
+            "path 里的 @ 不是 userinfo"
+        );
+        assert_eq!(redact_proxy_userinfo(""), "");
     }
 }
 
