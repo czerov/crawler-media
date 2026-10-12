@@ -100,6 +100,18 @@ pub(super) const APP_TABLES: &str = r#"
         );
         CREATE INDEX IF NOT EXISTS sites_enabled_idx ON sites(enabled);
         CREATE INDEX IF NOT EXISTS user_tokens_user_idx ON user_tokens(user_id);
+        -- Media 身份查询索引。实测（bundled SQLite 3.50.2，5 万行）：
+        --   alias 查找 4.06ms→0.011ms；title/kind/year 1.52ms→0.014ms；
+        --   resolve_scanned_media 的 OR 形状只有在这 6 个分支**全部**可索引时才
+        --   从 SCAN 变 MULTI-INDEX OR（6.72ms→0.035ms）。
+        -- 证据：docs/audits/2026-10-12-remediation-review-repro/media-lookup-plans.md
+        -- 故意**不加 UNIQUE**：Movie 与 TV 的 TMDB 数字 id 可以相同，身份是内部 id。
+        CREATE INDEX IF NOT EXISTS media_tmdb_idx ON media(tmdb_id);
+        CREATE INDEX IF NOT EXISTS media_douban_idx ON media(douban_id);
+        CREATE INDEX IF NOT EXISTS media_tvdb_idx ON media(tvdb_id);
+        CREATE INDEX IF NOT EXISTS media_bangumi_idx ON media(bangumi_id);
+        CREATE INDEX IF NOT EXISTS media_anilist_idx ON media(anilist_id);
+        CREATE INDEX IF NOT EXISTS media_title_kind_year_idx ON media(title, kind, year);
         "#;
 
 pub(super) const LIBRARY_TABLES: &str = r#"
