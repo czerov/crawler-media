@@ -10,7 +10,7 @@
 
 **Tech Stack:** Rust 2024、Axum 0.8、Tokio、parking_lot、rusqlite 0.37（bundled SQLite）、现有 tempfile/tower 测试；无新增第三方依赖。
 
-**Spec:** [第一批技术设计](<2026-10-13-library-data-safety-batch-1-design.md>)。执行者必须同时阅读设计与本计划；代码基线 `ba82258`。
+**Spec:** [第一批技术设计](<2026-10-13-library-data-safety-batch-1-design.md>)。执行者必须同时阅读设计与本计划；代码基线 `ba82258`。本批验收后按 [总路线图](<2026-10-13-database-api-scan-master-plan.md>) 进入第二批，不重新设计公共接口。
 
 ## Global Constraints
 

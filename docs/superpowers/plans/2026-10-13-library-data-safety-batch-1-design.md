@@ -3,7 +3,7 @@
 - 状态：待用户审阅；本文件不表示已实施或已验收。
 - 日期：2026-10-13（Asia/Shanghai）。
 - 代码基线：`ba82258`；实施前重新核对工作区，不能覆盖后续用户改动。
-- 对应实施计划：[第一批实施计划](<2026-10-13-library-data-safety-batch-1-plan.md>)。
+- 对应实施计划：[第一批实施计划](<2026-10-13-library-data-safety-batch-1-plan.md>)；完整依赖及后续批次见 [总路线图](<2026-10-13-database-api-scan-master-plan.md>)。
 - 依据：[术语](<../../../CONTEXT.md>)、[SQLite 生命周期分区](<../../adr/0008-sqlite-system-of-record.md>)、[Library 删除约定](<../../adr/0012-library-removal.md>)及本轮独立源码审查。
 
 ## 1. 目标与批次边界
@@ -15,7 +15,7 @@
 | watcher 删除事件改为持久缺失标记 | 播放会话代际、seek 统计 |
 | 扫描恢复清 missing；管理员清理前复核 | 自动 probe 失败恢复/outbox |
 | verify/prune/full scan/incremental scan/Video scan 的归属边界 | 扫描 Job 化、预算、游标、单飞 |
-| 统一同库 ledger 派生事实事务清理 | 分页投影、读连接、catalog/Jobs 性能 |
+| 统一同库 ledger 派生事实事务清理 | 第三批浏览投影、catalog/Jobs性能；读连接池暂不引入 |
 | 冻结、配置变化、旧 ledger ID 的发布检查 | 自动跨路径身份匹配、改名保持 LedgerId |
 
 不承诺无可靠别名的文件改名后一定复用 MediaId。保留旧用户事实，与安全地重新关联事实是两件事。沿用 ADR-0012 的可靠 NFO/别名规则；禁止仅凭相似文件名迁移 Playback。
