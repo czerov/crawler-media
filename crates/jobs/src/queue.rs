@@ -109,6 +109,15 @@ impl Queue {
         store::fail_claimed(&self.conn, claimed, now, error)
     }
 
+    /// 放回队列为 queued，保持原 attempt 与 run_after，不产生失败记录
+    pub fn requeue_without_attempt(&self, job: &Job) -> Result<(), JobError> {
+        let _ = self.conn.execute(
+            "UPDATE jobs SET status = 'queued', started_at = NULL WHERE id = ?1 AND status = 'running'",
+            rusqlite::params![job.id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn fail(&self, id: JobId, now: i64, error: &str) -> Result<Job, JobError> {
         store::fail(&self.conn, id, now, error)
     }

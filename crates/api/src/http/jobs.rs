@@ -391,18 +391,25 @@ pub(crate) async fn run_job(State(state): State<ApiState>, Path(id): Path<String
             "任务已禁用，请先启用再手动执行",
         );
     }
-    // 运行中/已排队：返回既有排队结果，不误报新增实例。
+    // 运行中或已经在队列最前面 (run_after <= now) 的排队任务：返回既有排队/运行结果，不误报新增实例。
     if let Ok(Some(live)) = queue.get_live_child(def.id) {
-        return ok(json!({ "queued": false, "live_status": live.status.as_str() })).into_response();
+        if live.status == jobs::JobStatus::Running || (live.status == jobs::JobStatus::Queued && live.run_after == 0) {
+            return ok(json!({ "queued": false, "live_status": live.status.as_str() })).into_response();
+        }
     }
-    if let Err(error) = queue.ensure_scheduled_for(0, def.id) {
-        return err(
+    // 如果已有处于未来的 queued 状态子任务，将其提前为 run_after=0
+    let scheduled = queue.ensure_scheduled_for(0, def.id);
+    match scheduled {
+        Ok(jobs) => {
+            let created = !jobs.is_empty();
+            ok(json!({ "queued": created || true })).into_response()
+        }
+        Err(error) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "job.enqueue_failed",
             &error.to_string(),
-        );
+        ),
     }
-    ok(json!({ "queued": true })).into_response()
 }
 
 #[derive(Deserialize)]

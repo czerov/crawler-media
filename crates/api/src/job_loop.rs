@@ -201,17 +201,39 @@ fn claim_pending_jobs(
     let active_attempts: Vec<_> = active.values().cloned().collect();
     queue.recover_except(now, &active_attempts)?;
     let skipped_maintenance = schedule_due(&queue, now, source)?;
-    let claimed = queue.claim(now, 2)?;
+    let claimed = if source == TickSource::DevHttp {
+        // 开发入口：只 claim 非维护任务，不取消排队中的维护任务，也不污染维护任务的最近报告
+        claim_non_maintenance(&queue, now, 2)?
+    } else {
+        queue.claim(now, 2)?
+    };
     for job in &claimed {
         active.insert(job.id, job.clone());
     }
     Ok((claimed, skipped_maintenance))
 }
 
+fn claim_non_maintenance(
+    queue: &jobs::Queue,
+    now: i64,
+    limit: usize,
+) -> Result<Vec<Job>, JobError> {
+    let all = queue.claim(now, limit)?;
+    let mut claimed = Vec::new();
+    for job in all {
+        if job.kind.is_maintenance() {
+            // 将其无惩罚放回 queued 状态，不增加 attempt 也不记录错误
+            let _ = queue.requeue_without_attempt(&job);
+        } else {
+            claimed.push(job);
+        }
+    }
+    Ok(claimed)
+}
+
 /// 按 tick 来源排期。
 ///
-/// 开发入口**不为维护 def 生成子任务**，并取消后台已经排到的维护子任务：否则
-/// `claim` 会把它们拿走并在持锁约定下执行 runner。返回被跳过的维护 kind。
+/// 开发入口**不为维护 def 生成子任务**。返回被跳过的维护 kind。
 fn schedule_due(
     queue: &jobs::Queue,
     now: i64,
@@ -230,15 +252,7 @@ fn schedule_due(
             queue.ensure_scheduled_for(now, def.id)?;
             continue;
         }
-        // 该入口一律不执行维护任务：报告出来（不区分本轮是否到期），并取消后台已经排到
-        // 的 queued 子任务，避免 `claim` 把它们拿走。
         skipped.push(def.kind.as_str().to_string());
-        let queued = queue
-            .get_live_child(def.id)?
-            .is_some_and(|live| live.status == jobs::JobStatus::Queued);
-        if queued {
-            queue.cancel_def_children(def.id)?;
-        }
         tracing::warn!(
             kind = def.kind.as_str(),
             "开发入口 /jobs/tick 不执行维护任务，交给后台 job_loop"
