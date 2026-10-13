@@ -5,15 +5,15 @@ use crate::store::{SessionRow, Store, StoreError, UNIT_WHOLE, UnitState};
 
 use super::ApiServerProvider;
 
-struct PlaybackTarget {
-    media: Media,
-    ledger_id: String,
+pub(super) struct PlaybackTarget {
+    pub(super) media: Media,
+    pub(super) ledger_id: String,
     season: i32,
     episode: i32,
     duration_ms: Option<i64>,
 }
 
-fn resolve_target(
+pub(super) fn resolve_target(
     provider: &ApiServerProvider,
     user_id: UserId,
     id: &str,
@@ -110,9 +110,11 @@ pub(super) fn report_event(
     paused: bool,
     client: PlaybackClientInfo,
     event: PlaybackEvent,
+    identity: media_server::provider::PlaybackEventIdentity,
 ) -> Result<(), String> {
     let target = resolve_target(provider, user_id, id)?
         .ok_or_else(|| format!("Jellyfin playback item {id} is missing or not visible"))?;
+    let target_ledger_id = target.ledger_id.parse::<domain::LedgerId>().map_err(|e| e.to_string())?;
     let now = crate::job_loop::unix_now();
     let position_ms = position_ms.max(0);
     let store = provider.state.store.lock();
@@ -122,6 +124,49 @@ pub(super) fn report_event(
     {
         return Err("device revoked".into());
     }
+
+    // Classify event using shared logic
+    let prior = store.get_session(user_id, &client.device_id).map_err(|e| e.to_string())?;
+    let binding = if let Some(ref sid) = identity.play_session_id {
+        store.play_session_binding(user_id, &client.device_id, sid).map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+
+    let shared_identity = crate::playback_events::PlaybackEventIdentity {
+        play_session_id: identity.play_session_id.clone(),
+        event_sequence: identity.event_sequence,
+    };
+
+    let event_kind = match event {
+        PlaybackEvent::Playing => crate::playback_events::PlaybackEventKind::Start,
+        PlaybackEvent::Progress => crate::playback_events::PlaybackEventKind::Progress,
+        PlaybackEvent::Stopped => crate::playback_events::PlaybackEventKind::Stop,
+    };
+
+    let decision = crate::playback_events::classify_event(
+        prior.as_ref(),
+        binding.as_ref(),
+        &shared_identity,
+        target_ledger_id,
+        event_kind,
+    );
+
+    match decision {
+        crate::playback_events::EventDecision::Ignore => return Ok(()),
+        crate::playback_events::EventDecision::Start => {
+            if let Some(ref sid) = identity.play_session_id {
+                let _ = store.activate_play_session(user_id, &client.device_id, sid);
+            }
+        }
+        crate::playback_events::EventDecision::Stop => {
+            if let Some(ref sid) = identity.play_session_id {
+                let _ = store.close_play_session_id(user_id, &client.device_id, sid);
+            }
+        }
+        crate::playback_events::EventDecision::Update => {}
+    }
+
     store
         .playback_write(|store| {
             persist_event(
@@ -132,12 +177,13 @@ pub(super) fn report_event(
                 paused,
                 &client,
                 event,
+                identity.play_session_id.as_deref(),
+                identity.event_sequence,
                 now,
             )
         })
         .map_err(|error| error.to_string())
 }
-
 #[allow(clippy::too_many_arguments)]
 fn persist_event(
     store: &Store,
@@ -147,6 +193,8 @@ fn persist_event(
     paused: bool,
     client: &PlaybackClientInfo,
     event: PlaybackEvent,
+    play_session_id: Option<&str>,
+    event_sequence: Option<i64>,
     now: i64,
 ) -> Result<(), StoreError> {
     let current = current_session(store, user_id, &client.device_id, target, now)?;
@@ -197,10 +245,11 @@ fn persist_event(
         paused,
         watched_ms,
         current.as_ref(),
+        play_session_id,
+        event_sequence,
         now,
     ))
 }
-
 fn current_session(
     store: &Store,
     user_id: UserId,
@@ -291,6 +340,8 @@ fn stop_session(
         true,
         watched_ms,
         existing,
+        existing.and_then(|s| s.play_session_id.as_deref()),
+        existing.and_then(|s| s.last_event_sequence),
         now,
     ))?;
     store.close_session(user_id, &client.device_id, now)?;
@@ -301,6 +352,7 @@ fn unit_value(value: i32) -> Option<i32> {
     (value != UNIT_WHOLE).then_some(value)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn session_row(
     client: &PlaybackClientInfo,
     user_id: UserId,
@@ -309,6 +361,8 @@ fn session_row(
     paused: bool,
     watched_ms: i64,
     existing: Option<&SessionRow>,
+    play_session_id: Option<&str>,
+    event_sequence: Option<i64>,
     now: i64,
 ) -> SessionRow {
     SessionRow {
@@ -346,8 +400,8 @@ fn session_row(
         started_at: existing.map(|session| session.started_at).unwrap_or(now),
         last_report_at: now,
         ledger_id: Some(target.ledger_id.clone()),
-        play_session_id: existing.and_then(|session| session.play_session_id.clone()),
+        play_session_id: play_session_id.map(str::to_string).or_else(|| existing.and_then(|s| s.play_session_id.clone())),
         last_report_at_ms: now * 1000,
-        last_event_sequence: existing.and_then(|session| session.last_event_sequence),
+        last_event_sequence: event_sequence.or_else(|| existing.and_then(|s| s.last_event_sequence)),
     }
 }

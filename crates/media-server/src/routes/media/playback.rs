@@ -259,6 +259,7 @@ fn video_content_type(path: &FsPath) -> &'static str {
 pub async fn playback_info(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let snapshot = state
@@ -306,9 +307,15 @@ pub async fn playback_info(
     if let Some(name) = snapshot.metadata.episode_name.as_ref() {
         source["Name"] = json!(name);
     }
+    let client = user.playback_client(&headers);
+    let play_session_id = state
+        .provider
+        .issue_play_session(user.id, &client.device_id, &id)
+        .await
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
     Ok(Json(json!({
         "MediaSources": [source],
-        "PlaySessionId": uuid::Uuid::new_v4().to_string(),
+        "PlaySessionId": play_session_id,
         "Chapters": dto::render_chapters_json(&snapshot),
     })))
 }

@@ -175,12 +175,28 @@ impl PresenceFixture {
         uri: &str,
         token: Option<&str>,
     ) -> (StatusCode, Value) {
+        self.request_with_body(method, uri, token, Value::Null).await
+    }
+
+    pub async fn request_with_body(
+        &self,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let app = router(self.state.clone());
         let mut builder = Request::builder().method(method).uri(uri);
         if let Some(t) = token {
             builder = builder.header("Authorization", format!("Bearer {}", t));
         }
-        let req = builder.body(Body::empty()).unwrap();
+        let req_body = if body.is_null() {
+            Body::empty()
+        } else {
+            builder = builder.header("Content-Type", "application/json");
+            Body::from(serde_json::to_vec(&body).unwrap())
+        };
+        let req = builder.body(req_body).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)

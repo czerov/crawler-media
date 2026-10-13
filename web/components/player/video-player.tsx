@@ -308,6 +308,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
    * 刚点的选择，表现为「切了 SRT 字幕却没加载」（真机踩中）。
    */
   const subtitleTouchedRef = useRef(false);
+  const playSessionIdRef = useRef<string | null>(null);
+  const eventSequenceRef = useRef<number>(0);
   // 惰性初始化从 localStorage 读：字幕调好的字号/位置不该每次进来都重调
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle>(loadSubtitleStyle);
   /** 画质上限（max_height）。null = 自动。持久化，弱网用户不必每部片重选 */
@@ -1010,6 +1012,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
           }
           return;
         }
+        playSessionIdRef.current = session.play_session_id ?? null;
+        eventSequenceRef.current = 0;
         if (session.decision.outcome === "consent") {
           // 刚点过「开启并播放」、开关也保存成功，服务端却仍要求同意：这是
           // 异常闭环（设置没生效/后端异常），绝不能把一模一样的弹窗原样闪
@@ -1473,14 +1477,15 @@ export function VideoPlayer(props: VideoPlayerProps) {
   /** 一次进度心跳；响应里带着「已被管理员结束」就退出。 */
   const sendProgress = useCallback(
     (paused: boolean | undefined) => {
+      eventSequenceRef.current += 1;
       void reportPlaybackProgress(
         {
           ...unit,
           event: "progress",
           position_ms: positionRef.current,
-          // 暂停态给活动页「正在播放」的徽标用；读元素原生状态，与 Jellyfin
-          // 客户端上报的 IsPaused 同义
           paused,
+          play_session_id: playSessionIdRef.current,
+          event_sequence: eventSequenceRef.current,
           ...trackRefsRef.current(),
         },
         apiRef.current,
@@ -1501,7 +1506,17 @@ export function VideoPlayer(props: VideoPlayerProps) {
     if (state.phase !== "playing") return;
     if (reportedStartRef.current !== unitKey) {
       reportedStartRef.current = unitKey;
-      void reportPlaybackProgress({ ...unit, event: "start", ...trackRefs() }, apiRef.current)
+      eventSequenceRef.current += 1;
+      void reportPlaybackProgress(
+        {
+          ...unit,
+          event: "start",
+          play_session_id: playSessionIdRef.current,
+          event_sequence: eventSequenceRef.current,
+          ...trackRefs(),
+        },
+        apiRef.current,
+      )
         .then((watch) => {
           if (watch.ended_by_admin) onEndedByAdmin();
         })
@@ -1564,12 +1579,14 @@ export function VideoPlayer(props: VideoPlayerProps) {
       if (reportedStartRef.current === null) return;
       // 停止之后再到的暂停 / 心跳不能再上报：服务端会把刚结束的会话重建回来
       reportedStartRef.current = null;
+      eventSequenceRef.current += 1;
       void reportPlaybackProgress(
         {
           ...snapshot,
           event: "stop",
           position_ms: positionRef.current,
-          // 停止也要带轨记忆：切完字幕/音轨立刻退出的那次选择不能丢
+          play_session_id: playSessionIdRef.current,
+          event_sequence: eventSequenceRef.current,
           ...trackRefsRef.current(),
         },
         apiRef.current,
@@ -1585,12 +1602,14 @@ export function VideoPlayer(props: VideoPlayerProps) {
   useEffect(() => {
     const onPageHide = () => {
       if (reportedStartRef.current !== null) {
+        eventSequenceRef.current += 1;
         reportPlaybackProgressOnUnload(
           {
             ...unit,
             event: "stop",
             position_ms: positionRef.current,
-            // 同 SPA 离开路径：停止上报带上轨记忆
+            play_session_id: playSessionIdRef.current,
+            event_sequence: eventSequenceRef.current,
             ...trackRefsRef.current(),
           },
           apiRef.current,

@@ -33,6 +33,7 @@ pub mod directory;
 mod dynamic_downloader;
 pub mod fingerprint_job;
 pub mod http;
+pub mod playback_events;
 pub mod management;
 pub mod library_lifecycle;
 pub mod library_presence;

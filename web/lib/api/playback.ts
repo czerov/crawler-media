@@ -647,6 +647,7 @@ export interface PlaybackSession {
   decision: PlaybackDecision;
   /** 档 0 没有会话（原文件直出），此处为 null */
   session_id: string | null;
+  play_session_id?: string | null;
   /** 可直接喂给 <video src> 或 hls.js 的地址，已带签名 token */
   stream_url: string | null;
   /** 会话时间轴的零点在文件里的位置。**文件时间 = start_ms + currentTime**。
@@ -970,8 +971,9 @@ export interface PlaybackProgressBody extends PlaybackUnit {
   subtitle_track?: string;
   /** 暂停态；不报 = 实时会话保持原值 */
   paused?: boolean;
+  play_session_id?: string | null;
+  event_sequence?: number;
 }
-
 /** 进度上报体统一带上浏览器设备标识（活动页「正在播放」按它区分会话）。 */
 function withDevice(body: PlaybackProgressBody): PlaybackProgressBody & { device_id: string } {
   return { ...body, device_id: getPlayerDeviceId() };

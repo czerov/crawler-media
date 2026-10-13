@@ -605,6 +605,23 @@ impl MediaServerProvider for ApiServerProvider {
         playback::update_progress(self, user_id, id, position_ms)
     }
 
+    async fn issue_play_session(
+        &self,
+        user_id: UserId,
+        device_id: &str,
+        id: &str,
+    ) -> Result<String, String> {
+        let target = playback::resolve_target(self, user_id, id)?
+            .ok_or_else(|| format!("Playback item {id} missing or not visible"))?;
+        use std::str::FromStr;
+        let ledger_id = domain::LedgerId::from_str(&target.ledger_id).map_err(|e| e.to_string())?;
+        let now = crate::job_loop::unix_now();
+        let store = self.state.store.lock();
+        store
+            .issue_play_session(user_id, device_id, ledger_id, now)
+            .map_err(|e| e.to_string())
+    }
+
     async fn report_playback_event(
         &self,
         user_id: UserId,
@@ -613,7 +630,8 @@ impl MediaServerProvider for ApiServerProvider {
         paused: bool,
         client: PlaybackClientInfo,
         event: PlaybackEvent,
+        identity: media_server::provider::PlaybackEventIdentity,
     ) -> Result<(), String> {
-        playback::report_event(self, user_id, id, position_ms, paused, client, event)
+        playback::report_event(self, user_id, id, position_ms, paused, client, event, identity)
     }
 }

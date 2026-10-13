@@ -44,7 +44,14 @@ pub(crate) async fn start_session(
         }
     };
     let _ = crate::http::library::ensure_probe_enqueued(&state, &row);
-    tracing::info!(media_id = %media.id, file_id = %row.id, %user_id, start_ms, "Playback session selected");
+    let device_id = body.get("device_id").and_then(|v| v.as_str()).unwrap_or("web-player");
+    let play_session_id = {
+        let store = state.store.lock();
+        store
+            .issue_play_session(user_id, device_id, row.id, crate::job_loop::unix_now())
+            .ok()
+    };
+    tracing::info!(media_id = %media.id, file_id = %row.id, %user_id, start_ms, ?play_session_id, "Playback session selected");
     let stream_id = row.id.to_string().replace('-', "");
     let is_strm = std::path::Path::new(&row.path)
         .extension()
@@ -70,9 +77,9 @@ pub(crate) async fn start_session(
     ok(json!({
         "decision": decision,
         "session_id": null,
+        "play_session_id": play_session_id,
         "stream_url": stream_url,
         "start_ms": start_ms,
-        "timeline": "file",
         "subtitle_urls": subtitle_urls,
         "hw_backend": null,
         "chapters": chapters,

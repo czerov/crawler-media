@@ -16,6 +16,10 @@ pub(super) struct ProgressBody {
     position_ticks: Option<i64>,
     #[serde(default, rename = "IsPaused")]
     is_paused: Option<bool>,
+    #[serde(default, rename = "PlaySessionId")]
+    play_session_id: Option<String>,
+    #[serde(default, rename = "EventSequence")]
+    event_sequence: Option<i64>,
 }
 
 async fn report_session_event(
@@ -26,6 +30,21 @@ async fn report_session_event(
     event: PlaybackEvent,
     paused: bool,
 ) -> StatusCode {
+    // Validate session ID length and sequence if provided
+    if let Some(sid) = &body.play_session_id {
+        if sid.len() > 128 {
+            return StatusCode::BAD_REQUEST;
+        }
+    }
+    if let Some(seq) = body.event_sequence {
+        if seq < 0 {
+            return StatusCode::BAD_REQUEST;
+        }
+    }
+    let identity = crate::provider::PlaybackEventIdentity {
+        play_session_id: body.play_session_id,
+        event_sequence: body.event_sequence,
+    };
     let (Some(item_id), Some(position_ticks)) = (body.item_id.as_deref(), body.position_ticks)
     else {
         return StatusCode::NO_CONTENT;
@@ -46,7 +65,7 @@ async fn report_session_event(
     }
     match state
         .provider
-        .report_playback_event(user.id, item_id, position_ms, paused, client, event)
+        .report_playback_event(user.id, item_id, position_ms, paused, client, event, identity)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT,

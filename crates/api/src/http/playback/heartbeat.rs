@@ -40,6 +40,18 @@ pub(crate) async fn progress(
             "缺少 device_id",
         );
     }
+    let play_session_id = body["play_session_id"].as_str().map(str::to_string);
+    let event_sequence = body["event_sequence"].as_i64();
+    if let Some(ref sid) = play_session_id {
+        if sid.len() > 128 {
+            return err(StatusCode::BAD_REQUEST, "playback.invalid", "play_session_id 超长");
+        }
+    }
+    if let Some(seq) = event_sequence {
+        if seq < 0 {
+            return err(StatusCode::BAD_REQUEST, "playback.invalid", "event_sequence 必须非负");
+        }
+    }
     let (row, media, season, episode, duration_ms) = {
         let store = state.store.lock();
         match store.is_device_revoked(user_id, device_id) {
@@ -227,11 +239,62 @@ fn persist_heartbeat(
 
     let event = heartbeat.body["event"].as_str().unwrap_or("progress");
     let previous = store.get_session(heartbeat.user_id, device)?;
-    let unit = update_unit(store, heartbeat, event)?;
-    if previous.is_none() && event != "start" {
-        // An ended session must not be implicitly resurrected by a heartbeat.
-        return Ok((unit, true));
+    let play_session_id = heartbeat.body["play_session_id"].as_str().map(str::to_string);
+    let event_sequence = heartbeat.body["event_sequence"].as_i64();
+
+    let binding = if let Some(ref sid) = play_session_id {
+        store.play_session_binding(heartbeat.user_id, device, sid)?
+    } else {
+        None
+    };
+
+    let identity = crate::playback_events::PlaybackEventIdentity {
+        play_session_id: play_session_id.clone(),
+        event_sequence,
+    };
+
+    let event_kind = match event {
+        "start" => crate::playback_events::PlaybackEventKind::Start,
+        "stop" => crate::playback_events::PlaybackEventKind::Stop,
+        _ => crate::playback_events::PlaybackEventKind::Progress,
+    };
+
+    let ledger_id = match heartbeat.ledger_id.parse::<domain::LedgerId>() {
+        Ok(lid) => lid,
+        Err(_) => return Ok((store.unit_state(heartbeat.user_id, heartbeat.media_id, heartbeat.season, heartbeat.episode)?.unwrap_or_default(), true)),
+    };
+
+    let decision = crate::playback_events::classify_event(
+        previous.as_ref(),
+        binding.as_ref(),
+        &identity,
+        ledger_id,
+        event_kind,
+    );
+
+    match decision {
+        crate::playback_events::EventDecision::Ignore => {
+            return Ok((
+                store
+                    .unit_state(heartbeat.user_id, heartbeat.media_id, heartbeat.season, heartbeat.episode)?
+                    .unwrap_or_default(),
+                true,
+            ));
+        }
+        crate::playback_events::EventDecision::Start => {
+            if let Some(ref sid) = play_session_id {
+                let _ = store.activate_play_session(heartbeat.user_id, device, sid);
+            }
+        }
+        crate::playback_events::EventDecision::Stop => {
+            if let Some(ref sid) = play_session_id {
+                let _ = store.close_play_session_id(heartbeat.user_id, device, sid);
+            }
+        }
+        crate::playback_events::EventDecision::Update => {}
     }
+
+    let unit = update_unit(store, heartbeat, event)?;
     let next = next_session(
         heartbeat,
         &unit,
@@ -248,7 +311,12 @@ fn persist_heartbeat(
             store.upsert_session(&closing)?;
         }
     } else if !admin_ended {
-        store.upsert_session(&next)?;
+        let mut to_save = next;
+        if play_session_id.is_some() {
+            to_save.play_session_id = play_session_id;
+            to_save.last_event_sequence = event_sequence;
+        }
+        store.upsert_session(&to_save)?;
     }
     if event == "stop" || admin_ended {
         store.close_session(heartbeat.user_id, device, heartbeat.now)?;

@@ -34,6 +34,11 @@ pub struct PlaybackClientInfo {
     pub device_name: Option<String>,
     pub client_version: Option<String>,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlaybackEventIdentity {
+    pub play_session_id: Option<String>,
+    pub event_sequence: Option<i64>,
+}
 
 #[derive(Clone, Debug)]
 pub struct MediaItemSnapshot {
@@ -361,6 +366,14 @@ pub trait MediaServerProvider: Send + Sync + 'static {
         position_ms: i64,
         paused: bool,
     ) -> Result<(), String>;
+    async fn issue_play_session(
+        &self,
+        _user_id: UserId,
+        _device_id: &str,
+        _item_id: &str,
+    ) -> Result<String, String> {
+        Ok(uuid::Uuid::new_v4().to_string())
+    }
 
     async fn report_playback_event(
         &self,
@@ -370,6 +383,7 @@ pub trait MediaServerProvider: Send + Sync + 'static {
         paused: bool,
         _client: PlaybackClientInfo,
         _event: PlaybackEvent,
+        _identity: PlaybackEventIdentity,
     ) -> Result<(), String> {
         self.update_progress(user_id, id, position_ms, paused).await
     }
