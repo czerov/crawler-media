@@ -21,6 +21,8 @@ pub use library_deletion::LibraryRemoval;
 pub mod library_defaults;
 mod library_ownership;
 mod library_paths;
+mod library_scope;
+pub use library_scope::{LibraryPathScope, StrictOwner};
 mod maps;
 mod media;
 mod open;
