@@ -324,16 +324,25 @@ fn jobs_retention_does_not_loop_when_all_candidates_are_protected() {
             concurrency_key: Some("tied".into()),
         })
         .unwrap();
-    // 完全并列的 last-child 组：整组保留，has_more=true 但 deleted 恒为 0。
+    // 完全并列的 last-child 组：整组保留。修复 C1 后它们**不进候选窗口**，因此
+    // has_more=false、不会空转；protected 作为诊断计数上限为 batch_size+1。
     raw_terminal_jobs(&data, Some(&def.id.to_string()), 600, now - 10 * DAY);
 
     let job = enqueue_claim(&state, JobKind::JobsRetention, KEEP, now);
     run(&state, &job).unwrap();
 
     let report = progress_of(&state, &job);
-    assert_eq!(report["batches"], 1, "deleted==0 时必须停下: {report}");
+    assert_eq!(report["batches"], 1, "没有可删候选时只跑一批: {report}");
     assert_eq!(report["deleted"], 0);
-    assert_eq!(report["protected"], 500);
+    assert_eq!(
+        report["candidates"], 0,
+        "并列 last-child 组不进候选窗口: {report}"
+    );
+    assert_eq!(report["protected"], 501, "诊断计数上限 batch_size+1");
+    assert_eq!(
+        report["budget_exhausted"], false,
+        "没有更多可删候选，不是预算耗尽: {report}"
+    );
     assert_eq!(terminal_count(&data), 600, "并列 last-child 组必须全部保留");
 }
 
@@ -628,4 +637,31 @@ fn queue_tick_path_refuses_maintenance_instead_of_deadlocking() {
         "必须给出明确拒绝原因而不是静默执行: {finished:?}"
     );
     assert!(json!({ "ok": true }).is_object());
+}
+
+/// DB8 复核 I1 回归：试运行不能把 `has_more` 吞掉说"已完成"。
+///
+/// dry_run 不删除，因此"再取下一批"只会重复检视同一批行（虚报候选数），所以只检视
+/// 一批是正确的；但必须把 `has_more` 如实映射成 `budget_exhausted`，否则用户开 dry_run
+/// 想看规模，却得到"只有 500 条、已完成"的结论。
+#[test]
+fn dry_run_reports_a_truncated_budget_instead_of_claiming_completion() {
+    let (_tmp, state) = temp_state(Arc::new(SqliteExecutor));
+    let data = data_dir(&state);
+    let now = unix_now();
+    // 1200 条可删候选（def_id 为 NULL → 不受 last-child 保护）。
+    raw_terminal_jobs(&data, None, 1_200, now - 40 * DAY);
+
+    let job = enqueue_claim(&state, JobKind::JobsRetention, PREVIEW, now);
+    run(&state, &job).unwrap();
+
+    let report = progress_of(&state, &job);
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["deleted"], 0, "dry_run 零删除: {report}");
+    assert_eq!(report["candidates"], 500, "试运行检视一批: {report}");
+    assert_eq!(
+        report["budget_exhausted"], true,
+        "还有更多可删候选时必须如实报告，不能说'已完成': {report}"
+    );
+    assert_eq!(terminal_count(&data), 1_200, "dry_run 不写库");
 }

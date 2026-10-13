@@ -411,9 +411,10 @@ async fn preview_is_read_only_and_reports_bounded_counts() {
     )
     .await;
     assert_eq!(preview["kind"], "jobs_retention", "{preview}");
-    // 种子 job 是该 def 的最新终态 → 属于 last-child 保护组：候选 1、保护 1、可删 0。
-    assert_eq!(preview["scanned"], 1, "{preview}");
-    assert_eq!(preview["candidates"], 1, "{preview}");
+    // 种子 job 是该 def 的最新终态 → 属于 last-child 保护组。修复 C1 后受保护行
+    // **不进候选窗口**，因此可删候选为 0，保护数单独由 `protected` 报告。
+    assert_eq!(preview["scanned"], 0, "{preview}");
+    assert_eq!(preview["candidates"], 0, "{preview}");
     assert_eq!(preview["protected"], 1, "{preview}");
     assert_eq!(preview["truncated"], false, "{preview}");
     assert_eq!(row_counts(tmp.path()), before, "preview 不得写 DB");
@@ -712,4 +713,56 @@ async fn watcher_still_emits_when_terminal_count_drops() {
         "terminal 计数下降也必须触发更新（不得假设计数单调递增）"
     );
     assert!(updates.poll_count() > 0, "共享 poller 必须实际轮询过");
+}
+
+/// DB8 复核 I2：维护任务的周期范围必须在**旧端点**上也生效。
+///
+/// 否则可以绕过维护配置端点，在任务卡片上把维护周期改成 30 秒；而非维护任务的既有
+/// 契约（30 秒合法）不变。
+#[tokio::test]
+async fn legacy_schedule_endpoint_enforces_the_maintenance_interval_range() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = test_state(tmp.path());
+    let app = router(state.clone());
+    let id = find_def(&state, jobs::JobKind::DatabaseMaintenance).id;
+
+    for secs in [30u64, 3599, 31_536_001] {
+        let (status, error) = call_err(
+            &app,
+            "PUT",
+            &format!("/api/v1/jobs/{id}/schedule"),
+            "management-secret",
+            json!({ "interval_secs": secs }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "维护任务 {secs} 秒必须被拒绝: {error}"
+        );
+    }
+    let saved = call(
+        &app,
+        "PUT",
+        &format!("/api/v1/jobs/{id}/schedule"),
+        "management-secret",
+        json!({ "interval_secs": 7_200 }),
+    )
+    .await;
+    assert_eq!(saved["schedule"]["interval_secs"], 7_200);
+
+    // 非维护任务保持既有契约：30 秒仍然合法。
+    let other = find_def(&state, jobs::JobKind::Transfer).id;
+    let saved = call(
+        &app,
+        "PUT",
+        &format!("/api/v1/jobs/{other}/schedule"),
+        "management-secret",
+        json!({ "interval_secs": 30 }),
+    )
+    .await;
+    assert_eq!(
+        saved["schedule"]["interval_secs"], 30,
+        "非维护任务的周期契约不得改变: {saved}"
+    );
 }

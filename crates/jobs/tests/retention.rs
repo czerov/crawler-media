@@ -186,8 +186,10 @@ fn keeps_latest_terminal_per_def_and_full_tie_group() {
     let before = last_ids(queue, &defs);
 
     let batch = queue.prune_terminal_jobs(CUTOFF, 500, false).unwrap();
-    assert_eq!(batch.scanned, 9, "golf 的未超龄终态不进入候选窗口");
-    assert_eq!(batch.candidates, 9);
+    // 候选窗口只含**可删**行（d_old / f_old / g_old）；被 last-child 保护的行不再进入
+    // 窗口，而由 `protected` 单独报告——这正是 DB8 复核 C1 的修复方式。
+    assert_eq!(batch.scanned, 3, "窗口只含可删行");
+    assert_eq!(batch.candidates, 3);
     assert_eq!(batch.protected, 6, "delta 1 + echo 2 + foxtrot 2 + hotel 1");
     assert_eq!(batch.deleted, 3);
     assert!(!batch.has_more);
@@ -412,4 +414,50 @@ fn delete_failure_rolls_back_the_whole_batch_and_returns_err() {
         "失败前已执行的分片也必须随事务回滚"
     );
     assert!(queue.get(blocked).unwrap().is_some());
+}
+
+/// DB8 复核 C1 回归：候选窗口按 `finished_at` 从旧到新取，如果**最旧的一批恰好全是
+/// 各自 def 的最新终态行**（因此被 last-child 保护），旧实现会把它们选进窗口、算出
+/// `deleted = 0`，调用方据此认为"没有可删候选"而永久停止——清理静默失效却报告成功。
+///
+/// 修复方式：把「可删」谓词并入候选窗口，使窗口只含真正能删的行。
+#[test]
+fn progresses_even_when_the_oldest_terminal_rows_are_all_protected() {
+    let fixture = Fixture::new();
+    let queue = &fixture.queue;
+
+    // 600 个 def，各只有一条超龄终态行 → 全部是各自 def 的最新行 → 全部受保护。
+    for index in 0..600 {
+        let def = new_def(queue, &format!("protected-{index}"));
+        insert_raw_job(&fixture, Some(def), "succeeded", Some(1_000));
+    }
+    // 一个 def 有两条超龄行：旧的那条可删，新的那条受保护。
+    let mixed = new_def(queue, "mixed");
+    let deletable = insert_raw_job(&fixture, Some(mixed), "succeeded", Some(500_000));
+    let protected = insert_raw_job(&fixture, Some(mixed), "succeeded", Some(500_100));
+
+    let cutoff = 600_000;
+    let batch = queue.prune_terminal_jobs(cutoff, 500, false).unwrap();
+    assert_eq!(
+        batch.deleted, 1,
+        "最旧的一批全被保护时仍必须推进到可删行（否则清理永久失效）: {batch:?}"
+    );
+    assert!(
+        queue.get(deletable).unwrap().is_none(),
+        "可删的旧行应被删除"
+    );
+    assert!(
+        queue.get(protected).unwrap().is_some(),
+        "受 last-child 保护的行必须保留"
+    );
+    assert_eq!(
+        queue.get_last_child(mixed).unwrap().unwrap().id,
+        protected,
+        "last-child 语义不变"
+    );
+
+    // 推进一次后确实没有更多可删候选：再调用应报告 deleted=0 且 has_more=false。
+    let again = queue.prune_terminal_jobs(cutoff, 500, false).unwrap();
+    assert_eq!(again.deleted, 0);
+    assert!(!again.has_more, "没有可删候选时 has_more 必须为 false");
 }

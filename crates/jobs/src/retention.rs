@@ -10,13 +10,11 @@
 //!   整个并列组保留。`def_id IS NULL` 的独立历史不分组保护，按年龄删除。
 //! - 不删除 `job_defs`；单次最多检视/处理 `batch_size` 行；每批一个事务；`dry_run` 零写入。
 //!
-//! 统计口径（与 Task 3 的 `PlaybackRetentionBatch` 同义）：`scanned` 与 `candidates` 都是本批
-//! 检视的超龄终态行数（≤ `batch_size`，未超龄的行不进入窗口），`protected` 是其中被
-//! last-child 规则保留的行数，`deleted` 是真正删除的行数（`dry_run` 恒为 0）。
-//! `has_more` 表示窗口之外仍有超龄候选；被保护的候选同样算候选，因此调用方必须像维护
-//! runner 一样自行限制批数，不能仅凭 `has_more` 无限循环。
-
-use std::collections::HashSet;
+//! 统计口径：候选窗口**只含可删行**（被 last-child 保护的行不进窗口，否则最旧一批
+//! 全是受保护行时清理会永久失效并报成功——DB8 复核 C1）。因此 `scanned` 与
+//! `candidates` 都是本批可删行数（≤ `batch_size`），`protected` 是同时间范围内被
+//! last-child 规则保留的行数（报告用诊断，不参与删除），`deleted` 是真正删除的行数
+//! （`dry_run` 恒为 0）。`has_more` 表示窗口之外仍有**可删**候选。
 
 use rusqlite::{Connection, params, params_from_iter};
 
@@ -51,16 +49,12 @@ pub(crate) fn prune_terminal_jobs(
     let window = candidate_window(&tx, cutoff, batch_size)?;
     let has_more = window.len() > batch_size;
     let candidates: Vec<&str> = window.iter().take(batch_size).map(String::as_str).collect();
-    let protected = protected_ids(&tx, &candidates)?;
-    let deletable: Vec<&str> = candidates
-        .iter()
-        .copied()
-        .filter(|id| !protected.contains(*id))
-        .collect();
+    // 窗口已只含可删行；`protected` 只作为报告诊断（同时间范围内被保护的行数）。
+    let protected = protected_window(&tx, cutoff, batch_size)?;
     let deleted = if dry_run {
         0
     } else {
-        delete_ids(&tx, &deletable)?
+        delete_ids(&tx, &candidates)?
     };
     tx.commit()?;
 
@@ -68,7 +62,7 @@ pub(crate) fn prune_terminal_jobs(
         scanned: candidates.len(),
         candidates: candidates.len(),
         deleted,
-        protected: protected.len(),
+        protected,
         has_more,
     };
     tracing::info!(
@@ -85,8 +79,27 @@ pub(crate) fn prune_terminal_jobs(
     Ok(batch)
 }
 
-/// 候选窗口：超龄终态行从旧到新，取至多 `batch_size + 1` 行，多出的一行只用于判断
-/// `has_more`，不进入本批删除范围。
+/// 「可删」谓词：`def_id IS NULL`，或同 def 存在**严格更新**的终态兄弟（即本行不在
+/// `get_last_child` 会读到的并列组里）。
+///
+/// 它必须出现在**候选窗口**里，而不是只用于事后过滤：否则当最旧的一批恰好全是各自
+/// def 的最新终态行时，窗口永远只含被保护行 → `deleted` 恒为 0 → 调用方按"没有可删
+/// 候选"停止，清理永久失效却报告成功（DB8 复核 C1）。
+fn deletable_predicate() -> String {
+    format!(
+        "def_id IS NULL OR EXISTS (
+        SELECT 1 FROM jobs newer
+        WHERE newer.def_id = jobs.def_id
+          AND newer.status IN ({TERMINAL})
+          AND newer.finished_at IS NOT NULL
+          AND (newer.finished_at > jobs.finished_at
+               OR (newer.finished_at = jobs.finished_at AND newer.run_after > jobs.run_after))
+    )"
+    )
+}
+
+/// 候选窗口：超龄**且可删**的终态行从旧到新，取至多 `batch_size + 1` 行，多出的一行
+/// 只用于判断 `has_more`，不进入本批删除范围。
 ///
 /// `ORDER BY finished_at, rowid` 与 `jobs_finished_idx` 的自然顺序一致，不需要临时排序，
 /// 也不会因为并列 `finished_at` 而漏行或重复行。
@@ -95,9 +108,11 @@ fn candidate_window(
     cutoff: i64,
     batch_size: usize,
 ) -> Result<Vec<String>, JobError> {
+    let deletable = deletable_predicate();
     let mut stmt = conn.prepare(&format!(
         "SELECT id FROM jobs
          WHERE status IN ({TERMINAL}) AND finished_at IS NOT NULL AND finished_at < ?1
+           AND ({deletable})
          ORDER BY finished_at ASC, rowid ASC
          LIMIT ?2"
     ))?;
@@ -106,32 +121,31 @@ fn candidate_window(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-/// 候选里属于各自 def 最新并列组的 id —— 即 `get_last_child` 可能读到的那一组。
+/// 报告用诊断：同一时间范围内**被 last-child 保护**的行数。
 ///
-/// `def_id IS NULL` 不在保护范围内；def 是否还在 `job_defs` 中与保护无关。
-fn protected_ids(conn: &Connection, candidates: &[&str]) -> Result<HashSet<String>, JobError> {
-    if candidates.is_empty() {
-        return Ok(HashSet::new());
-    }
-    let placeholders = vec!["?"; candidates.len()].join(",");
-    let sql = format!(
-        "SELECT c.id FROM jobs c
-         WHERE c.id IN ({placeholders})
-           AND c.def_id IS NOT NULL
-           AND NOT EXISTS (
-               SELECT 1 FROM jobs l
-               WHERE l.def_id = c.def_id
-                 AND l.status IN ({TERMINAL})
-                 AND l.finished_at IS NOT NULL
-                 AND (l.finished_at > c.finished_at
-                      OR (l.finished_at = c.finished_at AND l.run_after > c.run_after))
-           )"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(candidates.iter()), |row| {
-        row.get::<_, String>(0)
-    })?;
-    rows.collect::<Result<HashSet<_>, _>>().map_err(Into::into)
+/// 窗口已排除这些行，所以它们不再影响 `deleted`/`has_more`；这里只是让报告仍能显示
+/// "还有多少行是因为保护而留着"。
+fn protected_window(
+    conn: &Connection,
+    cutoff: i64,
+    batch_size: usize,
+) -> Result<usize, JobError> {
+    let deletable = deletable_predicate();
+    let limit = as_i64(batch_size.saturating_add(1));
+    let count: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT id FROM jobs
+                 WHERE status IN ({TERMINAL}) AND finished_at IS NOT NULL AND finished_at < ?1
+                   AND NOT ({deletable})
+                 ORDER BY finished_at ASC, rowid ASC
+                 LIMIT ?2
+             )"
+        ),
+        params![cutoff, limit],
+        |row| row.get(0),
+    )?;
+    Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
 }
 
 fn delete_ids(conn: &Connection, ids: &[&str]) -> Result<usize, JobError> {

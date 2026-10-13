@@ -222,14 +222,23 @@ export function ScheduledJobsView() {
                   <div className="mt-3 rounded-lg border border-white/10 bg-white/[0.05] p-3 text-xs">
                     <div className="font-semibold text-white/90 mb-2">修改执行周期:</div>
                     <div className="flex flex-wrap gap-2 mb-2">
-                      {[
-                        { label: "30秒", secs: 30 },
-                        { label: "1分钟", secs: 60 },
-                        { label: "5分钟", secs: 300 },
-                        { label: "10分钟", secs: 600 },
-                        { label: "30分钟", secs: 1800 },
-                        { label: "1小时", secs: 3600 },
-                      ].map((preset) => (
+                      {(isMaintenanceJob(job)
+                        ? [
+                            { label: "1小时", secs: 3600 },
+                            { label: "6小时", secs: 21600 },
+                            { label: "12小时", secs: 43200 },
+                            { label: "1天", secs: 86400 },
+                            { label: "7天", secs: 604800 },
+                          ]
+                        : [
+                            { label: "30秒", secs: 30 },
+                            { label: "1分钟", secs: 60 },
+                            { label: "5分钟", secs: 300 },
+                            { label: "10分钟", secs: 600 },
+                            { label: "30分钟", secs: 1800 },
+                            { label: "1小时", secs: 3600 },
+                          ]
+                      ).map((preset) => (
                         <button
                           key={preset.secs}
                           type="button"
@@ -248,10 +257,15 @@ export function ScheduledJobsView() {
                       <span className="text-white/60">自定义秒数:</span>
                       <input
                         type="number"
-                        min={5}
-                        max={86400 * 7}
+                        // 维护任务有服务端强制的 3600..=31536000；用别的范围会让
+                        // "保存维护配置"永远 400，用户被自己锁死（DB8 复核 I2）。
+                        min={isMaintenanceJob(job) ? 3600 : 5}
+                        max={isMaintenanceJob(job) ? 31536000 : 86400 * 7}
                         value={scheduleSecs}
-                        onChange={(e) => setScheduleSecs(Math.max(5, parseInt(e.target.value) || 30))}
+                        onChange={(e) => {
+                          const floor = isMaintenanceJob(job) ? 3600 : 5;
+                          setScheduleSecs(Math.max(floor, parseInt(e.target.value) || floor));
+                        }}
                         className="w-24 rounded border border-white/20 bg-black/40 px-2 py-1 text-xs text-white"
                       />
                       <button

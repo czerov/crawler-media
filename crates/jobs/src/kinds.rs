@@ -86,7 +86,10 @@ impl Schedule {
 
     pub fn next_after(&self, now: i64) -> i64 {
         match self {
-            Self::Interval { secs } => now + i64::try_from(*secs).unwrap_or(i64::MAX),
+            // saturating：超大 secs（u64）在 release 下 `now + i64::MAX` 会回绕成负数，
+            // 使 run_after <= now → 立即被 claim → follow-up 再算一次负数 → 每 tick
+            // 反复执行、永不停止（DB8 复核 I2 后果 C）。
+            Self::Interval { secs } => now.saturating_add(i64::try_from(*secs).unwrap_or(i64::MAX)),
         }
     }
 }

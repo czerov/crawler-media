@@ -56,7 +56,7 @@ pub fn run(state: &ApiState, job: &Job) -> Result<(), String> {
             report.cutoff = Some(cutoff);
             report.dry_run = policy.dry_run;
             let dry_run = policy.dry_run;
-            run_batches(&mut report, &cancelled, || {
+            run_batches(&mut report, dry_run, &cancelled, || {
                 let queue = state.jobs.lock();
                 queue
                     .prune_terminal_jobs(cutoff, BATCH_SIZE, dry_run)
@@ -69,7 +69,7 @@ pub fn run(state: &ApiState, job: &Job) -> Result<(), String> {
             report.cutoff = Some(cutoff);
             report.dry_run = policy.dry_run;
             let dry_run = policy.dry_run;
-            run_batches(&mut report, &cancelled, || {
+            run_batches(&mut report, dry_run, &cancelled, || {
                 let store = state.store.lock();
                 store
                     .prune_playback_logs(cutoff, BATCH_SIZE, dry_run)
@@ -293,10 +293,15 @@ impl BatchCounts {
 
 /// 分批执行并累计报告。
 ///
-/// 停止条件：`deleted == 0 || !has_more` 或批数用尽。**不能** `while has_more`：
-/// last-child 保护会让 `has_more` 恒为 true 而 `deleted` 恒为 0。
+/// 停止条件：
+/// - **dry_run**：只检视一批，然后把 `has_more` 如实映射成 `budget_exhausted`。
+///   试运行不删除，再取下一批只会重复检视同一批行（会虚报候选数），所以不能循环；
+///   但也**不能**把 `has_more` 吞掉说"已完成"——用户开 dry_run 就是为了先看规模。
+/// - **实删**：`!has_more`（窗口已只含可删行，所以这是真正的"没有更多可删候选"），
+///   或 `deleted == 0`（本轮已无可删行），或批数用尽。
 fn run_batches(
     report: &mut MaintenanceReport,
+    dry_run: bool,
     cancelled: &dyn Fn() -> bool,
     mut next: impl FnMut() -> Result<BatchCounts, String>,
 ) -> Result<(), String> {
@@ -313,13 +318,20 @@ fn run_batches(
         report.deleted += batch.deleted;
         report.protected += batch.protected;
         batches += 1;
-        if batch.deleted == 0 || !batch.has_more {
+        if dry_run {
+            more_remains = batch.has_more;
+            if batch.has_more {
+                report.note = Some("试运行只检视一批；还有更多可删候选未计入".to_string());
+            }
+            break;
+        }
+        if !batch.has_more || batch.deleted == 0 {
             more_remains = false;
             break;
         }
         more_remains = true;
     }
     report.batches = batches;
-    report.budget_exhausted = more_remains && batches >= MAX_BATCHES;
+    report.budget_exhausted = more_remains && (dry_run || batches >= MAX_BATCHES);
     Ok(())
 }
