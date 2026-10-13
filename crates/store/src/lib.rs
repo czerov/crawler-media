@@ -42,6 +42,8 @@ mod roots;
 mod schema;
 mod scanned_ledger;
 mod scan_probe_obligations;
+mod scan_operations;
+pub use scan_operations::{ScanOperation, ScanOperationStatus};
 pub use scan_probe_obligations::ScanProbeObligation;
 mod sites;
 mod subscribe_wanted;

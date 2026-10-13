@@ -496,6 +496,14 @@ fn admin_library_routes() -> Router<ApiState> {
             delete(library_duplicates::delete_duplicate),
         )
         .route("/libraries/{id}/scan", post(library_scan::scan_library))
+        .route(
+            "/libraries/{id}/scan-operations/{operation_id}",
+            get(library_scan::operations::get_scan_operation),
+        )
+        .route(
+            "/libraries/{id}/scan-operations/{operation_id}/cancel",
+            post(library_scan::operations::cancel_scan_operation),
+        )
         .route("/libraries/{id}/verify", post(library_presence::verify_handler))
         .route(
             "/libraries/{id}/missing-rows",

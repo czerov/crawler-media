@@ -13,6 +13,7 @@ use crate::management::ApiState;
 use crate::scrape_store::ScrapeStoreExt;
 
 pub(crate) mod scope;
+pub(crate) mod operations;
 pub(crate) mod report;
 use report::format_scan_report;
 use scope::{ScanScope, walk_video_files};
@@ -26,16 +27,21 @@ pub(crate) async fn scan_library(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Response {
-    match tokio::task::spawn_blocking(move || scan_library_sync(state, id)).await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::error!(%error, "媒体库扫描线程异常退出");
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "library.scan",
-                &format!("扫描任务执行失败: {error}"),
-            )
-        }
+    match state.scan_coordinator.enqueue(&state, &id, vec![]) {
+        Ok(op) => (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "data": {
+                    "operation_id": op.id,
+                    "status": op.status.as_str(),
+                    "queued": true,
+                    "transferred": false,
+                }
+            })),
+        )
+            .into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "library.scan", &e),
     }
 }
 
@@ -237,7 +243,7 @@ fn scan_library_sync(state: ApiState, id: String) -> Response {
     scan_library_leased(&state, &id, &lease)
 }
 
-fn scan_library_leased(
+pub(crate) fn scan_library_leased(
     state: &ApiState,
     id: &str,
     lease: &crate::library_lifecycle::LibraryWorkLease,

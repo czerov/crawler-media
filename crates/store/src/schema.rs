@@ -8,6 +8,7 @@ mod probe_state;
 mod tables;
 mod browse_projection;
 mod read_revisions;
+mod scan_operations;
 
 /// Schema version constants. Bump when adding new migrations.
 /// The version is stored via `PRAGMA user_version` on each database file.
@@ -264,6 +265,7 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
              reason TEXT NOT NULL
          );",
     )?;
+    scan_operations::migrate_scan_operations(conn)?;
     browse_projection::migrate_browse_projection(conn)?;
     read_revisions::migrate_read_revisions("library", conn)?;
     read_revisions::create_revision_trigger(conn, "ledger", "lib_ledger")?;

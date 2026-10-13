@@ -1245,15 +1245,47 @@ export async function listLibraryGallery(
 // 扫描 / 元数据 / 章节
 // ---------------------------------------------------------------------------
 
-/** 触发一次可恢复的库扫描（POST /libraries/{id}/scan）。 */
+export interface ScanOperationResponse {
+  operation_id: string;
+  status: string;
+  queued: boolean;
+  transferred: boolean;
+}
+
+export interface ScanOperationDetails {
+  operation_id: string;
+  status: string;
+  generation: number;
+  report: Record<string, unknown>;
+}
+
+/** 触发一次库扫描（POST /libraries/{id}/scan 返回 202 Accepted 与 operation_id）。 */
 export async function startLibraryScan(
   id: string,
-): Promise<{ started: boolean; message: string; job_id: string; created: boolean }> {
-  const data = await unwrap(
-    request<ApiEnvelope<Record<string, unknown>>>(`/libraries/${id}/scan`, { method: "POST" }),
+): Promise<ScanOperationResponse> {
+  return unwrap(
+    request<ApiEnvelope<ScanOperationResponse>>(`/libraries/${id}/scan`, { method: "POST" }),
   );
-  const start = jobStartOf(data ?? {});
-  return { started: start.started, message: start.message ?? "", job_id: start.job_id, created: start.created };
+}
+
+/** 获取扫描操作的最新状态与报告。 */
+export async function fetchScanOperation(
+  libraryId: string,
+  operationId: string,
+): Promise<ScanOperationDetails> {
+  return unwrap(
+    request<ApiEnvelope<ScanOperationDetails>>(`/libraries/${libraryId}/scan-operations/${encodeURIComponent(operationId)}`),
+  );
+}
+
+/** 取消在途扫描操作。 */
+export async function cancelScanOperation(
+  libraryId: string,
+  operationId: string,
+): Promise<{ cancelled: boolean }> {
+  return unwrap(
+    request<ApiEnvelope<{ cancelled: boolean }>>(`/libraries/${libraryId}/scan-operations/${encodeURIComponent(operationId)}/cancel`, { method: "POST" }),
+  );
 }
 
 
