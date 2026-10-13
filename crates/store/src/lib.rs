@@ -13,6 +13,10 @@ mod fingerprint_samples;
 mod ledger;
 mod ledger_cleanup;
 mod ledger_quality;
+mod ledger_presence;
+pub use ledger_presence::{
+    FilePresence, LedgerPresenceMode, LedgerPresenceObservation, LedgerPresenceResult,
+};
 mod legacy_recycle;
 mod libraries;
 mod library;

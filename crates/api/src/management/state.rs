@@ -27,6 +27,8 @@ pub struct ApiState {
     pub(crate) subtitle_delivery: Arc<crate::subtitle_delivery::SubtitleDelivery>,
     /// 浏览路径的只读文件访问（NFO / stat）；生产直接读磁盘，测试可注入阻塞实现。
     pub(crate) browse_files: Arc<dyn crate::browse_file_read::BrowseFileRead>,
+    /// 文件系统观察 seam（verify / prune / watcher）；生产默认真实实现，测试可注入。
+    pub(crate) library_files: Arc<dyn crate::library_presence::LibraryFileRead>,
     /// 进程内共享的任务计数 watcher（所有 SSE 连接共用一个 poller）。
     pub(crate) job_updates: Arc<crate::job_updates::JobUpdates>,
     /// Library 封面渲染与版本化发布（生产默认真实渲染器，测试可注入）。
@@ -212,6 +214,7 @@ impl ApiState {
                 2,
             )),
             browse_files: Arc::new(crate::browse_file_read::LocalBrowseFileRead),
+            library_files: Arc::new(crate::library_presence::SystemLibraryFileRead),
             job_updates: Arc::new(crate::job_updates::JobUpdates::new()),
             cover_service: Arc::new(crate::library_cover_service::LibraryCoverService::local()),
             library_work,
@@ -246,6 +249,13 @@ impl ApiState {
 
     pub fn with_log_buffer(mut self, log_buffer: LogBuffer) -> Self {
         self.log_buffer = log_buffer;
+        self
+    }
+    pub fn with_library_file_read(
+        mut self,
+        files: Arc<dyn crate::library_presence::LibraryFileRead>,
+    ) -> Self {
+        self.library_files = files;
         self
     }
 

@@ -27,6 +27,7 @@ pub(crate) mod library_duplicates;
 pub(crate) mod library_gallery;
 pub(crate) mod library_housekeeping;
 pub(crate) mod library_organize;
+pub(crate) mod library_presence;
 pub(crate) mod library_scan;
 pub(crate) mod media;
 pub(crate) mod media_posters;
@@ -495,10 +496,10 @@ fn admin_library_routes() -> Router<ApiState> {
             delete(library_duplicates::delete_duplicate),
         )
         .route("/libraries/{id}/scan", post(library_scan::scan_library))
-        .route("/libraries/{id}/verify", post(library::verify_files))
+        .route("/libraries/{id}/verify", post(library_presence::verify_handler))
         .route(
             "/libraries/{id}/missing-rows",
-            delete(library::delete_missing_rows),
+            delete(library_presence::prune_handler),
         )
         .route(
             "/libraries/{id}/organize-preview",

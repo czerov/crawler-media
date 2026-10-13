@@ -35,6 +35,7 @@ pub mod fingerprint_job;
 pub mod http;
 pub mod management;
 pub mod library_lifecycle;
+pub mod library_presence;
 pub mod maintenance;
 pub mod marker_resolver;
 pub mod media_posters;
