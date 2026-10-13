@@ -246,6 +246,7 @@ impl ApiState {
             crate::library_lifecycle::resume_library_removals(&state)
                 .map_err(std::io::Error::other)?;
             state.probe.try_start_workers();
+            crate::scan_probe_dispatch::start_dispatcher(state.clone());
         }
         Ok(state)
     }

@@ -48,6 +48,7 @@ mod runtime_downloader;
 pub mod settings_keys;
 pub mod store;
 pub mod theintrodb;
+pub mod scan_probe_dispatch;
 pub mod ui;
 pub use poster_fetch::PosterFetch;
 pub mod anilist_http;

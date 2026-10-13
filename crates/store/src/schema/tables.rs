@@ -210,6 +210,11 @@ pub(super) const LIBRARY_TABLES: &str = r#"
             ON probe_jobs(media_id, created_at_ms DESC);
         CREATE INDEX IF NOT EXISTS probe_job_units_job_status_idx
             ON probe_job_units(job_id, status);
+        CREATE TABLE IF NOT EXISTS ledger_probe_obligations (
+            ledger_id TEXT PRIMARY KEY,
+            created_at_ms INTEGER NOT NULL,
+            reason TEXT NOT NULL
+        );
         "#;
 
 pub(super) const SUBSCRIBE_TABLES: &str = r#"

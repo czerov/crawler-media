@@ -11,7 +11,7 @@ mod tables;
 /// The version is stored via `PRAGMA user_version` on each database file.
 pub const APP_SCHEMA_VERSION: i64 = 5;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
-pub const LIBRARY_SCHEMA_VERSION: i64 = 7;
+pub const LIBRARY_SCHEMA_VERSION: i64 = 8;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 4;
 
 /// Read the current schema version from a database file.
@@ -249,6 +249,14 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
     )?;
     fingerprint::migrate_library_fingerprint(conn)?;
     probe_state::migrate_probe_state(conn)?;
+    // library schema 8: ledger_probe_obligations 表用于扫描原子登记后的 probe 义务跟踪与恢复
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ledger_probe_obligations (
+             ledger_id TEXT PRIMARY KEY,
+             created_at_ms INTEGER NOT NULL,
+             reason TEXT NOT NULL
+         );",
+    )?;
     set_schema_version(conn, LIBRARY_SCHEMA_VERSION)?;
     Ok(())
 }

@@ -46,8 +46,9 @@ pub fn record_paths(
         let media = store
             .resolve_scanned_media(incoming)
             .map_err(|e| e.to_string())?;
+        let now_ms = crate::job_loop::unix_now() * 1000;
         store
-            .insert_ledger(&LedgerRow {
+            .insert_scanned_ledger(&LedgerRow {
                 id: LedgerId::new(),
                 media_id: media.id,
                 path: path_str,
@@ -59,7 +60,7 @@ pub fn record_paths(
                 quality_source: QualitySource::Release,
                 confidence: parsed.confidence,
                 filter_score: None,
-            })
+            }, now_ms)
             .map_err(|e| e.to_string())?;
         inserted.push(dest);
     }
@@ -104,8 +105,9 @@ pub fn record_video_paths(
                 anilist_id: None,
             })
             .map_err(|e| e.to_string())?;
+        let now_ms = crate::job_loop::unix_now() * 1000;
         store
-            .insert_ledger(&LedgerRow {
+            .insert_scanned_ledger(&LedgerRow {
                 id: LedgerId::new(),
                 media_id: media.id,
                 path: dest.display().to_string(),
@@ -117,7 +119,7 @@ pub fn record_video_paths(
                 quality_source: QualitySource::Release,
                 confidence: Confidence::High,
                 filter_score: None,
-            })
+            }, now_ms)
             .map_err(|e| e.to_string())?;
         inserted.push(dest);
     }

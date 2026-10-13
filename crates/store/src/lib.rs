@@ -37,6 +37,8 @@ mod probe_tasks;
 mod roots;
 mod schema;
 mod scanned_ledger;
+mod scan_probe_obligations;
+pub use scan_probe_obligations::ScanProbeObligation;
 mod sites;
 mod subscribe_wanted;
 mod subscribe_library;

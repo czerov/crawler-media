@@ -25,6 +25,11 @@ pub(crate) fn delete_ledger_by_id_str_in_tx(
     tx: &Transaction<'_>,
     id_str: &str,
 ) -> Result<bool, StoreError> {
+    // Delete probe obligations in library.db
+    tx.execute(
+        "DELETE FROM ledger_probe_obligations WHERE ledger_id = ?1",
+        [id_str],
+    )?;
     // Delete file-derived caches and metadata
     crate::library::delete_file_meta_for_ledger(tx, id_str)?;
 

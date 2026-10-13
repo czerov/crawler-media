@@ -20,8 +20,8 @@ fn open_creates_four_sqlite_files() {
     );
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "library").unwrap().1,
-        7,
-        "library schema version should be 7"
+        8,
+        "library schema version should be 8"
     );
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "subscribe").unwrap().1,
