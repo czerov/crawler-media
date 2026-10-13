@@ -35,6 +35,9 @@ fn session(user: UserId, media: MediaId, device: &str, started: i64) -> SessionR
         started_at: started,
         last_report_at: started,
         ledger_id: None,
+        play_session_id: None,
+        last_report_at_ms: started * 1000,
+        last_event_sequence: None,
     }
 }
 

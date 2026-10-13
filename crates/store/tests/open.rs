@@ -25,7 +25,7 @@ fn open_creates_four_sqlite_files() {
     );
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "subscribe").unwrap().1,
-        3,
-        "subscribe schema version should be 3"
+        4,
+        "subscribe schema version should be 4"
     );
 }

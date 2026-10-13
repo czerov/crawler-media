@@ -36,6 +36,9 @@ fn log_fixture(
             started_at: started,
             last_report_at: started,
             ledger_id: None,
+            play_session_id: None,
+            last_report_at_ms: started * 1000,
+            last_event_sequence: None,
         })
         .unwrap();
     store.close_session(user, device, started + 1).unwrap().unwrap();

@@ -179,6 +179,9 @@ fn next_session(
         started_at: previous.map(|s| s.started_at).unwrap_or(heartbeat.now),
         last_report_at: heartbeat.now,
         ledger_id: Some(heartbeat.ledger_id.clone()),
+        play_session_id: previous.and_then(|s| s.play_session_id.clone()),
+        last_report_at_ms: heartbeat.now * 1000,
+        last_event_sequence: previous.and_then(|s| s.last_event_sequence),
     }
 }
 

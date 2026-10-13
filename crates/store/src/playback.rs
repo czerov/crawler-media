@@ -8,6 +8,8 @@ use domain::{MediaId, UserId};
 
 use super::{Store, StoreError};
 
+pub mod session_ids;
+pub use session_ids::{PlaySessionBinding, PlaySessionIdState};
 pub const UNIT_WHOLE: i32 = -1;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -54,6 +56,9 @@ pub struct SessionRow {
     pub started_at: i64,
     pub last_report_at: i64,
     pub ledger_id: Option<String>,
+    pub play_session_id: Option<String>,
+    pub last_report_at_ms: i64,
+    pub last_event_sequence: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

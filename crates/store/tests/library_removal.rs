@@ -155,6 +155,9 @@ fn removal_closes_playback_sessions_for_removed_files_and_preserves_other_librar
         started_at: 100,
         last_report_at: 200,
         ledger_id: Some(a_row.id.to_string()),
+        play_session_id: None,
+        last_report_at_ms: 200_000,
+        last_event_sequence: None,
     };
     let session_b = store::SessionRow {
         device_id: device_b.into(),
@@ -178,6 +181,9 @@ fn removal_closes_playback_sessions_for_removed_files_and_preserves_other_librar
         started_at: 100,
         last_report_at: 200,
         ledger_id: Some(b_row.id.to_string()),
+        play_session_id: None,
+        last_report_at_ms: 200_000,
+        last_event_sequence: None,
     };
     store.upsert_session(&session_a).unwrap();
     store.upsert_session(&session_b).unwrap();

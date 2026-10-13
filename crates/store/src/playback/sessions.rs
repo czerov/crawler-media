@@ -11,9 +11,10 @@ impl Store {
                 (device_id, user_id, media_id, season, episode, client, device_name,
                  client_version, play_method, position_ms, start_position_ms, duration_ms,
                  paused, watched_ms, rate_bps, bytes_sent, connections, admin_ended,
-                 started_at, last_report_at, ledger_id)
+                 started_at, last_report_at, ledger_id, play_session_id, last_report_at_ms,
+                 last_event_sequence)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19, ?20, ?21)",
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 session.device_id,
                 session.user_id.to_string(),
@@ -36,6 +37,9 @@ impl Store {
                 session.started_at,
                 session.last_report_at,
                 session.ledger_id,
+                session.play_session_id,
+                session.last_report_at_ms,
+                session.last_event_sequence,
             ],
         )?;
         Ok(())
@@ -51,7 +55,8 @@ impl Store {
                 "SELECT device_id, user_id, media_id, season, episode, client, device_name,
                         client_version, play_method, position_ms, start_position_ms,
                         duration_ms, paused, watched_ms, rate_bps, bytes_sent, connections,
-                        admin_ended, started_at, last_report_at, ledger_id
+                        admin_ended, started_at, last_report_at, ledger_id, play_session_id,
+                        last_report_at_ms, last_event_sequence
                  FROM playback_sessions WHERE user_id = ?1 AND device_id = ?2",
                 params![user_id.to_string(), device_id],
                 map_session,
@@ -65,15 +70,14 @@ impl Store {
             "SELECT device_id, user_id, media_id, season, episode, client, device_name,
                     client_version, play_method, position_ms, start_position_ms,
                     duration_ms, paused, watched_ms, rate_bps, bytes_sent, connections,
-                    admin_ended, started_at, last_report_at, ledger_id
+                    admin_ended, started_at, last_report_at, ledger_id, play_session_id,
+                    last_report_at_ms, last_event_sequence
              FROM playback_sessions WHERE device_id = ?1
              ORDER BY last_report_at DESC",
         )?;
         let rows = stmt.query_map(params![device_id], map_session)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
-
-    /// Sessions with a heartbeat inside the timeout window.
     pub fn active_sessions(
         &self,
         now: i64,
@@ -84,7 +88,8 @@ impl Store {
             "SELECT device_id, user_id, media_id, season, episode, client, device_name,
                     client_version, play_method, position_ms, start_position_ms,
                     duration_ms, paused, watched_ms, rate_bps, bytes_sent, connections,
-                    admin_ended, started_at, last_report_at, ledger_id
+                    admin_ended, started_at, last_report_at, ledger_id, play_session_id,
+                    last_report_at_ms, last_event_sequence
              FROM playback_sessions WHERE last_report_at >= ?1
              ORDER BY last_report_at DESC",
         )?;
@@ -224,5 +229,8 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         started_at: row.get(18)?,
         last_report_at: row.get(19)?,
         ledger_id: row.get(20)?,
+        play_session_id: row.get(21)?,
+        last_report_at_ms: row.get(22)?,
+        last_event_sequence: row.get(23)?,
     })
 }

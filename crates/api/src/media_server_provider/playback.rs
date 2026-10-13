@@ -346,5 +346,8 @@ fn session_row(
         started_at: existing.map(|session| session.started_at).unwrap_or(now),
         last_report_at: now,
         ledger_id: Some(target.ledger_id.clone()),
+        play_session_id: existing.and_then(|session| session.play_session_id.clone()),
+        last_report_at_ms: now * 1000,
+        last_event_sequence: existing.and_then(|session| session.last_event_sequence),
     }
 }

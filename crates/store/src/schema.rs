@@ -12,7 +12,7 @@ mod tables;
 pub const APP_SCHEMA_VERSION: i64 = 5;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 pub const LIBRARY_SCHEMA_VERSION: i64 = 7;
-pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 3;
+pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 4;
 
 /// Read the current schema version from a database file.
 ///
@@ -308,6 +308,29 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     )?;
     // 老库遗留的 playback_progress 表：数据并入 playback_units 后删除。
     migrate_legacy_playback_progress(conn)?;
+    // subscribe schema 4: playback_sessions 新增代际与毫秒字段，新增 playback_session_ids 表
+    ensure_column(conn, "playback_sessions", "play_session_id", "TEXT")?;
+    ensure_column(
+        conn,
+        "playback_sessions",
+        "last_report_at_ms",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(conn, "playback_sessions", "last_event_sequence", "INTEGER")?;
+    conn.execute_batch(
+        "UPDATE playback_sessions SET last_report_at_ms = last_report_at * 1000 WHERE last_report_at_ms = 0;
+         CREATE TABLE IF NOT EXISTS playback_session_ids (
+             user_id TEXT NOT NULL,
+             device_id TEXT NOT NULL,
+             play_session_id TEXT NOT NULL,
+             item_id TEXT NOT NULL,
+             issued_at INTEGER NOT NULL,
+             generation INTEGER NOT NULL,
+             state TEXT NOT NULL,
+             PRIMARY KEY (user_id, device_id, play_session_id)
+         );
+         CREATE INDEX IF NOT EXISTS playback_session_ids_expiry_idx ON playback_session_ids(issued_at);",
+    )?;
     set_schema_version(conn, SUBSCRIBE_SCHEMA_VERSION)?;
     Ok(())
 }

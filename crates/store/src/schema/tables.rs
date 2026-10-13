@@ -280,8 +280,22 @@ pub(super) const SUBSCRIBE_TABLES: &str = r#"
             started_at INTEGER NOT NULL,
             last_report_at INTEGER NOT NULL,
             ledger_id TEXT,
+            play_session_id TEXT,
+            last_report_at_ms INTEGER NOT NULL DEFAULT 0,
+            last_event_sequence INTEGER,
             PRIMARY KEY (user_id, device_id)
         );
+        CREATE TABLE IF NOT EXISTS playback_session_ids (
+            user_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            play_session_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            issued_at INTEGER NOT NULL,
+            generation INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (user_id, device_id, play_session_id)
+        );
+        CREATE INDEX IF NOT EXISTS playback_session_ids_expiry_idx ON playback_session_ids(issued_at);
         CREATE TABLE IF NOT EXISTS playback_logs (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
