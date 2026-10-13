@@ -8,7 +8,7 @@ mod catalog_refresh;
 mod check_in;
 mod episode_still;
 pub(crate) mod fanart_artwork;
-mod job_loop;
+pub mod job_loop;
 mod jobs_api;
 mod open_coverage;
 pub(crate) mod scrape_config;

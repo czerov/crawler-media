@@ -33,6 +33,8 @@ pub struct ApiState {
     pub(crate) cover_service: Arc<crate::library_cover_service::LibraryCoverService>,
     pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
     pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
+    /// 后台 job_loop 控制（停止意图与正在运行的 blocking worker 跟踪）。
+    pub(crate) job_loop_control: Arc<crate::job_loop::JobLoopControl>,
     /// 数据库维护执行器（生产为真实 SQLite；测试可注入阻塞/报错的假实现）。
     pub(crate) maintenance_executor: Arc<dyn crate::maintenance::DatabaseExecutor>,
     /// 进程内维护互斥：`concurrency_key` 只防同一 def 重叠，这里覆盖不同维护 def。
@@ -214,6 +216,7 @@ impl ApiState {
             cover_service: Arc::new(crate::library_cover_service::LibraryCoverService::local()),
             library_work,
             jobs: Arc::new(Mutex::new(jobs)),
+            job_loop_control: Arc::new(crate::job_loop::JobLoopControl::new()),
             maintenance_executor: Arc::new(crate::maintenance::SqliteExecutor),
             maintenance_lock: Arc::new(Mutex::new(())),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -317,12 +320,24 @@ impl ApiState {
         self.jobs.clone()
     }
 
+    pub fn job_loop_control(&self) -> Arc<crate::job_loop::JobLoopControl> {
+        self.job_loop_control.clone()
+    }
+
     /// 替换数据库维护执行器（测试注入阻塞/报 busy/磁盘不足的假实现）。
     pub fn with_maintenance_executor(
         mut self,
         executor: Arc<dyn crate::maintenance::DatabaseExecutor>,
     ) -> Self {
         self.maintenance_executor = executor;
+        self
+    }
+
+    pub fn with_job_loop_control(
+        mut self,
+        control: Arc<crate::job_loop::JobLoopControl>,
+    ) -> Self {
+        self.job_loop_control = control;
         self
     }
 

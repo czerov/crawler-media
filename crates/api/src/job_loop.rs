@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
@@ -8,18 +9,83 @@ use tokio::task::JoinHandle;
 use crate::management::ApiState;
 use crate::worker::StateRunner;
 
-pub fn spawn_job_loop(state: ApiState) -> JoinHandle<()> {
-    spawn_job_loop_with(state, Duration::from_secs(1), unix_now)
+/// 控制后台 job_loop 的生命周期与正在运行的 blocking worker。
+#[derive(Default)]
+pub struct JobLoopControl {
+    stopping: AtomicBool,
+    active_workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl JobLoopControl {
+    pub fn new() -> Self {
+        Self {
+            stopping: AtomicBool::new(false),
+            active_workers: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn request_stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    pub fn track_worker(&self, handle: JoinHandle<()>) {
+        let mut workers = self.active_workers.lock();
+        workers.retain(|h| !h.is_finished());
+        workers.push(handle);
+    }
+
+    pub async fn drain(&self) {
+        let handles = {
+            let mut workers = self.active_workers.lock();
+            std::mem::take(&mut *workers)
+        };
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+}
+
+pub struct JobLoopHandle {
+    loop_task: JoinHandle<()>,
+    control: Arc<JobLoopControl>,
+}
+
+impl JobLoopHandle {
+    pub fn new(loop_task: JoinHandle<()>, control: Arc<JobLoopControl>) -> Self {
+        Self { loop_task, control }
+    }
+
+    pub async fn shutdown(self) -> Result<(), String> {
+        self.control.request_stop();
+        self.loop_task.abort();
+        let _ = self.loop_task.await;
+        self.control.drain().await;
+        Ok(())
+    }
+}
+
+pub fn spawn_job_loop(state: ApiState) -> JobLoopHandle {
+    let control = state.job_loop_control();
+    spawn_job_loop_with(state, Duration::from_secs(1), unix_now, control)
 }
 
 pub fn spawn_job_loop_with(
     state: ApiState,
     interval: Duration,
     clock: impl Fn() -> i64 + Send + 'static,
-) -> JoinHandle<()> {
+    control: Arc<JobLoopControl>,
+) -> JobLoopHandle {
     let clock: Arc<Mutex<Box<dyn Fn() -> i64 + Send>>> = Arc::new(Mutex::new(Box::new(clock)));
-    tokio::spawn(async move {
+    let loop_control = control.clone();
+    let loop_task = tokio::spawn(async move {
         loop {
+            if loop_control.is_stopping() {
+                break;
+            }
             let now = read_clock(&clock);
             if let Err(error) = state.probe.dispatch_due(now.saturating_mul(1000), 32) {
                 tracing::error!(%error, now, "【媒体探测】派发到期阶段失败");
@@ -30,7 +96,10 @@ pub fn spawn_job_loop_with(
             // 表现就是「正在连接服务…」+ me 不返回。挪到 spawn_blocking 池。
             let state_clone = state.clone();
             let completion_clock = Arc::clone(&clock);
-            tokio::task::spawn_blocking(move || {
+            let worker_handle = tokio::task::spawn_blocking(move || {
+                if state_clone.job_loop_control().is_stopping() {
+                    return;
+                }
                 if let Err(error) = run_pending_jobs_with_clock(
                     &state_clone,
                     now,
@@ -45,9 +114,12 @@ pub fn spawn_job_loop_with(
                     .lock()
                     .sweep_stale_sessions(now, crate::http::playback::session_timeout_secs());
             });
+            loop_control.track_worker(worker_handle);
             tokio::time::sleep(interval).await;
         }
-    })
+    });
+
+    JobLoopHandle::new(loop_task, control)
 }
 
 /// 一轮 tick 的来源：决定维护任务是否参与本轮调度。

@@ -23,7 +23,7 @@ pub use policy::{
     validate_retention_days,
 };
 pub use report::{DatabaseOutcome, DatabaseReport, MaintenanceReport};
-pub use runner::run;
+pub use runner::{check_maintenance_stop, run, MaintenanceStop};
 
 use jobs::{JobKind, NewDef, Queue, Schedule};
 

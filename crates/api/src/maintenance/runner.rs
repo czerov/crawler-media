@@ -38,7 +38,7 @@ pub fn run(state: &ApiState, job: &Job) -> Result<(), String> {
 
     let now = job.started_at.unwrap_or_else(crate::job_loop::unix_now);
     let started = Instant::now();
-    let cancelled = || job_cancelled(state, job);
+    let check_stop = || check_maintenance_stop(state, job);
     let version = match &policy {
         MaintenancePolicy::Database(policy) => policy.version,
         MaintenancePolicy::Jobs(policy) => policy.version,
@@ -49,14 +49,14 @@ pub fn run(state: &ApiState, job: &Job) -> Result<(), String> {
 
     let outcome = match &policy {
         MaintenancePolicy::Database(policy) => {
-            run_database(state, job, policy, now, &cancelled, &mut report)
+            run_database(state, job, policy, now, &check_stop, &mut report)
         }
         MaintenancePolicy::Jobs(policy) => {
             let cutoff = cutoff(now, policy.retention_days)?;
             report.cutoff = Some(cutoff);
             report.dry_run = policy.dry_run;
             let dry_run = policy.dry_run;
-            run_batches(&mut report, dry_run, &cancelled, || {
+            run_batches(&mut report, dry_run, &check_stop, || {
                 let queue = state.jobs.lock();
                 queue
                     .prune_terminal_jobs(cutoff, BATCH_SIZE, dry_run)
@@ -69,7 +69,7 @@ pub fn run(state: &ApiState, job: &Job) -> Result<(), String> {
             report.cutoff = Some(cutoff);
             report.dry_run = policy.dry_run;
             let dry_run = policy.dry_run;
-            run_batches(&mut report, dry_run, &cancelled, || {
+            run_batches(&mut report, dry_run, &check_stop, || {
                 let store = state.store.lock();
                 store
                     .prune_playback_logs(cutoff, BATCH_SIZE, dry_run)
@@ -118,15 +118,48 @@ fn refuse_when_queue_lock_held(state: &ApiState) -> Result<(), String> {
     Err("维护任务不能在持有 Queue 锁的路径中执行（Queue::tick / 持锁 runner）；请由后台 job_loop 调度".into())
 }
 
-/// 取消信号：本次 attempt 已不再是库里的 running 行（被取消/恢复/删除）。
-fn job_cancelled(state: &ApiState, job: &Job) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaintenanceStop {
+    Active,
+    Disabled,
+    Cancelled,
+    ShuttingDown,
+    ReadFailed,
+}
+
+/// 检查维护任务是否应当在批次/库边界停止：
+/// 1. 是否正在停机 (shutting down)
+/// 2. 对应的 def 是否被禁用 (disabled)
+/// 3. 本次 job 状态是否已被取消或变更 (cancelled)
+/// 4. 状态读取失败保守停止 (read failed)
+pub fn check_maintenance_stop(state: &ApiState, job: &Job) -> MaintenanceStop {
+    if state.job_loop_control().is_stopping() {
+        return MaintenanceStop::ShuttingDown;
+    }
     let queue = state.jobs.lock();
+    if let Some(def_id) = job.def_id {
+        match queue.def(def_id) {
+            Ok(Some(def)) if !def.enabled => return MaintenanceStop::Disabled,
+            Ok(None) => return MaintenanceStop::Cancelled,
+            Err(error) => {
+                tracing::warn!(job_id = %job.id, %error, "读取维护任务定义失败，保守停止");
+                return MaintenanceStop::ReadFailed;
+            }
+            _ => {}
+        }
+    }
     match queue.get(job.id) {
-        Ok(Some(current)) => current.status != JobStatus::Running || current.attempt != job.attempt,
-        Ok(None) => true,
+        Ok(Some(current)) => {
+            if current.status != JobStatus::Running || current.attempt != job.attempt {
+                MaintenanceStop::Cancelled
+            } else {
+                MaintenanceStop::Active
+            }
+        }
+        Ok(None) => MaintenanceStop::Cancelled,
         Err(error) => {
             tracing::warn!(job_id = %job.id, %error, "读取维护任务状态失败，保守停止");
-            true
+            MaintenanceStop::ReadFailed
         }
     }
 }
@@ -161,7 +194,7 @@ fn run_database(
     job: &Job,
     policy: &DatabaseMaintenancePolicy,
     now: i64,
-    cancelled: &dyn Fn() -> bool,
+    check_stop: &dyn Fn() -> MaintenanceStop,
     report: &mut MaintenanceReport,
 ) -> Result<(), String> {
     // 只把 owned 路径带出 Store 锁，随后立刻释放。
@@ -181,15 +214,31 @@ fn run_database(
     }
 
     let mut failures = Vec::new();
+    let cancelled = || check_stop() != MaintenanceStop::Active;
     for target in database_targets(&data_dir, &app_path) {
-        if cancelled() {
-            report.note = Some("任务已取消，未启动下一库".to_string());
-            break;
+        match check_stop() {
+            MaintenanceStop::Active => {}
+            MaintenanceStop::Disabled => {
+                report.note = Some("任务定义已禁用，未启动下一库".to_string());
+                break;
+            }
+            MaintenanceStop::ShuttingDown => {
+                report.note = Some("服务正在关闭，未启动下一库".to_string());
+                break;
+            }
+            MaintenanceStop::Cancelled => {
+                report.note = Some("任务已取消，未启动下一库".to_string());
+                break;
+            }
+            MaintenanceStop::ReadFailed => {
+                report.note = Some("读取任务状态失败，未启动下一库".to_string());
+                break;
+            }
         }
         let context = MaintenanceContext {
             now,
             last_vacuum_success: read_last_vacuum(state, target.name),
-            cancelled,
+            cancelled: &cancelled,
         };
         let result = state
             .maintenance_executor
@@ -302,15 +351,30 @@ impl BatchCounts {
 fn run_batches(
     report: &mut MaintenanceReport,
     dry_run: bool,
-    cancelled: &dyn Fn() -> bool,
+    check_stop: &dyn Fn() -> MaintenanceStop,
     mut next: impl FnMut() -> Result<BatchCounts, String>,
 ) -> Result<(), String> {
     let mut batches = 0usize;
     let mut more_remains = false;
     while batches < MAX_BATCHES {
-        if cancelled() {
-            report.note = Some("任务已取消，未启动下一批".to_string());
-            break;
+        match check_stop() {
+            MaintenanceStop::Active => {}
+            MaintenanceStop::Disabled => {
+                report.note = Some("任务定义已禁用，未启动下一批".to_string());
+                break;
+            }
+            MaintenanceStop::ShuttingDown => {
+                report.note = Some("服务正在关闭，未启动下一批".to_string());
+                break;
+            }
+            MaintenanceStop::Cancelled => {
+                report.note = Some("任务已取消，未启动下一批".to_string());
+                break;
+            }
+            MaintenanceStop::ReadFailed => {
+                report.note = Some("读取任务状态失败，未启动下一批".to_string());
+                break;
+            }
         }
         let batch = next()?;
         report.scanned += batch.scanned;
