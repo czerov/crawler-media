@@ -12,6 +12,8 @@ use crate::http::{err, ok, ok_list};
 use crate::management::ApiState;
 use crate::scrape_store::ScrapeStoreExt;
 
+pub(crate) mod scope;
+use scope::ScanScope;
 use super::library::{
     facets, missing_library, preferred_row, require_visible_library, rows_in_library, selection,
 };
@@ -400,17 +402,35 @@ fn scan_video_library(
     for root in roots {
         walk_video_files(root, &mut files);
     }
-    let inserted = match {
-        let store = state.store.lock();
-        if lease.control().is_cancelled()
-            || !store.library_accepts_work(library_id).unwrap_or(false)
-        {
+    let scan_scope = match ScanScope::capture(state, library_id) {
+        Ok(s) => s,
+        Err(crate::library_presence::PresenceError::Deleting) => {
             return err(StatusCode::CONFLICT, "library.deleting", "Library 正在删除");
         }
+        Err(crate::library_presence::PresenceError::ScopeChanged) => {
+            return err(StatusCode::CONFLICT, "library.scope_changed", "Library 配置变化");
+        }
+        Err(e) => return err(StatusCode::CONFLICT, "library.scan", &format!("{:?}", e)),
+    };
+    let files = match scan_scope.filter_paths(files) {
+        Ok(f) => f,
+        Err(e) => return err(StatusCode::CONFLICT, "library.ownership_ambiguous", &format!("{:?}", e)),
+    };
+    let inserted = match lease.publish(|| {
+        let store = state.store.lock();
+        scan_scope.validate(&store).map_err(|e| format!("{:?}", e))?;
         crate::watch_ledger::record_video_paths(&store, files.clone())
-    } {
+    }) {
         Ok(inserted) => inserted,
-        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &error),
+        Err(error) => {
+            if error.contains("Deleting") {
+                return err(StatusCode::CONFLICT, "library.deleting", "Library 正在删除");
+            }
+            if error.contains("ScopeChanged") {
+                return err(StatusCode::CONFLICT, "library.scope_changed", "Library 配置变化");
+            }
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &error);
+        }
     };
     crate::http::library::enqueue_probes_for_paths(state, inserted);
     for file in files {
