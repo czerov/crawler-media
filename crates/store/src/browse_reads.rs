@@ -80,4 +80,90 @@ impl Store {
         }
         Ok(units)
     }
+
+    /// Playback units for a specific list of media ids, chunked to stay under SQLite variable limits.
+    pub fn playback_units_for_media(
+        &self,
+        user: UserId,
+        ids: &[MediaId],
+    ) -> Result<Vec<PlaybackUnitSnapshot>, StoreError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut units = Vec::new();
+        for chunk in ids.chunks(MEDIA_BATCH_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT media_id, season, episode,
+                        position_ms, played, favorite, duration_ms, audio_track,
+                        subtitle_track, play_count, updated_at
+                 FROM playback_units
+                 WHERE user_id = ?1 AND media_id IN ({placeholders})
+                 ORDER BY media_id, season, episode"
+            );
+            let mut stmt = self.subscribe.prepare(&sql)?;
+            let mut params_vec = Vec::with_capacity(1 + chunk.len());
+            params_vec.push(rusqlite::types::Value::from(user.to_string()));
+            for id in chunk {
+                params_vec.push(rusqlite::types::Value::from(id.to_string()));
+            }
+            let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+                Ok(PlaybackUnitSnapshot {
+                    media_id: parse_id(row.get::<_, String>(0)?, 0)?,
+                    season: row.get(1)?,
+                    episode: row.get(2)?,
+                    state: UnitState {
+                        position_ms: row.get(3)?,
+                        played: row.get::<_, i64>(4)? != 0,
+                        favorite: row.get::<_, i64>(5)? != 0,
+                        duration_ms: row.get(6)?,
+                        audio_track: row.get(7)?,
+                        subtitle_track: row.get(8)?,
+                        play_count: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    },
+                })
+            })?;
+            for row in rows {
+                units.push(row?);
+            }
+        }
+        Ok(units)
+    }
+
+    /// Page browse_media rows directly from the projection for simple title queries.
+    pub fn browse_title_page(
+        &self,
+        library_id: &str,
+        offset: usize,
+        limit: usize,
+        desc: bool,
+    ) -> Result<Vec<super::BrowseMediaFacts>, StoreError> {
+        let order = if desc { "DESC" } else { "ASC" };
+        let sql = format!(
+            "SELECT media_id, title, year, facts_json
+             FROM browse_media
+             WHERE library_id = ?1
+             ORDER BY title {order}, media_id ASC
+             LIMIT ?2 OFFSET ?3"
+        );
+        let mut stmt = self.library.prepare(&sql)?;
+        let rows = stmt.query_map(params![library_id, limit, offset], |row| {
+            let mid: String = row.get(0)?;
+            let title: String = row.get(1)?;
+            let year: Option<u16> = row.get(2)?;
+            let facts_str: String = row.get(3)?;
+            use std::str::FromStr;
+            let media_id = MediaId::from_str(&mid)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
+            let facts = serde_json::from_str(&facts_str).unwrap_or_default();
+            Ok(super::BrowseMediaFacts {
+                media_id,
+                title,
+                year,
+                facts,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }

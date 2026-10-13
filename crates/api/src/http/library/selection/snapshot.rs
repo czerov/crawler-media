@@ -44,16 +44,6 @@ pub(crate) fn load_browse_snapshot(
     let ownership = store.library_ownership().map_err(super::store_error)?;
     let missing = store.missing_at_by_path().map_err(super::store_error)?;
     let cache = store.list_catalog_cache().map_err(super::store_error)?;
-    let units = match user {
-        Some(user) => store
-            .playback_units_for_user(user)
-            .map_err(super::store_error)?
-            .into_iter()
-            .map(|unit| ((unit.media_id, unit.season, unit.episode), unit.state))
-            .collect(),
-        None => HashMap::new(),
-    };
-
     // 归属用快照纯函数判定：不再每行调一次 `library_for_path`（它会重新读全库配置）。
     let mut owned_by_media: HashMap<MediaId, Vec<LedgerRow>> = HashMap::new();
     for row in store.list_ledger().map_err(super::store_error)? {
@@ -65,6 +55,15 @@ pub(crate) fn load_browse_snapshot(
     let ids: Vec<MediaId> = owned_by_media.keys().copied().collect();
     let media_by_id = store.media_batch(&ids).map_err(super::store_error)?;
 
+    let units = match user {
+        Some(user) => store
+            .playback_units_for_media(user, &ids)
+            .map_err(super::store_error)?
+            .into_iter()
+            .map(|unit| ((unit.media_id, unit.season, unit.episode), unit.state))
+            .collect(),
+        None => HashMap::new(),
+    };
     let mut groups = Vec::with_capacity(owned_by_media.len());
     for (id, rows) in owned_by_media {
         let Some(media) = media_by_id.get(&id).cloned() else {
