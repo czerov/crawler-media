@@ -217,6 +217,15 @@ impl Queue {
         store::set_def_payload_by_id(&self.conn, def_id, expected_payload, payload)
     }
 
+    pub fn prune_terminal_window(
+        &self,
+        cutoff: i64,
+        limit: usize,
+        dry_run: bool,
+    ) -> Result<crate::retention_cursor::RetentionWindow, JobError> {
+        crate::retention_cursor::prune_terminal_window(&self.conn, cutoff, limit, dry_run)
+    }
+
     /// Enable or disable defs whose payload matches. Disabled defs are not scheduled,
     /// and queued children are cancelled by the store layer.
     pub fn set_def_enabled(&self, payload: &str, enabled: bool) -> Result<usize, JobError> {

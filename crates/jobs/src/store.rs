@@ -61,6 +61,7 @@ pub fn migrate(conn: &Connection) -> Result<(), JobError> {
             WHERE status IN ('succeeded','failed','cancelled');
         "#,
     )?;
+    crate::retention_cursor::migrate_retention_cursors(conn)?;
     Ok(())
 }
 
