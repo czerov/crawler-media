@@ -29,6 +29,8 @@ pub struct ApiState {
     pub(crate) browse_files: Arc<dyn crate::browse_file_read::BrowseFileRead>,
     /// 文件系统观察 seam（verify / prune / watcher）；生产默认真实实现，测试可注入。
     pub(crate) library_files: Arc<dyn crate::library_presence::LibraryFileRead>,
+    /// 播放时钟 seam（生产为真实系统毫秒时钟；测试可注入假时钟）。
+    pub(crate) playback_clock: Arc<dyn crate::playback_events::PlaybackClock>,
     /// 进程内共享的任务计数 watcher（所有 SSE 连接共用一个 poller）。
     pub(crate) job_updates: Arc<crate::job_updates::JobUpdates>,
     /// Library 封面渲染与版本化发布（生产默认真实渲染器，测试可注入）。
@@ -215,6 +217,7 @@ impl ApiState {
             )),
             browse_files: Arc::new(crate::browse_file_read::LocalBrowseFileRead),
             library_files: Arc::new(crate::library_presence::SystemLibraryFileRead),
+            playback_clock: Arc::new(crate::playback_events::SystemPlaybackClock),
             job_updates: Arc::new(crate::job_updates::JobUpdates::new()),
             cover_service: Arc::new(crate::library_cover_service::LibraryCoverService::local()),
             library_work,
@@ -256,6 +259,13 @@ impl ApiState {
         files: Arc<dyn crate::library_presence::LibraryFileRead>,
     ) -> Self {
         self.library_files = files;
+        self
+    }
+    pub fn with_playback_clock(
+        mut self,
+        clock: Arc<dyn crate::playback_events::PlaybackClock>,
+    ) -> Self {
+        self.playback_clock = clock;
         self
     }
 

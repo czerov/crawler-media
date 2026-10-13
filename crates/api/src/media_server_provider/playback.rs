@@ -220,10 +220,13 @@ fn persist_event(
         event == PlaybackEvent::Playing && current.is_none(),
         now,
     )?;
+    let now_ms = now * 1000;
     let watched_ms = accumulated_watch_time(
         current.as_ref(),
         position_ms,
-        paused && event != PlaybackEvent::Stopped,
+        paused,
+        event == PlaybackEvent::Stopped,
+        now_ms,
     );
     if event == PlaybackEvent::Stopped {
         return stop_session(
@@ -307,16 +310,18 @@ fn persist_event_position(
     Ok(())
 }
 
-fn accumulated_watch_time(current: Option<&SessionRow>, position_ms: i64, paused: bool) -> i64 {
+fn accumulated_watch_time(
+    current: Option<&SessionRow>,
+    position_ms: i64,
+    paused: bool,
+    stopped: bool,
+    now_ms: i64,
+) -> i64 {
     let Some(session) = current else {
         return 0;
     };
-    let delta = if session.paused || paused {
-        0
-    } else {
-        (position_ms - session.position_ms).max(0)
-    };
-    session.watched_ms + delta
+    let delta = crate::playback_events::watched_increment(session, position_ms, paused, stopped, now_ms, 1.0);
+    session.watched_ms.saturating_add(delta)
 }
 
 fn stop_session(

@@ -168,7 +168,11 @@ fn next_session(
     let position_ms = unit.position_ms;
     let paused = body["paused"].as_bool().unwrap_or(false);
     let previous = previous.filter(|_| !start);
-    let delta = (position_ms - previous.map(|s| s.position_ms).unwrap_or(position_ms)).max(0);
+    let rate = body["rate"].as_f64().unwrap_or(1.0);
+    let now_ms = heartbeat.now * 1000;
+    let delta = previous
+        .map(|prev| crate::playback_events::watched_increment(prev, position_ms, paused, false, now_ms, rate))
+        .unwrap_or(0);
     SessionRow {
         device_id: device.to_string(),
         user_id: heartbeat.user_id,
@@ -183,7 +187,7 @@ fn next_session(
         start_position_ms: previous.map(|s| s.start_position_ms).unwrap_or(position_ms),
         duration_ms: unit.duration_ms,
         paused,
-        watched_ms: previous.map(|s| s.watched_ms).unwrap_or(0) + if paused { 0 } else { delta },
+        watched_ms: previous.map(|s| s.watched_ms).unwrap_or(0).saturating_add(delta),
         rate_bps: 0,
         bytes_sent: 0,
         connections: 1,

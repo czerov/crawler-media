@@ -2,6 +2,8 @@
 
 use domain::LedgerId;
 use store::{PlaySessionBinding, PlaySessionIdState, SessionRow};
+pub mod clock;
+pub use clock::{PlaybackClock, SystemPlaybackClock};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PlaybackEventIdentity {
@@ -15,13 +17,50 @@ pub enum PlaybackEventKind {
     Progress,
     Stop,
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventDecision {
     Start,
     Update,
     Stop,
     Ignore,
+}
+
+/// current position, event flags, timestamps, and playback rate.
+///
+/// Implements Section 3 of Batch 2 design:
+/// - elapsed = clamp(now_ms - last_report_at_ms, 0, 30_000)
+/// - if previous was paused or current event is paused (and not stop): delta = 0
+/// - advance = max(position - previous.position, 0)
+/// - if advance > elapsed * rate + 2_000 -> treated as seek, delta = 0
+/// - otherwise delta = min(elapsed, advance / rate) rounded down to integer ms
+pub fn watched_increment(
+    previous: &SessionRow,
+    position_ms: i64,
+    paused: bool,
+    stopped: bool,
+    now_ms: i64,
+    rate: f64,
+) -> i64 {
+    let rate = if (0.25..=4.0).contains(&rate) { rate } else { 1.0 };
+    let elapsed = clock::clamp_elapsed(now_ms, previous.last_report_at_ms);
+    if elapsed == 0 {
+        return 0;
+    }
+
+    // If previous was paused, or current progress is paused, no watch time is accumulated
+    if previous.paused || (paused && !stopped) {
+        return 0;
+    }
+
+    let advance = (position_ms - previous.position_ms).max(0);
+    let allowed_advance = (elapsed as f64 * rate) as i64 + 2_000;
+    if advance > allowed_advance {
+        // Seek detected
+        return 0;
+    }
+
+    let advance_scaled = (advance as f64 / rate) as i64;
+    elapsed.min(advance_scaled).max(0)
 }
 
 /// Classify an incoming playback event based on session identity, bindings, and previous session.
