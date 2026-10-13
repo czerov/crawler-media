@@ -187,6 +187,9 @@ fn seed_media(
             started_at: started,
             last_report_at: started,
             ledger_id: None,
+            play_session_id: None,
+            last_report_at_ms: started * 1000,
+            last_event_sequence: None,
         })
         .unwrap();
     store.close_session(admin, &device, started + 1).unwrap();
@@ -331,6 +334,22 @@ fn env_modes(default: &[&str]) -> Vec<String> {
     }
 }
 
+fn env_endpoints(default: &[&'static str]) -> Vec<String> {
+    match std::env::var("PERF_ENDPOINTS") {
+        Ok(raw) => raw
+            .split(',')
+            .map(|value| {
+                let trimmed = value.trim();
+                if !default.iter().any(|&d| d == trimmed) {
+                    panic!("unknown endpoint in PERF_ENDPOINTS: {trimmed}");
+                }
+                trimmed.to_string()
+            })
+            .collect(),
+        Err(_) => default.iter().map(|value| (*value).to_string()).collect(),
+    }
+}
+
 fn print_row(mode: &str, size: usize, endpoint: &str, samples: &[Sample]) {
     let mut times: Vec<Duration> = samples.iter().map(|sample| sample.elapsed).collect();
     times.sort();
@@ -351,17 +370,17 @@ fn print_row(mode: &str, size: usize, endpoint: &str, samples: &[Sample]) {
 async fn endpoint_latency_matrix() {
     let sizes = env_list("PERF_SIZES", DEFAULT_SIZES);
     let modes = env_modes(DEFAULT_MODES);
+    let endpoints = env_endpoints(ENDPOINTS);
     let samples = env_list("PERF_SAMPLES", &[DEFAULT_SAMPLES])
         .first()
         .copied()
         .unwrap_or(DEFAULT_SAMPLES)
         .max(1);
-
     println!("mode\tsize\tendpoint\tstatus\tbytes\tmedian_ms\tp95_ms\tsamples");
     for mode in modes {
         for size in &sizes {
             let (_tmp, _state, app, library_id) = fixture(*size, &mode);
-            for endpoint in ENDPOINTS {
+            for endpoint in &endpoints {
                 let uri = endpoint_uri(endpoint, &library_id);
                 let measured = measure(&app, &uri, samples).await;
                 print_row(&mode, *size, endpoint, &measured);
