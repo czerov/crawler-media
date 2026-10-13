@@ -315,6 +315,7 @@ struct BatchCounts {
     candidates: usize,
     deleted: usize,
     protected: usize,
+    protected_truncated: bool,
     has_more: bool,
 }
 
@@ -325,6 +326,7 @@ impl BatchCounts {
             candidates: batch.candidates,
             deleted: batch.deleted,
             protected: batch.protected,
+            protected_truncated: batch.protected_truncated,
             has_more: batch.has_more,
         }
     }
@@ -335,6 +337,7 @@ impl BatchCounts {
             candidates: batch.candidates,
             deleted: batch.deleted,
             protected: batch.protected,
+            protected_truncated: false,
             has_more: batch.has_more,
         }
     }
@@ -380,7 +383,12 @@ fn run_batches(
         report.scanned += batch.scanned;
         report.candidates += batch.candidates;
         report.deleted += batch.deleted;
-        report.protected += batch.protected;
+        // 关键：protected 是同一时间窗口下的保护诊断，不跨批重复累加！
+        // 取各批中观测到的最大值，若任意一批截断则标记为下界。
+        report.protected = report.protected.max(batch.protected);
+        if batch.protected_truncated {
+            report.protected_is_lower_bound = true;
+        }
         batches += 1;
         if dry_run {
             more_remains = batch.has_more;

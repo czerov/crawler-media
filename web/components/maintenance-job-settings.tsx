@@ -167,8 +167,8 @@ export function MaintenanceJobSettings({
             </button>
             {preview && (
               <span className="text-white/70">
-                扫描 {preview.scanned} · 候选 {preview.candidates} · 保护 {preview.protected} ·{" "}
-                {preview.truncated ? "预算不足（计数为下界，非精确总量）" : "完整窗口"}
+                扫描 {preview.scanned} · 候选 {preview.candidates} · 保护 {preview.protected}{preview.protected_truncated ? " (下界)" : ""} ·{" "}
+                {preview.truncated ? "预算截断（计数为下界，非精确总量）" : "完整窗口"}
               </span>
             )}
           </div>

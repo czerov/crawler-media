@@ -27,6 +27,7 @@ pub struct RetentionBatch {
     pub candidates: usize,
     pub deleted: usize,
     pub protected: usize,
+    pub protected_truncated: bool,
     pub has_more: bool,
 }
 
@@ -50,7 +51,7 @@ pub(crate) fn prune_terminal_jobs(
     let has_more = window.len() > batch_size;
     let candidates: Vec<&str> = window.iter().take(batch_size).map(String::as_str).collect();
     // 窗口已只含可删行；`protected` 只作为报告诊断（同时间范围内被保护的行数）。
-    let protected = protected_window(&tx, cutoff, batch_size)?;
+    let (protected, protected_truncated) = protected_window(&tx, cutoff, batch_size)?;
     let deleted = if dry_run {
         0
     } else {
@@ -63,6 +64,7 @@ pub(crate) fn prune_terminal_jobs(
         candidates: candidates.len(),
         deleted,
         protected,
+        protected_truncated,
         has_more,
     };
     tracing::info!(
@@ -121,15 +123,15 @@ fn candidate_window(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-/// 报告用诊断：同一时间范围内**被 last-child 保护**的行数。
+/// 报告用诊断：同一时间范围内**被 last-child 保护**的行数与是否截断。
 ///
 /// 窗口已排除这些行，所以它们不再影响 `deleted`/`has_more`；这里只是让报告仍能显示
-/// "还有多少行是因为保护而留着"。
+/// "还有多少行是因为保护而留着"。返回 (探测计数, 是否截断)。
 fn protected_window(
     conn: &Connection,
     cutoff: i64,
     batch_size: usize,
-) -> Result<usize, JobError> {
+) -> Result<(usize, bool), JobError> {
     let deletable = deletable_predicate();
     let limit = as_i64(batch_size.saturating_add(1));
     let count: i64 = conn.query_row(
@@ -145,7 +147,10 @@ fn protected_window(
         params![cutoff, limit],
         |row| row.get(0),
     )?;
-    Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
+    let count = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
+    let truncated = count > batch_size;
+    let count = count.min(batch_size);
+    Ok((count, truncated))
 }
 
 fn delete_ids(conn: &Connection, ids: &[&str]) -> Result<usize, JobError> {

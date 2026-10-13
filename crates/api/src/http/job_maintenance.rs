@@ -209,17 +209,21 @@ pub(crate) async fn preview_maintenance(
                 .lock()
                 .prune_terminal_jobs(cutoff, BATCH_SIZE, true)
             {
-                Ok(batch) => json!({
-                    "kind": def.kind.as_str(),
-                    "policy_version": policy.version,
-                    "retention_days": policy.retention_days,
-                    "cutoff": cutoff,
-                    "scanned": batch.scanned,
-                    "candidates": batch.candidates,
-                    "protected": batch.protected,
-                    "truncated": batch.has_more,
-                    "note": "只读预览：只统计服务端固定预算窗口内的候选，不执行任何删除。",
-                }),
+                Ok(batch) => {
+                    let truncated = batch.has_more || batch.protected_truncated;
+                    json!({
+                        "kind": def.kind.as_str(),
+                        "policy_version": policy.version,
+                        "retention_days": policy.retention_days,
+                        "cutoff": cutoff,
+                        "scanned": batch.scanned,
+                        "candidates": batch.candidates,
+                        "protected": batch.protected,
+                        "protected_truncated": batch.protected_truncated,
+                        "truncated": truncated,
+                        "note": "只读预览：只统计服务端固定预算窗口内的候选，不执行任何删除。",
+                    })
+                }
                 Err(error) => {
                     return err(
                         StatusCode::INTERNAL_SERVER_ERROR,

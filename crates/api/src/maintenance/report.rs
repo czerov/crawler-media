@@ -68,6 +68,8 @@ pub struct MaintenanceReport {
     pub candidates: usize,
     pub deleted: usize,
     pub protected: usize,
+    /// 保护行数量是否达到了批次探测上限（为 true 时说明保护数是下界，并非精确总量）。
+    pub protected_is_lower_bound: bool,
     pub batches: usize,
     pub budget_exhausted: bool,
     pub elapsed_ms: u64,
@@ -88,6 +90,7 @@ impl MaintenanceReport {
             candidates: 0,
             deleted: 0,
             protected: 0,
+            protected_is_lower_bound: false,
             batches: 0,
             budget_exhausted: false,
             elapsed_ms: 0,

@@ -65,6 +65,7 @@ export interface MaintenancePreview {
   scanned: number;
   candidates: number;
   protected: number;
+  protected_truncated?: boolean;
   truncated: boolean;
   note?: string;
 }
@@ -79,6 +80,7 @@ export interface MaintenanceReport {
   candidates?: number;
   deleted?: number;
   protected?: number;
+  protected_is_lower_bound?: boolean;
   batches?: number;
   budget_exhausted?: boolean;
   elapsed_ms?: number;

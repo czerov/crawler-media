@@ -338,7 +338,11 @@ fn jobs_retention_does_not_loop_when_all_candidates_are_protected() {
         report["candidates"], 0,
         "并列 last-child 组不进候选窗口: {report}"
     );
-    assert_eq!(report["protected"], 501, "诊断计数上限 batch_size+1");
+    assert_eq!(report["protected"], 500, "诊断计数上限 batch_size (500)");
+    assert_eq!(
+        report["protected_is_lower_bound"], true,
+        "超过 batch_size 探测上限时必须标记为下界: {report}"
+    );
     assert_eq!(
         report["budget_exhausted"], false,
         "没有更多可删候选，不是预算耗尽: {report}"
