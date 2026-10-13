@@ -1,6 +1,6 @@
 # 第三批：接口与数据库有界性能、扫描执行治理技术设计
 
-- 状态：待审阅，未实施。
+- 状态：已实施。
 - 前置：[第一批](<2026-10-13-library-data-safety-batch-1-design.md>)、[第二批](<2026-10-13-library-correctness-batch-2-design.md>)验收通过。
 - 配套：[第三批开发计划](<2026-10-13-library-performance-batch-3-plan.md>)；[总路线图](<2026-10-13-database-api-scan-master-plan.md>)。
 
