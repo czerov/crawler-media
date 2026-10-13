@@ -1,5 +1,9 @@
 # 第二轮修复复审问题整改 Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** 第二轮功能/规范整改历史方案状态 UNRECONCILED；T1–T8 等原编号与风险接受记录保留，须逐 ID 核对实现、恢复及浏览器验收，不把草案时期的“未执行”当成当前能力结论。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 > 上述是计划模板中的执行模式名称；实际执行仅加载当前环境提供的对应 skill，不假定未安装的 skill 可用。团队执行须遵循本仓库的写入范围与依赖约束。
 
@@ -12,7 +16,7 @@
 ## Global Constraints
 
 - 当前代码快照：`e9e87dcf6c6df70d517981f4272405adddbc680c`；上一轮修复前基线：`142e0bb`。
-- 本文是整改计划，不表示整改已执行。代码快照仍包含本文描述的已知缺陷。
+- 本文是当时整改计划；上述历史代码快照包含所述缺陷，不能据此推定当前代码仍有全部同样缺陷。当前逐 ID 闭环状态未重核，见顶部 UNRECONCILED 边界。
 - 问题来源：[原审计报告](<2026-10-05-full-project-bug-audit.md>)及当前会话第二次复审；复审大多数结论为源码/调用链确认，不冒充浏览器或生产环境复现。
 - 每个 issue 是独立垂直 slice；执行前确认对应 issue、依赖和授权。不要将所有整改合成一个大修复提交。
 - 遵循 [AGENTS.md](<../../../AGENTS.md>)、[CONTEXT.md](<../../../CONTEXT.md>)；不改动用户 [README.zh.md](<../../../README.zh.md>)。

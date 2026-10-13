@@ -214,6 +214,23 @@ VidHub 用例通过已安装的 VidHub app 连接隔离实例执行。第一次�
 
 每轮回归为每个 ID 记录：构建号、环境、User 角色、浏览器或 VidHub 版本、结果（Pass/Fail/Blocked/Not run）、实际结果和证据文件位置。Fail 必须包含失败原因、失败步骤、预期与实际结果、复现条件；Blocked 必须包含阻塞原因和解除条件；如已创建缺陷，还要记录缺陷链接。不得把 Blocked 或 Not run 计入通过率。
 
+## 数据库／维护新增验收（2026-10-13，尚未执行）
+
+本节是待执行用例，不计入本轮workspace通过数。缺陷和自动化任务对应 [总复核](<../audits/2026-10-13-database-api-review.md>) 与 [T1–T9](<../superpowers/plans/2026-10-13-database-api-followup.md>)。
+
+| ID | 操作／条件 | 预期 | 当前状态 |
+|---|---|---|---|
+| DB8-01 | 清理第一批提交后禁用def | 已提交保留结果，不启动下一批 | 已知F01；本用例Not run |
+| DB8-02 | future queued已存在，90天改365天或打开dry_run | 尚未运行child采用新策略，running不改 | 已知F02；本用例Not run |
+| DB8-03 | payload＋schedule保存遭schedule写入失败／并发仅改周期 | 整笔回滚／陈旧token409，响应为实际状态 | 已知F04；本用例Not run |
+| DB8-04 | 600保护行、0可删；600保护＋1200可删多批 | 截断如实标志、保护不重复计数 | 已知F03；本用例Not run |
+| DB8-05 | 无过期／全部保护大历史，预览同时进行无关请求 | 真预算退出，不占async worker，lower bound明确 | F05待实现与测量 |
+| DB8-06 | 改预览草稿后旧响应晚返回 | 旧结果丢弃，报告显示本策略与预算限制 | 已知F12；本用例Not run |
+| DB8-07 | future queued点立即执行；开发tick与后台维护同时存在 | queued安全提前、无重复live；tick不取消维护 | 已知F12；本用例Not run |
+| DB8-08 | 显式VACUUM超时／disk变化／scan在预检后开始 | 真实停止或明确best-effort超限，不谎报硬界 | F06需先批准合同 |
+| DB8-09 | 升级首次调度＋重启保存后的开关／策略 | 默认警告明确，配置不复位；不把StateRunner直调当loop验收 | T9待补 |
+| COVER-LEGACY | legacy封面升级中freeze／CAS失败／trigger拒绝 | 当前引用bytes不变，只清未引用版本 | 已知F08；本用例Not run |
+
 ## 当前限制
 
 本文件是可评审的回归用例基线，不代表这些流程已执行。当前仓库有前端逻辑/契约测试，但没有浏览器 E2E runner；VidHub 也需要隔离实例和 app 实测。下一步应先用真实浏览器和 VidHub app 执行 P0 用例，逐项保留结果与失败原因，再将高频浏览器流程落成可重放的 E2E，并将 VH 用例保留为每次发布的设备验收清单。

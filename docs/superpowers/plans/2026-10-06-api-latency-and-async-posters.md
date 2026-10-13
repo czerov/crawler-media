@@ -1,5 +1,9 @@
 # 接口低延迟与异步海报交付 Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** 订阅锁等待/异步海报的历史诊断与方案；当时测量和运行 commit 不代表当前部署或 SLA。当前 API 性能证据见下方 review，本文 Task 尚未逐项对账。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking。
 > 上述执行模式来自计划模板；仅使用当前环境实际提供的技能。未获用户明确授权不得创建 Agent Teams。本计划不授权实施、推送、重启现有服务或操作真实媒体数据。
 

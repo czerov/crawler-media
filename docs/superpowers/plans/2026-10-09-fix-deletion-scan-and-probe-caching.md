@@ -1,5 +1,9 @@
 # 修复删集误删兄弟台账并重新探测
 
+> **历史状态（2026-10-13 整理）：** 已有实现的历史修复：90fa56a/7cf5505 保护现存兄弟台账并只为新增行排队；复选框/Expected 保留为原记录，不是本次测试结果。原 workspace 免跑说法不是当前 AGENTS 豁免，本次未补跑也不追认当时已跑。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 删除一集时只移除这一集的台账和派生缓存；同季仍在磁盘上的剧集保持原 `ledger_id`、流信息和声纹，不被重新 ffprobe 或重新采集声纹。
@@ -146,7 +150,7 @@ Expected: PASS。
 
 Run: `cargo test -p api`
 
-Expected: PASS。不跑 `cargo test --workspace`，那不是本改动的常规门禁。
+Expected: PASS。原计划当时写了“不跑 workspace”，但这不是当前 [AGENTS.md](<../../../AGENTS.md>) 的有效豁免：Rust 改动需逐 crate 测试并最终运行 `cargo test --workspace`。此处不追认历史 workspace 已运行；本次仅修正文档，未补跑测试。
 
 - [x] **Step 3: 不额外提交**
 

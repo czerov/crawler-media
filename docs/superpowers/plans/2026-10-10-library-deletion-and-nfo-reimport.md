@@ -1,5 +1,9 @@
 # Library 删除与 NFO 重新扫描 Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** 已有实现：cf83f05 及 16867bf 合并的后续 hardening 提供删库冻结/取消/清理和 NFO 身份恢复；[ADR-0012](<../../adr/0012-library-removal.md>) 记录实际接受边界。真实 restart-mid-clean/draining、UI/VidHub 与 fresh probe 完整执行不能由 API fixture 或保留旧进度推定通过。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. 本仓库执行时使用当前可用的 `executing-plans`；不要调用不存在的技能。只有用户选择子代理执行时才派发普通 subagent，不创建 Agent Teams。
 
 **Goal:** 允许删除含文件记录的 Library，停止关联任务并清除其扫描/探测数据，不改动磁盘文件和用户观看数据；重新添加同一目录时优先读取 NFO，复用可靠匹配到的 MediaId，恢复观看进度。
@@ -339,7 +343,7 @@ cargo test --workspace
 - [x] 媒体流仍探测；新库 IntroDB/章节/声纹仍关闭：Tasks 3、6、7。
 - [x] Subscribe 不删、目标失效明确提示，不静默转移默认库：Tasks 3、4、7。
 - [x] last-kind 不变、默认库提升、管理删除中状态与端点权限：Tasks 1、4。
-- [x] 本计划仅文档，不执行删除用户实际 Library、不更改现有生产记录。
+- [x] 原方案交付时仅文档、未操作用户生产 Library；后续实现见顶部。该复选框不是当前功能未实现的声明，也不授权执行真实删库。
 
 ## 执行交接
 

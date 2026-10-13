@@ -1,5 +1,11 @@
 # UI / API 正确性收口 Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** UI/API 契约历史整改；legacy、筛选发现、订阅选库等范围以原 Task 为准，未逐项重核完成状态。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
+> **规模规则更新：** 文中的 60 行硬限/整改目标是历史要求；当前 [AGENTS.md](<../../../AGENTS.md>) 为生产函数软限 60、测试软限 80、两者硬限 120。历史测试/行数记录不改写，规模合规不等于功能安全。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 修掉 review + 浏览器实点里确认的数据丢失、发现筛选 502、订阅换库空操作和网络设置死链；顺手收掉 Task 7 残留兼容层与 compact 合集封面。不拆 legacy 根路由，不碰 Jellyfin。
@@ -258,7 +264,7 @@ EOF
   - 无 query：行为不变，删该库根下全部 `missing_at IS NOT NULL` 行（「全部清理」）
   - `?media_item_id={uuid}`：只删该 `MediaId` 且落在本库根内的缺失行
 
-前端 [`library-detail-view.tsx:2154`](web/components/library-detail-view.tsx) 单条按钮文案是「清理「{title}」的 N 条缺失记录」，却调用 `clearMissingLibraryRecords(libraryId, item.media_item_id)`；helper 忽略第二参数。本 Task 让第二参数生效，不改文案。
+前端 [`library-detail-view.tsx:2154`](<../../../web/components/library-detail-view.tsx>) 单条按钮文案是「清理「{title}」的 N 条缺失记录」，却调用 `clearMissingLibraryRecords(libraryId, item.media_item_id)`；helper 忽略第二参数。本 Task 让第二参数生效，不改文案。
 
 - [ ] **Step 1: Store + HTTP 失败测试**
 

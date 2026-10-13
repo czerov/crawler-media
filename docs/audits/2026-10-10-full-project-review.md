@@ -1,5 +1,9 @@
 # crawler-media 全项目逻辑与设计 Review
 
+> **历史状态（2026-10-13 整理）：** PIPE/ROOT/ACCESS/I 原发现属于当时基线；整改计划和 follow-up 提供局部实现线索，但全清单仍为 **UNRECONCILED**，须逐 ID 确认关闭/残余风险。下文缺陷复现和当时绿色基线不代表今天仍有同样缺陷或全部已修复。
+>
+> 原设计/ID/测试记录保留；旧执行、清理和提交命令不是当前执行授权，不应直接重跑。当前依据：[数据库/API review](<2026-10-13-database-api-review.md>) 与 [剩余计划](<../superpowers/plans/2026-10-13-database-api-followup.md>)；未覆盖的历史发现仍须独立对账。
+
 审查日期：2026-10-10（Asia/Shanghai）。审查基线：`277de10270f3b2ce7ccb5f30075073fdbfa614b2`。正文行号基于该基线，后续代码变更可能导致位置偏移。
 
 本轮只审查并输出文档，不修复业务代码。确认 **25 项问题：3 项 P1、21 项 P2、1 项 P3**。其中 24 项通过离线行为复现确认，Obscura 接线问题通过生产调用链确认。P1 表示可能丢失已有文件、破坏持续运行的 Subscribe，或批准破坏性质量降级；P2 表示常规功能错误、用户状态丢失或配置宣称的能力不可用；P3 是低优先级输入边界问题。
@@ -61,7 +65,7 @@
 
 ### PIPE-01 [P1]：持久化丢失 source 质量，Wash-cut 可把已有 Remux 降级为 HDTV
 
-**定位**：[crates/store/src/subscribes.rs:638](/Users/jianxiong.cao/work/fun/crawler-media/crates/store/src/subscribes.rs:638)，尤其第 645 行 `source: None`；[crates/subscribe/src/choose.rs:112](/Users/jianxiong.cao/work/fun/crawler-media/crates/subscribe/src/choose.rs:112)。
+**定位**：[crates/store/src/subscribes.rs:638](<../../crates/store/src/subscribes.rs#L638>)，尤其第 645 行 `source: None`；[crates/subscribe/src/choose.rs:112](<../../crates/subscribe/src/choose.rs#L112>)。
 
 **触发**：已有电影/TV 文件是 Remux；Wash-cut 的 UpgradeLadder 包含 `source`（或 WashTarget 指定来源）；Transfer 完成并将 facts/ledger 保存后进入下一轮搜索。不存在进程重启的必要条件，每次从 Store 重新加载即可触发。
 
@@ -73,11 +77,11 @@
 
 ### PIPE-02 [P1]：仍公开的 legacy /run 在新 ledger 提交前删除旧版本
 
-**定位**：[crates/api/src/management/subscribes/run.rs:276](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/management/subscribes/run.rs:276)（第 291 行 `preserve_removed: false`），`:381-395`；[crates/subscribe/src/collect.rs:361](/Users/jianxiong.cao/work/fun/crawler-media/crates/subscribe/src/collect.rs:361)。
+**定位**：[crates/api/src/management/subscribes/run.rs:276](<../../crates/api/src/management/subscribes/run.rs#L276>)（第 291 行 `preserve_removed: false`），`:381-395`；[crates/subscribe/src/collect.rs:361](<../../crates/subscribe/src/collect.rs#L361>)。
 
 **触发**：`POST /api/v1/subscriptions/{id}/run` 对 Wash-cut 获取已完成的更高分文件，且写入新 ledger 时发生 SQLite/IO 错误。
 
-**因果链**：该路由仍启用（[crates/api/src/http/mod.rs:201](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/mod.rs:201)）。collector 在 `preserve_removed=false` 时立刻 unlink 旧版本；legacy persist 又先删旧 ledger，然后才插入新 ledger。新插入一旦失败，请求返回 500，但旧文件和旧 ledger 已经消失，facts 仍指旧路径，新文件则未入账。相比之下，常规后台 Transfer 在 [crates/api/src/worker/transfer.rs:25](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/worker/transfer.rs:25) 已遵循“先持久化新记录/facts，再删旧文件”；两条入口的删除安全性不同。
+**因果链**：该路由仍启用（[crates/api/src/http/mod.rs:201](<../../crates/api/src/http/mod.rs#L201>)）。collector 在 `preserve_removed=false` 时立刻 unlink 旧版本；legacy persist 又先删旧 ledger，然后才插入新 ledger。新插入一旦失败，请求返回 500，但旧文件和旧 ledger 已经消失，facts 仍指旧路径，新文件则未入账。相比之下，常规后台 Transfer 在 [crates/api/src/worker/transfer.rs:25](<../../crates/api/src/worker/transfer.rs#L25>) 已遵循“先持久化新记录/facts，再删旧文件”；两条入口的删除安全性不同。
 
 **实证**：临时测试 `legacy_wash_cut_keeps_old_file_if_replacement_ledger_write_fails`：用 MemoryDownloader 提供 replacement，用测试临时 library.db 的 BEFORE INSERT trigger 确定性注入 ledger 写入错误，HTTP 返回 500 后 `old.is_file()` 为 false。只使用 tempfile 和 fake Downloader，未访问真实媒体或数据库。
 
@@ -85,7 +89,7 @@
 
 ### PIPE-03 [P2]：连续 /run 将在途 pending 永久写成已拥有 facts，并错误宣告完成
 
-**定位**：[crates/api/src/management/subscribes/run.rs:224](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/management/subscribes/run.rs:224)；[crates/subscribe/src/choose.rs:418](/Users/jianxiong.cao/work/fun/crawler-media/crates/subscribe/src/choose.rs:418)。
+**定位**：[crates/api/src/management/subscribes/run.rs:224](<../../crates/api/src/management/subscribes/run.rs#L224>)；[crates/subscribe/src/choose.rs:418](<../../crates/subscribe/src/choose.rs#L418>)。
 
 **触发**：普通非 Wash-cut Subscribe 已提交下载但尚无已完成文件时，连续调用两次 legacy `POST /subscriptions/{id}/run`。
 
@@ -97,7 +101,7 @@
 
 ### PIPE-04 [P2]：新 Subscribe 不从共享 Library 读取已有事实，重复下载已拥有内容
 
-**定位**：[crates/api/src/subscribe_create.rs:24](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/subscribe_create.rs:24)；[crates/api/src/worker/finish_search.rs:90](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/worker/finish_search.rs:90)；[crates/api/src/management/subscribes/run.rs:223](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/management/subscribes/run.rs:223)。
+**定位**：[crates/api/src/subscribe_create.rs:24](<../../crates/api/src/subscribe_create.rs#L24>)；[crates/api/src/worker/finish_search.rs:90](<../../crates/api/src/worker/finish_search.rs#L90>)；[crates/api/src/management/subscribes/run.rs:223](<../../crates/api/src/management/subscribes/run.rs#L223>)。
 
 **触发**：目标 Library 已有对应 Media 的文件（来自扫描、旧 Subscribe 或另一 User）；用户为相同 alias 的 Media 新建普通 Subscribe 并开始搜索。
 
@@ -109,7 +113,7 @@
 
 ### PIPE-05 [P2]：整季包裸 S01E01 文件被误认成外来 Media，无法 Transfer
 
-**定位**：[crates/subscribe/src/file_identity.rs:5](/Users/jianxiong.cao/work/fun/crawler-media/crates/subscribe/src/file_identity.rs:5)；关联 [crates/release/src/boundary.rs:31](/Users/jianxiong.cao/work/fun/crawler-media/crates/release/src/boundary.rs:31) 与 `crates/release/src/lib.rs` 的 title 回退。
+**定位**：[crates/subscribe/src/file_identity.rs:5](<../../crates/subscribe/src/file_identity.rs#L5>)；关联 [crates/release/src/boundary.rs:31](<../../crates/release/src/boundary.rs#L31>) 与 `crates/release/src/lib.rs` 的 title 回退。
 
 **触发**：合法整季多文件 Torrent，如 `Test.Show.S01.1080p`，其内部视频使用常见裸文件名 `S01E01.mkv`、`S01E02.mkv`。
 
@@ -123,7 +127,7 @@
 
 ### ROOT-01 [P1] 删除最后一个文件会误删仍被 Subscribe 引用的 Media
 
-**定位**：[crates/api/src/fs_watcher.rs:477](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/fs_watcher.rs:477)；[crates/store/src/media.rs:214](/Users/jianxiong.cao/work/fun/crawler-media/crates/store/src/media.rs:214)。
+**定位**：[crates/api/src/fs_watcher.rs:477](<../../crates/api/src/fs_watcher.rs#L477>)；[crates/store/src/media.rs:214](<../../crates/store/src/media.rs#L214>)。
 
 **触发与影响**：存在 active Subscribe，并且目标 Media 只剩一个 Library 文件。用户从磁盘删除该文件，Watcher 清理 ledger 后发现 remaining=0，直接清除 Media。Subscribe 行仍然存在，但其 media_id 已无对应身份；后续搜索不能加载目标 Media，无法按持续目标补齐。Media 身份的生命周期被错误地绑定到“至少拥有一个文件”。
 
@@ -133,7 +137,7 @@
 
 ### ROOT-02 [P2] 删除单个版本时会清除其他版本仍需的 locked marker
 
-**定位**：[crates/api/src/fs_watcher.rs:483](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/fs_watcher.rs:483)。
+**定位**：[crates/api/src/fs_watcher.rs:483](<../../crates/api/src/fs_watcher.rs#L483>)。
 
 **触发与影响**：同一 Media/S01E01 有两个 ledger 版本，并有用户手动锁定的 episode marker。删除其中一个版本，Watcher 在检查剩余版本前无条件调用 delete_media_marker；另一版本仍可播放，但手动片头/片尾事实丢失。已有章节缓存可能暂时遮蔽丢失，缓存失效后会暴露。
 
@@ -143,7 +147,7 @@
 
 ### ROOT-03 [P2] Video Library 实时扫描走 Movie/TV 识别路径
 
-**定位**：[crates/api/src/fs_watcher.rs:437](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/fs_watcher.rs:437)；[crates/api/src/http/library_scan.rs:43](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/library_scan.rs:43)；[crates/api/src/watch_ledger.rs:118](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/watch_ledger.rs:118)。手动扫描的正确分支在 `library_scan.rs:148`。
+**定位**：[crates/api/src/fs_watcher.rs:437](<../../crates/api/src/fs_watcher.rs#L437>)；[crates/api/src/http/library_scan.rs:43](<../../crates/api/src/http/library_scan.rs#L43>)；[crates/api/src/watch_ledger.rs:118](<../../crates/api/src/watch_ledger.rs#L118>)。手动扫描的正确分支在 `library_scan.rs:148`。
 
 **触发与影响**：kind=Video、realtime_watch=true 的 Library 中新建 `Vacation.2026.1080p.mp4`。实时扫描虽读取 Library.kind，实际 InPlace 扫描与 record_paths 不使用它决定身份，只按 Release 是否带 season 创建 Movie 或 TV。用户自己的 Video 会从 Video 视图消失，并进入错误分类/元数据识别流程；同一个 Library 的手动扫描与实时扫描语义不一致。
 
@@ -153,7 +157,7 @@
 
 ### ROOT-04 [P2] 同一章节请求第二次读取会借用未验证的同季片头
 
-**定位**：[crates/api/src/marker_resolver.rs:65](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/marker_resolver.rs:65)。
+**定位**：[crates/api/src/marker_resolver.rs:65](<../../crates/api/src/marker_resolver.rs#L65>)。
 
 **触发与影响**：E1 已有片头，E2 自身没有 marker/章节且无外部检测客户端。第一次读取 E2 返回空并缓存空列表；第二次读取看到空缓存，会任取同季另一个 episode 的 marker，直接构造 E2 的 IntroStart 章节。没有新证据，也没有对 E2 比对。不同开场、特殊集或不同剪辑会得到错误跳过提示/自动跳过区间。
 
@@ -163,7 +167,7 @@
 
 ### ROOT-05 [P2] 冲突模板选择依赖遍历顺序
 
-**定位**：[crates/marker/src/adaptive/verify.rs:50](/Users/jianxiong.cao/work/fun/crawler-media/crates/marker/src/adaptive/verify.rs:50)。
+**定位**：[crates/marker/src/adaptive/verify.rs:50](<../../crates/marker/src/adaptive/verify.rs#L50>)。
 
 **触发与影响**：目标窗口同时匹配多个模型，分别支持互不兼容的时间区间，且各模型都达到多 episode 支持阈值。verify_template_window 遇到第一个成功模型立即返回 Verified，只做单模型内的歧义检查，没有比较跨模型冲突。生产允许构建多个模板，证据聚类顺序会影响最终跳过范围。
 
@@ -175,7 +179,7 @@
 
 ### ACCESS-01 [P2] 清空观看记录同时删除收藏
 
-**定位**：[crates/store/src/playback.rs:357](/Users/jianxiong.cao/work/fun/crawler-media/crates/store/src/playback.rs:357)；入口 [crates/api/src/http/playback_logs.rs:259](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/playback_logs.rs:259)；界面确认说明 [web/components/settings-view.tsx:332](/Users/jianxiong.cao/work/fun/crawler-media/web/components/settings-view.tsx:332)。
+**定位**：[crates/store/src/playback.rs:357](<../../crates/store/src/playback.rs#L357>)；入口 [crates/api/src/http/playback_logs.rs:259](<../../crates/api/src/http/playback_logs.rs#L259>)；界面确认说明 [web/components/settings-view.tsx:332](<../../web/components/settings-view.tsx#L332>)。
 
 **触发**：给一个 Media 收藏（可以从未播放），在设置或首页菜单执行“清空全部观看记录”。
 
@@ -187,7 +191,7 @@
 
 ### ACCESS-02 [P2] Jellyfin 播放至结尾不更新已看状态
 
-**定位**：[crates/api/src/media_server_provider/playback.rs:212](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/media_server_provider/playback.rs:212)（`played` 恒为 None）；[crates/store/src/playback.rs:142](/Users/jianxiong.cao/work/fun/crawler-media/crates/store/src/playback.rs:142)（只保留旧值）；对比 web 完成判定 [crates/api/src/http/playback/heartbeat.rs:140](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/playback/heartbeat.rs:140)。
+**定位**：[crates/api/src/media_server_provider/playback.rs:212](<../../crates/api/src/media_server_provider/playback.rs#L212>)（`played` 恒为 None）；[crates/store/src/playback.rs:142](<../../crates/store/src/playback.rs#L142>)（只保留旧值）；对比 web 完成判定 [crates/api/src/http/playback/heartbeat.rs:140](<../../crates/api/src/http/playback/heartbeat.rs#L140>)。
 
 **触发**：首次通过 Jellyfin 客户端顺序发送 Playing、Progress、Stopped，最后位置达到已知视频时长。
 
@@ -199,7 +203,7 @@
 
 ### ACCESS-03 [P2] Jellyfin 首次写入规范电影单元遮蔽旧版观看状态
 
-**定位**：[crates/api/src/media_server_provider/playback.rs:51](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/media_server_provider/playback.rs:51)；对比已经实现迁移的 web 写路径 [crates/api/src/http/playback/heartbeat.rs:97](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/playback/heartbeat.rs:97)。
+**定位**：[crates/api/src/media_server_provider/playback.rs:51](<../../crates/api/src/media_server_provider/playback.rs#L51>)；对比已经实现迁移的 web 写路径 [crates/api/src/http/playback/heartbeat.rs:97](<../../crates/api/src/http/playback/heartbeat.rs#L97>)。
 
 **触发**：升级数据中一部电影仅有旧 `(0,0)` 单元（已看、时长、收藏、轨道记忆和次数）；升级后首次通过 Jellyfin 播放。
 
@@ -211,7 +215,7 @@
 
 ### ACCESS-04 [P2] 标准 Authorization 中的 Jellyfin DeviceId 在播放事件里被忽略
 
-**定位**：[crates/media-server/src/routes.rs:705](/Users/jianxiong.cao/work/fun/crawler-media/crates/media-server/src/routes.rs:705)；认证解析则支持该来源：[crates/media-server/src/auth.rs:47](/Users/jianxiong.cao/work/fun/crawler-media/crates/media-server/src/auth.rs:47)。
+**定位**：[crates/media-server/src/routes.rs:705](<../../crates/media-server/src/routes.rs#L705>)；认证解析则支持该来源：[crates/media-server/src/auth.rs:47](<../../crates/media-server/src/auth.rs#L47>)。
 
 **触发**：同一 User 的两台客户端使用 `Authorization: MediaBrowser Token="...", DeviceId="...", Client="..."`，不额外发送 `X-Emby-Device-Id`。这是认证层已接受的输入形状。
 
@@ -223,7 +227,7 @@
 
 ### ACCESS-05 [P2] 已停止设备在列表里变成伪造 id，注销返回成功却无法阻止真实设备
 
-**定位**：[crates/api/src/http/playback_activity.rs:215](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/playback_activity.rs:215)；[crates/store/src/playback.rs:511](/Users/jianxiong.cao/work/fun/crawler-media/crates/store/src/playback.rs:511) 的日志不保存真实 device_id。
+**定位**：[crates/api/src/http/playback_activity.rs:215](<../../crates/api/src/http/playback_activity.rs#L215>)；[crates/store/src/playback.rs:511](<../../crates/store/src/playback.rs#L511>) 的日志不保存真实 device_id。
 
 **触发**：设备 `actual-device`（名称 Bedroom Apple TV）播放并停止；到设备列表选中这台离线设备执行注销。
 
@@ -235,7 +239,7 @@
 
 ### ACCESS-06 [P2] web 设备注销阻止进度，却没有阻止该设备的视频取流
 
-**定位**：[crates/api/src/http/playback.rs:467](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/playback.rs:467)；[crates/media-server/src/routes/media/playback.rs:40](/Users/jianxiong.cao/work/fun/crawler-media/crates/media-server/src/routes/media/playback.rs:40)；web 吞掉 heartbeat 403：[web/components/player/video-player.tsx:1475](/Users/jianxiong.cao/work/fun/crawler-media/web/components/player/video-player.tsx:1475)。
+**定位**：[crates/api/src/http/playback.rs:467](<../../crates/api/src/http/playback.rs#L467>)；[crates/media-server/src/routes/media/playback.rs:40](<../../crates/media-server/src/routes/media/playback.rs#L40>)；web 吞掉 heartbeat 403：[web/components/player/video-player.tsx:1475](<../../web/components/player/video-player.tsx#L1475>)。
 
 **触发**：浏览器以 device_id=browser 上报 start，管理员在设备列表注销 browser。浏览器取流 URL 来自 start_session，只带用户 api_key，不带设备身份。
 
@@ -247,7 +251,7 @@
 
 ### ACCESS-07 [P2] web 观看进度写失败仍返回成功并伪造已保存快照
 
-**定位**：[crates/api/src/http/playback/heartbeat.rs:164](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/playback/heartbeat.rs:164)。
+**定位**：[crates/api/src/http/playback/heartbeat.rs:164](<../../crates/api/src/http/playback/heartbeat.rs#L164>)。
 
 **触发**：SQLite 播放单元写入失败（磁盘/约束/数据库异常），同时 User、Media、ledger 仍可正常读取。
 
@@ -259,7 +263,7 @@
 
 ### ACCESS-08 [P2] 前后端质量指标字段不一致，所有正常播放器 QoE 上报被丢弃
 
-**定位**：[web/components/player/video-player.tsx:1533](/Users/jianxiong.cao/work/fun/crawler-media/web/components/player/video-player.tsx:1533)，[web/lib/api/playback.ts:1104](/Users/jianxiong.cao/work/fun/crawler-media/web/lib/api/playback.ts:1104)；后端 [crates/api/src/http/playback.rs:538](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/playback.rs:538)。
+**定位**：[web/components/player/video-player.tsx:1533](<../../web/components/player/video-player.tsx#L1533>)，[web/lib/api/playback.ts:1104](<../../web/lib/api/playback.ts#L1104>)；后端 [crates/api/src/http/playback.rs:538](<../../crates/api/src/http/playback.rs#L538>)。
 
 **触发**：正常播放后离开播放器，qoeSnapshot 发出 `{library_file_id, tier, engine, watched_ms, ...}`。
 
@@ -273,7 +277,7 @@
 
 ### ACCESS-09 [P3] history limit=0 可使已认证请求触发 handler panic
 
-**定位**：[crates/api/src/http/playback_logs.rs:110](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/playback_logs.rs:110)。
+**定位**：[crates/api/src/http/playback_logs.rs:110](<../../crates/api/src/http/playback_logs.rs#L110>)。
 
 **触发**：当前用户存在至少一条可见播放日志，GET `/api/v1/playback/history?limit=0`。
 
@@ -288,7 +292,7 @@
 
 ### I01 [P2] 配置不完整的默认 Downloader 会悄悄接入测试用 MemoryDownloader
 
-**位置**：[crates/api/src/runtime_downloader.rs:100](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/runtime_downloader.rs:100)；调用链 `dynamic_downloader.rs:65`，`delivery.rs:63-69`。`http/downloaders/instances.rs:138-148` 接受缺失 username/password 的配置。
+**位置**：[crates/api/src/runtime_downloader.rs:100](<../../crates/api/src/runtime_downloader.rs#L100>)；调用链 `dynamic_downloader.rs:65`，`delivery.rs:63-69`。`http/downloaders/instances.rs:138-148` 接受缺失 username/password 的配置。
 
 **触发**：在 UI/API 创建 qBittorrent 并设为默认，未填密码；或对已有默认项清空凭证；然后提交 Torrent。也覆盖未配置默认 Downloader 的正式环境，配置选择会直接返回 Memory。
 
@@ -300,7 +304,7 @@
 
 ### I02 [P2] 路径映射把前缀相同的兄弟目录当作同一个根
 
-**位置**：[crates/downloader/src/path_map.rs:21](/Users/jianxiong.cao/work/fun/crawler-media/crates/downloader/src/path_map.rs:21)。
+**位置**：[crates/downloader/src/path_map.rs:21](<../../crates/downloader/src/path_map.rs#L21>)。
 
 **触发**：映射 `/downloads -> /host/qb`，Downloader 返回 `/downloads-old/Film.mkv`；或者配置多个有共同字符串前缀的下载根。
 
@@ -312,7 +316,7 @@
 
 ### I03 [P2] Metadata source 的一次无效成功响应会污染缓存七天，恢复网络仍不能恢复功能
 
-**位置**：[crates/media/src/client.rs:398](/Users/jianxiong.cao/work/fun/crawler-media/crates/media/src/client.rs:398)（`body_with_language` 在解析/校验前 `cache.put`）；同样模式存在 `douban.rs`、`tvdb.rs`、`bangumi.rs`、`anilist.rs` 的 `body`。
+**位置**：[crates/media/src/client.rs:398](<../../crates/media/src/client.rs#L398>)（`body_with_language` 在解析/校验前 `cache.put`）；同样模式存在 `douban.rs`、`tvdb.rs`、`bangumi.rs`、`anilist.rs` 的 `body`。
 
 **触发**：原有正常 search/details 缓存过期；上游/中间代理暂时返回 HTTP 200 的 HTML 错误页、空体或结构不合法的 JSON；随后上游恢复。
 
@@ -324,7 +328,7 @@
 
 ### I04 [P2] HTTP Login/Check-in 把返回登录表单的失败当成成功
 
-**位置**：[crates/hooks/src/plugins.rs:78](/Users/jianxiong.cao/work/fun/crawler-media/crates/hooks/src/plugins.rs:78)（Login），`:191-198`（Check-in）；生产 API 使用 [crates/api/src/http/sites.rs:443](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/sites.rs:443)，周期流程使用 `api/src/check_in.rs:36-43`。
+**位置**：[crates/hooks/src/plugins.rs:78](<../../crates/hooks/src/plugins.rs#L78>)（Login），`:191-198`（Check-in）；生产 API 使用 [crates/api/src/http/sites.rs:443](<../../crates/api/src/http/sites.rs#L443>)，周期流程使用 `api/src/check_in.rs:36-43`。
 
 **触发**：没有 Cookie 或 Cookie 失效；Site 将 attendance/login 请求重定向到登录表单并返回 200；反爬/验证码页也会发生同类响应。
 
@@ -336,7 +340,7 @@
 
 ### I05 [P2] 打开 managed Browser 开关后，无外部 CDP 的 render 请求仍无条件失败
 
-**位置**：[crates/indexer/src/browser.rs:118](/Users/jianxiong.cao/work/fun/crawler-media/crates/indexer/src/browser.rs:118)；配置只建目录 `:39-52`；正式启动接线 [crates/api/src/main.rs:205](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/main.rs:205)。
+**位置**：[crates/indexer/src/browser.rs:118](<../../crates/indexer/src/browser.rs#L118>)；配置只建目录 `:39-52`；正式启动接线 [crates/api/src/main.rs:205](<../../crates/api/src/main.rs#L205>)。
 
 **触发**：开启 `CRAWLER_MEDIA_BROWSER_ENABLED`，overlay profile 设置 `render:true`，Site 没有单独指定 `cdp_url`。
 
@@ -348,11 +352,11 @@
 
 ### I06 [P2] Obscura 开关只启动守护进程，配置没有接入 Indexer 的 Browser
 
-**位置**：[crates/api/src/main.rs:205](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/main.rs:205)；[crates/api/src/http/settings.rs:272](/Users/jianxiong.cao/work/fun/crawler-media/crates/api/src/http/settings.rs:272)；[crates/indexer/src/browser.rs:55](/Users/jianxiong.cao/work/fun/crawler-media/crates/indexer/src/browser.rs:55)。
+**位置**：[crates/api/src/main.rs:205](<../../crates/api/src/main.rs#L205>)；[crates/api/src/http/settings.rs:272](<../../crates/api/src/http/settings.rs#L272>)；[crates/indexer/src/browser.rs:55](<../../crates/indexer/src/browser.rs#L55>)。
 
 **触发**：在站点设置打开 Obscura 集成并保存，服务显示已运行；对需要 JS 渲染的 Site 搜索。
 
-**实际**：UI/API 存储 `obscura.enabled` / `obscura.url` 并启动进程，但创建 Fetcher 时完全不读取两者。`BrowserConfig::with_obscura` 在整个 `crates/` 中只有定义、没有调用。`ApiState.indexer` 已持有启动时创建的 `RoutedFetcher`；保存设置既不更新也不替换它。因而开启该功能前后，真正搜索仍使用原有每 Site CDP 或上面的失败分支；即使重启也一样。UI 承诺 Cloudflare/JS 请求调用此引擎（[web/components/site-config-section.tsx:1494](/Users/jianxiong.cao/work/fun/crawler-media/web/components/site-config-section.tsx:1494)）没有实现。
+**实际**：UI/API 存储 `obscura.enabled` / `obscura.url` 并启动进程，但创建 Fetcher 时完全不读取两者。`BrowserConfig::with_obscura` 在整个 `crates/` 中只有定义、没有调用。`ApiState.indexer` 已持有启动时创建的 `RoutedFetcher`；保存设置既不更新也不替换它。因而开启该功能前后，真正搜索仍使用原有每 Site CDP 或上面的失败分支；即使重启也一样。UI 承诺 Cloudflare/JS 请求调用此引擎（[web/components/site-config-section.tsx:1494](<../../web/components/site-config-section.tsx#L1494>)）没有实现。
 
 **证据**：穷尽生产标识符引用：OBSCURA 配置仅出现在 settings/main 自启；`with_obscura` 无任何调用。此项是静态接线证明，没有启动/下载安装真实服务。
 
@@ -388,7 +392,7 @@
 | review_integrations_tmp_login.rs | hooks | 2 failed | I04 |
 | review_integrations_tmp_browser.rs | indexer | 1 failed | I05 |
 
-复现源码已随报告保存在同目录附件（[复现说明](/Users/jianxiong.cao/work/fun/crawler-media/docs/audits/2026-10-10-full-project-review-repro/README.md)），保持原 crate/tests 路径；它们不是已修复的正式回归测试，默认 `cargo test` 不会执行 docs 下源码。其 README 给出安全恢复、运行及清理命令。各发现正文包含独立触发步骤和实际结果，不依赖临时日志才能理解。
+复现源码已随报告保存在同目录附件（[复现说明](<2026-10-10-full-project-review-repro/README.md>)），保持原 crate/tests 路径；它们不是已修复的正式回归测试，默认 `cargo test` 不会执行 docs 下源码。其 README 给出安全恢复、运行及清理命令。各发现正文包含独立触发步骤和实际结果，不依赖临时日志才能理解。
 
 原始日志保存在 `/tmp/crawler-media-project-review-pipeline-repro.log`、`/tmp/crawler-media-project-review-root.log`、`/tmp/crawler-media-project-review-models.log`、`/tmp/crawler-media-review-access-test.log`，以及 `/tmp/crawler-media-project-review-integrations-repro/` 下的日志；临时日志可能被系统清理，长期证据以文档和保存的源码为准。
 

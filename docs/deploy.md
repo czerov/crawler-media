@@ -27,7 +27,7 @@ pnpm build                       # 产出 dist/
 CRAWLER_MEDIA_UI=$PWD/dist cargo run -p api   # 浏览器打开 http://127.0.0.1:18765 即完整应用
 ```
 
-默认监听：后端 `127.0.0.1:18765`，前端 `127.0.0.1:3334`。登录：`admin` / `${CRAWLER_MEDIA_ADMIN_PASSWORD}`（首次启动必须独立设置）。
+默认监听：后端 `127.0.0.1:18765`，前端 `127.0.0.1:3334`。首次创建管理员时须独立设置 `CRAWLER_MEDIA_ADMIN_PASSWORD`；已有管理员使用当前保存的口令，不能把该启动变量当作每次重启都会覆盖口令。CLI token 与网页登录口令独立。
 
 ## Docker Compose
 
@@ -49,8 +49,7 @@ qBittorrent / Transmission 通过 `/api/v1/downloaders` 配置（持久化到 SQ
 
 ## 环境变量
 
-所有 `CRAWLER_MEDIA_*` 在启动时集中解析（`crates/api/src/config.rs`）；无法识别的
-`CRAWLER_MEDIA_*` 变量会打印 warning，便于发现拼写错误。
+主要服务启动配置由 [config](<../crates/api/src/config.rs>) 解析，并对未注册的 `CRAWLER_MEDIA_*` 打 warning。部分运行时工具仍有独立读取点，下面是部署常用变量，不是全部运行时配置的唯一注册表；typed settings 的完整收敛仍待实施。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -61,7 +60,7 @@ qBittorrent / Transmission 通过 `/api/v1/downloaders` 配置（持久化到 SQ
 | `CRAWLER_MEDIA_UI` | 空 | 前端静态产物目录 |
 | `CRAWLER_MEDIA_CORS_ORIGINS` | 空 | CORS 白名单（逗号分隔） |
 | `CRAWLER_MEDIA_BROWSER` | 关 | 旧 managed 开关；`1`/`true`/`yes` 现因能力不支持而拒绝启动，请配置外部 CDP |
-| `CRAWLER_MEDIA_TMDB_KEY` | 空 | TMDB API Key（同时可写入设置 UI） |
+| `CRAWLER_MEDIA_TMDB_KEY` | 空 | 非空 env／_FILE 固定 TMDB API Key 时，UI PUT 返回409；清除env pin后才可由UI修改 |
 | `CRAWLER_MEDIA_TVDB_KEY` | 空 | TVDB API Key |
 | `CRAWLER_MEDIA_QB_URL` / `_USER` / `_PASS` / `_CATEGORY` | 空 | qBittorrent 覆盖 |
 | `CRAWLER_MEDIA_QB_PATH_MAP` | 空 | qB 路径映射 `容器路径=宿主路径,...` |
@@ -88,4 +87,12 @@ CRAWLER_MEDIA_METADATA_PROXY_PASS_FILE=/run/secrets/proxy_pass
 
 ## 凭证
 
-站点凭证（cookie / API key / RSS URL）明文存 SQLite（ADR-0003），仅存在于 gitignored `data/live/.env` 或 UI 配置，绝不入库。
+Site 凭证（cookie / API key / RSS URL）按 [ADR-0003](<adr/0003-plaintext-site-credentials.md>) 明文持久化于 SQLite，须保护数据目录与一致备份。部署 secret 文件／env 必须不进入 Git 或 Docker 构建上下文；“不进版本库”不等于“不进数据库”。
+
+## 数据库维护与升级注意
+
+默认注册数据库轻量 optimize（每6小时）、Jobs历史清理（每天、90天、启用）、Playback历史清理（每天、90天、**关闭**）。首个启用任务可能立即执行，Jobs超90天终态历史可能在首次后台调度即删除；各def保留latest/tie组，运行／排队行不删。VACUUM默认关闭，绝不因每次DELETE自动重建库。
+
+**当前控制缺陷必须了解：** 禁用running清理尚不能阻止下一批，修改更安全策略尚不刷新已queued的下一次快照；预览／报告存在计数截断与扫描预算缺口。不能把UI关闭当作已经停止，也不能把保存dry_run当作下一次一定只读。见 [总复核F01–F06](<audits/2026-10-13-database-api-review.md>) 与 [DB8合同](<superpowers/plans/2026-10-12-db8-maintenance-retention.md>)。
+
+不要在运行时复制单个主体文件忽略WAL当备份；采用SQLite online backup或停机后对有关文件的一致备份。不要手工删除DB/WAL/SHM来缩空间。

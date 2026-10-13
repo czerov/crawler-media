@@ -1,5 +1,9 @@
 # Scrape Artwork and Fanart.tv Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** 实现已交付（3971634、e913904、65eba49、93ea3bd）；季 NFO、分集 still 和 TV/movie Fanart 路径已存在。空/空白 Fanart key 回退内置 key，并非关闭，见 [有效配置](<../../../crates/api/src/scrape_config.rs#L256-L262>)。真实 TMDB/Fanart 可用性、UI/VidHub 显示仍需实际验收。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** A TV scrape writes `season.nfo`, downloads each owned episode still beside the video, and — when a Fanart.tv key is configured — downloads the show logo, thumb, and banner plus each season's poster, thumb, and banner using Jellyfin file names.
@@ -14,7 +18,7 @@
 - Tests first. `cargo test` must not call TMDB, Fanart.tv, ffmpeg, or qBittorrent. Inject `CatalogGet` / `PosterFetch` and pass a fake ffmpeg path to `extract_frame_with_ffmpeg`.
 - No `unwrap` / `expect` on IO or parse paths except tests.
 - Logs: `info!` when a season NFO or image file is written; `warn!` with the error when a download, parse, or frame grab fails and the scrape continues. Never log the Fanart API key or a full image URL that contains `api_key=`.
-- `mirror_images` and `mirror_nfo` and `mirror_episode_thumbs` default to `true`. An empty Fanart API key means Fanart is off. Do not download Fanart bytes when the key is empty.
+- `mirror_images` and `mirror_nfo` and `mirror_episode_thumbs` default to `true`. An absent, empty, or whitespace-only Fanart API key falls back to the built-in key; it does not disable Fanart. Image writes still depend on `mirror_images`, required provider IDs and available artwork.
 - Do not overwrite an image file that already exists (`poster.jpg`, `fanart.jpg`, logo, banners, thumbs, stills). Do not delete the Emby pairs `<stem>.jpg` and `<stem>-thumb.jpg`. NFO files (`tvshow.nfo`, `season.nfo`, `<stem>.nfo`) are metadata text sidecars that refresh on scrape; `write_season_nfo` safely updates `<season>` metadata while rejecting non-season roots with `InvalidData`.
 - Fanart does not replace TMDB `poster.jpg` or TMDB `fanart.jpg`. Fanart `showbackground` / `moviebackground` are not written.
 - Fanart has no per-episode images. Episode stills stay on TMDB, then ffmpeg.
@@ -634,9 +638,9 @@ Only add `Cargo.toml` if `sha2` was added. Do not stage an unrelated lockfile hu
 **Interfaces:**
 - `ScrapeConfigSetting` gains `pub fanart_api_key: Option<String>` and `pub fanart_language: Vec<String>`, both `#[serde(default)]`.
 - `EffectiveScrapeConfig` gains `pub fanart_api_key: Option<String>` and `pub fanart_language: Vec<String>`.
-- Empty key stays `None`. A key of only spaces becomes `None`. `fanart_language` empty means the effective list is `["zh", "en"]`.
+- The stored key may remain `None`/blank; effective composition trims it and falls back to the built-in key when absent or whitespace-only (see the implementation linked above). `fanart_language` empty means the effective list is `["zh", "en"]`.
 - GET `/settings/scrape` sets `setting.fanart_api_key` to `None` when the caller is not an admin, same as `theintrodb_api_key` at `scrape_settings.rs` line 121. The effective object also omits the raw key for non-admins: expose `fanart_configured: bool` instead of the key in `effective`.
-- The settings form puts the key next to the TheIntroDB key, label `Fanart.tv API Key`, hint `电视剧用 TVDB id，电影用 TMDB id。留空则不下载 logo / thumb / banner / 季图。`
+- The settings form puts the key next to the TheIntroDB key, label `Fanart.tv API Key`, hint semantics `电视剧用 TVDB id，电影用 TMDB id。留空使用内置 key，不表示关闭 Fanart。`（原草案的“留空不下载”文案与实际有效配置不符，不再作为要求）
 
 - [x] **Step 1: Write the failing test**
 
@@ -911,4 +915,4 @@ git commit -m "refactor: move season sidecar helpers out of scrape_metadata"
 - Existing `fanart.jpg` is not replaced: the unit test in Task 7 asserts the TMDB bytes survive.
 - TVDB id is filled from TMDB `external_ids` before the Fanart TV call: Task 5 and Task 7.
 - API key is stored like TheIntroDB and hidden from non-admins: Task 6.
-- No banner source other than Fanart. An empty key leaves banner, logo, and season images absent. That is the configured-off behavior, not a missing task.
+- No banner source other than Fanart. An empty/blank configured key uses the built-in key, not a configured-off mode. Missing provider IDs, unavailable upstream artwork or disabled image mirroring can still leave images absent.

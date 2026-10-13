@@ -1,5 +1,9 @@
 # 前端页面 / API 契约与模块生命周期修改开发计划
 
+> **历史状态（2026-10-13 整理）：** 页面/API/生命周期历史整改；10-05 follow-up 记载 T01–T12 已执行，仍需按原 ID 对照实现/验证，不能推定真实浏览器和外部服务已验收。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
 > **当前技能目录说明：**上面的技能名是 writing-plans 模板约定；本会话可用的是 `executing-plans`，没有 `subagent-driven-development`。执行时只能加载实际可用技能，不能调用不存在的技能。可以使用普通 subagent 做独立研究/复核；Agent Teams 仅在用户明确要求时使用。

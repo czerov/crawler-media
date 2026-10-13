@@ -1,5 +1,9 @@
 # Lock audit — 2026-10-10
 
+> **历史状态（2026-10-13 整理）：** 已修复锁循环和当时失败基线的历史记录；“Remaining contention risks”不是当前仍存在的逐项结论，亦未全部对账。后续 API offlock 改动须依最新 review 单独核验；不把静态检查或旧 green 当成无死锁/真实压力证明。
+>
+> 原设计/ID/测试记录保留；旧执行、清理和提交命令不是当前执行授权，不应直接重跑。当前依据：[数据库/API review](<../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<../superpowers/plans/2026-10-13-database-api-followup.md>)；未覆盖的历史发现仍须独立对账。
+
 ## Scope and limits
 
 Static inspection of production Mutex/RwLock acquisition sites across workspace crates, with focused call-chain review of nested locks, temporary guards in match/if let, callbacks, synchronous IO, and await boundaries. Tests and generated code were not treated as production findings. This is not a formal proof of freedom from all deadlocks.

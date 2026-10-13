@@ -1,5 +1,9 @@
 # API / crate 正确性与边界收口 Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** API/crate 边界历史整改；正文含部分完成记录，整体仍需按 Task/发现 ID 逐项对账，不能由后续 API review 推定全部关闭。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (this session) or superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 先修会错身份、会误删 pending、会 panic 的路径；再把 CLI 迁到 `/api/v1` 并冻结 legacy HTTP；最后补齐 `User.role` / `LibraryId` 等 domain 缺口。不按过时契约补假端点。

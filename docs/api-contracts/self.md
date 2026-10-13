@@ -65,7 +65,7 @@ HTTP 路径是 `/rule-sets`；表名仍是 `filters`。这是有意的 API 别�
 
 `{id, kind, name, root_paths, is_default, item_count, file_count, total_size_bytes, …}`
 
-每种 `kind` 可以有多个库（多根、可见性、刮削开关等）。完整字段见 `crates/api/src/store/libraries.rs` 与 `GET /libraries`。
+每种 `kind` 可以有多个库（多根、可见性、刮削开关等）。完整字段见 [Store Library](<../../crates/store/src/libraries.rs>) 与 `GET /libraries`。
 
 ### LibraryFacets
 
@@ -108,23 +108,28 @@ HTTP 路径是 `/rule-sets`；表名仍是 `filters`。这是有意的 API 别�
 - `expected_payload` 是并发令牌：**保存前的原 payload**，不是 payload 内的 schema `version`。与当前值不符 → 409 `job.conflict`；缺失 → 400 `job.missing_token`。
 - 未知 def → 404 `job.missing`；def 存在但非维护 kind → 400 `job.not_maintenance`；非法配置 → 400 `job.invalid_config`（且不落库）。
 - `interval_secs` 只对维护任务加范围 `3600..=31536000`，越界 → 400 `job.invalid_interval`；其他任务契约不变。
-- 返回 `{id, kind, payload, payload_token, schedule?}`；比较与写入在同一事务内完成。
+- 返回 `{id, kind, payload, payload_token, schedule?}`。**当前只有 payload 的比较与更新在同一事务**；schedule 在后续独立写入，可能部分保存、并发混合，且省略 interval 时返回 `schedule:null` 不代表实际周期已清空。这是待修 F04，不是保证整个配置原子。
+- 目标是完整配置（payload＋schedule）的 CAS，并刷新尚未运行的 queued 子任务；当前旧 payload token 不能检测只改周期的冲突。见 [F02/F04 与后续计划](<../superpowers/plans/2026-10-13-database-api-followup.md>)。
 
 `POST /api/v1/jobs/{id}/maintenance-preview`（**仅管理员**，会员 403）：
 
 - body = `{payload?}`（缺省用该 def 当前已保存的 payload）。
-- **只读、有预算**：不写 def、不创建删除 Job、不改数据库内容，也不返回任何用户播放明细。
+- **只读、匹配返回行数有限额**：不写def、不创建删除Job、不改数据库内容，也不返回播放明细；真正SQL扫描／时间预算仍是待实现目标，不能将行数限额当硬执行上限。
 - 返回 `{kind, policy_version, retention_days?, cutoff?, scanned, candidates, protected, truncated, note?}`；
-  `truncated=true` 表示固定预算截断了窗口，计数是**下界**而不是精确总量。数据库维护没有删除候选，计数字段恒为 0。
+  目标合同中 `truncated=true` 表示固定预算截断了窗口，计数是**下界**而不是精确总量。**当前 Jobs 只按可删候选决定 truncated，保护计数最多501但未标其截断；不能把 `truncated=false` 当全部计数完整**（F03）。数据库维护没有删除候选，计数字段恒为 0。
+- `scanned/candidates` 当前是匹配窗口的行数，不是 SQLite 实际扫描量；LIMIT500 不构成时间或持锁预算，preview 同步 SQL 尚未 offload（F05）。
 
 手动执行（`POST /jobs/{id}/run`，仅管理员）：
 
 - `enabled=false` 的 def → 409 `job.disabled`（不再"返回 queued:true 却没入队"）。
-- 已有 queued/running 子任务 → 200 `{queued: false, live_status}`，不误报新增实例；否则 200 `{queued: true}`。
-- 修改配置只影响**下次**执行；运行中的 job 保留启动时的策略快照。
+- 已有 queued/running 子任务 → 200 `{queued: false, live_status}`，不误报新增实例；否则 200 `{queued: true}`。**当前 future queued 不会被提前**，因而按钮“立即执行”的语义未完整实现（F12）。
+- **目标合同**：修改配置用于尚未运行的下次执行，运行中保留快照。**当前偏差**：已 queued 子任务仍带旧策略，改为更安全策略也可能再按旧策略删除一次（F02）；发布前需修复，而不是将偏差当允许的行为。
 
-清理语义提醒：启用播放历史清理后，**历史页与依赖播放历史的统计窗口都只剩保留期内的数据**（不是仅隐藏列表）；
-删除不可撤销，只能从备份恢复；关闭任务只阻止后续批次，不恢复已删除数据。SSE `/jobs/stream` 的 `count` 因清理会**下降**，客户端不得把它当单调递增序列。
+清理语义提醒：启用播放历史清理后，**历史页与依赖播放历史的统计窗口都只剩保留期内的数据**（不是仅隐藏列表）；删除不可撤销，只能从一致备份恢复。
+
+**目标合同**要求关闭后不启动下一批；**当前禁用只取消 queued，running 清理不检查 def.enabled，仍会继续后续批次**（F01）。不能只凭UI开关认定清理已停止，已删除数据也不会恢复。SSE `/jobs/stream` 的 `count` 因清理会**下降**，客户端不得把它当单调递增序列。
+
+上述已确认偏差与优先级以 [总复核](<../audits/2026-10-13-database-api-review.md>) 为准；DB8 不是“全部完成并验收”。
 
 ## 现行表面（去哪看）
 

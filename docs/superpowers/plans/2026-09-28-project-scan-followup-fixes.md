@@ -1,5 +1,11 @@
 # 全项目扫描后续缺陷修复 Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** 九项扫描整改历史清单；A/B/C 原编号保留，尚未逐 ID 与当前代码/验证证据对账（UNRECONCILED），不是全部未实现或全部关闭。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
+> **规模规则更新：** 文中的 60 行硬限/整改目标是历史要求；当前 [AGENTS.md](<../../../AGENTS.md>) 为生产函数软限 60、测试软限 80、两者硬限 120。历史测试/行数记录不改写，规模合规不等于功能安全。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 修复本次全项目扫描确认的九项行为问题，补齐真正执行 HTTP/API 与 React 组件的回归测试，而非再次用测试数量或源码正则宣称全部修复。

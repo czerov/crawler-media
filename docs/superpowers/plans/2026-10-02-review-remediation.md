@@ -1,5 +1,11 @@
 # Review Remediation Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** 二次 review 的历史整改清单状态 UNRECONCILED；Task 1–7 须逐项核对，后续 API review 不构成文件安全、CDP 与部署全部关闭的证据。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
+> **规模规则更新：** 文中的 60 行硬限/整改目标是历史要求；当前 [AGENTS.md](<../../../AGENTS.md>) 为生产函数软限 60、测试软限 80、两者硬限 120。历史测试/行数记录不改写，规模合规不等于功能安全。
+
 > **For agentic workers:** Execute task-by-task using `executing-plans`. Steps use checkbox syntax; independently scoped subagents may implement tasks with non-overlapping file ownership.
 
 **Goal:** Resolve every finding in the second review at baseline a96f598 without compromising authentication, persisted configuration, or media files.

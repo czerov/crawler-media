@@ -1,5 +1,9 @@
 # Full-project Review Remediation Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** PIPE/ROOT/ACCESS/I 历史整改索引；后续 follow-up 有局部实现记录，但全部 ID 状态仍需逐项核对（UNRECONCILED）。最新数据库/API review 不自动关闭该全项目清单。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** Execute using executing-plans, test-first. Independent slices use ordinary subagents, not Agent Teams. Parent owns integration, review, verification and commits.
 
 **Goal:** Fix the confirmed 2026-10-10 audit defects on the user's current branch without including unrelated changes.

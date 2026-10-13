@@ -1,5 +1,9 @@
 # STRM 目录删除与变动防抖实现计划
 
+> **历史状态（2026-10-13 整理）：** 已废弃的安全指令：本文无 ledger 时级联删除 Media、Playback、收藏的规则不再作为实施依据；[ADR-0012](<../../adr/0012-library-removal.md>) 的身份/历史保留与严格归属规则替代冲突部分。目录事件还须保护仍存在的兄弟文件，不能按旧前缀步骤机械清理。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 完善文件监控（FsWatcher）对媒体目录及文件删除的处理：支持递归目录删除并级联清理台账及关联媒体，同时明确 45 秒宽限期（Grace Period）的作用范围（仅在变动场景下保护，真正删除/整目录删除时直接移除台账）。

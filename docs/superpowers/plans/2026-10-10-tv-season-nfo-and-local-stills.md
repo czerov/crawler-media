@@ -1,5 +1,9 @@
 # TV Season NFO and Local Episode Stills Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** 设计已由后续 [Scrape Artwork/Fanart 计划](<2026-10-10-scrape-artwork-and-fanart.md>) 和 2b76704/3971634/e913904 实现并扩展；本文“暂不下载”只限定原切片，不表示当前缺少 Fanart 图。真实来源图片完整性与播放器显示未在本次验证。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** When a TV show is scraped, write a real `season.nfo` and download each owned episode's TMDB still beside the video as `<stem>-thumb.jpg`, falling back to an ffmpeg frame (including a `.strm` remote URL) when TMDB has no still.

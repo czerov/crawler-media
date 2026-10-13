@@ -1,5 +1,9 @@
 # Review Follow-up Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** 正文 Execution Notes/Final Gates 记录 Task 1–6 的实现和当时测试；保留尚未勾选的收尾与规模边界，不据此重跑已完成任务或宣称全仓无缺陷。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** Use the available `executing-plans` skill to implement task-by-task. Unavailable superpowers skills must not be invoked. Steps use checkbox syntax.
 
 **Goal:** Close the two validation blockers and six concrete functional findings from the a466da2 → 95498e3 + working-tree review.

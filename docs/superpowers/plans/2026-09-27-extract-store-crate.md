@@ -1,5 +1,11 @@
 # Store 迁出 api crate Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** Store 抽离已有实现及正文执行记录；后续边界修正单独追踪，旧来源路径与行数是迁移时快照，不是当前布局。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
+> **规模规则更新：** 文中的 60 行硬限/整改目标是历史要求；当前 [AGENTS.md](<../../../AGENTS.md>) 为生产函数软限 60、测试软限 80、两者硬限 120。历史测试/行数记录不改写，规模合规不等于功能安全。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (this session) or superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把 SQLite 系统记录从 `crates/api/src/store/` 整包迁到独立 crate `crates/store`。`api` 只再导出 `::store::*`，对外路径 `api::Store` / `api::store::*` 不变。本轮不改 `jobs` / `playback` / `library` 去直接依赖 `store`。

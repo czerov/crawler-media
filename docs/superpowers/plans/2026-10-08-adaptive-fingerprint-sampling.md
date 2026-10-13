@@ -1,5 +1,9 @@
 # 声纹自适应采样优化 Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** 已实现的设计/任务历史：7584e17、6527d21、87f8d8f、5eaf6b6、93ecb0a、072d87d、b7730be 及后续 review 修复交付了独立采集、规划、持久化、季编排、进度与 benchmark 支持。真实整季 STRM 三组配对、人工边界和真实 UI/VidHub 验收仍不能由 fixture/报告测试代替；未勾选步骤不表示算法未实现。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 减少同季重复片头片尾的远程读取，让每集仍有准确的直接采样证据，并提供真实整季耗时和流量验收。
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Rust workspace、Tokio、SQLite/rusqlite、tracing、rusty-chromaprint 0.3、现有 FFmpeg 进程、TypeScript API DTO。
 
-**Spec:** [2026-10-08-adaptive-fingerprint-sampling-design.md](../specs/2026-10-08-adaptive-fingerprint-sampling-design.md)。本计划是用户请求的详细方案草案；开发前需审阅设计和计划。代码研究起点 `main@0fd078e`；已核对交付时新增的 `6fc3f9c` 仅调整章节场景图回退，没有把计划中的性能目标视为实测结果。
+**Spec:** [2026-10-08-adaptive-fingerprint-sampling-design.md](<../specs/2026-10-08-adaptive-fingerprint-sampling-design.md>)。本计划保留原详细方案草案及当时验收目标；后续已实施，当前状态见顶部，不应重新执行整份计划。代码研究起点 `main@0fd078e`；已核对交付时新增的 `6fc3f9c` 仅调整章节场景图回退，没有把计划中的性能目标视为实测结果。
 
 ## Global Constraints
 
@@ -391,4 +395,4 @@ Manifest 仅保存媒体本地/STRM 路径、season/episode、人工区间和确
 - 已自检设计覆盖、任务依赖、接口类型一致性和五项 Review Focus；未来行为测试的关键断言随任务列出。
 - 已检查两份文档的相对链接、代码围栏、尾部空格、未完成占位符和任务顺序。
 - 在 `main@6fc3f9c` 的产品代码基线上运行 `cargo test --workspace`：1,017 passed、0 failed、1 ignored，进程退出码 0。
-- 本次只创建方案文档；上述工作区测试验证当前基线，不证明新算法、强制重采修复或真实 STRM 提速已经完成。Task 1–7 仍未执行。
+- 原始方案交付当时只创建文档；上述工作区测试验证当时基线，不证明新算法、强制重采修复或真实 STRM 提速。当时 Task 1–7 尚未执行；后续实现提交见顶部，真实 STRM 提速仍需实测证据。

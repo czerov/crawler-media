@@ -1,5 +1,11 @@
 # v1 信封断言与 resource.action 错误码 Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** v1 错误信封历史补强；原 Task 及测试结果保留，本次未重新核对每条错误码/公开接缝。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
+> **规模规则更新：** 文中的 60 行硬限/整改目标是历史要求；当前 [AGENTS.md](<../../../AGENTS.md>) 为生产函数软限 60、测试软限 80、两者硬限 120。历史测试/行数记录不改写，规模合规不等于功能安全。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (this session) or superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 给仍走 `ApiError` 的 v1 路径锁住 `{ok:false,error:{code,message}}`，把泛化 code 改成与 `http::err` 一致的 `resource.action`，并拆开超限的 `def_json_with_store`。不拆 `/api/v1/subscriptions/{id}/run`。

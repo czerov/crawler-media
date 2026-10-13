@@ -8,7 +8,7 @@ MoviePilot 拆分：APScheduler 进程内任务（`subscribe_search`、`transfer
 
 ## 位置
 
-第五个文件：`{data}/jobs.db`。可弃的意义是清空它会忘记在途工作，而不是身份。身份留在 `app.db`；catalog 缓存在 `catalog.db`；ledger 在 `library.db`；subscribe facts 在 `subscribe.db`（ADR-0008）。
+Store 四文件之外的队列文件：`{data}/jobs.db`。它不是可随意清空的cache：清空会丢用户修改的def策略／开关／周期、queued/running工作、重试和历史。Media身份留在app，catalog是缓存，ledger在library，Subscribe事实在subscribe（[ADR-0008](<0008-sqlite-system-of-record.md>)）。终态历史可按明确的latest/tie保护规则分批删；不得据“不丢Media身份”推断整个jobs.db可丢。
 
 两张表：
 
@@ -19,7 +19,7 @@ job_defs (
                                  -- | scrape | check_in | catalog_refresh | watch_intake
   name TEXT NOT NULL,
   enabled INTEGER NOT NULL,
-  schedule TEXT,                 -- null = 仅按需；否则 interval:<secs> 或 cron:<expr>
+  schedule TEXT,                 -- null = 仅按需；现行仅 interval:<secs>，未实现 cron
   payload TEXT NOT NULL,         -- JSON: subscribe_id, site_id, root_id, …
   timeout_secs INTEGER,
   concurrency_key TEXT           -- 可选互斥，如 site:<id> 或 subscribe:<id>
@@ -37,19 +37,20 @@ jobs (
   finished_at INTEGER,
   error TEXT,
   progress TEXT,                 -- 简短的运维可见行，不是日志文件
-  UNIQUE(def_id) WHERE status IN ('queued','running')   -- 每个 def 至多一个存活子行
+  -- 现行分别对 queued 和 running 建部分UNIQUE(def_id)；各状态至多一条，
+  -- 不是一个覆盖两状态的共同唯一约束。应用逻辑另控制普通排期的live child。
 )
 ```
 
-WAL。进程内一个写线程。API 进程*就是* worker；无 Redis、无额外二进制。
+WAL。进程内通过Queue mutex串行访问该连接，**不是专用单写线程**。API进程就是worker；正式循环claim时持锁、StateRunner执行离锁、落结果短锁，无Redis或独立worker服务。
 
 ## 运行时
 
 每秒一次循环：`SELECT … FROM jobs WHERE status='queued' AND run_after<=now ORDER BY run_after LIMIT N`。用 `UPDATE … SET status='running' WHERE status='queued'` 认领，崩溃不会双跑同一行。进程启动时，超过 `timeout_secs` 的 `running` 变为 `queued` 且 `attempt+1`。`attempt` 达到 5 后置为 `failed` 并停止。
 
-带 `schedule` 的 `job_defs` 在前一个子行到达终态（或不存在）时插入下一个 `jobs` 行。这是唯一的“cron”。UI 列出 `job_defs`（能跑什么）与近期 `jobs`（跑了什么）。手动搜索 POST 一个 `def_id` 为 null 的一次性 `jobs` 行。
+带schedule的def在完成时spawn follow-up（run_after=完成时间＋interval）；缺live child时ensure_scheduled也可立即补首个子任务。这里只是Interval循环，不是已支持cron表达式。UI 列出 `job_defs`（能跑什么）与近期 `jobs`（跑了什么）。手动搜索 POST 一个 `def_id` 为 null 的一次性 `jobs` 行。
 
-并发：默认 2 个 runner。`concurrency_key` 序列化不得重叠的工作（一个 **Site** 搜索、一个 **Subscribe** 填充）。不同 key 并行。
+并发：每tick最多claim2条，当前tick内逐条执行；后台每秒派发blocking tick且不等待上一tick结束，因此**不等价于全实例最多2个运行任务**。`concurrency_key`阻止同key的running重叠；不同key可跨tick并行，若需全局并发上限须单独设计／验收。
 
 ## Kind → 现有模块
 
@@ -76,6 +77,12 @@ WAL。进程内一个写线程。API 进程*就是* worker；无 Redis、无额�
 - 每个被 **Subscribe** 指向的 **Media** 一个 `catalog_refresh`，间隔 24 小时。
 
 创建 **Subscribe** 会插入其 `job_defs` 行。删除它会取消 queued 子行并禁用该 def。
+
+## 维护任务（2026-10-13 状态）
+
+已注册database_maintenance、jobs_retention、playback_history_retention；默认开关／周期／payload、latest/tie保护与剩余控制缺陷见 [DB8合同](<../superpowers/plans/2026-10-12-db8-maintenance-retention.md>)。保留参数只在job_defs.payload，schema version不是配置并发revision。
+
+当前关闭只取消queued，running retention尚未在批边界检查def.enabled；保存新策略未刷新future queued快照。这两条是已确认待修项，不是本ADR许可继续删除的合同。`/jobs/tick`的开发skip会取消queued维护子任务，也不是无副作用的“观察”。详见 [总复核](<../audits/2026-10-13-database-api-review.md>)。
 
 ## 不做这些
 

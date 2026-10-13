@@ -2,7 +2,7 @@
 
 行存 SQLite。字节（视频、NFO、图、Indexer YAML、Chromium）留在磁盘。行中的路径指向这些字节。**Users**、**Sites**、**Filters**、**Subscribes**、**Media**、**Library** ledger、**Naming templates**、**Metadata source** 负载不存在 ad-hoc 文件的第二事实来源。
 
-今天 `data/crawler-media.db` 已持有 users、media（仅标题 + 别名）、sites、filters、subscribes、facts、ledger、tokens、playback，以及一个 key/value `settings` 袋。TMDB 响应放在 `data/tmdb/` 下，作为无 TTL 的文件。**Transfer** 用 `Media.title` 命名目录并保留 Downloader 文件名。Library 根是 `data/library`，不是一行记录。这就是为什么 live 运行产生 `The Long Watch - S01E01/<release-name>.mkv`，清缓存是 `rm -rf tmdb/` 而不是 SQL。
+**历史背景（拆库决策时，不是当前实现）：** 当时 `data/crawler-media.db` 持有 users、media（仅标题 + 别名）、sites、filters、subscribes、facts、ledger、tokens、playback，以及一个 key/value `settings` 袋。TMDB 响应放在 `data/tmdb/` 下，作为无 TTL 的文件。**Transfer** 用 `Media.title` 命名目录并保留 Downloader 文件名。Library 根是 `data/library`，不是一行记录。这就是为什么 live 运行产生 `The Long Watch - S01E01/<release-name>.mkv`，清缓存是 `rm -rf tmdb/` 而不是 SQL。
 
 ## 四个文件
 
@@ -21,10 +21,10 @@
 
 ## 留在磁盘上的内容
 
-- 视频 / 字幕 / 音频文件在 **Library** 根下（路径存 `ledger.path`，相对该根）。
+- 视频 / 字幕 / 音频文件在 **Library** 根下。当前 `ledger.path` 保存实际文件路径（通常为绝对路径），不能假定是相对 `root_id`；现行归属按路径最长唯一根解析，`root_id` 尚未成为持久归属事实。
 - 这些文件旁的 NFO 与图（路径也在 `scrape_sidecars`）。
 - Indexer overlay YAML（`{data}/indexers/`）。选择器是代码形态的配置，不是凭证。**Site** cookie/key/RSS 留在 `app.db`（ADR-0003）。
-- 可选 Chromium（ADR-0007）。
+- 外部 Browser 的CDP端点配置；当前不下载／启动受管Chromium（[ADR-0007](<0007-cdp-browser-opt-in.md>)）。
 
 不要把 mkv blob 存进 SQLite。`catalog.db` 填充后，不要再维护一份平行的 TMDB JSON 树。
 
@@ -76,7 +76,9 @@ catalog_cache (
 
 TMDB 客户端读写这张表，替代 `{data}/tmdb/` 文件。默认 TTL 7 天；miss 或过期命中网络并替换该行。Stale-if-error：网络失败但行存在时，即使过了 `expires_at` 也返回该行。解析出的 **Media** 不是缓存；payload 才是。识别仍会 upsert `app.db` **Media**（内部 id、别名、标题、年份）。
 
-## Schema 增量（相对今天）
+## 原始 Schema 增量提案（历史，不是现行 DDL）
+
+此节记录当时拆库方向；实际表／迁移以 [Store schema](<../../crates/store/src/schema.rs>) 与 [tables](<../../crates/store/src/schema/tables.rs>) 为准。尤其 `ledger.root_id` 提案未等于完成backfill，不能据此直接跨文件JOIN或删除归属判断。
 
 `app.db`
 
@@ -88,7 +90,7 @@ TMDB 客户端读写这张表，替代 `{data}/tmdb/` 文件。默认 TTL 7 天�
 
 `library.db`
 
-- `ledger`：加 `root_id TEXT`，`path` 保持相对该根，质量列不变。
+- 历史提案为 `ledger.root_id TEXT`＋相对路径；当前有root_id列但未作为已填充归属来源，path按实际文件路径使用。质量列含义不变，归属／删除仍遵守 [ADR-0012](<0012-library-removal.md>)。
 - `scrape_sidecars`（`ledger_id`、`kind` nfo|poster|fanart、`path`、PRIMARY KEY（`ledger_id`、`kind`））。
 
 `subscribe.db` 沿用今天的 `subscribes`、`subscribe_facts`、`playback_progress`，含义不变。
@@ -103,15 +105,15 @@ Jinja 模板：MoviePilot 的能力。v1 否决——封闭占位符集合对两
 
 按 **Subscribe** 命名：对一台 NAS 媒体库来说布局太多。按类型的实例全局。以后可以在 **Library** 根上挂 overlay，如果两块磁盘需要不同目录树。
 
-## 后记：四个权威库之外的两个文件（2026-10-12）
+## 后记：四个Store文件之外的队列与缓存（2026-10-12，10-13纠正职责）
 
-本 ADR 的"四个文件"指的是**权威** Store 库。实现里还有两个派生库，它们不在上表内，但同样由 SQLite 持有：
+本 ADR 的“四个文件”指 **Store 管理的生命周期分区**，其中catalog本身也是可重建cache，并非四者都是不可丢弃权威事实。实现还有两个文件；jobs保存执行／调度事实，fanart是缓存，不能统一叫“两个可弃派生库”：
 
 | 文件 | 性质 | 可清空？ | 连接策略 |
 |---|---|---|---|
-| `jobs.db` | **Job** 队列（`job_defs` + `jobs`）。`CON` 里 **Job** 是实例级队列，不是任何权威域的一部分 | 否（丢了会丢调度与重试历史） | WAL + 5000ms busy_timeout + `foreign_keys=ON`（`jobs::Queue::open`） |
+| `jobs.db` | **Job** 定义与执行／重试记录（`job_defs`＋`jobs`），本身是运行状态事实 | 不可当缓存随意清空：会丢用户调度配置、在途工作、重试与历史 | WAL + 5000ms busy_timeout + `foreign_keys=ON`（`jobs::Queue::open`） |
 | `fanart.db` | fanart.tv 图片元数据缓存，复用与 `catalog.db` **相同**的 `catalog_cache` 表结构 | **是**（纯缓存） | WAL + 5000ms busy_timeout + `foreign_keys=ON`（`media::CatalogCache::open_source`） |
 
-两者都不是第二个事实来源：删掉 `fanart.db` 只会让 fanart 重新抓取，删掉 `jobs.db` 只会丢调度历史（不丢 **Media** / **Library** / **Subscribe** 事实）。连接策略由各 crate 内的 `apply_connection_policy` 显式设置，不依赖 bundled SQLite 的构建默认值；`journal_mode` 是文件头属性（`crates/*/tests/connection_policy.rs` 从外部连接断言），`busy_timeout`/`foreign_keys` 是连接级设置（各 crate 的单元测试在**自己打开的连接**上断言）。
+两者不是 Media/Library/Subscribe 的第二份记录，但不能据此说删除 jobs.db “只丢历史”：还丢def中的用户维护参数／开关／周期和queued/running工作。fanart可重抓，jobs只允许按明确保护规则清理终态历史。连接策略由各 crate 内的 `apply_connection_policy` 显式设置，不依赖 bundled SQLite 的构建默认值；`journal_mode` 是文件头属性（`crates/*/tests/connection_policy.rs` 从外部连接断言），`busy_timeout`/`foreign_keys` 是连接级设置（各 crate 的单元测试在**自己打开的连接**上断言）。
 
 跨文件仍然没有外键，也没有跨文件事务：这一点对这两个库同样成立。

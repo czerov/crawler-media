@@ -4,10 +4,11 @@
 
 ## 探索之前先读这些
 
-- 仓库根的 **`CONTEXT.md`**
-- **`docs/adr/`** —— 阅读与你将工作的区域相关的 ADR
-- **`docs/agents/roadmap.md`** —— 当前状态与历史（grilling 时代的 `docs/spec.md` 已作为过时移除）
-- **`AGENTS.md`** —— 用户请求如何工作、测试 seam、Rust 体积限制
+- 仓库根的 [CONTEXT.md](<../../CONTEXT.md>) —— 领域词汇；当前需求以用户请求为准，实现以当前代码和证据为准
+- [ADR](<../adr>) —— 仅阅读与你将工作的区域相关的决策
+- [roadmap](<roadmap.md>) —— 阶段历史归档，不是当前状态或 API 规范；仅当用户请求引用时读取
+- [AGENTS.md](<../../AGENTS.md>) —— 工作范围、测试 seam、Rust 体积限制
+- 当前数据库/API 状态与已知剩余工作：[review](<../audits/2026-10-13-database-api-review.md>)、[follow-up](<../superpowers/plans/2026-10-13-database-api-followup.md>)。未覆盖的历史审计发现仍需逐 ID 对账，不因归档而视为关闭。
 
 若这些文件中有任何不存在，**静默继续**。不要标记其缺失；不要主动建议创建它们。`/domain-modeling` skill（经 `/grill-with-docs` 与 `/improve-codebase-architecture` 触达）在术语或决策实际被解析时才惰性创建它们。
 

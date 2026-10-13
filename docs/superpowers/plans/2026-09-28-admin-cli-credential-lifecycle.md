@@ -1,5 +1,11 @@
 # 管理员 CLI 凭据生命周期与部署修复 Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** CLI bearer 生命周期历史方案；安全边界和一次性迁移决策保留，本次未重验现存实例凭据升级。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
+> **规模规则更新：** 文中的 60 行硬限/整改目标是历史要求；当前 [AGENTS.md](<../../../AGENTS.md>) 为生产函数软限 60、测试软限 80、两者硬限 120。历史测试/行数记录不改写，规模合规不等于功能安全。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 更换 CLI token 时立刻撤销旧值；同时更换旧 CLI token 与管理员密码时不能留下旧口令；管理员 UI 改密不使 CLI 永久失效；新安装部署示例能启动。

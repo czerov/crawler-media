@@ -1,5 +1,9 @@
 # 媒体章节与片头片尾识别技术方案 (STRM 与本地视频通用)
 
+> **历史状态（2026-10-13 整理）：** 初始章节设计历史；其中 STRM 重建后无条件复用媒体信息/标记的承诺已被 [自适应版本化采样设计](<2026-10-08-adaptive-fingerprint-sampling-design.md>) 与 [ADR-0012](<../../adr/0012-library-removal.md>) 的 fresh ledger/fresh probe 政策替代。语义 Media 身份保留不等于旧文件探测/声纹证据永远有效；真实 UI/VidHub 跳过行为尚须实测。
+>
+> 原设计/ID/测试记录保留；旧执行、清理和提交命令不是当前执行授权，不应直接重跑。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<../plans/2026-10-13-database-api-followup.md>)；未覆盖的历史发现仍须独立对账。
+
 ## 1. 背景与目标
 
 本方案旨在解决媒体库中视频文件的**章节提取**与**跳过片头片尾 (Skip Intro/Outro/Recap/Credits)** 能力，重点面向 **Jellyfin 协议客户端（如 Infuse、VidHub、Jellyfin App）** 以及 Web 播放器。
@@ -12,7 +16,7 @@
    - **第二层（次选/内嵌元数据，零网络）**：通过 `ffprobe` 提取容器内嵌章节，正则匹配 `Intro` / `OP` / `片头` / `ED` 等。
    - **第三层（终极兜底/本地声纹比对，高开销）**：针对前两层均未命中的无章节剧集，通过 Chromaprint 音频指纹交叉滑动比对提取公共片头。
 4. **媒体库级独立控制**：声纹比对作为 CPU/网络密集型功能，提供按媒体库（Library）粒度的独立开关。
-5. **抗 STRM 频繁重建机制**：片头标记绑定在语义实体 `(media_id, season, episode)` 上，即使外部程序重写/删除重建 `.strm`，元数据与片头标记自动复用；同时提供前端「强制重新提取」能力。
+5. **抗 STRM 频繁重建机制（原始目标，复用规则已被替代）**：标记的语义键为 `(media_id, season, episode)`，但不能承诺重写/删除重建 `.strm` 后无条件复用媒体信息与采集证据；当前按来源版本校验，新 ledger 安排 fresh probe，手动强制请求重采。见顶部后续设计与 ADR。
 
 ---
 

@@ -1,5 +1,9 @@
 # 媒体信息与声纹增量探测优化 Implementation Plan
 
+> **历史状态（2026-10-13 整理）：** 已有实现：5eaf6b6、3be7c39、937276d、c5275c0 提供持久化阶段/重试资格、缺失声纹增量入队、截止时间重试与等待期停止轮询。真实远端 403/EOF 根因、整季性能和真实重启/播放器体验不因实现提交而视为已验证。
+>
+> 本文保留原设计、发现/任务 ID 与当时证据；日期本身不表示过时。旧执行/提交/清理命令仅作历史记录，不应直接重跑；复选框不是当前实现清单。当前依据：[数据库/API review](<../../audits/2026-10-13-database-api-review.md>) 与 [剩余计划](<2026-10-13-database-api-followup.md>)，未覆盖的旧 ID 仍须单独对账。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 恢复单集时只处理该集的缺失事实；片尾声纹失败后保留已成功结果，由后台按持久化退避补采，不因查询轮询不断创建任务或重复整季比对。
@@ -20,7 +24,7 @@
 - 只提交本次修改。开始执行前记录工作区已有修改，不覆盖、不暂存、不提交用户的无关改动。
 - 日志：意外失败及第三方错误必须保留 error 上下文；退避/降级 warn；任务生命周期 info；逐文件缓存命中和匹配细节 debug。
 - 不修改静态图片端点认证，不修改 Playback 协议认证。
-- 本文件是实施方案，不代表已实现或已通过测试。
+- 本文件保留最初实施方案；后续已实现（见顶部提交），但原计划中的命令/预期不自动成为实际测试或真实来源验收证据。
 
 ---
 
