@@ -111,14 +111,13 @@ impl Store {
 
     /// Oldest expired log ids, capped at `batch_size + 1` so the caller can
     /// tell whether more candidates remain without counting the whole table.
-    /// `started_at` order rides the existing `playback_logs_started_idx` and
-    /// keeps the scan bounded; the age decision still uses `ended_at`.
+    /// Rides `playback_logs_ended_idx` for indexed, bounded scanning.
     fn expired_log_ids(&self, cutoff: i64, batch_size: usize) -> Result<Vec<String>, StoreError> {
         let limit = i64::try_from(batch_size.saturating_add(1)).unwrap_or(i64::MAX);
         let mut stmt = self.subscribe.prepare(
             "SELECT id FROM playback_logs
              WHERE ended_at < ?1
-             ORDER BY started_at ASC, id ASC
+             ORDER BY ended_at ASC, started_at ASC, id ASC
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![cutoff, limit], |row| row.get(0))?;

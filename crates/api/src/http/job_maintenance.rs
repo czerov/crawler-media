@@ -196,22 +196,21 @@ pub(crate) async fn preview_maintenance(
         Err(response) => return response,
     };
     let now = crate::job_loop::unix_now();
-    let preview = match &policy {
-        MaintenancePolicy::Jobs(policy) => {
-            let cutoff = match cutoff(now, policy.retention_days) {
-                Ok(cutoff) => cutoff,
-                Err(message) => {
-                    return err(StatusCode::BAD_REQUEST, "job.invalid_config", &message);
-                }
-            };
-            match state
-                .jobs
-                .lock()
-                .prune_terminal_jobs(cutoff, BATCH_SIZE, true)
-            {
-                Ok(batch) => {
+    let state_for_blocking = state.clone();
+    let preview_result = state
+        .http_work
+        .run(std::time::Duration::from_secs(10), move || {
+            match &policy {
+                MaintenancePolicy::Jobs(policy) => {
+                    let cutoff = cutoff(now, policy.retention_days)
+                        .map_err(|e| (StatusCode::BAD_REQUEST, "job.invalid_config", e))?;
+                    let batch = state_for_blocking
+                        .jobs
+                        .lock()
+                        .prune_terminal_jobs(cutoff, BATCH_SIZE, true)
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "job.preview_failed", e.to_string()))?;
                     let truncated = batch.has_more || batch.protected_truncated;
-                    json!({
+                    Ok(json!({
                         "kind": def.kind.as_str(),
                         "policy_version": policy.version,
                         "retention_days": policy.retention_days,
@@ -222,56 +221,54 @@ pub(crate) async fn preview_maintenance(
                         "protected_truncated": batch.protected_truncated,
                         "truncated": truncated,
                         "note": "只读预览：只统计服务端固定预算窗口内的候选，不执行任何删除。",
-                    })
+                    }))
                 }
-                Err(error) => {
-                    return err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "job.preview_failed",
-                        &error.to_string(),
-                    );
+                MaintenancePolicy::PlaybackHistory(policy) => {
+                    let cutoff = cutoff(now, policy.retention_days)
+                        .map_err(|e| (StatusCode::BAD_REQUEST, "job.invalid_config", e))?;
+                    let preview = state_for_blocking
+                        .store
+                        .lock()
+                        .preview_playback_logs(cutoff, BATCH_SIZE)
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "job.preview_failed", e.to_string()))?;
+                    Ok(json!({
+                        "kind": def.kind.as_str(),
+                        "policy_version": policy.version,
+                        "retention_days": policy.retention_days,
+                        "cutoff": cutoff,
+                        "scanned": preview.scanned,
+                        "candidates": preview.candidates,
+                        "protected": preview.protected,
+                        "truncated": preview.truncated,
+                        "note": "只读预览：只统计保留窗口外的播放历史行数，不返回任何播放明细，也不删除。",
+                    }))
                 }
-            }
-        }
-        MaintenancePolicy::PlaybackHistory(policy) => {
-            let cutoff = match cutoff(now, policy.retention_days) {
-                Ok(cutoff) => cutoff,
-                Err(message) => {
-                    return err(StatusCode::BAD_REQUEST, "job.invalid_config", &message);
-                }
-            };
-            match state.store.lock().preview_playback_logs(cutoff, BATCH_SIZE) {
-                Ok(preview) => json!({
+                MaintenancePolicy::Database(policy) => Ok(json!({
                     "kind": def.kind.as_str(),
                     "policy_version": policy.version,
-                    "retention_days": policy.retention_days,
-                    "cutoff": cutoff,
-                    "scanned": preview.scanned,
-                    "candidates": preview.candidates,
-                    "protected": preview.protected,
-                    "truncated": preview.truncated,
-                    "note": "只读预览：只统计保留窗口外的播放历史行数，不返回任何播放明细，也不删除。",
-                }),
-                Err(error) => {
-                    return err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "job.preview_failed",
-                        &error.to_string(),
-                    );
-                }
+                    "scanned": 0,
+                    "candidates": 0,
+                    "protected": 0,
+                    "truncated": false,
+                    "note": "数据库维护按需 optimize / VACUUM，没有可预览的删除候选。",
+                })),
             }
+        })
+        .await;
+
+    match preview_result {
+        Ok(Ok(preview)) => ok(preview).into_response(),
+        Ok(Err((code, err_code, msg))) => err(code, err_code, &msg),
+        Err(crate::blocking_budget::BlockingError::Busy) => {
+            err(StatusCode::SERVICE_UNAVAILABLE, "runtime.busy", "服务繁忙，请稍后重试预览")
         }
-        MaintenancePolicy::Database(policy) => json!({
-            "kind": def.kind.as_str(),
-            "policy_version": policy.version,
-            "scanned": 0,
-            "candidates": 0,
-            "protected": 0,
-            "truncated": false,
-            "note": "数据库维护按需 optimize / VACUUM，没有可预览的删除候选。",
-        }),
-    };
-    ok(preview).into_response()
+        Err(crate::blocking_budget::BlockingError::Timeout) => {
+            err(StatusCode::GATEWAY_TIMEOUT, "job.preview_timeout", "预览统计超时")
+        }
+        Err(crate::blocking_budget::BlockingError::Worker(msg)) => {
+            err(StatusCode::INTERNAL_SERVER_ERROR, "job.preview_failed", &msg)
+        }
+    }
 }
 
 fn cutoff(now: i64, retention_days: u32) -> Result<i64, String> {

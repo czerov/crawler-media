@@ -337,4 +337,5 @@ pub(super) const SUBSCRIBE_TABLES: &str = r#"
         CREATE INDEX IF NOT EXISTS playback_sessions_user_idx ON playback_sessions(user_id);
         CREATE INDEX IF NOT EXISTS playback_logs_user_started_idx ON playback_logs(user_id, started_at);
         CREATE INDEX IF NOT EXISTS playback_logs_started_idx ON playback_logs(started_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS playback_logs_ended_idx ON playback_logs(ended_at ASC, started_at ASC, id ASC);
         "#;
