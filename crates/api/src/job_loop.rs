@@ -59,6 +59,11 @@ impl JobLoopHandle {
         Self { loop_task, control }
     }
 
+    pub fn abort(&self) {
+        self.control.request_stop();
+        self.loop_task.abort();
+    }
+
     pub async fn shutdown(self) -> Result<(), String> {
         self.control.request_stop();
         self.loop_task.abort();
@@ -70,10 +75,19 @@ impl JobLoopHandle {
 
 pub fn spawn_job_loop(state: ApiState) -> JobLoopHandle {
     let control = state.job_loop_control();
-    spawn_job_loop_with(state, Duration::from_secs(1), unix_now, control)
+    spawn_job_loop_with_control(state, Duration::from_secs(1), unix_now, control)
 }
 
 pub fn spawn_job_loop_with(
+    state: ApiState,
+    interval: Duration,
+    clock: impl Fn() -> i64 + Send + 'static,
+) -> JobLoopHandle {
+    let control = state.job_loop_control();
+    spawn_job_loop_with_control(state, interval, clock, control)
+}
+
+pub fn spawn_job_loop_with_control(
     state: ApiState,
     interval: Duration,
     clock: impl Fn() -> i64 + Send + 'static,

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use api::job_loop::{JobLoopControl, spawn_job_loop_with};
+use api::job_loop::{JobLoopControl, spawn_job_loop_with_control};
 use api::maintenance::{SqliteExecutor, run};
 use jobs::{JobKind, NewDef};
 
@@ -116,7 +116,7 @@ fn disable_after_first_committed_batch_stops_the_next_batch() {
 async fn shutdown_stops_claims_and_drains_real_blocking_work() {
     let (_tmp, state) = temp_state(Arc::new(SqliteExecutor));
     let loop_control = Arc::new(JobLoopControl::new());
-    let handle = spawn_job_loop_with(
+    let handle = spawn_job_loop_with_control(
         state.clone(),
         Duration::from_millis(50),
         unix_now,
