@@ -226,6 +226,9 @@ impl Queue {
         crate::retention_cursor::prune_terminal_window(&self.conn, cutoff, limit, dry_run)
     }
 
+    pub fn change_state(&self) -> Result<crate::change_state::JobChangeState, JobError> {
+        crate::change_state::get_job_change_state(&self.conn)
+    }
     /// Enable or disable defs whose payload matches. Disabled defs are not scheduled,
     /// and queued children are cancelled by the store layer.
     pub fn set_def_enabled(&self, payload: &str, enabled: bool) -> Result<usize, JobError> {

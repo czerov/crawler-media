@@ -62,6 +62,7 @@ pub fn migrate(conn: &Connection) -> Result<(), JobError> {
         "#,
     )?;
     crate::retention_cursor::migrate_retention_cursors(conn)?;
+    crate::change_state::migrate_job_change_state(conn)?;
     Ok(())
 }
 

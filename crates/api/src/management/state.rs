@@ -36,11 +36,11 @@ pub struct ApiState {
     pub projection: Arc<crate::browse_projection::ProjectionService>,
     /// 扫描操作协调器（持久单飞与并发控制）。
     pub scan_coordinator: Arc<crate::scan_operations::ScanCoordinator>,
-    pub(crate) job_updates: Arc<crate::job_updates::JobUpdates>,
+    pub job_updates: Arc<crate::job_updates::JobUpdates>,
     /// Library 封面渲染与版本化发布（生产默认真实渲染器，测试可注入）。
     pub(crate) cover_service: Arc<crate::library_cover_service::LibraryCoverService>,
     pub(crate) library_work: Arc<crate::library_lifecycle::LibraryWorkRegistry>,
-    pub(crate) jobs: Arc<Mutex<jobs::Queue>>,
+    pub jobs: Arc<Mutex<jobs::Queue>>,
     /// 后台 job_loop 控制（停止意图与正在运行的 blocking worker 跟踪）。
     pub(crate) job_loop_control: Arc<crate::job_loop::JobLoopControl>,
     /// 数据库维护执行器（生产为真实 SQLite；测试可注入阻塞/报错的假实现）。

@@ -16,8 +16,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobCount {
     pub count: i64,
+    pub revision: i64,
 }
-
 struct Inner {
     sender: Option<watch::Sender<JobCount>>,
     /// 每次启动新 poller 都自增：旧 poller 看到代际不符即退出，绝不清理新状态。
@@ -104,8 +104,8 @@ impl JobUpdates {
 
     /// 订阅时立刻查一次真实计数：失败且没有上一次好值时返回 `Err`。
     fn current_count(&self, queue: &Arc<Mutex<jobs::Queue>>) -> Result<JobCount, String> {
-        match queue.lock().count_finished_since(0) {
-            Ok(count) => Ok(JobCount { count }),
+        match queue.lock().change_state() {
+            Ok(state) => Ok(JobCount { count: state.finished_count, revision: state.revision }),
             Err(error) => {
                 let last = self
                     .inner
@@ -149,9 +149,9 @@ async fn poll_loop(
             }
         };
         polls.fetch_add(1, Ordering::SeqCst);
-        match queue.lock().count_finished_since(0) {
-            Ok(count) => {
-                let next = JobCount { count };
+        match queue.lock().change_state() {
+            Ok(state) => {
+                let next = JobCount { count: state.finished_count, revision: state.revision };
                 sender.send_if_modified(|value| {
                     if *value == next {
                         false

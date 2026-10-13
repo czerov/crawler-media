@@ -1,4 +1,6 @@
 mod kinds;
+pub mod change_state;
+pub use change_state::JobChangeState;
 mod queue;
 mod read;
 mod retention;
