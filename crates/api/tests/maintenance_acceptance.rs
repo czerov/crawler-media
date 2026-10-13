@@ -320,3 +320,51 @@ fn large_history_prune_stops_at_the_budget_and_resumes_next_run() {
     println!("large-history run#2: deleted={}", report["deleted"]);
     assert_eq!(report["deleted"], 10_000, "下一次运行继续推进，不是死循环");
 }
+
+#[tokio::test]
+async fn real_job_loop_executes_maintenance_with_shutdown_and_updates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = real_state(tmp.path());
+    let now = support::unix_now();
+
+    // 塞入一条超龄 scrape 终态
+    let stale = support::enqueue_claim(&state, JobKind::Scrape, "{}", now - 100 * DAY);
+    state.jobs().lock().succeed_claimed(&stale, now - 100 * DAY).unwrap();
+
+    let def = maintenance_defs(&state)
+        .into_iter()
+        .find(|d| d.kind == JobKind::JobsRetention)
+        .unwrap();
+
+    // 立即排队并设置 run_after 为当前时间以保证在循环中被立刻 claim
+    state.jobs().lock().ensure_scheduled_for(0, def.id).unwrap();
+
+    // 启动真正的后台 job loop
+    let clock = Arc::new(std::sync::atomic::AtomicI64::new(now));
+    let clock_for_loop = clock.clone();
+    let control = state.job_loop_control();
+    let handle = api::job_loop::spawn_job_loop_with_control(
+        state.clone(),
+        std::time::Duration::from_millis(20),
+        move || clock_for_loop.load(std::sync::atomic::Ordering::SeqCst),
+        control.clone(),
+    );
+
+    // 推进时钟让 jobs_retention 被调度执行
+    clock.fetch_add(10, std::sync::atomic::Ordering::SeqCst);
+
+    // 等待后台运行直到 stale job 被自动清理
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut cleaned = false;
+    while std::time::Instant::now() < deadline {
+        if state.jobs().lock().get(stale.id).unwrap().is_none() {
+            cleaned = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(cleaned, "后台真实 job_loop 必须能够调度并执行维护清理");
+
+    // 验证 shutdown 优雅退出
+    handle.shutdown().await.expect("shutdown 正常退出");
+}
