@@ -339,3 +339,49 @@ run#2: deleted=10000            ← 下一次运行继续推进，不是 while h
 - `has_active_work()`、Queue 锁探测、磁盘准入都是**快照式"降低冲突"**，不是与 Library 扫描互斥的证明。
 - 进程内维护 mutex 不覆盖多进程；取消只在批次/库边界检查，且当前生产没有取消运行中维护任务的写入者。
 - 前端 `last_report` 已交付并测到 DTO 层，但抽屉尚未渲染成历史列表。
+
+---
+
+## 11. 独立复核与修复（2026-10-13）
+
+fresh-context 复核（`git diff 4670239..HEAD`）结论：**With fixes** —— 1 Critical / 2 Important / 7 Minor。
+核心删除路径、锁序、allowlist、CAS、预览只读均被验证无问题（附证据）；但发现一条会让清理
+**静默永久失效并报成功**的缺陷。三条 Critical/Important 已在 `d1c8205` 修复：
+
+### C1（Critical，已修）候选窗口未含保护谓词 → 清理永久停止却报成功
+
+- **触发**：候选窗口按 `finished_at ASC` 取最旧 `batch_size+1` 行；若最旧的一批恰好全是各自 def 的
+  最新终态行（因此被 last-child 保护），窗口永远只含受保护行 → `deleted` 恒为 0 → 调用方按
+  "没有可删候选"停止 → 任务**成功**、`deleted=0`、无告警。每删一个 Subscribe/Media 就留下一个
+  "只剩一条终态行"的 def_id，池子涨到 500 即触发。
+- **修复**：把「可删」谓词（`def_id IS NULL OR 存在严格更新的同 def 终态兄弟`）并入**候选窗口**，
+  使窗口只含真正能删的行；`has_more` 因此真正表示"还有可删候选"。`protected` 改为同一时间范围内
+  被保护行数的**诊断计数**（上限 `batch_size+1`）。
+- **回归测试**：`crates/jobs/tests/retention.rs::progresses_even_when_the_oldest_terminal_rows_are_all_protected`
+  （600 个受保护行比可删行更旧；修复前 `deleted=0`，修复后删到那条可删行并正确报告 `has_more=false`）。
+
+### I1（Important，已修）dry_run 吞掉 `has_more` → 试运行低估删除规模
+
+- **修复**：dry_run 只检视一批（不删除时再取下一批只会重复检视同一批行、会虚报），但把
+  `has_more` 如实映射成 `budget_exhausted`，并给出"还有更多可删候选未计入"的 note。
+- **回归测试**：`crates/api/tests/maintenance_runtime.rs::dry_run_reports_a_truncated_budget_instead_of_claiming_completion`。
+
+### I2（Important，已修）维护周期范围只在新增端点强制
+
+- **修复**：(1) 旧端点 `PUT /jobs/{id}/schedule` 对 `kind.is_maintenance()` 复用
+  `validate_maintenance_interval`；(2) 定时任务页对维护任务改用 1小时/6小时/12小时/1天/7天 预设与
+  `min=3600`，不再让抽屉的"保存维护配置"被自己的周期值锁死；(3) `Schedule::next_after` 改用
+  `saturating_add`——否则超大 `secs`（u64）在 release 下回绕成负数 → `run_after <= now` → 立即
+  claim → follow-up 再算一次负数 → **每 tick 反复执行、永不停止**。
+- **回归测试**：`crates/api/tests/maintenance_http.rs::legacy_schedule_endpoint_enforces_the_maintenance_interval_range`
+  （并断言非维护任务的 30 秒契约不变）。
+
+**修复后门**：`cargo test --workspace` → **exit 0，226 个套件、1666 个测试、0 失败**；
+`pnpm -C web typecheck` → exit 0。
+
+### 未修的 Minor（已记录，未进入修复范围）
+
+M1 `refuse_when_queue_lock_held` 是 100ms 采样启发式（HTTP 读路径持锁时可能误判并消耗一次重试，自愈）；
+M2 `last_report` 前端未渲染，且 `/jobs/tick` 会把它清成 null；M3 payload CAS 与周期更新分属两事务；
+M4 jobs 目标按 `data_dir/jobs.db` 推导（当前无影响）；M5 三个维护 def 各用独立 concurrency_key；
+M6 payload 损坏时每次 `GET /jobs` 打 `error!`；M7 `runner.rs` 一处未使用参数告警。
