@@ -84,7 +84,7 @@ export interface MaintenanceReport {
   batches?: number;
   budget_exhausted?: boolean;
   elapsed_ms?: number;
-  databases?: Array<Record<string, unknown>>;
+  databases?: Array<{ skip_reason?: string | null } & Record<string, unknown>>;
   note?: string | null;
 }
 

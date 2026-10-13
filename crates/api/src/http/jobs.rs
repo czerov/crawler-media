@@ -391,24 +391,59 @@ pub(crate) async fn run_job(State(state): State<ApiState>, Path(id): Path<String
             "任务已禁用，请先启用再手动执行",
         );
     }
-    // 运行中或已经在队列最前面 (run_after <= now) 的排队任务：返回既有排队/运行结果，不误报新增实例。
-    if let Ok(Some(live)) = queue.get_live_child(def.id) {
-        if live.status == jobs::JobStatus::Running || (live.status == jobs::JobStatus::Queued && live.run_after == 0) {
-            return ok(json!({ "queued": false, "live_status": live.status.as_str() })).into_response();
-        }
+    if let Some(response) = maintenance_already_running(&queue, &def) {
+        return response;
     }
-    // 如果已有处于未来的 queued 状态子任务，将其提前为 run_after=0
+    let before = queue.get_live_child(def.id).ok().flatten();
     let scheduled = queue.ensure_scheduled_for(0, def.id);
     match scheduled {
-        Ok(jobs) => {
-            let created = !jobs.is_empty();
-            ok(json!({ "queued": created || true })).into_response()
-        }
+        Ok(created_jobs) => ok(manual_run_body(before.as_ref(), &created_jobs)).into_response(),
         Err(error) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "job.enqueue_failed",
             &error.to_string(),
         ),
+    }
+}
+
+/// 维护任务正在跑时直接返回；读失败不能当成没在跑。普通任务返回 `None`。
+fn maintenance_already_running(queue: &jobs::Queue, def: &jobs::JobDef) -> Option<Response> {
+    if !def.kind.is_maintenance() {
+        return None;
+    }
+    match queue.has_running_child(def.id) {
+        Ok(false) => None,
+        Ok(true) => Some(
+            ok(json!({
+                "status": "already_running",
+                "queued": false,
+                "live_status": "running"
+            }))
+            .into_response(),
+        ),
+        Err(error) => Some(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "job.enqueue_failed",
+            &error.to_string(),
+        )),
+    }
+}
+
+fn manual_run_body(before: Option<&jobs::Job>, created: &[jobs::Job]) -> Value {
+    if !created.is_empty() {
+        return json!({ "status": "created", "queued": true, "live_status": "queued" });
+    }
+    let Some(before) = before else {
+        return json!({ "status": "already_running", "queued": false });
+    };
+    if before.status == jobs::JobStatus::Queued && before.run_after > 0 {
+        json!({ "status": "expedited", "queued": true, "live_status": "queued" })
+    } else {
+        json!({
+            "status": "already_queued",
+            "queued": false,
+            "live_status": before.status.as_str()
+        })
     }
 }
 

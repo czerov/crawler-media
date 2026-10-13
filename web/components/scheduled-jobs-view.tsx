@@ -4,6 +4,7 @@ import { useEffect, useState, useTransition } from "react";
 import {
   isMaintenanceJob,
   listJobs,
+  parseMaintenanceReport,
   runJob,
   toggleJob,
   updateJobSchedule,
@@ -11,6 +12,7 @@ import {
   type JobView,
 } from "@/lib/api/jobs";
 import { MaintenanceJobSettings } from "@/components/maintenance-job-settings";
+import { maintenanceReportSummary } from "@/lib/maintenance-preview";
 
 function formatInterval(secs: number): string {
   if (secs < 60) return `每 ${secs} 秒`;
@@ -327,6 +329,11 @@ export function ScheduledJobsView() {
                     <div className="flex justify-between">
                       <span className="text-[var(--text-muted)] font-sans">上次执行时间:</span>
                       <span>{new Date(typeof job.last_finished_at === "number" ? job.last_finished_at * 1000 : job.last_finished_at).toLocaleTimeString()}</span>
+                    </div>
+                  )}
+                  {maintenanceReportSummary(parseMaintenanceReport(job.last_report)) && (
+                    <div className="mt-2 rounded bg-white/5 p-2 font-sans text-white/70">
+                      最近报告：{maintenanceReportSummary(parseMaintenanceReport(job.last_report))}
                     </div>
                   )}
                   {job.last_status === "failed" && job.last_error && (

@@ -127,6 +127,18 @@ pub enum MaintenanceStop {
     ReadFailed,
 }
 
+impl MaintenanceStop {
+    pub fn stop_note(self, unit: &str) -> Option<String> {
+        match self {
+            Self::Active => None,
+            Self::Disabled => Some(format!("任务定义已禁用，未启动下一{unit}")),
+            Self::ShuttingDown => Some(format!("服务正在关闭，未启动下一{unit}")),
+            Self::Cancelled => Some(format!("任务已取消，未启动下一{unit}")),
+            Self::ReadFailed => Some(format!("读取任务状态失败，未启动下一{unit}")),
+        }
+    }
+}
+
 /// 检查维护任务是否应当在批次/库边界停止：
 /// 1. 是否正在停机 (shutting down)
 /// 2. 对应的 def 是否被禁用 (disabled)
@@ -216,28 +228,16 @@ fn run_database(
     let mut failures = Vec::new();
     let cancelled = || check_stop() != MaintenanceStop::Active;
     for target in database_targets(&data_dir, &app_path) {
-        match check_stop() {
-            MaintenanceStop::Active => {}
-            MaintenanceStop::Disabled => {
-                report.note = Some("任务定义已禁用，未启动下一库".to_string());
-                break;
-            }
-            MaintenanceStop::ShuttingDown => {
-                report.note = Some("服务正在关闭，未启动下一库".to_string());
-                break;
-            }
-            MaintenanceStop::Cancelled => {
-                report.note = Some("任务已取消，未启动下一库".to_string());
-                break;
-            }
-            MaintenanceStop::ReadFailed => {
-                report.note = Some("读取任务状态失败，未启动下一库".to_string());
-                break;
-            }
+        let stop = check_stop();
+        if let Some(note) = stop.stop_note("库") {
+            report.note = Some(note);
+            break;
         }
+        let history = read_vacuum_history(state, target.name);
         let context = MaintenanceContext {
             now,
-            last_vacuum_success: read_last_vacuum(state, target.name),
+            last_vacuum_success: history.last_success,
+            vacuum_history_unreadable: history.unreadable,
             cancelled: &cancelled,
         };
         let result = state
@@ -289,13 +289,46 @@ fn vacuum_setting_key(name: DatabaseName) -> String {
     format!("maintenance.vacuum_last_success.{}", name.as_str())
 }
 
-fn read_last_vacuum(state: &ApiState, name: DatabaseName) -> Option<i64> {
+struct VacuumHistory {
+    last_success: Option<i64>,
+    unreadable: bool,
+}
+
+fn read_vacuum_history(state: &ApiState, name: DatabaseName) -> VacuumHistory {
     let store = state.store.lock();
-    store
-        .get_setting(&vacuum_setting_key(name))
-        .ok()
-        .flatten()
-        .and_then(|raw| raw.parse().ok())
+    match store.get_setting(&vacuum_setting_key(name)) {
+        Ok(None) => VacuumHistory {
+            last_success: None,
+            unreadable: false,
+        },
+        Ok(Some(raw)) => match raw.parse() {
+            Ok(last) => VacuumHistory {
+                last_success: Some(last),
+                unreadable: false,
+            },
+            Err(_) => {
+                tracing::error!(
+                    database = name.as_str(),
+                    "VACUUM 冷却时间无法解析，本轮保守跳过"
+                );
+                VacuumHistory {
+                    last_success: None,
+                    unreadable: true,
+                }
+            }
+        },
+        Err(error) => {
+            tracing::error!(
+                database = name.as_str(),
+                %error,
+                "读取 VACUUM 冷却时间失败，本轮保守跳过"
+            );
+            VacuumHistory {
+                last_success: None,
+                unreadable: true,
+            }
+        }
+    }
 }
 
 /// VACUUM 成功才推进冷却；跳过/失败不写，避免"没做也当作做过"。
@@ -360,24 +393,10 @@ fn run_batches(
     let mut batches = 0usize;
     let mut more_remains = false;
     while batches < MAX_BATCHES {
-        match check_stop() {
-            MaintenanceStop::Active => {}
-            MaintenanceStop::Disabled => {
-                report.note = Some("任务定义已禁用，未启动下一批".to_string());
-                break;
-            }
-            MaintenanceStop::ShuttingDown => {
-                report.note = Some("服务正在关闭，未启动下一批".to_string());
-                break;
-            }
-            MaintenanceStop::Cancelled => {
-                report.note = Some("任务已取消，未启动下一批".to_string());
-                break;
-            }
-            MaintenanceStop::ReadFailed => {
-                report.note = Some("读取任务状态失败，未启动下一批".to_string());
-                break;
-            }
+        let stop = check_stop();
+        if let Some(note) = stop.stop_note("批") {
+            report.note = Some(note);
+            break;
         }
         let batch = next()?;
         report.scanned += batch.scanned;

@@ -223,7 +223,9 @@ fn claim_non_maintenance(
     for job in all {
         if job.kind.is_maintenance() {
             // 将其无惩罚放回 queued 状态，不增加 attempt 也不记录错误
-            let _ = queue.requeue_without_attempt(&job);
+            if let Err(error) = queue.requeue_without_attempt(&job) {
+                tracing::error!(job_id = %job.id, %error, "将维护任务放回队列失败");
+            }
         } else {
             claimed.push(job);
         }

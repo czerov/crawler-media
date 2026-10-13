@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   previewMaintenance,
   updateMaintenanceConfig,
   type JobView,
   type MaintenancePreview,
 } from "@/lib/api/jobs";
+import { acceptPreview } from "@/lib/maintenance-preview";
 
 /** 保留天数契约范围（与后端 `MIN_RETENTION_DAYS..=MAX_RETENTION_DAYS` 一致）。 */
 const MIN_RETENTION_DAYS = 1;
@@ -62,6 +63,7 @@ export function MaintenanceJobSettings({
     setRetentionDays(readNumber(summary?.retention_days, 90));
     setDryRun(readBool(summary?.dry_run, false));
     setVacuumEnabled(readBool(summary?.vacuum_enabled, false));
+    setPreview(null);
   }, [job.id, summary?.retention_days, summary?.dry_run, summary?.vacuum_enabled]);
 
   const draftPayload = (): Record<string, unknown> => {
@@ -70,6 +72,14 @@ export function MaintenanceJobSettings({
     }
     return { version: summary?.version ?? 1, retention_days: retentionDays, dry_run: dryRun };
   };
+
+  const draftSignature = JSON.stringify(draftPayload());
+  const draftSignatureRef = useRef(draftSignature);
+  draftSignatureRef.current = draftSignature;
+
+  useEffect(() => {
+    setPreview(null);
+  }, [draftSignature]);
 
   const token = (): Record<string, unknown> => {
     if (job.payload_token) {
@@ -112,9 +122,12 @@ export function MaintenanceJobSettings({
       report(`保留天数必须在 ${MIN_RETENTION_DAYS}..=${MAX_RETENTION_DAYS} 之间`);
       return;
     }
+    const requested = draftSignatureRef.current;
     try {
       setPreviewing(true);
-      setPreview(await previewMaintenance(job.id, draftPayload()));
+      const res = await previewMaintenance(job.id, draftPayload());
+      const accepted = acceptPreview(draftSignatureRef.current, requested, res);
+      if (accepted) setPreview(accepted);
     } catch (e) {
       report("预览失败: " + (e as Error).message);
     } finally {
@@ -168,7 +181,7 @@ export function MaintenanceJobSettings({
             {preview && (
               <span className="text-white/70">
                 扫描 {preview.scanned} · 候选 {preview.candidates} · 保护 {preview.protected}{preview.protected_truncated ? " (下界)" : ""} ·{" "}
-                {preview.truncated ? "预算截断（计数为下界，非精确总量）" : "完整窗口"}
+                {preview.truncated ? "预算截断（计数为下界，非精确总量）" : "预览窗口"}
               </span>
             )}
           </div>

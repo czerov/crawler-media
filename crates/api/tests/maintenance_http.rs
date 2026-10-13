@@ -521,6 +521,40 @@ async fn run_is_refused_for_disabled_defs_and_queued_defs_report_existing() {
     )
     .await;
     assert_eq!(second["queued"], false, "重复触发不得误报新增: {second}");
+    assert_eq!(second["status"], "already_queued", "{second}");
+
+    let queued = state
+        .jobs()
+        .lock()
+        .get_live_child(id)
+        .unwrap()
+        .expect("立即执行后应有排队中的维护任务");
+    assert_eq!(queued.status, jobs::JobStatus::Queued);
+    assert_eq!(queued.run_after, 0);
+    let conn = rusqlite::Connection::open(tmp.path().join("data/jobs.db")).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE jobs SET status = 'running', started_at = ?2 WHERE id = ?1 AND status = 'queued'",
+            rusqlite::params![queued.id.to_string(), 1_000_i64],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "测试必须把刚排队的维护任务标成运行中");
+    let while_running = call(
+        &app,
+        "POST",
+        &format!("/api/v1/jobs/{id}/run"),
+        "management-secret",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(while_running["status"], "already_running", "{while_running}");
+    assert_eq!(while_running["queued"], false, "{while_running}");
+    state.jobs().lock().succeed(queued.id, 1_100).unwrap();
+    let follow_up = state.jobs().lock().get_live_child(id).unwrap();
+    assert!(
+        follow_up.as_ref().is_none_or(|job| job.run_after > 1_100),
+        "运行中再点立即执行不得留下 run_after=0 的新任务: {follow_up:?}"
+    );
 }
 
 #[tokio::test]

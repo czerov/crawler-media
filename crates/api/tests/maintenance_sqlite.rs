@@ -152,6 +152,37 @@ fn vacuum_runs_only_when_enabled_and_cooldown_allows() {
 }
 
 #[test]
+fn unreadable_vacuum_cooldown_skips_instead_of_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let app = data.join("app.db");
+    seed_large_db(&app);
+
+    let executor = ConfiguredSqliteExecutor::with_limits(tiny_limits(Duration::from_secs(30)));
+    let cancelled = never_cancelled();
+    let context = MaintenanceContext {
+        now: unix_now(),
+        last_vacuum_success: None,
+        vacuum_history_unreadable: true,
+        cancelled: &cancelled,
+    };
+    let report = executor
+        .execute(&app_target(&data, &app), true, &context)
+        .unwrap();
+
+    assert_eq!(report.outcome, DatabaseOutcome::Skipped);
+    assert!(
+        report
+            .skip_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("VACUUM"),
+        "读不到上次成功时间必须保守跳过，不能当成从未 VACUUM: {report:?}"
+    );
+}
+
+#[test]
 fn busy_database_is_skipped_not_failed() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
@@ -167,6 +198,7 @@ fn busy_database_is_skipped_not_failed() {
     let context = MaintenanceContext {
         now: unix_now(),
         last_vacuum_success: None,
+        vacuum_history_unreadable: false,
         cancelled: &cancelled,
     };
     let report = executor
@@ -194,6 +226,7 @@ fn insufficient_disk_headroom_skips_vacuum() {
     let context = MaintenanceContext {
         now: unix_now(),
         last_vacuum_success: None,
+        vacuum_history_unreadable: false,
         cancelled: &cancelled,
     };
     let report = executor
@@ -230,6 +263,7 @@ fn interrupted_vacuum_fails_bounded_and_leaves_no_watchdog_thread() {
     let context = MaintenanceContext {
         now: unix_now(),
         last_vacuum_success: None,
+        vacuum_history_unreadable: false,
         cancelled: &cancelled,
     };
 

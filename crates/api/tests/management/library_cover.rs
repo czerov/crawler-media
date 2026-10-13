@@ -152,11 +152,28 @@ async fn setup_movie_library_with_fanart(
         "image/jpeg"
     );
     assert!(cover_file.is_file(), "自动拷贝生成了 cover.jpg");
-    let generated = image::load_from_memory(&std::fs::read(&cover_file).unwrap()).unwrap();
+    // C2b / F08：legacy 文件内容保持原始 bytes 不被就地覆盖破坏，新生成的合成封面发布为新版本文件！
+    let after_scan = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/api/v1/libraries/{lib_id}/cover"),
+            Some("management-secret"),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(after_scan.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(after_scan.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let generated = image::load_from_memory(&bytes).unwrap();
     assert_eq!((generated.width(), generated.height()), (1920, 1080));
-    assert_ne!(
+    assert_ne!(bytes.as_ref(), b"fake fanart bytes 12345");
+    assert_eq!(
         std::fs::read(&cover_file).unwrap(),
-        b"fake fanart bytes 12345"
+        b"fake fanart bytes 12345",
+        "legacy 封面文件必须保持只读"
     );
     (lib_id, cover_file)
 }

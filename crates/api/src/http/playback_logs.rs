@@ -114,12 +114,18 @@ pub(crate) async fn history(
     };
     let days: Option<i64> = match query.get("days") {
         Some(s) => match s.parse::<i64>() {
-            Ok(d) if d >= 0 => Some(d),
+            Ok(d) if d >= 0 => {
+                if d > 36500 || d.checked_mul(86_400).is_none() {
+                    return err(StatusCode::BAD_REQUEST, "playback.invalid_days", "天数过滤参数超出有效范围");
+                }
+                Some(d)
+            }
             _ => return err(StatusCode::BAD_REQUEST, "playback.invalid_days", "天数过滤参数无效"),
         },
         None => None,
     };
     let now = unix_now();
+    let since = days.and_then(|d| d.checked_mul(86_400)).map(|secs| now.saturating_sub(secs));
     let store = state.store.lock();
     let admin = store
         .user_role(user_id)
@@ -145,7 +151,7 @@ pub(crate) async fn history(
         } else {
             None
         },
-        since: days.map(|days| now - days * 86_400),
+        since,
         user_id: target_user,
         visible_media: visible_media.map(|ids| ids.into_iter().collect()),
     };
@@ -156,7 +162,7 @@ pub(crate) async fn history(
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "playback.query_failed",
-                &format!("播放历史查询失败: {error}"),
+                "播放历史查询失败",
             );
         }
     };

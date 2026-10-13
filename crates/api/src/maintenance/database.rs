@@ -131,6 +131,8 @@ pub(crate) fn missing_optional_targets(data_dir: &Path) -> Vec<DatabaseTarget> {
 pub struct MaintenanceContext<'a> {
     pub now: i64,
     pub last_vacuum_success: Option<i64>,
+    /// 读不到上次成功时间时为 true。不能当成“从未 VACUUM”而缩短冷却。
+    pub vacuum_history_unreadable: bool,
     pub cancelled: &'a dyn Fn() -> bool,
 }
 
@@ -307,6 +309,7 @@ fn execute_work(
         page_count: as_u64(page_count),
         now: context.now,
         last_vacuum_success: context.last_vacuum_success,
+        vacuum_history_unreadable: context.vacuum_history_unreadable,
         limits,
     };
     if let Some(reason) = vacuum_skip_reason(&facts) {
@@ -333,11 +336,15 @@ struct VacuumFacts {
     page_count: u64,
     now: i64,
     last_vacuum_success: Option<i64>,
+    vacuum_history_unreadable: bool,
     limits: SqliteLimits,
 }
 
 /// 冷却与空闲页阈值。`Some(reason)` 表示必须跳过并写明哪一条不满足。
 fn vacuum_skip_reason(facts: &VacuumFacts) -> Option<String> {
+    if facts.vacuum_history_unreadable {
+        return Some("读不到上次成功 VACUUM 时间，保守跳过本轮 VACUUM".into());
+    }
     if let Some(last) = facts.last_vacuum_success {
         let elapsed = u64::try_from(facts.now.saturating_sub(last)).unwrap_or(0);
         if elapsed < VACUUM_MIN_INTERVAL_SECS {

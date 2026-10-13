@@ -123,7 +123,15 @@ pub(crate) async fn artwork_candidates(
     match result {
         Ok(Ok(val)) => ok(val).into_response(),
         Ok(Err(resp)) => resp,
-        Err(_) => err(StatusCode::SERVICE_UNAVAILABLE, "runtime.busy", "服务繁忙，获取海报候选超时"),
+        Err(BlockingError::Busy) => {
+            err(StatusCode::SERVICE_UNAVAILABLE, "runtime.busy", "服务繁忙，请稍后重试")
+        }
+        Err(BlockingError::Timeout) => {
+            err(StatusCode::GATEWAY_TIMEOUT, "library.artwork_timeout", "获取海报候选超时")
+        }
+        Err(BlockingError::Worker(msg)) => {
+            err(StatusCode::INTERNAL_SERVER_ERROR, "library.artwork_failed", &msg)
+        }
     }
 }
 

@@ -258,6 +258,12 @@ impl Queue {
         crate::schedule::get_live_child(&self.conn, def_id)
     }
 
+    /// 同一 def 可以同时有一条 running 和一条 queued。`get_live_child` 优先返回 queued，
+    /// 所以“是否正在执行”必须单独问。
+    pub fn has_running_child(&self, def_id: JobDefId) -> Result<bool, JobError> {
+        crate::schedule::has_running_child(&self.conn, def_id)
+    }
+
     pub fn get_last_child(&self, def_id: JobDefId) -> Result<Option<Job>, JobError> {
         crate::schedule::get_last_child(&self.conn, def_id)
     }
