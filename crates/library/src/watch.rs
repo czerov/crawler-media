@@ -5,6 +5,8 @@ use domain::{Confidence, Media, MediaKind, Release};
 
 use crate::scrape::scrape_beside;
 use crate::{LibraryError, TransferMode, resolve_mode};
+pub mod report;
+pub use report::{ScanIssue, ScanReport, ScanRootReport, ScanRootStatus};
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "m4v", "mov", "avi", "wmv", "webm", "flv", "ts", "m2ts", "mts", "mpg", "mpeg",
@@ -81,10 +83,147 @@ pub struct WatchOutcome {
 }
 
 pub fn scan_watch(job: &WatchJob, media: &Media) -> Result<WatchOutcome, LibraryError> {
+    let (outcome, _) = scan_watch_reported(job, media)?;
+    Ok(outcome)
+}
+
+pub fn scan_watch_reported(
+    job: &WatchJob,
+    media: &Media,
+) -> Result<(WatchOutcome, report::ScanRootReport), LibraryError> {
     match job.kind {
-        WatchKind::InPlace => in_place(job, media.kind),
-        WatchKind::Intake => intake(job, media),
+        WatchKind::InPlace => in_place_reported(job, media.kind),
+        WatchKind::Intake => {
+            let outcome = intake(job, media)?;
+            let root_report = report::ScanRootReport {
+                root: job.path.clone(),
+                status: report::ScanRootStatus::Completed,
+                visited: outcome.transferred.len(),
+                skipped: 0,
+                error_count: 0,
+                issues: vec![],
+            };
+            Ok((outcome, root_report))
+        }
     }
+}
+
+fn in_place_reported(job: &WatchJob, kind: MediaKind) -> Result<(WatchOutcome, report::ScanRootReport), LibraryError> {
+    let mut outcome = WatchOutcome::default();
+    let mut report = report::ScanRootReport {
+        root: job.path.clone(),
+        status: report::ScanRootStatus::Completed,
+        visited: 0,
+        skipped: 0,
+        error_count: 0,
+        issues: vec![],
+    };
+    if !job.path.exists() {
+        report.status = report::ScanRootStatus::Unreachable;
+        return Ok((outcome, report));
+    }
+    walk_in_place_reported(&job.path, &job.path, kind, job.scrape, &mut outcome, &mut report)?;
+    if report.error_count > 0 && report.status != report::ScanRootStatus::Unreachable {
+        report.status = report::ScanRootStatus::Partial;
+    }
+    Ok((outcome, report))
+}
+
+fn walk_in_place_reported(
+    dir: &std::path::Path,
+    root: &std::path::Path,
+    kind: MediaKind,
+    scrape: bool,
+    outcome: &mut WatchOutcome,
+    report: &mut report::ScanRootReport,
+) -> Result<(), LibraryError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            report.error_count += 1;
+            report.issues.push(report::ScanIssue {
+                path: dir.to_path_buf(),
+                kind: e.kind(),
+            });
+            report.status = report::ScanRootStatus::Partial;
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                report.error_count += 1;
+                report.issues.push(report::ScanIssue {
+                    path: dir.to_path_buf(),
+                    kind: e.kind(),
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+        report.visited += 1;
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                report.error_count += 1;
+                report.issues.push(report::ScanIssue {
+                    path,
+                    kind: e.kind(),
+                });
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            report.skipped += 1;
+            continue;
+        }
+        if meta.is_dir() {
+            walk_in_place_reported(&path, root, kind, scrape, outcome, report)?;
+            continue;
+        }
+        if !is_video_file(&path) {
+            report.skipped += 1;
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let mut parsed = release::parse(name);
+        if let Some(parent) = path.parent() {
+            enrich_from_ancestors(&mut parsed, parent, root);
+        }
+        let nfo_identity = identify_local(&mut parsed, &path, root, kind);
+        if parsed.confidence == Confidence::Low {
+            continue;
+        }
+        let media = Media {
+            id: domain::MediaId::new(),
+            kind: if parsed.season.is_some() {
+                MediaKind::Tv
+            } else {
+                MediaKind::Movie
+            },
+            title: parsed.title.clone(),
+            year: parsed.year,
+            original_title: None,
+            tmdb_id: None,
+            douban_id: None,
+            tvdb_id: None,
+            bangumi_id: None,
+            anilist_id: None,
+        };
+        if scrape && media.tmdb_id.is_some() {
+            scrape_beside(&path, &media, true, None)?;
+        }
+        outcome.transferred.push(TransferredFile {
+            path,
+            identified_release: Some(parsed),
+            nfo_identity,
+        });
+    }
+    Ok(())
 }
 
 /// 文件名已经能确定剧名时，仍从上层目录补年份和别名。
@@ -144,81 +283,6 @@ fn identify_local(
     identity
 }
 
-fn in_place(job: &WatchJob, kind: MediaKind) -> Result<WatchOutcome, LibraryError> {
-    let mut outcome = WatchOutcome::default();
-    walk_in_place(&job.path, &job.library_root, kind, job.scrape, &mut outcome)?;
-    Ok(outcome)
-}
-
-fn walk_in_place(
-    dir: &std::path::Path,
-    root: &std::path::Path,
-    kind: MediaKind,
-    scrape: bool,
-    outcome: &mut WatchOutcome,
-) -> Result<(), LibraryError> {
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        let meta = match fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if meta.is_dir() {
-            walk_in_place(&path, root, kind, scrape, outcome)?;
-            continue;
-        }
-        if !meta.is_file() {
-            continue;
-        }
-        if !is_video_file(&path) {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        let mut parsed = release::parse(name);
-        if let Some(parent) = path.parent() {
-            enrich_from_ancestors(&mut parsed, parent, root);
-        }
-        let nfo_identity = identify_local(&mut parsed, &path, root, kind);
-        if parsed.confidence == Confidence::Low {
-            continue;
-        }
-        let media = Media {
-            id: domain::MediaId::new(),
-            kind: if parsed.season.is_some() {
-                MediaKind::Tv
-            } else {
-                MediaKind::Movie
-            },
-            title: parsed.title.clone(),
-            year: parsed.year,
-            original_title: None,
-            tmdb_id: None,
-            douban_id: None,
-            tvdb_id: None,
-            bangumi_id: None,
-            anilist_id: None,
-        };
-        // 仅在已有 TMDB ID 等成熟元数据时才允许落盘 NFO；
-        // 未联网识别阶段绝不抢先生成无剧情的空壳 NFO 占位文件。
-        if scrape && media.tmdb_id.is_some() {
-            scrape_beside(&path, &media, true, None)?;
-        }
-        // B14: 把 scan 阶段经过 NFO/父目录 fallback 的 parsed 结果一并传出，
-        // 避免调用方按 basename 重解（movie.mkv + movie.nfo 因此能正确识别）。
-        outcome.transferred.push(TransferredFile {
-            path,
-            identified_release: Some(parsed),
-            nfo_identity,
-        });
-    }
-    Ok(())
-}
 
 fn intake(job: &WatchJob, media: &Media) -> Result<WatchOutcome, LibraryError> {
     let mut outcome = WatchOutcome::default();

@@ -47,8 +47,9 @@ impl LibraryPathScope {
         for lib in snapshot.libraries() {
             let mut resolved_roots = Vec::with_capacity(lib.root_paths.len());
             for root in &lib.root_paths {
-                let r = resolved_path(root)?;
-                resolved_roots.push(r);
+                if let Ok(r) = resolved_path(root) {
+                    resolved_roots.push(r);
+                }
             }
             libraries.push(ResolvedLibrary {
                 library: lib.clone(),
