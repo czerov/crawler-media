@@ -114,10 +114,16 @@ pub(crate) async fn update_maintenance_config(
     };
     let new_payload = body.payload.to_string();
     let expected = expected.to_string();
+    let new_schedule = body
+        .interval_secs
+        .map(|secs| jobs::Schedule::Interval { secs });
+    let schedule_ref = new_schedule.as_ref();
+    let new_schedule_param = body.interval_secs.map(|_| schedule_ref);
+
     let outcome = match state
         .jobs
         .lock()
-        .set_def_payload_cas(id, &expected, &new_payload)
+        .update_def_config_cas(id, &expected, &new_payload, new_schedule_param)
     {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -142,22 +148,13 @@ pub(crate) async fn update_maintenance_config(
         }
     }
 
-    if let Some(secs) = body.interval_secs {
-        if let Err(error) = state
-            .jobs
-            .lock()
-            .set_def_schedule_by_id(id, Some(jobs::Schedule::Interval { secs }))
-        {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "job.schedule_update_failed",
-                &error.to_string(),
-            );
-        }
-    }
-    let schedule = body
-        .interval_secs
-        .map(|secs| json!({ "interval_secs": secs }));
+    // 重新从库中读取实际生效的 schedule，避免在未修改 interval_secs 时返回错误 null
+    let active_def = load_def(&state, id).ok();
+    let schedule = active_def
+        .and_then(|d| d.schedule)
+        .and_then(|s| match s {
+            jobs::Schedule::Interval { secs } => Some(json!({ "interval_secs": secs })),
+        });
     tracing::info!(
         job_def_id = %id,
         kind = def.kind.as_str(),

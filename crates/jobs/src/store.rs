@@ -282,17 +282,16 @@ pub enum PayloadUpdate {
     Conflict,
 }
 
-/// Compare-and-set a def's payload in one transaction.
+/// Compare-and-set a def's payload and optional schedule in one atomic transaction,
+/// and refresh any already-queued child job's payload to match the new definition.
 ///
-/// 并发令牌就是**保存前的原 payload**，不是 payload 里那个 schema `version` 字段
-/// （`version` 只描述 JSON 结构，不随每次修改变化）。比较按 JSON 结构进行，
-/// 因此客户端直接回传自己读到的 `payload` 对象即可；服务端仍以比较时的真实值为准，
-/// 不接受仅凭请求里的期望值就写入。
-pub fn set_def_payload_by_id(
+/// 并发令牌就是**保存前的原 payload**，不是 payload 里那个 schema `version` 字段。
+pub fn update_def_config_cas(
     conn: &Connection,
     def_id: JobDefId,
-    expected: &str,
-    payload: &str,
+    expected_payload: &str,
+    new_payload: &str,
+    new_schedule: Option<Option<&Schedule>>,
 ) -> Result<PayloadUpdate, JobError> {
     let tx = conn.unchecked_transaction()?;
     let current: Option<String> = tx
@@ -305,15 +304,44 @@ pub fn set_def_payload_by_id(
     let Some(current) = current else {
         return Ok(PayloadUpdate::Missing);
     };
-    if !same_payload(&current, expected) {
+    if !same_payload(&current, expected_payload) {
         return Ok(PayloadUpdate::Conflict);
     }
     tx.execute(
         "UPDATE job_defs SET payload = ?1 WHERE id = ?2",
-        params![payload, def_id.to_string()],
+        params![new_payload, def_id.to_string()],
+    )?;
+    if let Some(schedule) = new_schedule {
+        let sched_str = schedule.map(|s| s.as_str());
+        tx.execute(
+            "UPDATE job_defs SET schedule = ?1 WHERE id = ?2",
+            params![sched_str, def_id.to_string()],
+        )?;
+    }
+    // 关键：同步刷新该 def 下已经处于 queued 状态的待执行子任务的 payload！
+    // 这样管理员更新了更安全的策略（例如延长保留期或开启 dry_run），已排队的任务
+    // 也会立即采用新策略执行，防止意外按旧策略删除。正在 running 的任务不受影响。
+    tx.execute(
+        "UPDATE jobs SET payload = ?1 WHERE def_id = ?2 AND status = 'queued'",
+        params![new_payload, def_id.to_string()],
     )?;
     tx.commit()?;
     Ok(PayloadUpdate::Updated)
+}
+
+/// Compare-and-set a def's payload in one transaction.
+///
+/// 并发令牌就是**保存前的原 payload**，不是 payload 里那个 schema `version` 字段
+/// （`version` 只描述 JSON 结构，不随每次修改变化）。比较按 JSON 结构进行，
+/// 因此客户端直接回传自己读到的 `payload` 对象即可；服务端仍以比较时的真实值为准，
+/// 不接受仅凭请求里的期望值就写入。
+pub fn set_def_payload_by_id(
+    conn: &Connection,
+    def_id: JobDefId,
+    expected: &str,
+    payload: &str,
+) -> Result<PayloadUpdate, JobError> {
+    update_def_config_cas(conn, def_id, expected, payload, None)
 }
 
 /// 按 JSON 结构比较两段 payload；任一侧不是合法 JSON 时退化为逐字比较。

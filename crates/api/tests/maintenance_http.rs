@@ -715,10 +715,8 @@ async fn watcher_still_emits_when_terminal_count_drops() {
     assert!(updates.poll_count() > 0, "共享 poller 必须实际轮询过");
 }
 
-/// DB8 复核 I2：维护任务的周期范围必须在**旧端点**上也生效。
-///
-/// 否则可以绕过维护配置端点，在任务卡片上把维护周期改成 30 秒；而非维护任务的既有
-/// 契约（30 秒合法）不变。
+/// DB8 复核 I2：维护任务的周期更新必须使用 maintenance-config 端点，
+/// 旧 schedule 端点对维护任务一律返回 409，防并发绕过 CAS。
 #[tokio::test]
 async fn legacy_schedule_endpoint_enforces_the_maintenance_interval_range() {
     let tmp = tempfile::tempdir().unwrap();
@@ -726,7 +724,7 @@ async fn legacy_schedule_endpoint_enforces_the_maintenance_interval_range() {
     let app = router(state.clone());
     let id = find_def(&state, jobs::JobKind::DatabaseMaintenance).id;
 
-    for secs in [30u64, 3599, 31_536_001] {
+    for secs in [30u64, 3599, 7_200, 31_536_001] {
         let (status, error) = call_err(
             &app,
             "PUT",
@@ -737,19 +735,11 @@ async fn legacy_schedule_endpoint_enforces_the_maintenance_interval_range() {
         .await;
         assert_eq!(
             status,
-            StatusCode::BAD_REQUEST,
-            "维护任务 {secs} 秒必须被拒绝: {error}"
+            StatusCode::CONFLICT,
+            "维护任务调用旧 schedule 端点必须返回 409: {error}"
         );
+        assert_eq!(error["error"]["code"], "job.use_maintenance_config");
     }
-    let saved = call(
-        &app,
-        "PUT",
-        &format!("/api/v1/jobs/{id}/schedule"),
-        "management-secret",
-        json!({ "interval_secs": 7_200 }),
-    )
-    .await;
-    assert_eq!(saved["schedule"]["interval_secs"], 7_200);
 
     // 非维护任务保持既有契约：30 秒仍然合法。
     let other = find_def(&state, jobs::JobKind::Transfer).id;

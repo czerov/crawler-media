@@ -484,12 +484,14 @@ pub(crate) async fn update_job_schedule(
                     "执行周期必须大于 0 秒",
                 );
             }
-            // 维护任务在这里也要强制范围：否则可以绕过维护配置端点把周期改成
-            // 30 秒（DB8 复核 I2）。其他任务契约不变。
-            if def.kind.is_maintenance()
-                && let Err(message) = crate::maintenance::validate_maintenance_interval(secs)
-            {
-                return err(StatusCode::BAD_REQUEST, "job.invalid_interval", &message);
+            // 维护任务不允许通过旧的 schedule 接口更新周期，必须走全配置原子的 maintenance-config 接口
+            // 避免并发绕过 CAS 并产生不一致的调度覆盖。
+            if def.kind.is_maintenance() {
+                return err(
+                    StatusCode::CONFLICT,
+                    "job.use_maintenance_config",
+                    "维护任务必须通过 /api/v1/jobs/{id}/maintenance-config 接口更新周期与配置",
+                );
             }
             Some(jobs::Schedule::Interval { secs })
         }

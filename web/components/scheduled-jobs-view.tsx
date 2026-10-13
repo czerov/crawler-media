@@ -7,6 +7,7 @@ import {
   runJob,
   toggleJob,
   updateJobSchedule,
+  updateMaintenanceConfig,
   type JobView,
 } from "@/lib/api/jobs";
 import { MaintenanceJobSettings } from "@/components/maintenance-job-settings";
@@ -75,7 +76,14 @@ export function ScheduledJobsView() {
   const handleUpdateSchedule = async (jobId: string, secs: number) => {
     try {
       setUpdatingSchedule(true);
-      await updateJobSchedule(jobId, secs);
+      const targetJob = jobs.find((j) => j.id === jobId);
+      if (targetJob && isMaintenanceJob(targetJob)) {
+        // 维护任务必须通过 maintenance-config 统一更新，避免绕过 CAS 并产生冲突
+        const draft = targetJob.payload || {};
+        await updateMaintenanceConfig(jobId, draft, draft, secs);
+      } else {
+        await updateJobSchedule(jobId, secs);
+      }
       setEditingScheduleId(null);
       await loadJobs();
     } catch (e) {
