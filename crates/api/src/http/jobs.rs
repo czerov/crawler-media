@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 
 use crate::http::{err, ok, ok_list};
+use crate::maintenance::MaintenancePolicy;
 use crate::management::ApiState;
 
 fn job_media_title(payload_val: &Value, store: &crate::Store) -> Option<String> {
@@ -82,6 +83,57 @@ fn def_media_title(def: &jobs::JobDef, store: &crate::Store) -> Option<String> {
     job_media_title(&payload_val, store)
 }
 
+/// 维护 def 的策略摘要（typed，供前端参数抽屉直接渲染）。
+///
+/// 非维护 def 返回 `None`，调用方不写该键——既有消费方看到的 DTO 不变。
+fn maintenance_summary(def: &jobs::JobDef) -> Option<Value> {
+    if !def.kind.is_maintenance() {
+        return None;
+    }
+    let summary = match MaintenancePolicy::parse(def.kind, &def.payload) {
+        Ok(MaintenancePolicy::Database(policy)) => json!({
+            "kind": def.kind.as_str(),
+            "version": policy.version,
+            "vacuum_enabled": policy.vacuum_enabled,
+        }),
+        Ok(MaintenancePolicy::Jobs(policy)) => json!({
+            "kind": def.kind.as_str(),
+            "version": policy.version,
+            "retention_days": policy.retention_days,
+            "dry_run": policy.dry_run,
+        }),
+        Ok(MaintenancePolicy::PlaybackHistory(policy)) => json!({
+            "kind": def.kind.as_str(),
+            "version": policy.version,
+            "retention_days": policy.retention_days,
+            "dry_run": policy.dry_run,
+        }),
+        Err(message) => {
+            // payload 坏了要显式暴露，不能假装是默认策略。
+            tracing::error!(
+                job_def_id = %def.id,
+                kind = def.kind.as_str(),
+                %message,
+                "维护 def 的 payload 无法解析"
+            );
+            json!({
+                "kind": def.kind.as_str(),
+                "invalid": true,
+                "error": message,
+            })
+        }
+    };
+    Some(summary)
+}
+
+/// 最近一次维护运行报告（读 `job.progress` 的原始 JSON 字符串）。
+///
+/// 报告可能由终态 job 或仍在运行的 job 写入；优先取最近一次终态。
+fn maintenance_report(live: Option<&jobs::Job>, last: Option<&jobs::Job>) -> Option<String> {
+    last.and_then(|job| job.progress.clone())
+        .or_else(|| live.and_then(|job| job.progress.clone()))
+}
+
 /// 纯渲染：调用方在锁外传入预先取好的 media title。
 fn def_json(
     def: &jobs::JobDef,
@@ -92,7 +144,7 @@ fn def_json(
     let payload_val: Value = serde_json::from_str(&def.payload).unwrap_or_else(|_| json!({}));
     let friendly_name = job_friendly_name(&def.name, media_title);
 
-    json!({
+    let mut rendered = json!({
         "id": def.id.to_string(),
         "kind": def.kind.as_str(),
         "name": def.name,
@@ -116,7 +168,19 @@ fn def_json(
                     .unwrap_or(Value::Null)
             })
         },
-    })
+    });
+    // 维护 def 才附加 typed 摘要 / 最近报告 / 修改令牌；其他 def 的既有字段不变。
+    if let Some(object) = rendered.as_object_mut() {
+        if let Some(summary) = maintenance_summary(def) {
+            object.insert("maintenance".into(), summary);
+            // 修改令牌：下一次 CAS 回传这个值（不是 payload 内的 schema version）。
+            object.insert("payload_token".into(), Value::String(def.payload.clone()));
+        }
+        if let Some(report) = maintenance_report(live, last) {
+            object.insert("last_report".into(), Value::String(report));
+        }
+    }
+    rendered
 }
 
 /// 单个 def 的渲染便捷入口（仍需 Store 取 media title）。
@@ -319,6 +383,18 @@ pub(crate) async fn run_job(State(state): State<ApiState>, Path(id): Path<String
     let Some(def) = defs.into_iter().find(|d| d.id == id) else {
         return err(StatusCode::NOT_FOUND, "job.missing", "任务不存在");
     };
+    if !def.enabled {
+        // 禁用任务不入队：显式 409，而不是 queued:true 却没入队（DB8 4.2）。
+        return err(
+            StatusCode::CONFLICT,
+            "job.disabled",
+            "任务已禁用，请先启用再手动执行",
+        );
+    }
+    // 运行中/已排队：返回既有排队结果，不误报新增实例。
+    if let Ok(Some(live)) = queue.get_live_child(def.id) {
+        return ok(json!({ "queued": false, "live_status": live.status.as_str() })).into_response();
+    }
     if let Err(error) = queue.ensure_scheduled_for(0, def.id) {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -85,6 +85,47 @@ HTTP 路径是 `/rule-sets`；表名仍是 `filters`。这是有意的 API 别�
 
 `Job` status = `queued|running|succeeded|failed|cancelled`。
 
+### 维护任务（DB8）
+
+维护任务是 `kind ∈ {database_maintenance, jobs_retention, playback_history_retention}` 的普通 JobDef；
+调度与开关仍走既有 JobDef 字段，**保留参数只存在该 def 的版本化 payload 里**（不在 settings 另存一份）。
+
+`payload`（`version: 1`；未知版本/未知字段/越界一律 400，绝不回退成更激进的删除策略）：
+
+- `database_maintenance`：`{version: 1, vacuum_enabled: bool}`（默认 `false`）。
+- `jobs_retention` / `playback_history_retention`：`{version: 1, retention_days: 1..=36500, dry_run: bool}`。
+  `retention_days=0` **不代表永久保留**；永久保留请关闭该任务。`batch_size=500`、`max_batches=20` 是服务端固定安全预算，不暴露给用户。
+
+维护 def 在 `GET /jobs` / `GET /jobs/{id}` 上**额外**返回（非维护 def 不返回这些键，既有字段不变）：
+
+- `maintenance`：typed 策略摘要，如 `{kind, version, retention_days, dry_run}` 或 `{kind, version, vacuum_enabled}`；payload 损坏时为 `{kind, invalid: true, error}`。
+- `payload_token`：**修改令牌**，等于服务端当前 `payload` 的原始 JSON 字符串。
+- `last_report`：最近一次维护运行报告（`job.progress` 的原始 JSON 字符串，可能为 `null`）。
+
+`PUT /api/v1/jobs/{id}/maintenance-config`（**仅管理员**，会员 403）：
+
+- body = `{payload, expected_payload, interval_secs?}`；`payload` 与 `expected_payload` 必填。
+- `expected_payload` 是并发令牌：**保存前的原 payload**，不是 payload 内的 schema `version`。与当前值不符 → 409 `job.conflict`；缺失 → 400 `job.missing_token`。
+- 未知 def → 404 `job.missing`；def 存在但非维护 kind → 400 `job.not_maintenance`；非法配置 → 400 `job.invalid_config`（且不落库）。
+- `interval_secs` 只对维护任务加范围 `3600..=31536000`，越界 → 400 `job.invalid_interval`；其他任务契约不变。
+- 返回 `{id, kind, payload, payload_token, schedule?}`；比较与写入在同一事务内完成。
+
+`POST /api/v1/jobs/{id}/maintenance-preview`（**仅管理员**，会员 403）：
+
+- body = `{payload?}`（缺省用该 def 当前已保存的 payload）。
+- **只读、有预算**：不写 def、不创建删除 Job、不改数据库内容，也不返回任何用户播放明细。
+- 返回 `{kind, policy_version, retention_days?, cutoff?, scanned, candidates, protected, truncated, note?}`；
+  `truncated=true` 表示固定预算截断了窗口，计数是**下界**而不是精确总量。数据库维护没有删除候选，计数字段恒为 0。
+
+手动执行（`POST /jobs/{id}/run`，仅管理员）：
+
+- `enabled=false` 的 def → 409 `job.disabled`（不再"返回 queued:true 却没入队"）。
+- 已有 queued/running 子任务 → 200 `{queued: false, live_status}`，不误报新增实例；否则 200 `{queued: true}`。
+- 修改配置只影响**下次**执行；运行中的 job 保留启动时的策略快照。
+
+清理语义提醒：启用播放历史清理后，**历史页与依赖播放历史的统计窗口都只剩保留期内的数据**（不是仅隐藏列表）；
+删除不可撤销，只能从备份恢复；关闭任务只阻止后续批次，不恢复已删除数据。SSE `/jobs/stream` 的 `count` 因清理会**下降**，客户端不得把它当单调递增序列。
+
 ## 现行表面（去哪看）
 
 | 面 | 挂载 | 说明 |

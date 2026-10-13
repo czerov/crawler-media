@@ -28,10 +28,47 @@ pub struct PlaybackRetentionBatch {
     pub has_more: bool,
 }
 
+/// Read-only preview of what the next [`Store::prune_playback_logs`] batch would
+/// see. It never writes: only candidate ids inside the bounded window are read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlaybackRetentionPreview {
+    pub scanned: usize,
+    pub candidates: usize,
+    pub protected: usize,
+    /// The fixed server-side budget cut the window short, so the counts are a
+    /// lower bound rather than an exact total.
+    pub truncated: bool,
+}
+
 /// One DELETE statement stays well below SQLite's bound-parameter budget.
 const DELETE_CHUNK: usize = 500;
 
 impl Store {
+    /// Bounded, read-only candidate count for the maintenance preview endpoint
+    /// (DB8 4.2). Uses the same predicate as the real batch, so the numbers mean
+    /// the same thing; `truncated` says the budget hid rows instead of pretending
+    /// to be an exact total. No def, job or playback row is written.
+    pub fn preview_playback_logs(
+        &self,
+        cutoff: i64,
+        batch_size: usize,
+    ) -> Result<PlaybackRetentionPreview, StoreError> {
+        if batch_size == 0 {
+            return Err(StoreError::Invalid(
+                "playback retention batch_size must be >= 1".into(),
+            ));
+        }
+        let ids = self.expired_log_ids(cutoff, batch_size)?;
+        let truncated = ids.len() > batch_size;
+        let scanned = ids.len().min(batch_size);
+        Ok(PlaybackRetentionPreview {
+            scanned,
+            candidates: scanned,
+            protected: 0,
+            truncated,
+        })
+    }
+
     /// Delete at most `batch_size` `playback_logs` rows whose `ended_at` is
     /// strictly older than `cutoff`; `ended_at == cutoff` is kept.
     ///

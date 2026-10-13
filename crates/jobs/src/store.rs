@@ -271,6 +271,62 @@ pub fn jobs_for_payload(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// `set_def_payload_by_id` 的并发结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadUpdate {
+    /// 比较通过并已写入新 payload。
+    Updated,
+    /// def 不存在。
+    Missing,
+    /// 服务端当前 payload 与调用方给的期望值不同（并发修改），未写入。
+    Conflict,
+}
+
+/// Compare-and-set a def's payload in one transaction.
+///
+/// 并发令牌就是**保存前的原 payload**，不是 payload 里那个 schema `version` 字段
+/// （`version` 只描述 JSON 结构，不随每次修改变化）。比较按 JSON 结构进行，
+/// 因此客户端直接回传自己读到的 `payload` 对象即可；服务端仍以比较时的真实值为准，
+/// 不接受仅凭请求里的期望值就写入。
+pub fn set_def_payload_by_id(
+    conn: &Connection,
+    def_id: JobDefId,
+    expected: &str,
+    payload: &str,
+) -> Result<PayloadUpdate, JobError> {
+    let tx = conn.unchecked_transaction()?;
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT payload FROM job_defs WHERE id = ?1",
+            params![def_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(current) = current else {
+        return Ok(PayloadUpdate::Missing);
+    };
+    if !same_payload(&current, expected) {
+        return Ok(PayloadUpdate::Conflict);
+    }
+    tx.execute(
+        "UPDATE job_defs SET payload = ?1 WHERE id = ?2",
+        params![payload, def_id.to_string()],
+    )?;
+    tx.commit()?;
+    Ok(PayloadUpdate::Updated)
+}
+
+/// 按 JSON 结构比较两段 payload；任一侧不是合法 JSON 时退化为逐字比较。
+fn same_payload(current: &str, expected: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(current),
+        serde_json::from_str::<serde_json::Value>(expected),
+    ) {
+        (Ok(current), Ok(expected)) => current == expected,
+        _ => current == expected,
+    }
+}
+
 pub fn set_def_enabled_by_id(
     conn: &Connection,
     def_id: JobDefId,

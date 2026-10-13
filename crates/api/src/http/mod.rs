@@ -14,6 +14,7 @@ pub(crate) mod downloaders;
 pub(crate) mod file_delete;
 pub(crate) mod fs;
 pub(crate) mod image_proxy;
+pub(crate) mod job_maintenance;
 pub(crate) mod jobs;
 pub(crate) mod library;
 pub(crate) mod library_admin;
@@ -610,6 +611,15 @@ fn admin_ops_routes() -> Router<ApiState> {
         // jobs：任务执行与启停
         .route("/jobs/{id}", patch(jobs::toggle_job))
         .route("/jobs/{id}/schedule", put(jobs::update_job_schedule))
+        // DB8 维护配置与只读预览（仅管理员；会员在 admin 中间件层 403）。
+        .route(
+            "/jobs/{id}/maintenance-config",
+            put(job_maintenance::update_maintenance_config),
+        )
+        .route(
+            "/jobs/{id}/maintenance-preview",
+            post(job_maintenance::preview_maintenance),
+        )
         .route("/jobs/{id}/run", post(jobs::run_job))
         .route("/jobs/{id}/cancel", post(jobs::cancel_job))
         .route("/jobs/tick", post(jobs::tick_jobs))

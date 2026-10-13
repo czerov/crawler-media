@@ -180,6 +180,17 @@ impl Queue {
         store::set_def_enabled_by_id(&self.conn, def_id, enabled)
     }
 
+    /// 事务内比较并更新 def 的 payload（维护配置 CAS，DB8 4.2）。
+    /// 并发令牌是**保存前的原 payload**，不是 payload 内的 schema `version`。
+    pub fn set_def_payload_cas(
+        &self,
+        def_id: JobDefId,
+        expected_payload: &str,
+        payload: &str,
+    ) -> Result<crate::PayloadUpdate, JobError> {
+        store::set_def_payload_by_id(&self.conn, def_id, expected_payload, payload)
+    }
+
     /// Enable or disable defs whose payload matches. Disabled defs are not scheduled,
     /// and queued children are cancelled by the store layer.
     pub fn set_def_enabled(&self, payload: &str, enabled: bool) -> Result<usize, JobError> {

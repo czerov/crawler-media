@@ -96,7 +96,7 @@ mod units;
 mod watch_aggregate;
 
 pub use log_scope::{PlaybackLogPage, PlaybackLogScope};
-pub use retention::PlaybackRetentionBatch;
+pub use retention::{PlaybackRetentionBatch, PlaybackRetentionPreview};
 pub use watch_aggregate::{
     WatchClient, WatchDay, WatchMedia, WatchMember, WatchReport, WatchTotals, WatchWindow,
 };

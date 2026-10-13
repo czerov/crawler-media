@@ -32,6 +32,80 @@ export interface JobDef {
   last_finished_at: string | number | null;
   last_error?: string | null;
   next_run_after: string | number | null;
+  /**
+   * DB8 维护任务的可选字段。非维护 def 不返回这些键，因此既有消费方不受影响。
+   * 修改令牌 = 保存前读到的 `payload`（不是 payload 内的 schema `version`）。
+   */
+  maintenance?: MaintenanceSummary;
+  payload_token?: string;
+  /** 最近一次维护运行报告（`job.progress` 的原始 JSON 字符串，可能为 null）。 */
+  last_report?: string | null;
+}
+
+/** 维护任务策略摘要（与后端 `MaintenancePolicy` 的 typed 投影一致）。 */
+export interface MaintenanceSummary {
+  kind: string;
+  version?: number;
+  /** 保留类任务（任务历史 / 播放历史清理）。 */
+  retention_days?: number;
+  dry_run?: boolean;
+  /** 数据库维护。 */
+  vacuum_enabled?: boolean;
+  /** payload 损坏时后端显式标记，不假装是默认策略。 */
+  invalid?: boolean;
+  error?: string;
+}
+
+/** 维护任务只读预览结果（有预算；`truncated` 表示计数只是下界）。 */
+export interface MaintenancePreview {
+  kind: string;
+  policy_version?: number;
+  retention_days?: number;
+  cutoff?: number;
+  scanned: number;
+  candidates: number;
+  protected: number;
+  truncated: boolean;
+  note?: string;
+}
+
+/** 维护任务最近一次运行报告（`last_report` 解析后的形状，字段均为可选）。 */
+export interface MaintenanceReport {
+  kind?: string;
+  policy_version?: number;
+  cutoff?: number | null;
+  dry_run?: boolean;
+  scanned?: number;
+  candidates?: number;
+  deleted?: number;
+  protected?: number;
+  batches?: number;
+  budget_exhausted?: boolean;
+  elapsed_ms?: number;
+  databases?: Array<Record<string, unknown>>;
+  note?: string | null;
+}
+
+const MAINTENANCE_KINDS = new Set([
+  "database_maintenance",
+  "jobs_retention",
+  "playback_history_retention",
+]);
+
+/** 是否是 DB8 维护任务（维护 def 才有参数抽屉与预览）。 */
+export function isMaintenanceJob(job: Pick<JobDef, "kind">): boolean {
+  return MAINTENANCE_KINDS.has(job.kind);
+}
+
+/** 解析 `last_report`；坏 JSON 返回 null，由调用方决定如何提示。 */
+export function parseMaintenanceReport(report: string | null | undefined): MaintenanceReport | null {
+  if (!report) return null;
+  try {
+    const parsed = JSON.parse(report);
+    return parsed && typeof parsed === "object" ? (parsed as MaintenanceReport) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** 任务中心的视图模型 = 任务定义（组件引用名保持旧名 JobView）。 */
@@ -91,6 +165,61 @@ export function updateJobSchedule(
         headers: { "Content-Type": "application/json" },
       },
     ),
+  );
+}
+
+/**
+ * 保存维护任务配置（DB8）。
+ *
+ * `expectedPayload` 是并发令牌：保存前从 `GET /jobs` 读到的 `payload`。
+ * 与服务端当前值不符时后端返回 409（`job.conflict`），调用方需要刷新后重试。
+ * `intervalSecs` 只对维护任务生效，合法范围 3600..=31536000。
+ */
+export function updateMaintenanceConfig(
+  jobId: string,
+  payload: Record<string, unknown>,
+  expectedPayload: Record<string, unknown>,
+  intervalSecs?: number,
+): Promise<{
+  id: string;
+  kind: string;
+  payload: Record<string, unknown>;
+  payload_token: string;
+  schedule: { interval_secs: number } | null;
+}> {
+  const body: Record<string, unknown> = { payload, expected_payload: expectedPayload };
+  if (intervalSecs !== undefined) body.interval_secs = intervalSecs;
+  return unwrap(
+    request<
+      ApiEnvelope<{
+        id: string;
+        kind: string;
+        payload: Record<string, unknown>;
+        payload_token: string;
+        schedule: { interval_secs: number } | null;
+      }>
+    >(`/jobs/${jobId}/maintenance-config`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+}
+
+/**
+ * 维护任务只读预览：只返回有预算的计数，不删除任何数据、不返回播放明细。
+ * `truncated=true` 表示固定预算截断了窗口，计数只是下界而非精确总量。
+ */
+export function previewMaintenance(
+  jobId: string,
+  payload: Record<string, unknown>,
+): Promise<MaintenancePreview> {
+  return unwrap(
+    request<ApiEnvelope<MaintenancePreview>>(`/jobs/${jobId}/maintenance-preview`, {
+      method: "POST",
+      body: JSON.stringify({ payload }),
+      headers: { "Content-Type": "application/json" },
+    }),
   );
 }
 

@@ -11,4 +11,5 @@ pub use kinds::{JobKind, Schedule};
 pub use queue::{NewDef, Queue, Runner};
 pub use read::JobChildren;
 pub use retention::RetentionBatch;
+pub use store::PayloadUpdate;
 pub use types::{Job, JobDef, JobError, JobStatus};

@@ -50,9 +50,9 @@ pub use libraries::Library;
 pub use library::{MarkerResultReplacement, StoredMediaMarker};
 pub use library_ownership::LibraryOwnership;
 pub use playback::{
-    PlayLogRow, PlaybackLogPage, PlaybackLogScope, PlaybackRetentionBatch, SessionRow, UNIT_WHOLE,
-    UnitRow, UnitState, WatchClient, WatchDay, WatchMedia, WatchMember, WatchReport, WatchTotals,
-    WatchWindow,
+    PlayLogRow, PlaybackLogPage, PlaybackLogScope, PlaybackRetentionBatch, PlaybackRetentionPreview,
+    SessionRow, UNIT_WHOLE, UnitRow, UnitState, WatchClient, WatchDay, WatchMedia, WatchMember,
+    WatchReport, WatchTotals, WatchWindow,
 };
 pub use probe_state::{
     retry_delay_ms, ProbeStage, ProbeStageCompletion, ProbeStageKey, ProbeStageState, ProbeStageStatus,

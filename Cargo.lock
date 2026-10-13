@@ -1044,6 +1044,7 @@ dependencies = [
  "domain",
  "parking_lot",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",

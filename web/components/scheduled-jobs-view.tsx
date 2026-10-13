@@ -1,7 +1,15 @@
 "use client";
 
 import { useEffect, useState, useTransition } from "react";
-import { listJobs, runJob, toggleJob, updateJobSchedule, type JobView } from "@/lib/api/jobs";
+import {
+  isMaintenanceJob,
+  listJobs,
+  runJob,
+  toggleJob,
+  updateJobSchedule,
+  type JobView,
+} from "@/lib/api/jobs";
+import { MaintenanceJobSettings } from "@/components/maintenance-job-settings";
 
 function formatInterval(secs: number): string {
   if (secs < 60) return `每 ${secs} 秒`;
@@ -60,6 +68,9 @@ export function ScheduledJobsView() {
   const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
   const [scheduleSecs, setScheduleSecs] = useState<number>(30);
   const [updatingSchedule, setUpdatingSchedule] = useState(false);
+  // 维护任务的参数抽屉（DB8）：保留天数 / dry_run / 预览 / VACUUM 高级开关。
+  const [settingsJobId, setSettingsJobId] = useState<string | null>(null);
+  const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
 
   const handleUpdateSchedule = async (jobId: string, secs: number) => {
     try {
@@ -173,6 +184,20 @@ export function ScheduledJobsView() {
                           上次: {job.last_status === "succeeded" ? "成功" : job.last_status === "failed" ? "失败" : "运行中"}
                         </span>
                       )}
+                      {isMaintenanceJob(job) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSettingsJobId(settingsJobId === job.id ? null : job.id);
+                            setMaintenanceError(null);
+                          }}
+                          title="维护参数：保留天数 / dry_run / 预览 / VACUUM"
+                          className="rounded bg-white/10 hover:bg-white/20 px-2 py-0.5 text-xs text-white/90 transition inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          <span>维护参数</span>
+                          <span className="text-[10px] text-white/50">⚙️</span>
+                        </button>
+                      )}
                     </div>
                   </div>
 
@@ -246,6 +271,26 @@ export function ScheduledJobsView() {
                       </button>
                     </div>
                   </div>
+                )}
+
+                {/* 维护任务参数抽屉（DB8）：非维护 def 不渲染，行为不变 */}
+                {isMaintenanceJob(job) && settingsJobId === job.id && (
+                  <>
+                    <MaintenanceJobSettings
+                      job={job}
+                      intervalSecs={job.schedule?.interval_secs}
+                      onSaved={async () => {
+                        setMaintenanceError(null);
+                        await loadJobs();
+                      }}
+                      onError={setMaintenanceError}
+                    />
+                    {maintenanceError && (
+                      <div className="mt-2 rounded border border-red-500/20 bg-red-500/10 p-2 text-xs text-red-300">
+                        {maintenanceError}
+                      </div>
+                    )}
+                  </>
                 )}
 
                 {/* 调度时间展示 */}
