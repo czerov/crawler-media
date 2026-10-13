@@ -43,72 +43,88 @@ pub(crate) async fn artwork_candidates(
     axum::Extension(user_id): axum::Extension<Option<domain::UserId>>,
     Path((id, item_id)): Path<(String, String)>,
 ) -> Response {
-    let store = state.store.lock();
-    let library = match require_visible_library(&store, &id, user_id) {
-        Ok(library) => library,
-        Err(response) => return response,
-    };
     let media_id = match MediaId::from_str(&item_id) {
         Ok(id) => id,
         Err(_) => return err(StatusCode::BAD_REQUEST, "library.invalid", "条目 id 无效"),
     };
-    let Some(media) = store.get_media(media_id).ok().flatten() else {
-        return err(StatusCode::NOT_FOUND, "library.item_missing", "条目不存在");
-    };
-    let rows: Vec<domain::LedgerRow> = store
-        .list_ledger()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|row| row.media_id == media_id)
-        .filter(|row| {
-            library_for_row(&store, row, &media).is_some_and(|owner| owner.id == library.id)
-        })
-        .collect();
-    if rows.is_empty() {
-        return err(StatusCode::NOT_FOUND, "library.item_missing", "条目不存在");
-    }
-    let selected = preferred_row(&rows);
-    let current = selected
-        .and_then(poster_path)
-        .map(|p| p.display().to_string());
-    let locked = poster_locked(&store, media_id);
-    drop(store);
 
-    let mut posters: Vec<Value> = Vec::new();
-    if let (Some(path), Some(row)) = (&current, selected) {
-        posters.push(json!({
-            "file_path": path,
-            "preview_url": crate::http::library::artwork_url("posters", row.id),
-            "width": 342,
-            "height": 513,
-            "language": null,
-            "vote_average": null,
-            "vote_count": null,
-        }));
+    // 将数据库快照查询与文件/网络 I/O 隔离在 blocking 预算池中执行，避免阻塞 Tokio async worker
+    let state_for_blocking = state.clone();
+    let result = state
+        .http_work
+        .run(std::time::Duration::from_secs(10), move || {
+            let store = state_for_blocking.store.lock();
+            let library = match require_visible_library(&store, &id, user_id) {
+                Ok(library) => library,
+                Err(response) => return Err(response),
+            };
+            let Some(media) = store.get_media(media_id).ok().flatten() else {
+                return Err(err(StatusCode::NOT_FOUND, "library.item_missing", "条目不存在"));
+            };
+            let rows: Vec<domain::LedgerRow> = store
+                .list_ledger()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|row| row.media_id == media_id)
+                .filter(|row| {
+                    library_for_row(&store, row, &media).is_some_and(|owner| owner.id == library.id)
+                })
+                .collect();
+            if rows.is_empty() {
+                return Err(err(StatusCode::NOT_FOUND, "library.item_missing", "条目不存在"));
+            }
+            let selected = preferred_row(&rows).cloned();
+            let locked = poster_locked(&store, media_id);
+            // 及时释放 Store 锁，再做后续文件/网络检查
+            drop(store);
+
+            let current = selected
+                .as_ref()
+                .and_then(poster_path)
+                .map(|p| p.display().to_string());
+
+            let mut posters: Vec<Value> = Vec::new();
+            if let (Some(path), Some(row)) = (&current, &selected) {
+                posters.push(json!({
+                    "file_path": path,
+                    "preview_url": crate::http::library::artwork_url("posters", row.id),
+                    "width": 342,
+                    "height": 513,
+                    "language": null,
+                    "vote_average": null,
+                    "vote_count": null,
+                }));
+            }
+            // Remote metadata candidate
+            if let Some(tmdb_id) = media.tmdb_id.clone() {
+                if let Ok(Some(url)) = state_for_blocking.catalog.poster_url(media.kind, &tmdb_id) {
+                    posters.push(json!({
+                        "file_path": url,
+                        "preview_url": url,
+                        "width": null,
+                        "height": null,
+                        "language": null,
+                        "vote_average": null,
+                        "vote_count": null,
+                    }));
+                }
+            }
+            Ok(json!({
+                "posters": posters,
+                "backdrops": [],
+                "current_poster": current,
+                "current_backdrop": null,
+                "poster_locked": locked,
+                "backdrop_locked": false,
+            }))
+        })
+        .await;
+
+    match result {
+        Ok(Ok(val)) => ok(val).into_response(),
+        Ok(Err(resp)) => resp,
+        Err(_) => err(StatusCode::SERVICE_UNAVAILABLE, "runtime.busy", "服务繁忙，获取海报候选超时"),
     }
-    // Remote metadata candidate, when a configured provider can reach it.
-    if let Some(tmdb_id) = media.tmdb_id.clone() {
-        if let Ok(Some(url)) = state.catalog.poster_url(media.kind, &tmdb_id) {
-            posters.push(json!({
-                "file_path": url,
-                "preview_url": url,
-                "width": null,
-                "height": null,
-                "language": null,
-                "vote_average": null,
-                "vote_count": null,
-            }));
-        }
-    }
-    ok(json!({
-        "posters": posters,
-        "backdrops": [],
-        "current_poster": current,
-        "current_backdrop": null,
-        "poster_locked": locked,
-        "backdrop_locked": false,
-    }))
-    .into_response()
 }
 
 fn artwork_target(

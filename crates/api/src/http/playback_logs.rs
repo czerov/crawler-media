@@ -105,11 +105,20 @@ pub(crate) async fn history(
         .and_then(|v| v.parse().ok())
         .unwrap_or(30)
         .clamp(1, 200);
-    let before = query
-        .get("before")
-        .and_then(|v| v.parse::<i128>().ok())
-        .map(|ms| (ms / 1000) as i64);
-    let days: Option<i64> = query.get("days").and_then(|v| v.parse().ok());
+    let before = match query.get("before") {
+        Some(s) => match s.parse::<i64>() {
+            Ok(ms) => Some(ms.checked_div(1000).unwrap_or(0)),
+            Err(_) => return err(StatusCode::BAD_REQUEST, "playback.invalid_cursor", "游标时间戳无效"),
+        },
+        None => None,
+    };
+    let days: Option<i64> = match query.get("days") {
+        Some(s) => match s.parse::<i64>() {
+            Ok(d) if d >= 0 => Some(d),
+            _ => return err(StatusCode::BAD_REQUEST, "playback.invalid_days", "天数过滤参数无效"),
+        },
+        None => None,
+    };
     let now = unix_now();
     let store = state.store.lock();
     let admin = store
@@ -144,11 +153,11 @@ pub(crate) async fn history(
         Ok(page) => page,
         Err(error) => {
             tracing::error!(%error, "播放历史分页失败");
-            crate::store::PlaybackLogPage {
-                entries: Vec::new(),
-                has_more: false,
-                hidden_count: 0,
-            }
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "playback.query_failed",
+                &format!("播放历史查询失败: {error}"),
+            );
         }
     };
     // 本页所有 entry 的 media/成员名一次物化；渲染阶段不再查库。
