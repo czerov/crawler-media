@@ -32,6 +32,8 @@ pub struct ApiState {
     /// 播放时钟 seam（生产为真实系统毫秒时钟；测试可注入假时钟）。
     pub(crate) playback_clock: Arc<dyn crate::playback_events::PlaybackClock>,
     /// 进程内共享的任务计数 watcher（所有 SSE 连接共用一个 poller）。
+    /// 浏览投影服务（单飞构建与失效管理）。
+    pub projection: Arc<crate::browse_projection::ProjectionService>,
     pub(crate) job_updates: Arc<crate::job_updates::JobUpdates>,
     /// Library 封面渲染与版本化发布（生产默认真实渲染器，测试可注入）。
     pub(crate) cover_service: Arc<crate::library_cover_service::LibraryCoverService>,
@@ -220,6 +222,7 @@ impl ApiState {
             playback_clock: Arc::new(crate::playback_events::SystemPlaybackClock),
             job_updates: Arc::new(crate::job_updates::JobUpdates::new()),
             cover_service: Arc::new(crate::library_cover_service::LibraryCoverService::local()),
+            projection: Arc::new(crate::browse_projection::ProjectionService::new()),
             library_work,
             jobs: Arc::new(Mutex::new(jobs)),
             job_loop_control: Arc::new(crate::job_loop::JobLoopControl::new()),

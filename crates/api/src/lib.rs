@@ -24,6 +24,7 @@ pub use scrape_store::ScrapeStoreExt;
 mod admit;
 pub mod auto_resolve;
 pub mod bootstrap_credentials;
+pub mod browse_projection;
 pub mod catalog;
 mod catalog_cache;
 mod catalog_fanout;
