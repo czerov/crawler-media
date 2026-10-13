@@ -10,22 +10,22 @@ fn open_creates_four_sqlite_files() {
     let versions = store.schema_versions();
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "app").unwrap().1,
-        5,
-        "app schema version should be 5"
+        6,
+        "app schema version should be 6"
     );
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "catalog").unwrap().1,
-        1,
-        "catalog schema version should be 1"
+        2,
+        "catalog schema version should be 2"
     );
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "library").unwrap().1,
-        8,
-        "library schema version should be 8"
+        9,
+        "library schema version should be 9"
     );
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "subscribe").unwrap().1,
-        4,
-        "subscribe schema version should be 4"
+        5,
+        "subscribe schema version should be 5"
     );
 }

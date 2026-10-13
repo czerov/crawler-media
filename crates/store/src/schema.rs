@@ -6,13 +6,15 @@ mod fingerprint;
 mod library_deletion;
 mod probe_state;
 mod tables;
+mod browse_projection;
+mod read_revisions;
 
 /// Schema version constants. Bump when adding new migrations.
 /// The version is stored via `PRAGMA user_version` on each database file.
-pub const APP_SCHEMA_VERSION: i64 = 5;
-pub const CATALOG_SCHEMA_VERSION: i64 = 1;
-pub const LIBRARY_SCHEMA_VERSION: i64 = 8;
-pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 4;
+pub const APP_SCHEMA_VERSION: i64 = 6;
+pub const CATALOG_SCHEMA_VERSION: i64 = 2;
+pub const LIBRARY_SCHEMA_VERSION: i64 = 9;
+pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 5;
 
 /// Read the current schema version from a database file.
 ///
@@ -105,6 +107,9 @@ pub fn migrate_app(conn: &Connection) -> Result<(), StoreError> {
             PRIMARY KEY (collection_id, media_item_id)
         );",
     )?;
+    read_revisions::migrate_read_revisions("app", conn)?;
+    read_revisions::create_revision_trigger(conn, "media", "app_media")?;
+    read_revisions::create_revision_trigger(conn, "libraries", "app_libraries")?;
     set_schema_version(conn, APP_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -217,6 +222,8 @@ pub fn migrate_catalog(conn: &Connection) -> Result<(), StoreError> {
         );
         "#,
     )?;
+    read_revisions::migrate_read_revisions("catalog", conn)?;
+    read_revisions::create_revision_trigger(conn, "catalog_cache", "cat_cache")?;
     set_schema_version(conn, CATALOG_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -257,6 +264,11 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
              reason TEXT NOT NULL
          );",
     )?;
+    browse_projection::migrate_browse_projection(conn)?;
+    read_revisions::migrate_read_revisions("library", conn)?;
+    read_revisions::create_revision_trigger(conn, "ledger", "lib_ledger")?;
+    read_revisions::create_revision_trigger(conn, "file_meta", "lib_file_meta")?;
+    read_revisions::create_revision_trigger(conn, "media_markers", "lib_markers")?;
     set_schema_version(conn, LIBRARY_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -339,6 +351,8 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
          );
          CREATE INDEX IF NOT EXISTS playback_session_ids_expiry_idx ON playback_session_ids(issued_at);",
     )?;
+    read_revisions::migrate_read_revisions("subscribe", conn)?;
+    read_revisions::create_revision_trigger(conn, "playback_units", "sub_units")?;
     set_schema_version(conn, SUBSCRIBE_SCHEMA_VERSION)?;
     Ok(())
 }
