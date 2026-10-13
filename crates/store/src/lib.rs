@@ -11,6 +11,7 @@ mod fingerprint_cache;
 mod fingerprint_models;
 mod fingerprint_samples;
 mod ledger;
+mod ledger_cleanup;
 mod ledger_quality;
 mod legacy_recycle;
 mod libraries;

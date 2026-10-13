@@ -114,9 +114,8 @@ impl Store {
             })
             .optional()?;
         if let Some(id) = ledger_id {
-            super::library::delete_file_meta_for_ledger(&tx, &id)?;
+            super::ledger_cleanup::delete_ledger_by_id_str_in_tx(&tx, &id)?;
         }
-        tx.execute("DELETE FROM ledger WHERE path = ?1", [path])?;
         tx.commit()?;
         Ok(())
     }
@@ -248,13 +247,12 @@ impl Store {
             .prepare("SELECT id FROM ledger WHERE media_id = ?1")?
             .query_map([media_id.to_string()], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
+        let mut changed = 0;
         for id in ids {
-            super::library::delete_file_meta_for_ledger(&tx, &id)?;
+            if super::ledger_cleanup::delete_ledger_by_id_str_in_tx(&tx, &id)? {
+                changed += 1;
+            }
         }
-        let changed = tx.execute(
-            "DELETE FROM ledger WHERE media_id = ?1",
-            params![media_id.to_string()],
-        )?;
         tx.commit()?;
         Ok(changed)
     }
