@@ -87,20 +87,16 @@ impl LibraryCoverService {
             if !needs_legacy_upgrade(&snapshot, &existing) {
                 return Ok(Some(existing));
             }
-            // 兼容路径：legacy 固定路径里的 fanart 副本就地升级（不 unlink、不新建
-            // 版本文件），指针仍走 revision CAS。
+            // 兼容路径升级（F08）：同样使用不可变的新版本文件进行渲染和 CAS 发布！
+            // 只有当 CAS 发布成功后，新版本文件才生效；如果发布失败（例如并发修改或 DB 写入失败），
+            // 原有的旧 legacy 文件（包括内容）绝对不被就地覆盖破坏。未成功引用的新文件会被清除。
             let options = crate::http::library::default_cover_options(&snapshot.library);
             let rendered = render_off_lock(self.renderer.clone(), &snapshot, options).await?;
             let Some(bytes) = rendered else {
                 mark(state, &snapshot.library.id, MARKER_RETRY);
                 return Ok(Some(existing));
             };
-            let target = existing.clone();
-            write_bytes(&target, bytes).await?;
-            let published = cas_publish(state, &snapshot, &target, MARKER_CHECKED, &lease)?;
-            if !published {
-                return Err("cover.stale: 封面已被更新的修改覆盖".into());
-            }
+            let target = publish(state, &snapshot, &bytes, MARKER_CHECKED, &lease).await?;
             mark(state, &snapshot.library.id, MARKER_CHECKED);
             return Ok(Some(target));
         }
@@ -242,16 +238,6 @@ fn needs_legacy_upgrade(snapshot: &CoverSnapshot, existing: &Path) -> bool {
         && snapshot.marker.as_deref() != Some(MARKER_CHECKED)
         && !snapshot.rows.is_empty()
         && crate::http::library::is_legacy_fanart_copy(&snapshot.rows, existing)
-}
-
-/// 写入一个已存在路径（legacy 就地升级专用）。
-async fn write_bytes(target: &Path, bytes: Vec<u8>) -> Result<(), String> {
-    let target = target.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        std::fs::write(&target, bytes).map_err(|error| format!("cover.write: {error}"))
-    })
-    .await
-    .map_err(|error| format!("cover.write: {error}"))?
 }
 
 /// `lease.publish` 内只做 CAS；命中返回 true。
