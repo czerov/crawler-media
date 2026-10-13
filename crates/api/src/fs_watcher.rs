@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 
 use crate::management::ApiState;
 
+pub(crate) mod presence;
 /// STRM 延迟删除条目：记录删除时间戳与删除前的流媒体 URL。
 #[derive(Clone, Debug)]
 pub struct PendingStrmDeletion {
@@ -151,16 +152,14 @@ pub fn spawn_fs_watcher(state: ApiState) {
             }
         }
 
-        // 启动后台定时任务，定期检查 STRM 宽限删除到期的项目
+        // 启动后台定时任务，定期维护 STRM 内存防抖追踪
         let sweep_tracker = tracker.clone();
-        let sweep_state = state.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 for path in sweep_tracker.expire_ready(45) {
-                    tracing::info!(path = %path.display(), "STRM 宽限期已过，永久删除这一集");
+                    tracing::info!(path = %path.display(), "STRM 宽限期已过，清除内存防抖");
                     sweep_tracker.forget(&path);
-                    delete_ledger_row(&sweep_state, &path.display().to_string());
                 }
             }
         });
@@ -396,9 +395,8 @@ pub fn handle_fs_events(
     }
 
     for path in tracker.expire_ready(45) {
-        tracing::info!(path = %path.display(), "STRM 宽限期已过，永久删除这一集");
+        tracing::info!(path = %path.display(), "STRM 宽限期已过，结束内存防抖");
         tracker.forget(&path);
-        delete_ledger_row(state, &path.display().to_string());
     }
 
     // 新增 STRM 在 Library 目录中需要执行 in-place scan 来写入台账；Scrape
@@ -457,27 +455,13 @@ fn note_removed_path(
     is_strm: bool,
     now: i64,
 ) {
-    tracing::info!(path = %path.display(), "检测到文件或目录被删除，进入宽限期");
-    let matched_rows = {
-        let store = state.store.lock();
-        store.list_ledger().ok().map(|rows| {
-            rows.into_iter()
-                .filter(|row| ledger_path_is_gone(path, &row.path))
-                .collect::<Vec<_>>()
-        })
-    };
-    if let Some(rows) = matched_rows {
-        for row in rows {
-            let row_path = PathBuf::from(&row.path);
-            if row_path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("strm")) {
-                tracing::info!(row_path = %row.path, media_id = %row.media_id, "台账 strm 已不在磁盘上，进入删除宽限期");
-                tracker.mark_deleted(row_path, None, now);
-            } else {
-                delete_ledger_row(state, &row.path);
-            }
-        }
-    } else if is_strm {
-        tracker.mark_deleted(path.to_path_buf(), None, now);
+    tracing::info!(path = %path.display(), "检测到文件或目录缺失");
+    if is_strm {
+        let previous_url = tracker.known_urls.lock().get(path).cloned();
+        tracker.mark_deleted(path.to_path_buf(), previous_url, now);
+    }
+    if let Err(e) = presence::observe_event(state, path) {
+        tracing::warn!(path = %path.display(), error = ?e, "Watcher 缺失标记失败");
     }
 }
 
@@ -491,6 +475,7 @@ fn note_present_path(
     scan_targets: &mut HashSet<(PathBuf, PathBuf)>,
 ) {
     tracing::info!(path = %path.display(), is_dir = path.is_dir(), is_strm, "检测到文件或目录新建或修改");
+    note_present_path_presence(state, path);
     if is_path_in_watch_intake(state, path) {
         *intake_changed = true;
     }
@@ -524,40 +509,10 @@ fn note_present_path(
     }
 }
 
-/// Remove a missing file's derived facts without confusing file ownership
-/// with Media identity or shared episode markers.
-fn delete_ledger_row(state: &ApiState, path: &str) {
-    if let Err(error) = cleanup_deleted_ledger(&state.store.lock(), path) {
-        tracing::error!(path, %error, "删除文件派生事实失败，保留尚未清理的身份与共享事实");
+fn note_present_path_presence(state: &ApiState, path: &Path) {
+    if let Err(e) = presence::observe_event(state, path) {
+        tracing::warn!(path = %path.display(), error = ?e, "Watcher 恢复标记失败");
     }
-}
-
-fn cleanup_deleted_ledger(store: &crate::Store, path: &str) -> Result<(), store::StoreError> {
-    let Some(row) = store.ledger_by_path(path)? else { return Ok(()); };
-    store.delete_ledger_path(&row.path)?;
-    let remaining = store.ledger_for_media(row.media_id)?;
-    let referenced = store.list_all_subscribes()?.iter().any(|sub| sub.media_id == row.media_id);
-    let other_version = remaining.iter().any(|other| {
-        other.season == row.season && other.episode == row.episode
-    });
-    if !other_version {
-        let locked = store.get_media_marker(row.media_id, row.season, row.episode)?
-            .is_some_and(|marker| marker.locked);
-        if !locked {
-            store.delete_media_marker(row.media_id, row.season, row.episode)?;
-        }
-    }
-    tracing::info!(row_path = %row.path, media_id = %row.media_id,
-        remaining = remaining.len(), referenced, "清理已删除 Library 文件的派生事实");
-    if remaining.is_empty() && !referenced {
-        store.delete_imported_pending_for_media(row.media_id)?;
-        store.delete_media_markers_for_media(row.media_id)?;
-        store.delete_playback_for_media(row.media_id)?;
-        store.delete_collection_items_for_media(&row.media_id.to_string())?;
-        store.delete_media(row.media_id)?;
-        tracing::info!(media_id = %row.media_id, "清理没有文件且无 Subscribe 引用的 Media");
-    }
-    Ok(())
 }
 
 /// 事件路径不存在时，只删除同样已经不在磁盘上的台账行。

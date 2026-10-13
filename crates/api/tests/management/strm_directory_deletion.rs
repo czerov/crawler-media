@@ -85,21 +85,24 @@ async fn test_directory_deletion_removes_nested_strm_and_cleans_up_media() {
     tracker.set_now(tracker.current_now() + 45);
     api::fs_watcher::handle_fs_events(&state, &tracker, Vec::new());
 
-    // 4. 验证 ledger 中的该文件记录已被自动清除
+    // 4. 验证 ledger 中的该文件记录被标记缺失，而不是自动物理删除
     let remaining_rows = state.store().lock().list_ledger().unwrap();
+    assert_eq!(
+        remaining_rows.len(),
+        1,
+        "整目录缺失后，strm 记录应保留但被标记缺失"
+    );
     assert!(
-        remaining_rows.is_empty(),
-        "整目录删除后，该目录下的 strm 台账记录应被自动清除，但实际仍存在: {:?}",
-        remaining_rows
+        state.store().lock().missing_at_by_path().unwrap().contains_key(&strm_file.display().to_string()),
+        "文件应被标记缺失"
     );
 
-    // 5. 验证 media 记录以及关联的播放/标记也被妥善清理（没有剩余 ledger 的媒体）
+    // 5. 验证 media 记录以及用户事实被保留
     let remaining_media = state.store().lock().get_media(media.id).unwrap();
     assert!(
-        remaining_media.is_none(),
-        "台账全清后，无关联文件的孤立媒体记录也应被清理"
+        remaining_media.is_some(),
+        "文件缺失不应删除 Media 用户事实"
     );
-
     // 6. 模拟从回收站还原该目录（重新创建目录与 strm 文件）
     std::fs::create_dir_all(&movie_dir).unwrap();
     std::fs::write(&strm_file, "https://example.com/video.mkv").unwrap();
