@@ -9,6 +9,27 @@ use std::path::{Path, PathBuf};
 use store::{LibraryPathScope, Store, StrictOwner};
 
 use crate::library_presence::PresenceError;
+pub fn walk_video_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            tracing::debug!(path = %path.display(), "Video 扫描跳过软链接");
+            continue;
+        }
+        if meta.is_dir() {
+            walk_video_files(&path, out);
+        } else if meta.is_file() && library::is_video_file(&path) {
+            out.push(path);
+        }
+    }
+}
+
 use crate::management::ApiState;
 
 pub struct ScanScope {

@@ -1,6 +1,6 @@
 # 第二批：Playback 正确性与扫描失败恢复技术设计
 
-- 状态：待审阅，未实施；基线 `ba82258`，开发时以第一批完成后的接口为准。
+- 状态：已实施。
 - 前置：[第一批技术设计](<2026-10-13-library-data-safety-batch-1-design.md>)、[第一批计划](<2026-10-13-library-data-safety-batch-1-plan.md>)。
 - 配套：[第二批实施计划](<2026-10-13-library-correctness-batch-2-plan.md>)。
 

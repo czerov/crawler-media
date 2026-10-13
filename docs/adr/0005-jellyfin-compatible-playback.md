@@ -40,3 +40,11 @@ Authorization: MediaBrowser Client="VidHub", Device="iPhone", DeviceId="device-i
 理由：一个只有 3 部剧、其中 2 部看过的小库，筛完只剩 1 张卡，看起来像坏了；而"最近入库"这个名字描述的就是入库时间，把看过的藏起来反而名不副实。Jellyfin Web 的「最近添加」不传 `isPlayed`（`src/components/homesections/sections/recentlyAdded.ts` 只传 `userId/limit/fields/parentId`），所以它也会看到已看完的排在行尾。
 
 代价（有意的）：客户端再没有开关能把已看完的藏掉——只有**显式**传 `IsPlayed=false` 才严格，而多数客户端不传。要做到"用户自己决定藏不藏"，得补用户配置表面（`UserConfiguration.HidePlayedInLatest` 与 `GET/POST /Users/{id}/Configuration`；Jellyfin Web 本来就读 `user.Configuration`），落地后可以按这个开关在"严格筛"与"只排不筛"之间切。这套表面目前**尚未实现**，`/Users/Me` 也不返回 `Configuration` 块。
+## 播放会话代际与 PlaySessionId 约束 (2026-10-13 Batch 2)
+
+Jellyfin 客户端在 `PlaybackInfo` 阶段获得由服务端生成的持久 `PlaySessionId`（绑定 User、Device、LedgerId）。
+
+- 客户端在 `/Sessions/Playing`、`/Sessions/Playing/Progress` 和 `/Sessions/Playing/Stopped` 中回传可选的 `PlaySessionId` 和 `EventSequence`。
+- 迟到的旧会话 Progress / Stop 事件（generation 低于当前会话）不会影响或关闭正在播放的新会话。
+- 无 `PlaySessionId` 的旧客户端（Legacy）仅在目标 LedgerId 与当前活跃会话相同时才更新状态，避免跨文件污染。
+- 观看时长累计严格按墙钟推进与播放倍率限制，超过正常播放速率与容差的快进跳转（Seek）不虚增观看时长。

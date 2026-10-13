@@ -16,3 +16,10 @@
 3. **支持 Partial 终态**：在 `probe_jobs` 表支持 `partial` 终态（片头成功但片尾未就绪），避免当作无退避的失败或整体成功。
 4. **生命周期与 Ledger 绑定**：当删除 Ledger 时，同步级联删除对应的 `probe_stage_state`。
 5. **轻量对比摘要**：新增 `probe_season_comparison_history` 表记录整季声纹对比摘要，供后续跳过未变化的声纹比对。
+## 扫描入库探测义务与重启恢复 (2026-10-13 Batch 2)
+
+在 `library.db` 新增 `ledger_probe_obligations` 表，随扫描台账在同一个 Immediate 事务中原子写入。
+
+- 即使扫描在元数据反查或部分阶段中途退出，已登记的 ledger 仍具备未完成的 probe 义务。
+- 调度器每 5 秒自动派发最多 100 条待处理义务；成功安排持久探测任务后才 ACK 删除义务行。
+- Ledger 删除级联清理对应的 probe obligation，保证已删除项目不会被异步 worker 恢复。

@@ -15,7 +15,7 @@ use crate::scrape_store::ScrapeStoreExt;
 pub(crate) mod scope;
 pub(crate) mod report;
 use report::format_scan_report;
-use scope::ScanScope;
+use scope::{ScanScope, walk_video_files};
 use super::library::{
     facets, missing_library, preferred_row, require_visible_library, rows_in_library, selection,
 };
@@ -512,26 +512,6 @@ fn scan_video_library(
     ok(json!(report_data)).into_response()
 }
 
-fn walk_video_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            tracing::debug!(path = %path.display(), "Video 扫描跳过软链接");
-            continue;
-        }
-        if meta.is_dir() {
-            walk_video_files(&path, out);
-        } else if meta.is_file() && library::is_video_file(&path) {
-            out.push(path);
-        }
-    }
-}
 
 /// POST /libraries/{id}/metadata/refresh — one cover per Media owned under the
 /// library, using the newest owned episode for TV; also writes rich NFO from
