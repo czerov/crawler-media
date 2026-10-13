@@ -166,6 +166,13 @@ async fn stream(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     if is_strm {
+        // Enforce 64KiB limit on STRM files (65536 bytes)
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > 65_536 {
+                tracing::warn!(path = %path.display(), len = meta.len(), "STRM file exceeds 64KiB limit");
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+        }
         return match library::read_strm_url(&path) {
             Some(direct_url) => {
                 Ok((StatusCode::FOUND, [(header::LOCATION, direct_url)]).into_response())

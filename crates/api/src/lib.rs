@@ -51,6 +51,7 @@ pub mod store;
 pub mod theintrodb;
 pub mod scan_probe_dispatch;
 pub mod ui;
+pub mod visible_scope;
 pub use poster_fetch::PosterFetch;
 pub mod anilist_http;
 pub mod bangumi_http;
