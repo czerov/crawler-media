@@ -7,6 +7,8 @@ use crate::scrape::scrape_beside;
 use crate::{LibraryError, TransferMode, resolve_mode};
 pub mod report;
 pub use report::{ScanIssue, ScanReport, ScanRootReport, ScanRootStatus};
+pub mod walker;
+pub use walker::{ScanChunk, ScanWalkBudget, ScanWalker};
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "m4v", "mov", "avi", "wmv", "webm", "flv", "ts", "m2ts", "mts", "mpg", "mpeg",

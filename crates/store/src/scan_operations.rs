@@ -159,6 +159,40 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Record paths seen during an operation chunk within an Immediate transaction.
+    pub fn record_scan_seen(&self, operation_id: &str, paths: &[PathBuf]) -> Result<(), StoreError> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.library,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        for p in paths {
+            tx.execute(
+                "INSERT OR IGNORE INTO scan_seen (operation_id, path) VALUES (?1, ?2)",
+                params![operation_id, p.display().to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Check if path has been seen by this operation.
+    pub fn is_scan_seen(&self, operation_id: &str, path: &str) -> Result<bool, StoreError> {
+        let found: bool = self.library.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scan_seen WHERE operation_id = ?1 AND path = ?2)",
+            params![operation_id, path],
+            |r| r.get(0),
+        )?;
+        Ok(found)
+    }
+
+    /// Clear seen entries when operation completes or is cancelled.
+    pub fn clear_scan_seen(&self, operation_id: &str) -> Result<(), StoreError> {
+        self.library.execute(
+            "DELETE FROM scan_seen WHERE operation_id = ?1",
+            [operation_id],
+        )?;
+        Ok(())
+    }
     /// Cancel a scan operation if it is active.
     pub fn cancel_scan(&self, id: &str, _now_ms: i64) -> Result<bool, StoreError> {
         let changed = self.library.execute(

@@ -52,6 +52,9 @@ pub use watch::{
     Unidentified, VIDEO_EXTENSIONS, WatchJob, WatchKind, WatchOutcome, is_video_file, scan_watch,
     scan_watch_intake_controlled, scan_watch_reported,
 };
+pub use watch::{
+    ScanChunk, ScanWalkBudget, ScanWalker,
+};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferMode {
     Hardlink,
