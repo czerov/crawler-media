@@ -58,3 +58,12 @@ The approved plan cites these user-facing removal discussions:
 - [Emby: delete library](https://emby.media/community/topic/117044-delete-library/)
 
 They are reference leads for the narrow distinction between removing a library configuration and deleting media files, not evidence about either project's internal caches, cancellation or Playback identity retention. During this implementation both URLs could not be fetched because the tool resolved their hosts to non-public addresses. Their contents were therefore **not independently verified** here; no stronger external compatibility claim is made.
+## Batch 1: Missing file lifecycle and presence safety (2026-10-13)
+
+### Decision
+
+- **Watcher does not automatically delete ledger rows**: filesystem deletion events mark matching active realtime ledger rows with `missing_at` instead of invoking GC on Media, Playback, Collections, or ledger rows. 45-second debounce expiration maintains memory state only and never deletes ledger rows.
+- **Explicit administrator pruning**: missing ledger rows and file-derived rows (`file_meta`, fingerprint caches/attempts/stages, `scrape_sidecars` DB records) are only deleted upon explicit admin requests via `DELETE /api/v1/libraries/{id}/missing-rows`.
+- **Strict ownership scoping**: presence verification, pruning, and all four scan types (full/incremental Movie/TV and Video) strictly enforce longest-prefix matching within the same MediaKind without falling back to kind defaults.
+- **Root availability guard**: if any library root is unreadable or not a directory, presence verification and pruning fail closed with 409 `library.root_unavailable`. (Note: this does not detect disconnected NAS mounts where the mountpoint directory still exists empty).
+- **User facts and media byte preservation**: Playback history/progress/favorites for all users, Media records, collection bindings, and disk bytes (NFO/sidecars/media) are preserved across missing file events and pruning.
