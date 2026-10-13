@@ -20,7 +20,11 @@ pub struct ApiState {
     /// 两套登录协议共用的 offlock 密码校验与 CAS 签发服务。
     pub(crate) password_login: Arc<crate::password_login::PasswordLogin>,
     /// 有界 blocking 预算：owned 快照上的 stat/catalog 计算准入（生产默认 8）。
-    pub(crate) http_work: Arc<crate::blocking_budget::BlockingBudget>,
+    pub http_work: Arc<crate::blocking_budget::BlockingBudget>,
+    /// 搜索有界 blocking 预算（默认 4）。
+    pub search_work: Arc<crate::blocking_budget::BlockingBudget>,
+    /// 文件目录浏览有界 blocking 预算（默认 2）。
+    pub fs_work: Arc<crate::blocking_budget::BlockingBudget>,
     /// notify 发送 seam（生产为显式超时的 HTTP 实现；测试可注入阻塞实现）。
     pub(crate) notify_transport: Arc<dyn crate::NotifyTransport>,
     /// 共享 single-flight 字幕交付（生产默认并发 2、受控 ffmpeg runner）。
@@ -214,6 +218,8 @@ impl ApiState {
                 2,
             )),
             http_work: Arc::new(crate::blocking_budget::BlockingBudget::new(8)),
+            search_work: Arc::new(crate::blocking_budget::BlockingBudget::new(4)),
+            fs_work: Arc::new(crate::blocking_budget::BlockingBudget::new(2)),
             notify_transport: Arc::new(crate::http::notify::notify_transport::HttpNotifyTransport),
             subtitle_delivery: Arc::new(crate::subtitle_delivery::SubtitleDelivery::new(
                 Arc::new(library::ControlledSubtitleRunner),

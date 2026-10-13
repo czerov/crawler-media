@@ -31,6 +31,10 @@ impl BlockingBudget {
             permits: Arc::new(Semaphore::new(concurrency)),
         }
     }
+    pub fn available_permits(&self) -> usize {
+        self.permits.available_permits()
+    }
+
 
     /// 在 blocking 线程上执行 `work`，最多等待 `deadline`。
     ///
