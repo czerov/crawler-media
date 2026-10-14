@@ -161,6 +161,104 @@ fn scope_signature_does_not_collide_on_commas_in_roots() {
     assert_ne!(scan_scope_signature(&a), scan_scope_signature(&tv));
 }
 
+/// P2-A：v1 编码 `kind:count:root1,root2,...` 不是单射——任务给出的两组根数组编码
+/// 逐字节相同，因此 `match_legacy_scope_signature` 绝不能把这种相等当成 `Same`。
+#[test]
+fn colliding_v1_encoding_is_not_proof_of_equality() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::Store::open(dir.path().join("data")).unwrap();
+    let old = store
+        .create_library(
+            MediaKind::Movie,
+            "Old",
+            &["/x/a,/x/b", "/x/c"],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+    let new = store
+        .create_library(
+            MediaKind::Movie,
+            "New",
+            &["/x/a", "/x/b,/x/c"],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+
+    let old_legacy = legacy_scope_signature(&old);
+    assert_eq!(old_legacy, "movie:2:/x/a,/x/b,/x/c");
+    assert_eq!(
+        old_legacy,
+        legacy_scope_signature(&new),
+        "测试前提：两组根数组的 v1 编码逐字节碰撞"
+    );
+    assert_ne!(
+        scan_scope_signature(&old),
+        scan_scope_signature(&new),
+        "v2 编码必须区分这两组配置（P2-4）"
+    );
+    assert!(
+        !legacy_encoding_is_injective(&new),
+        "含逗号的多根 v1 编码不可唯一还原"
+    );
+    assert_eq!(
+        match_legacy_scope_signature(&old_legacy, &new),
+        Some(LegacySignatureMatch::Ambiguous),
+        "碰撞的遗留签名不能升级成当前配置"
+    );
+}
+
+/// P2-A：无逗号的多根配置，v1 编码可唯一还原，逐字节相等就是配置相等的证明。
+#[test]
+fn comma_free_v1_encoding_is_provably_equivalent() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::Store::open(dir.path().join("data")).unwrap();
+    let library = store
+        .create_library(
+            MediaKind::Movie,
+            "A",
+            &["/x/a", "/x/b"],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+    let legacy = legacy_scope_signature(&library);
+    assert_eq!(legacy, "movie:2:/x/a,/x/b");
+    assert!(legacy_encoding_is_injective(&library));
+    assert_eq!(
+        match_legacy_scope_signature(&legacy, &library),
+        Some(LegacySignatureMatch::Same)
+    );
+}
+
+/// P2-A：单根时 joined 就是唯一根（没有分隔符），即使路径含逗号也可唯一还原。
+#[test]
+fn single_root_v1_encoding_is_provably_equivalent_even_with_comma() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::Store::open(dir.path().join("data")).unwrap();
+    let library = store
+        .create_library(
+            MediaKind::Movie,
+            "A",
+            &["/x/a,b"],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+    let legacy = legacy_scope_signature(&library);
+    assert_eq!(legacy, "movie:1:/x/a,b");
+    assert!(legacy_encoding_is_injective(&library));
+    assert_eq!(
+        match_legacy_scope_signature(&legacy, &library),
+        Some(LegacySignatureMatch::Same)
+    );
+}
+
 /// P3-1 + P3-3：轮内并入的事件必须让本轮补扫，且终态报告是跨轮累计。
 #[tokio::test]
 async fn dirty_event_during_round_requeues_with_cumulative_report() {

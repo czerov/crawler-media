@@ -410,6 +410,11 @@ async fn playback_unit_write_does_not_invalidate_public_projection() {
 }
 
 /// 无关 ledger / catalog 增长不得让目标 Library 的请求或重建做更多文件 IO。
+///
+/// 这里只量文件 IO。DB 侧的行读取量由 `store::browse_reads` 的 VM-step 单测
+/// 覆盖：非默认库的候选读保持索引有界；**默认库**的回退分支是
+/// `NOT (属于任何同 kind 根)` 的补集，仍会全表扫描 ledger（P3-D，已在
+/// `ledger_candidates_for_library` 文档中记录）。
 #[tokio::test]
 async fn unrelated_ledger_and_catalog_growth_does_not_add_target_file_io() {
     let fix = seeded_fixture();

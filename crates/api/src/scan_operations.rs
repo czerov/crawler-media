@@ -29,8 +29,9 @@ pub struct ScanCoordinator {
 /// `["/x/a,/x/b","/x/c"]` 与 `["/x/a","/x/b,/x/c"]` 不能碰撞（P2-4）。
 ///
 /// 旧构建写下的 `v1` 编码（`kind:count:root1,root2,...`）由
-/// [`match_legacy_scope_signature`] 在准入时识别：只有与「当前配置重新编码出的旧格式」
-/// 逐字节相同的旧签名才可就地升级；有歧义或与当前配置不同的旧签名一律取消（P2-NEW-1）。
+/// [`match_legacy_scope_signature`] 在准入时识别：只有「与当前配置重新编码出的旧格式」
+/// 逐字节相同、**且该旧编码可唯一还原**的旧签名才可就地升级；有歧义或与当前配置不同
+/// 的旧签名一律取消（P2-NEW-1 / P2-A）。
 pub fn scan_scope_signature(lib: &store::Library) -> String {
     let mut roots: Vec<_> = lib.root_paths.iter().map(|p| p.display().to_string()).collect();
     roots.sort();
@@ -238,13 +239,34 @@ fn legacy_scope_signature(library: &store::Library) -> String {
     )
 }
 
+/// 当前配置重新编码出的 v1 签名是否可唯一还原（编码单射）。
+///
+/// v1 用同一个逗号既当分隔符又当路径字符：`count <= 1` 时没有分隔符，joined 就是
+/// 全部根，唯一；`count >= 2` 时只有 joined 里的逗号数恰好等于 `count - 1`（即没有
+/// 任何根路径含逗号）才唯一。否则 `["/x/a,/x/b","/x/c"]` 与 `["/x/a","/x/b,/x/c"]`
+/// 会编码成同一串字节（P2-A），逐字节相等不能证明配置相等。
+fn legacy_encoding_is_injective(library: &store::Library) -> bool {
+    let count = library.root_paths.len();
+    if count <= 1 {
+        return true;
+    }
+    let mut roots: Vec<String> = library
+        .root_paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    roots.sort();
+    roots.join(",").matches(',').count() == count - 1
+}
+
 /// 旧（v1）scope 签名与当前配置的比对结果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LegacySignatureMatch {
-    /// 与「当前配置重新编码出的旧格式」逐字节相同：这行确实来自同一配置，可就地升级。
+    /// 与「当前配置重新编码出的旧格式」逐字节相同，**且该旧编码可唯一还原**：
+    /// 这行确实来自同一配置，可就地升级。
     Same,
-    /// 旧编码不可唯一还原（根路径含分隔符），且与当前配置的旧编码不同：无法证明等价，
-    /// 必须取消。理由字符串只是留痕，不能替代这个安全判定（P2-NEW-1）。
+    /// 旧编码不可唯一还原（根路径含分隔符）：无法证明等价，必须取消。理由字符串只是
+    /// 留痕，不能替代这个安全判定（P2-NEW-1 / P2-A）。
     Ambiguous,
     /// 可无歧义解码，但与当前配置不一致：真实的 scope 变化，必须取消。
     Different,
@@ -255,9 +277,12 @@ enum LegacySignatureMatch {
 /// 返回 `None` = 不是可识别的旧格式（空串、损坏值、已是新格式），调用方按 scope
 /// 变化处理。
 ///
-/// 安全判据只有一个：把**当前**配置重新编码成旧格式后，是否与持久化值逐字节相同。
-/// 只有 [`LegacySignatureMatch::Same`] 允许就地升级；`Ambiguous` 与 `Different` 都必须
-/// 取消——「旧编码有歧义」不是放行理由，恰恰是无法证明等价的证据。
+/// 允许就地升级需要同时满足两个条件：
+/// 1. 把**当前**配置重新编码成旧格式后，与持久化值逐字节相同；
+/// 2. 该旧编码对当前配置可唯一还原（[`legacy_encoding_is_injective`]）。
+///
+/// 只有 [`LegacySignatureMatch::Same`] 允许升级；`Ambiguous` 与 `Different` 都必须
+/// 取消——「旧编码有歧义」不是放行理由，恰恰是无法证明等价的证据（P2-A）。
 fn match_legacy_scope_signature(
     persisted: &str,
     library: &store::Library,
@@ -266,7 +291,12 @@ fn match_legacy_scope_signature(
         return None;
     }
     if persisted == legacy_scope_signature(library) {
-        return Some(LegacySignatureMatch::Same);
+        // 逐字节相等只有在旧编码单射时才是等价证明（P2-A）。
+        return Some(if legacy_encoding_is_injective(library) {
+            LegacySignatureMatch::Same
+        } else {
+            LegacySignatureMatch::Ambiguous
+        });
     }
     let mut parts = persisted.splitn(3, ':');
     let kind = parts.next()?;
@@ -291,7 +321,8 @@ fn stale_scope_reason(persisted: &str, current: &str) -> String {
     format!("library scope changed: persisted={persisted} current={current}")
 }
 
-/// 旧编码有歧义且与当前配置的旧编码不同：无法证明等价，按 scope 变化取消。
+/// 旧编码无法唯一还原（无论是否与当前配置的旧编码逐字节相同）：无法证明等价，
+/// 按 scope 变化取消。
 fn unprovable_legacy_reason(persisted: &str, current: &str) -> String {
     format!(
         "legacy scope signature is ambiguous and not provably equivalent to current config: \
@@ -300,10 +331,11 @@ fn unprovable_legacy_reason(persisted: &str, current: &str) -> String {
 }
 
 /// 准入签名判定：`Ok(Some(reason))` = 旧格式已升级；`Ok(None)` = 与新编码一致；
-/// `Err(reason)` = 真实的 scope 变化，调用方必须取消。
+/// `Err(reason)` = 无法证明等价，调用方必须取消。
 ///
-/// 只有「当前配置重新编码成旧格式后与持久化值逐字节相同」才允许升级（P2-NEW-1）；
-/// 有歧义或可解码但不一致的旧签名一律取消，绝不升级成当前配置去扫新 scope。
+/// 只有「当前配置重新编码成旧格式后与持久化值逐字节相同」**且该旧编码可唯一还原**
+/// 才允许升级（P2-NEW-1 / P2-A）；有歧义或可解码但不一致的旧签名一律取消，绝不升级
+/// 成当前配置去扫新 scope。
 ///
 /// 升级走 store 的 CAS（同一 IMMEDIATE 事务内比对+写入）；CAS 失败说明签名被并发
 /// 改写，重读一次再判定，绝不覆盖别人的值。

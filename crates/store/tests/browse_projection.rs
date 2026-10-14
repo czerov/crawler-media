@@ -240,6 +240,10 @@ fn insert_ledger_row(store: &Store, path: &std::path::Path) {
 
 /// P3-NEW-5：目标 Library 的候选读不读取无关根的 ledger 行，但仍保留
 /// 「未命中任何根 → 该 kind 默认 Library」的旧归属回退。
+///
+/// 这里只断言**返回行**。默认回退分支的 DB 成本（`SCAN ledger`，VM steps 随
+/// 无关台账增长）由 `browse_reads::tests::default_library_candidate_read_is_not_bounded`
+/// 用 VM steps 度量并记录为 P3-D 限制。
 #[test]
 fn ledger_candidates_for_library_skip_unrelated_roots_and_keep_default_fallback() {
     let tmp = tempfile::tempdir().unwrap();
@@ -318,5 +322,179 @@ fn ledger_candidates_for_library_skip_unrelated_roots_and_keep_default_fallback(
             .iter()
             .any(|row| row.path.ends_with("stray/x.mkv")),
         "默认回退行必须包含在候选里"
+    );
+}
+
+fn candidate_paths(store: &Store, library_id: &str) -> Vec<String> {
+    let ownership = store.library_ownership().unwrap();
+    let mut paths: Vec<String> = store
+        .ledger_candidates_for_library(&ownership, library_id)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// P2-B：候选读必须与旧 `owner()` 的组件级 `Path::starts_with` 等价。根写成
+/// `/movies/./`、`/movies//`、`/movies/` 时，干净路径（扫描外部工具写入的
+/// ledger）仍必须进入候选；相邻前缀 `/movies` vs `/movies2` 不得误配。
+#[test]
+fn ledger_candidates_match_component_ownership_for_non_canonical_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_str().unwrap().to_string();
+    struct Case {
+        root: String,
+        path: String,
+        owned_by_target: bool,
+    }
+    let cases = vec![
+        Case {
+            root: format!("{base}/movies/./"),
+            path: format!("{base}/movies/Visible.mkv"),
+            owned_by_target: true,
+        },
+        Case {
+            root: format!("{base}//movies//"),
+            path: format!("{base}/movies/Visible.mkv"),
+            owned_by_target: true,
+        },
+        Case {
+            root: format!("{base}/movies/"),
+            path: format!("{base}/movies/Visible.mkv"),
+            owned_by_target: true,
+        },
+        // 扫描自己写下的路径同样带非规范拼写。
+        Case {
+            root: format!("{base}/movies/./"),
+            path: format!("{base}/movies/./Visible.mkv"),
+            owned_by_target: true,
+        },
+        Case {
+            root: format!("{base}//movies//"),
+            path: format!("{base}//movies//Visible.mkv"),
+            owned_by_target: true,
+        },
+        // 相邻前缀：`/movies2` 不属于 `/movies`，必须回退到默认库而不是目标库。
+        Case {
+            root: format!("{base}/movies"),
+            path: format!("{base}/movies2/Visible.mkv"),
+            owned_by_target: false,
+        },
+    ];
+
+    for (index, case) in cases.iter().enumerate() {
+        let store = Store::open(tmp.path().join(format!("case{index}"))).unwrap();
+        let library = store
+            .create_library(
+                domain::MediaKind::Movie,
+                "Target",
+                &[case.root.as_str()],
+                "everyone",
+                true,
+                &[],
+            )
+            .unwrap();
+        insert_ledger_row(&store, std::path::Path::new(&case.path));
+
+        let ownership = store.library_ownership().unwrap();
+        let owner_id = ownership
+            .owner(std::path::Path::new(&case.path), domain::MediaKind::Movie)
+            .map(|owner| owner.id.clone());
+        assert_eq!(
+            owner_id.as_deref() == Some(library.id.as_str()),
+            case.owned_by_target,
+            "case {index}: 旧 owner() 口径与用例前提不一致（root={}, path={}）",
+            case.root,
+            case.path
+        );
+
+        let candidates = candidate_paths(&store, &library.id);
+        assert_eq!(
+            candidates.contains(&case.path),
+            case.owned_by_target,
+            "case {index}: 候选读必须与 owner() 等价（root={}, path={}）",
+            case.root,
+            case.path
+        );
+    }
+}
+
+/// 根为 `/` 时所有绝对路径都属于该库；`/` 前缀不能被文本比较漏掉。
+#[test]
+fn ledger_candidates_treat_root_slash_as_every_absolute_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let library = store
+        .create_library(
+            domain::MediaKind::Movie,
+            "Root",
+            &["/"],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+    let path = format!("{}/Visible.mkv", tmp.path().to_str().unwrap());
+    insert_ledger_row(&store, std::path::Path::new(&path));
+
+    let ownership = store.library_ownership().unwrap();
+    let owner = ownership
+        .owner(std::path::Path::new(&path), domain::MediaKind::Movie)
+        .expect("root / owns every absolute path");
+    assert_eq!(owner.id, library.id);
+    assert!(
+        candidate_paths(&store, &library.id).contains(&path),
+        "根 `/` 的候选读不得漏掉绝对路径"
+    );
+}
+
+/// 嵌套根：子库的行必须进入子库候选，父库候选仍可包含（由 owner() 在内存里
+/// 判给子库），两者都不得丢失。
+#[test]
+fn ledger_candidates_keep_nested_root_rows_for_parent_and_child() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let parent_root = tmp.path().join("tv");
+    let child_root = parent_root.join("anime");
+    std::fs::create_dir_all(&child_root).unwrap();
+    let parent = store
+        .create_library(
+            domain::MediaKind::Tv,
+            "Parent",
+            &[parent_root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+    let child = store
+        .create_library(
+            domain::MediaKind::Tv,
+            "Child",
+            &[child_root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+    let path = child_root.join("Show/Episode.mkv");
+    insert_ledger_row(&store, &path);
+    let path = path.to_string_lossy().to_string();
+
+    let ownership = store.library_ownership().unwrap();
+    let owner = ownership
+        .owner(std::path::Path::new(&path), domain::MediaKind::Tv)
+        .expect("nested root has an owner");
+    assert_eq!(owner.id, child.id, "最深根胜出");
+
+    assert!(
+        candidate_paths(&store, &child.id).contains(&path),
+        "子库候选必须包含自己的行"
+    );
+    assert!(
+        candidate_paths(&store, &parent.id).contains(&path),
+        "父库候选保留子库行，交由 owner() 在内存里过滤"
     );
 }

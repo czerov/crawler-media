@@ -83,26 +83,43 @@ impl BuildOutcome {
     }
 }
 
-type InflightMap = HashMap<String, broadcast::Sender<BuildOutcome>>;
+type InflightMap = HashMap<String, Arc<Inflight>>;
 
-struct InflightLeaderGuard<'a> {
-    inflight: &'a Mutex<InflightMap>,
-    library_id: String,
-    tx: Option<broadcast::Sender<BuildOutcome>>,
+/// One in-progress build for a Library. Followers subscribe to `tx` and observe
+/// the same outcome the blocking build publishes.
+struct Inflight {
+    tx: broadcast::Sender<BuildOutcome>,
 }
 
-impl<'a> Drop for InflightLeaderGuard<'a> {
+/// Held by the **blocking build closure** and dropped when that closure actually
+/// ends. The inflight entry therefore outlives a request's wait: a request
+/// timeout only ends the wait, while retries for the same Library join the
+/// running build instead of starting a second one. `entry` identity is checked
+/// so a stale guard cannot evict a newer build's entry.
+struct InflightRemoval {
+    inflight: Arc<Mutex<InflightMap>>,
+    library_id: String,
+    entry: Arc<Inflight>,
+}
+
+impl Drop for InflightRemoval {
     fn drop(&mut self) {
         let mut map = self.inflight.lock();
-        map.remove(&self.library_id);
+        if map
+            .get(&self.library_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.entry))
+        {
+            map.remove(&self.library_id);
+        }
     }
 }
 
 pub struct ProjectionService {
-    dirty_libraries: Mutex<HashMap<String, u64>>,
+    dirty_libraries: Arc<Mutex<HashMap<String, u64>>>,
     /// 至少被浏览过一次的 Library；周期刷新只覆盖这些库。
     visited: Mutex<HashSet<String>>,
-    inflight: Mutex<InflightMap>,
+    /// 每个 Library 至多一个进行中的构建；条目由 blocking 闭包在结束时移除。
+    inflight: Arc<Mutex<InflightMap>>,
     /// 有界构建容量：permit 由 blocking 构建闭包持有到真正结束。
     build_budget: Arc<BlockingBudget>,
     /// leader 构建与 follower 等待共用的 deadline。
@@ -121,9 +138,9 @@ struct Current {
 impl ProjectionService {
     pub fn new() -> Self {
         Self {
-            dirty_libraries: Mutex::new(HashMap::new()),
+            dirty_libraries: Arc::new(Mutex::new(HashMap::new())),
             visited: Mutex::new(HashSet::new()),
-            inflight: Mutex::new(HashMap::new()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
             build_budget: Arc::new(BlockingBudget::new(PROJECTION_BUILD_CAPACITY)),
             deadline: PROJECTION_DEADLINE,
             disabled: false,
@@ -189,24 +206,22 @@ impl ProjectionService {
             return Ok(snapshot);
         }
 
-        // Single-flight coordination
-        let (rx, leader_guard) = {
+        // Single-flight coordination: the entry is owned by the blocking build
+        // (see `InflightRemoval`), so it stays after this wait ends and retries
+        // join the running build instead of starting a second one.
+        let (rx, leader) = {
             let mut map = self.inflight.lock();
-            if let Some(tx) = map.get(&library_id) {
-                (tx.subscribe(), None)
+            if let Some(entry) = map.get(&library_id) {
+                (entry.tx.subscribe(), None)
             } else {
                 let (tx, rx) = broadcast::channel(1);
-                map.insert(library_id.clone(), tx.clone());
-                let guard = InflightLeaderGuard {
-                    inflight: &self.inflight,
-                    library_id: library_id.clone(),
-                    tx: Some(tx),
-                };
-                (rx, Some(guard))
+                let entry = Arc::new(Inflight { tx });
+                map.insert(library_id.clone(), entry.clone());
+                (rx, Some(entry))
             }
         };
 
-        if leader_guard.is_none() {
+        let Some(entry) = leader else {
             // The leader may have published between the freshness check and our
             // subscribe; re-check before paying the deadline wait.
             if let Some(snapshot) = self.fresh_snapshot(&state, &library_id).await? {
@@ -219,23 +234,12 @@ impl ProjectionService {
                 Ok(Err(_)) => Err(ProjectionError::Cancelled),
                 Err(_) => Err(ProjectionError::Timeout),
             };
-        }
+        };
 
-        let mut leader_guard = leader_guard.unwrap();
         let dirty_version_before = self.dirty_libraries.lock().get(&library_id).copied();
-        let outcome = self.build_and_publish(state, library_id.clone()).await;
-
-        if matches!(outcome, BuildOutcome::Ready(_)) {
-            let mut dirty_map = self.dirty_libraries.lock();
-            if dirty_map.get(&library_id).copied() == dirty_version_before {
-                dirty_map.remove(&library_id);
-            }
-        }
-
-        if let Some(tx) = leader_guard.tx.take() {
-            let _ = tx.send(outcome.clone());
-        }
-        drop(leader_guard);
+        let outcome = self
+            .build_and_publish(state, library_id.clone(), entry, dirty_version_before)
+            .await;
 
         match outcome {
             BuildOutcome::Ready(snapshot) => Ok(snapshot),
@@ -244,17 +248,69 @@ impl ProjectionService {
     }
 
     /// 构建 + 发布 + 回读，全部在共享构建容量与 deadline 内、blocking 线程上完成。
-    async fn build_and_publish(&self, state: ApiState, library_id: String) -> BuildOutcome {
+    ///
+    /// inflight 条目由 blocking 闭包持有的 [`InflightRemoval`] 在构建真正结束时
+    /// 移除；请求侧 deadline 只结束本次等待，超时不会让同一 Library 再起第二次
+    /// 构建。dirty 清理同样在闭包里按 `dirty_version_before` CAS，构建期间的新
+    /// 脏标记不会被这次发布吞掉。
+    async fn build_and_publish(
+        &self,
+        state: ApiState,
+        library_id: String,
+        entry: Arc<Inflight>,
+        dirty_version_before: Option<u64>,
+    ) -> BuildOutcome {
         let budget = self.build_budget.clone();
         let deadline = self.deadline;
-        match budget
-            .run(deadline, move || publish_blocking(&state, &library_id))
-            .await
-        {
+        let dirty_libraries = self.dirty_libraries.clone();
+        let job_library = library_id.clone();
+        let job_entry = entry.clone();
+        let removal = InflightRemoval {
+            inflight: self.inflight.clone(),
+            library_id: library_id.clone(),
+            entry: entry.clone(),
+        };
+        let result = budget
+            .run(deadline, move || {
+                let outcome = publish_blocking(&state, &job_library);
+                if matches!(outcome, BuildOutcome::Ready(_)) {
+                    let mut dirty = dirty_libraries.lock();
+                    if dirty.get(&job_library).copied() == dirty_version_before {
+                        dirty.remove(&job_library);
+                    }
+                }
+                let _ = job_entry.tx.send(outcome.clone());
+                drop(removal);
+                outcome
+            })
+            .await;
+        match result {
             Ok(outcome) => outcome,
-            Err(BlockingError::Busy) => BuildOutcome::Busy,
+            // 未取得 permit：没有任何构建在跑，通知 follower 并交回条目让重试重建。
+            Err(BlockingError::Busy) => {
+                let _ = entry.tx.send(BuildOutcome::Busy);
+                self.remove_inflight(&library_id, &entry);
+                BuildOutcome::Busy
+            }
+            // 等待结束，但 blocking 构建仍在跑；条目由闭包在真正结束时移除。
             Err(BlockingError::Timeout) => BuildOutcome::Timeout,
-            Err(BlockingError::Worker(message)) => BuildOutcome::Failed(message),
+            Err(BlockingError::Worker(message)) => {
+                let outcome = BuildOutcome::Failed(message);
+                let _ = entry.tx.send(outcome.clone());
+                self.remove_inflight(&library_id, &entry);
+                outcome
+            }
+        }
+    }
+
+    /// 仅在条目仍是本次构建时移除，避免误删更新的构建。
+    fn remove_inflight(&self, library_id: &str, entry: &Arc<Inflight>) {
+        let mut map = self.inflight.lock();
+        if map
+            .get(library_id)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            map.remove(library_id);
         }
     }
 

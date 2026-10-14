@@ -2,7 +2,7 @@
 //! user's complete playback units.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use domain::{LedgerRow, Media, MediaId, UserId};
 use rusqlite::params;
@@ -177,13 +177,44 @@ impl Store {
     /// rows under unrelated roots are never read. That keeps the projection
     /// builder's DB rows, lock hold, and memory bounded by the target Library
     /// instead of the whole instance.
+    ///
+    /// The SQL predicate is text-based, while `owner` compares whole `Path`
+    /// components. To stay equivalent for roots written as `/movies/./` or
+    /// `/movies//`, every root contributes both its component-normalized text
+    /// and its literal (trailing-separator-trimmed) text. Both are prefixes of
+    /// the same component path, so each predicate is a *subset* of the true
+    /// `Path::starts_with(root)` set — the union is still a subset, which keeps
+    /// the default-library `NOT (...)` fallback a superset of "matches no root".
+    /// A stored path that spells the root portion itself non-canonically (e.g.
+    /// `/a/./b/x` against a configured `/a/b`) is the residual gap; the builder
+    /// cannot see it because the text index never matches.
+    ///
+    /// **Known limitation (P3-D):** for the kind's default Library the fallback
+    /// branch is `NOT (matches any same-kind root)`, i.e. the complement of an
+    /// indexed union. SQLite cannot seek that complement, so it scans the
+    /// `ledger` b-tree: a default Library's build cost grows with total ledger
+    /// rows, including unrelated ones. Closing this needs an indexed
+    /// "matches no root" fact (e.g. a maintained `root_id`); see the
+    /// `default_library_candidate_read_is_not_bounded` test.
     pub fn ledger_candidates_for_library(
         &self,
         ownership: &LibraryOwnership,
         library_id: &str,
     ) -> Result<Vec<LedgerRow>, StoreError> {
+        self.ledger_candidates_with_vm_steps(ownership, library_id)
+            .map(|(rows, _)| rows)
+    }
+
+    /// Same read as [`Self::ledger_candidates_for_library`], additionally
+    /// reporting the SQLite VM steps the candidate query consumed so tests can
+    /// assert DB work instead of only returned rows.
+    fn ledger_candidates_with_vm_steps(
+        &self,
+        ownership: &LibraryOwnership,
+        library_id: &str,
+    ) -> Result<(Vec<LedgerRow>, i64), StoreError> {
         let Some(target) = ownership.library(library_id) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
         let kind = target.kind;
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
@@ -192,7 +223,7 @@ impl Store {
         let target_roots: Vec<String> = target
             .root_paths
             .iter()
-            .map(|root| root_predicate(&mut values, root))
+            .flat_map(|root| root_predicates(&mut values, root))
             .collect();
         if !target_roots.is_empty() {
             clauses.push(format!("({})", target_roots.join(" OR ")));
@@ -206,7 +237,7 @@ impl Store {
             let mut all_roots: Vec<String> = Vec::new();
             for library in ownership.libraries().iter().filter(|lib| lib.kind == kind) {
                 for root in &library.root_paths {
-                    all_roots.push(root_predicate(&mut values, root));
+                    all_roots.extend(root_predicates(&mut values, root));
                 }
             }
             if all_roots.is_empty() {
@@ -217,7 +248,7 @@ impl Store {
         }
 
         if clauses.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let sql = format!(
             "SELECT id, media_id, path, season, episode, resolution, codec, hdr,
@@ -227,7 +258,9 @@ impl Store {
         );
         let mut stmt = self.library.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), map_ledger)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let collected = rows.collect::<Result<Vec<_>, _>>()?;
+        let vm_steps = i64::from(stmt.get_status(rusqlite::StatementStatus::VmStep));
+        Ok((collected, vm_steps))
     }
 
     /// Missing-file markers for the given ledger paths only, chunked under the
@@ -255,18 +288,178 @@ impl Store {
     }
 }
 
-/// SQL predicate equivalent to `Path::starts_with(root)` for the `ledger.path`
-/// text column: equal, or inside the half-open range `root || '/'` ..
-/// `root || '0'` (byte-wise `'/' + 1 == '0'`), which is exactly the strings
-/// sharing the root plus one separator and lets SQLite use `ledger_path_idx`
-/// instead of scanning unrelated rows. Roots are normalized by trimming
-/// trailing separators, so `/movies` and `/movies/` behave identically and
-/// `/movies-other` does not match `/movies`.
-fn root_predicate(values: &mut Vec<rusqlite::types::Value>, root: &Path) -> String {
-    let index = values.len() + 1;
-    let normalized = root.to_string_lossy();
-    values.push(rusqlite::types::Value::from(
-        normalized.trim_end_matches('/').to_string(),
-    ));
-    format!("(path = ?{index} OR (path >= ?{index} || '/' AND path < ?{index} || '0'))")
+/// SQL predicates equivalent to `Path::starts_with(root)` for the `ledger.path`
+/// text column: equal, or inside the half-open range `prefix || '/'` ..
+/// `prefix || '0'` (byte-wise `'/' + 1 == '0'`), which is exactly the strings
+/// sharing the prefix plus one separator and lets SQLite use `ledger_path_idx`
+/// instead of scanning unrelated rows.
+///
+/// `root` is emitted once for its component-normalized text (`Path::components`
+/// drops `.` and repeated separators) and once for its literal text with
+/// trailing separators trimmed. Any string matching either prefix starts with
+/// the root's components, so both are subsets of the true `starts_with` set and
+/// the OR stays safe for the default-library `NOT (...)` fallback.
+fn root_predicates(values: &mut Vec<rusqlite::types::Value>, root: &Path) -> Vec<String> {
+    let normalized = normalized_root_text(root);
+    let literal = root.to_string_lossy().trim_end_matches('/').to_string();
+    let mut prefixes = vec![normalized];
+    if prefixes[0] != literal {
+        prefixes.push(literal);
+    }
+    prefixes
+        .into_iter()
+        .map(|prefix| {
+            values.push(rusqlite::types::Value::from(prefix));
+            let index = values.len();
+            format!("(path = ?{index} OR (path >= ?{index} || '/' AND path < ?{index} || '0'))")
+        })
+        .collect()
 }
+
+/// `root` with `.` components and repeated separators removed, matching the
+/// component view `Path::starts_with` compares. Trailing separators are trimmed
+/// so `/movies/` and `/movies` share one predicate; the root `/` trims to the
+/// empty prefix, whose range `>= '/' AND < '0'` is every absolute path.
+fn normalized_root_text(root: &Path) -> String {
+    let mut normalized = PathBuf::new();
+    for component in root.components() {
+        normalized.push(component.as_os_str());
+    }
+    normalized.to_string_lossy().trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::{Confidence, LedgerId, MediaKind, QualitySource};
+
+    fn insert_row(store: &Store, path: &Path) {
+        store
+            .insert_ledger(&LedgerRow {
+                id: LedgerId::new(),
+                media_id: MediaId::new(),
+                path: path.to_string_lossy().to_string(),
+                season: None,
+                episode: None,
+                resolution: None,
+                codec: None,
+                hdr: None,
+                quality_source: QualitySource::Release,
+                confidence: Confidence::High,
+                filter_score: None,
+            })
+            .unwrap();
+    }
+
+    /// P3-D：非默认库的候选读走 `ledger_path_idx`，VM steps 不随无关台账增长。
+    #[test]
+    fn non_default_candidate_read_stays_bounded_as_unrelated_ledger_grows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("data")).unwrap();
+        let target_root = tmp.path().join("movies");
+        let other_root = tmp.path().join("other");
+        std::fs::create_dir_all(&target_root).unwrap();
+        std::fs::create_dir_all(&other_root).unwrap();
+        let target = store
+            .create_library(
+                MediaKind::Movie,
+                "Target",
+                &[target_root.to_str().unwrap()],
+                "everyone",
+                true,
+                &[],
+            )
+            .unwrap();
+        store
+            .create_library(
+                MediaKind::Movie,
+                "Other",
+                &[other_root.to_str().unwrap()],
+                "everyone",
+                true,
+                &[],
+            )
+            .unwrap();
+        for index in 0..3 {
+            insert_row(&store, &target_root.join(format!("m{index}.mkv")));
+        }
+        for index in 0..10 {
+            insert_row(&store, &other_root.join(format!("o{index}.mkv")));
+        }
+        let ownership = store.library_ownership().unwrap();
+        let (small_rows, small_steps) = store
+            .ledger_candidates_with_vm_steps(&ownership, &target.id)
+            .unwrap();
+
+        for index in 10..3_000 {
+            insert_row(&store, &other_root.join(format!("o{index}.mkv")));
+        }
+        let (large_rows, large_steps) = store
+            .ledger_candidates_with_vm_steps(&ownership, &target.id)
+            .unwrap();
+
+        assert_eq!(small_rows.len(), 3);
+        assert_eq!(large_rows.len(), 3);
+        assert!(small_steps > 0, "候选读必须真的执行了 SQL");
+        assert!(
+            large_steps <= small_steps + 100,
+            "非默认库候选读必须仍用索引：无关台账 10→3000 行时 VM steps {small_steps}→{large_steps}"
+        );
+    }
+
+    /// P3-D 已记录的限制：默认库回退分支是「不属于任何同 kind 根」的补集，
+    /// SQLite 无法 seek，VM steps 随整个 ledger 增长（返回行数却不变）。
+    #[test]
+    fn default_library_candidate_read_is_not_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("data")).unwrap();
+        let other_root = tmp.path().join("other");
+        std::fs::create_dir_all(&other_root).unwrap();
+        store
+            .create_library(
+                MediaKind::Movie,
+                "Other",
+                &[other_root.to_str().unwrap()],
+                "everyone",
+                true,
+                &[],
+            )
+            .unwrap();
+        let default = store
+            .default_library(MediaKind::Movie)
+            .unwrap()
+            .expect("seeded default movie library");
+        insert_row(&store, &tmp.path().join("stray").join("x.mkv"));
+        for index in 0..10 {
+            insert_row(&store, &other_root.join(format!("o{index}.mkv")));
+        }
+        let ownership = store.library_ownership().unwrap();
+        let (small_rows, small_steps) = store
+            .ledger_candidates_with_vm_steps(&ownership, &default.id)
+            .unwrap();
+
+        for index in 10..3_000 {
+            insert_row(&store, &other_root.join(format!("o{index}.mkv")));
+        }
+        let (large_rows, large_steps) = store
+            .ledger_candidates_with_vm_steps(&ownership, &default.id)
+            .unwrap();
+
+        assert_eq!(small_rows.len(), large_rows.len());
+        assert_eq!(small_rows.len(), 1, "无关根的行不进入默认库候选");
+        assert!(
+            large_steps > small_steps + 1_000,
+            "默认库回退必须如实暴露全表扫描：VM steps {small_steps}→{large_steps}"
+        );
+    }
+
+    /// `./`、重复分隔符与尾部分隔符在组件层面等价于规范根。
+    #[test]
+    fn root_predicates_normalize_dot_and_repeated_separators() {
+        assert_eq!(normalized_root_text(Path::new("/a/b/./")), "/a/b");
+        assert_eq!(normalized_root_text(Path::new("/a//b//")), "/a/b");
+        assert_eq!(normalized_root_text(Path::new("/a/b/")), "/a/b");
+        assert_eq!(normalized_root_text(Path::new("/")), "");
+    }
+}
+

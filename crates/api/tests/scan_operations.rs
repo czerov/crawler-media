@@ -268,6 +268,12 @@ async fn legacy_signature_with_unchanged_config_is_upgraded_not_cancelled() {
     let legacy = fix.legacy_scope_signature();
     let current = fix.scope_signature();
     assert_ne!(legacy, current, "测试前提：旧编码与新编码不同");
+    // 单根、路径不含逗号：v1 编码可唯一还原，逐字节相等就是配置相等的证明（P2-A）。
+    assert_eq!(
+        legacy.split(',').count(),
+        1,
+        "测试前提：这是可证明等价的非碰撞旧编码: {legacy}"
+    );
 
     let op = {
         let store = fix.state.store();
@@ -297,10 +303,85 @@ async fn legacy_signature_with_unchanged_config_is_upgraded_not_cancelled() {
     assert_eq!(fix.state.store().lock().list_ledger().unwrap().len(), 1);
 }
 
-/// P2-NEW-1：旧编码有歧义（根路径含逗号），但**逐字节等于**当前配置重新编码出的旧格式时，
-/// 这行确实来自同一配置：允许就地升级并照常扫描。
+/// P2-A：v1 编码不是单射——两组不同的根数组可以编码出同一串字节，逐字节相等不能
+/// 证明配置相等。带着旧根数组签名的 operation 绝不能被升级成当前 scope 去扫新根。
+///
+/// 碰撞与任务给出的例子同形，只是把根放在 tempdir 下以便新 scope 里真的有文件：
+///   旧根 `[<P>/a, b,<P>/c]` 与当前根 `[<P>/a,b, <P>/c]`
+///   都编码成 `movie:2:<P>/a,b,<P>/c`。
 #[tokio::test]
-async fn legacy_signature_equal_to_current_legacy_encoding_is_upgraded() {
+async fn colliding_legacy_signature_never_adopts_current_scope() {
+    let fix = PresenceFixture::new();
+    let base = fix.dir.path().to_string_lossy().to_string();
+    // 当前（新）配置：第二个根路径自身含逗号，v1 的逗号拼接无法唯一还原。
+    let comma_root = format!("{base}/a,b");
+    let plain_root = format!("{base}/c");
+    std::fs::create_dir_all(&comma_root).unwrap();
+    std::fs::create_dir_all(&plain_root).unwrap();
+    // 新 scope 里放真实文件：修复前会被登记进台账，这正是必须为 0 的行。
+    std::fs::write(format!("{comma_root}/Movie Comma (2024).mkv"), b"1").unwrap();
+    std::fs::write(format!("{plain_root}/Movie Plain (2024).mkv"), b"2").unwrap();
+    {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .update_library(
+                &fix.library_id,
+                None,
+                Some(&[comma_root.as_str(), plain_root.as_str()]),
+                None,
+            )
+            .unwrap();
+    }
+
+    // 旧配置的根数组：只留在遗留 operation 的签名里，配置里已经不存在。
+    let old_roots = [format!("{base}/a"), format!("b,{base}/c")];
+    let legacy = format!("movie:{}:{}", old_roots.len(), old_roots.join(","));
+    assert_eq!(
+        legacy,
+        fix.legacy_scope_signature(),
+        "测试前提：旧根数组与当前根数组的 v1 编码逐字节碰撞"
+    );
+    assert_ne!(legacy, fix.scope_signature(), "测试前提：遗留签名仍是旧编码");
+
+    let op = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .enqueue_scan(&fix.library_id, &legacy, &[], 1000)
+            .unwrap()
+    };
+
+    fix.state.scan_coordinator.trigger_next(&fix.state);
+    let done = fix.wait_scan_terminal_op(&op.id).await;
+    assert_eq!(
+        done.status,
+        store::ScanOperationStatus::Cancelled,
+        "碰撞的遗留签名无法证明等价，必须取消而不是扫当前 scope: {}",
+        done.report
+    );
+    assert_eq!(done.report["error"], "library.scope_changed");
+    assert!(
+        done.report["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("not provably equivalent")),
+        "取消原因必须说明旧编码无法证明等价: {}",
+        done.report
+    );
+    assert_eq!(
+        done.scope_signature, legacy,
+        "取消时不得把持久化签名改写成当前 scope"
+    );
+    assert!(
+        fix.state.store().lock().list_ledger().unwrap().is_empty(),
+        "取消的 operation 不得把当前 scope 的文件登记进台账"
+    );
+}
+
+/// P2-A：旧编码有歧义（根路径含逗号）时，即使**逐字节等于**当前配置重新编码出的旧格式，
+/// 也无法证明这行来自同一配置——必须取消，绝不升级成当前 scope。
+#[tokio::test]
+async fn ambiguous_legacy_signature_equal_to_current_encoding_is_cancelled() {
     let fix = PresenceFixture::new();
     // 第二个根路径带逗号：v1 的逗号拼接无法唯一还原（`split(',')` 段数多于 count）。
     let comma_root = fix.dir.path().join("movies,alt");
@@ -339,20 +420,22 @@ async fn legacy_signature_equal_to_current_legacy_encoding_is_upgraded() {
     let done = fix.wait_scan_terminal_op(&op.id).await;
     assert_eq!(
         done.status,
-        store::ScanOperationStatus::Completed,
-        "可证明等价的旧编码必须保留扫描意图: {}",
+        store::ScanOperationStatus::Cancelled,
+        "无法唯一还原的旧编码必须取消，不能升级成当前 scope: {}",
         done.report
     );
-    assert_eq!(done.scope_signature, current, "旧编码必须被就地升级");
+    assert_eq!(done.report["error"], "library.scope_changed");
     assert!(
-        done.report["signature_upgrade"].is_string(),
-        "升级必须留下显式原因: {}",
+        done.report["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("not provably equivalent")),
+        "取消原因必须说明旧编码无法证明等价: {}",
         done.report
     );
-    assert_eq!(
-        fix.state.store().lock().list_ledger().unwrap().len(),
-        2,
-        "升级后按当前配置扫描，两个根的文件都要入账"
+    assert_eq!(done.scope_signature, legacy, "取消时不得改写签名");
+    assert!(
+        fix.state.store().lock().list_ledger().unwrap().is_empty(),
+        "取消的 operation 不得登记任何文件"
     );
 }
 
