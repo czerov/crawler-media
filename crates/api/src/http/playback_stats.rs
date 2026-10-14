@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use crate::http::playback::media_target_json;
 use crate::http::playback_logs::{member_filter, member_name, visible_media_ids};
 use crate::http::{err, ok};
-use crate::job_loop::unix_now;
 use crate::management::ApiState;
 use crate::store::{WatchDay, WatchMedia, WatchReport, WatchTotals};
 
@@ -41,7 +40,9 @@ pub(crate) async fn watch_stats(
             "tz_offset 超出 ±1440 分钟",
         );
     }
-    let now = unix_now();
+    // 窗口基准走注入时钟；`playback_watch_report` 的 `now` 与窗口是**秒**
+    // （窗口 = days * 86_400 秒）。
+    let now = state.playback_clock.now_ms() / 1000;
     let store = state.store.lock();
     let admin = store
         .user_role(user_id)

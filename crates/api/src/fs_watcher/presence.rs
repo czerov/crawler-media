@@ -9,7 +9,7 @@ use store::{
     LibraryPathScope, StrictOwner,
 };
 
-use crate::library_presence::PresenceError;
+use crate::library_presence::{PresenceError, PresencePublishError, publish_presence};
 use crate::management::ApiState;
 
 fn collect_event_observations(
@@ -101,19 +101,19 @@ fn publish_event_observations(
             }
         };
 
-        let sub_res = lease.publish(|| {
+        let sub_res = publish_presence(&lease, || {
             let store_arc = state.store();
             let guard = store_arc.lock();
-            let current_snapshot = guard.library_ownership().map_err(|e| e.to_string())?;
+            let current_snapshot = guard.library_ownership()?;
             if !current_snapshot.accepts_work(&lib_id) {
-                return Err("library is deleting".to_string());
+                return Err(PresencePublishError::LibraryDeleting);
             }
             if !scope.matches(&current_snapshot) {
-                return Err("scope changed".to_string());
+                return Err(PresencePublishError::ScopeChanged);
             }
             guard
                 .apply_ledger_presence(&observations, LedgerPresenceMode::Verify, now)
-                .map_err(|e| e.to_string())
+                .map_err(PresencePublishError::from)
         });
 
         match sub_res {
@@ -123,13 +123,13 @@ fn publish_event_observations(
                 total_result.deleted += res.deleted;
                 total_result.skipped += res.skipped;
             }
-            Err(err) => {
+            Err(error) => {
                 // 「library 正在删除 / scope 变化」是 watcher 的预期竞争：管理员冻结
                 // Library 时 watcher 可能正在发布旧观察，这不是故障，不能打成 ERROR。
-                if is_expected_presence_race(&err) {
-                    tracing::debug!(library_id = %lib_id, error = %err, "watcher presence 发布被生命周期/scope 变化取消");
+                if is_expected_presence_race(&error) {
+                    tracing::debug!(library_id = %lib_id, error = %error, "watcher presence 发布被生命周期/scope 变化取消");
                 } else {
-                    tracing::error!(library_id = %lib_id, error = %err, "发布 watcher presence 失败");
+                    tracing::error!(library_id = %lib_id, error = %error, "发布 watcher presence 失败");
                 }
             }
         }
@@ -138,13 +138,10 @@ fn publish_event_observations(
     total_result
 }
 
-/// 预期竞争（Library 冻结/删除、scope 换代）与真实故障的区分：
-/// 前者是生命周期管理的正常结果，只记 debug/warn，不打 ERROR。
-fn is_expected_presence_race(error: &str) -> bool {
-    error.contains("library is deleting")
-        || error.contains("scope changed")
-        || error.contains("Library work cancelled")
-        || error.contains("Library 正在删除或已不存在")
+/// 预期竞争（Library 冻结/删除、scope 换代、租约取消）与真实故障的区分：
+/// 按类型判定，不匹配文案 —— 改文案不会把真实故障变成"预期竞争"。
+fn is_expected_presence_race(error: &PresenceError) -> bool {
+    matches!(error, PresenceError::Deleting | PresenceError::ScopeChanged)
 }
 
 /// Observe a file event path and apply presence to matching active realtime libraries.
@@ -182,4 +179,22 @@ pub(crate) fn observe_event(
     }
 
     Ok(publish_event_observations(state, &scope, observations_by_lib))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真实 Store 故障即使文案里带 `scope changed`，也不能被当成预期竞争：
+    /// 旧实现按 `contains` 分类时，改一条错误文案就会把故障降级成 debug。
+    #[test]
+    fn store_failure_is_not_an_expected_race_even_when_text_looks_like_one() {
+        assert!(!is_expected_presence_race(&PresenceError::Store(
+            store::StoreError::Invalid("scope changed".into())
+        )));
+        assert!(!is_expected_presence_race(&PresenceError::Busy));
+        assert!(!is_expected_presence_race(&PresenceError::Missing));
+        assert!(is_expected_presence_race(&PresenceError::Deleting));
+        assert!(is_expected_presence_race(&PresenceError::ScopeChanged));
+    }
 }

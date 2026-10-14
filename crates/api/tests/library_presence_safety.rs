@@ -92,6 +92,69 @@ async fn frozen_or_deleted_library_rejects_presence_operations() {
     assert_eq!(res["error"]["code"], "library.deleting");
 }
 
+/// 在 `readable_root`（scope 已捕获、发布屏障尚未进入）里执行一次生命周期变更。
+fn install_root_hook<F>(fix: &PresenceFixture, action: F)
+where
+    F: Fn(&api::Store, &str) + Send + Sync + 'static,
+{
+    let store = fix.state.store();
+    let library_id = fix.library_id.clone();
+    let fired = AtomicBool::new(false);
+    *fix.mock_files.on_readable_root.lock() = Some(Box::new(move |_path| {
+        if fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        action(&store.lock(), &library_id);
+    }));
+}
+
+/// 发布屏障内的 scope 换代必须按类型判成 `ScopeChanged`（409
+/// `library.scope_changed`）。按文案分类的旧实现会把它落成伪造的 Store 故障
+/// （500 `internal_error`）：同一个生命周期竞争被当成真实故障。
+#[tokio::test]
+async fn scope_change_race_is_classified_as_scope_changed() {
+    let fix = PresenceFixture::new();
+    let (_media_id, row) = fix.insert_media_and_ledger("target.mkv");
+    // 第二个 Library 在 scope 捕获之后被冻结：`accepts_work` 集合换代，
+    // 目标 Library 本身仍然接受工作（不会被误判成 Deleting）。
+    let other_root = fix.dir.path().join("other");
+    std::fs::create_dir_all(&other_root).unwrap();
+    let other_id = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .create_library(
+                MediaKind::Movie,
+                "Other",
+                &[other_root.to_str().unwrap()],
+                "everyone",
+                true,
+                &[],
+            )
+            .unwrap()
+            .id
+    };
+    install_root_hook(&fix, move |store, _library_id| {
+        store.begin_library_removal(&other_id).unwrap();
+    });
+
+    let (status, res) = fix
+        .request(
+            "POST",
+            &format!("/api/v1/libraries/{}/verify", fix.library_id),
+            Some(&fix.admin_token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{res}");
+    assert_eq!(res["error"]["code"], "library.scope_changed");
+
+    // 竞争发生时屏障整体回滚：不写任何 presence 观察，也不动账本行。
+    let guard = fix.state.store();
+    let guard = guard.lock();
+    assert!(guard.missing_at_by_path().unwrap().is_empty());
+    assert!(guard.get_ledger(&row.id.to_string()).unwrap().is_some());
+}
+
 #[tokio::test]
 async fn prune_with_permission_denied_on_recheck_skips_and_preserves_ledger() {
     let fix = PresenceFixture::new();

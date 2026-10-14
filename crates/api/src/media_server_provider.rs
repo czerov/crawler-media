@@ -563,7 +563,8 @@ impl MediaServerProvider for ApiServerProvider {
         let Some((media_id, season, episode)) = resolve_mark_unit(&store, user_id, id) else {
             return Ok(false);
         };
-        let now = crate::job_loop::unix_now();
+        // 播放域时间走注入时钟；`playback_units.updated_at` 是**秒**。
+        let now = self.state.playback_clock.now_ms() / 1000;
         if played.is_none() {
             let Some(favorite) = favorite else {
                 return Ok(true);
@@ -617,7 +618,8 @@ impl MediaServerProvider for ApiServerProvider {
             .ok_or_else(|| format!("Playback item {id} missing or not visible"))?;
         use std::str::FromStr;
         let ledger_id = domain::LedgerId::from_str(&target.ledger_id).map_err(|e| e.to_string())?;
-        let now = crate::job_loop::unix_now();
+        // 播放域时间走注入时钟；`issue_play_session` 的 `issued_at` 是**秒**。
+        let now = self.state.playback_clock.now_ms() / 1000;
         let store = self.state.store.lock();
         store
             .issue_play_session(user_id, device_id, ledger_id, now)

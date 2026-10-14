@@ -34,6 +34,9 @@ mod walk;
 #[cfg(test)]
 mod hooks;
 
+#[cfg(test)]
+mod tests;
+
 use std::path::PathBuf;
 
 use axum::http::StatusCode;
@@ -46,7 +49,6 @@ use crate::scrape_store::ScrapeStoreExt;
 
 use super::library_by_id;
 use super::report::format_scan_report;
-use super::video::scan_video_library;
 use outcome::{ScanRun, failed_response};
 use scope::capture_and_verify_scope;
 use walk::ScanContext;
@@ -106,15 +108,8 @@ pub(crate) fn scan_library_leased_resumable(
     // 测试屏障：在「准入读到的配置」与「捕获 scope」之间执行一次（P2-4 / P3-1）。
     #[cfg(test)]
     test_scope_hook::run(op_id.unwrap_or_default());
-    if kind == domain::MediaKind::Video {
-        if !full_scope && !targets.is_empty() {
-            tracing::warn!(library_id = id, "Video Library 暂不支持增量目标扫描，按整库执行");
-        }
-        // Video 也必须在发布任何文件之前把捕获 scope 绑定到持久化 signature（P2-4）。
-        let scan_scope = capture_and_verify_scope(state, id, op_id)?;
-        return scan_video_library(state, &roots, lease, &scan_scope)
-            .map_err(|response| failed_response(response, "library.scan_video"));
-    }
+    // Video 与 Movie/TV 走同一条有界路径：同样的目标展开、chunk、取消与断点。
+    // Video 专属语义只在 chunk 内分叉（登记与封面，见 `video` / `walk`）。
     let starts = scan_starts(&roots, targets, full_scope);
     if starts.is_empty() {
         return Err(failed_response(

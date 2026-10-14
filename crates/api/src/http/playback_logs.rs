@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::http::{err, ok};
-use crate::job_loop::unix_now;
 use crate::management::ApiState;
 use crate::store::PlayLogRow;
 
@@ -137,7 +136,8 @@ pub(crate) async fn history(
         },
         None => None,
     };
-    let now = unix_now();
+    // `days` 窗口基准走注入时钟；`since` 是**秒**（`started_at >= since`）。
+    let now = state.playback_clock.now_ms() / 1000;
     let since = days.and_then(|d| d.checked_mul(86_400)).map(|secs| now.saturating_sub(secs));
     let store = state.store.lock();
     let admin = store

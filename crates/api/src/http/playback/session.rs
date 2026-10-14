@@ -45,10 +45,13 @@ pub(crate) async fn start_session(
     };
     let _ = crate::http::library::ensure_probe_enqueued(&state, &row);
     let device_id = body.get("device_id").and_then(|v| v.as_str()).unwrap_or("web-player");
+    // 播放域时间一律走注入时钟。`issue_play_session` 的 `issued_at` 是**秒**
+    // （Store 内部按 30 天秒数清理过期会话）。
+    let issued_at = state.playback_clock.now_ms() / 1000;
     let play_session_id = {
         let store = state.store.lock();
         store
-            .issue_play_session(user_id, device_id, row.id, crate::job_loop::unix_now())
+            .issue_play_session(user_id, device_id, row.id, issued_at)
             .ok()
     };
     tracing::info!(media_id = %media.id, file_id = %row.id, %user_id, start_ms, ?play_session_id, "Playback session selected");

@@ -1,5 +1,8 @@
 //! chunk 遍历与处理：过滤归属 → 入账 → 失效变化事实 → 身份解析 → 探测入队 → 记断点。
 //!
+//! Video 与 Movie/TV 共用同一条 chunk 路径，只有两处按 `kind` 分叉：登记
+//! （[`ScanContext::register_chunk`]）与身份解析（Video 无解析，只补封面）。
+//!
 //! 锁纪律（B3 §2）：文件版本事实在 Store 锁外采集，锁内只做短 DB 读写与内存判断。
 
 use std::collections::HashMap;
@@ -12,6 +15,7 @@ use crate::http::err;
 use crate::http::library::enqueue_probes_for_paths;
 use crate::management::ApiState;
 
+use super::super::video::attach_video_artwork;
 use super::checkpoint::{checkpoint_fresh, invalidate_changed_facts};
 #[cfg(test)]
 use super::hooks::test_metadata_hook;
@@ -187,7 +191,7 @@ impl ScanContext<'_> {
                 self.scan_scope
                     .validate(&store)
                     .map_err(|e| format!("{e:?}"))?;
-                crate::watch_ledger::record_paths(&store, filtered.clone())
+                self.register_chunk(&store, &filtered)
             })
             .map_err(publish_failure)?;
         // 版本变化的文件：派生探测事实必须失效，并按 durable obligation 合同重排探测。
@@ -203,7 +207,6 @@ impl ScanContext<'_> {
             .cloned()
             .collect();
         let affected = invalidate_changed_facts(self.state, &changed_in_scope);
-        let scan_media = scan_media_for(self.state, &filtered);
         // 到这里 ledger 已提交：任何后续失败都必须把这段前缀带回调用方（P3-3）。
         let committed = ChunkTotals {
             scanned,
@@ -218,17 +221,42 @@ impl ScanContext<'_> {
                 totals: committed,
             });
         }
-        resolve_scan_metadata(self.state, self.id, self.lease, scan_media, &inserted, self.scrape)
-            .map_err(|response| ChunkError {
-                response,
-                error: "library.scan_metadata".to_string(),
-                totals: committed,
-            })?;
-        let mut probe_paths = inserted.clone();
-        probe_paths.extend(affected);
-        enqueue_probes_for_paths(self.state, probe_paths);
+        // 本 chunk 真正处理过的文件：新增/恢复 + 版本变化。
+        let mut processed_paths = inserted.clone();
+        processed_paths.extend(affected);
+        if self.kind == domain::MediaKind::Video {
+            // Video 没有身份解析/刮削阶段：登记即完成，只补封面。旧路径对每个处理过
+            // 的文件都附着 poster/backdrop，这里沿用（断点跳过的未变化文件不重复）。
+            attach_video_artwork(self.state, &processed_paths, self.lease.control());
+        } else {
+            let scan_media = scan_media_for(self.state, &filtered);
+            resolve_scan_metadata(self.state, self.id, self.lease, scan_media, &inserted, self.scrape)
+                .map_err(|response| ChunkError {
+                    response,
+                    error: "library.scan_metadata".to_string(),
+                    totals: committed,
+                })?;
+        }
+        enqueue_probes_for_paths(self.state, processed_paths);
         self.record_seen(&filtered, stamps);
         Ok(committed)
+    }
+
+    /// 按库类型登记 chunk：Video 走「每个视频文件一个 Media」，Movie/TV 走 Release
+    /// 识别 + NFO 身份。两条路径都只登记，不做识别（识别在 `process_chunk` 后半段）。
+    fn register_chunk(
+        &self,
+        store: &crate::Store,
+        filtered: &[library::TransferredFile],
+    ) -> Result<Vec<PathBuf>, String> {
+        if self.kind == domain::MediaKind::Video {
+            crate::watch_ledger::record_video_paths(
+                store,
+                filtered.iter().map(|file| file.path.clone()),
+            )
+        } else {
+            crate::watch_ledger::record_paths(store, filtered.to_vec())
+        }
     }
 
     /// 把处理完成的路径写进本 operation 的 `scan_seen` 断点（复用锁外采集的版本事实）。

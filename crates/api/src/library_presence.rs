@@ -69,6 +69,99 @@ impl From<StoreError> for PresenceError {
     }
 }
 
+impl std::fmt::Display for PresenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("library not found"),
+            Self::Deleting => f.write_str("library is deleting"),
+            Self::Ambiguous => f.write_str("library ownership is ambiguous"),
+            Self::RootUnavailable => f.write_str("library root is unavailable"),
+            Self::ScopeChanged => f.write_str("library scope changed"),
+            Self::Busy => f.write_str("system is currently busy"),
+            Self::Store(error) => write!(f, "store: {error}"),
+        }
+    }
+}
+
+/// Failure inside the presence publication barrier, typed **at the source that
+/// produces it**.
+///
+/// Lifecycle races are classified by variant; the rendered text exists for logs
+/// and user-visible messages only and must never drive classification.
+#[derive(Debug)]
+pub(crate) enum PresencePublishError {
+    /// The Library is frozen for removal (or already gone).
+    LibraryDeleting,
+    /// The captured scope no longer matches the persisted ownership snapshot.
+    ScopeChanged,
+    /// Cooperative cancellation of the Library work lease.
+    Cancelled,
+    /// Store failure while applying the presence transaction.
+    Store(StoreError),
+}
+
+impl From<StoreError> for PresencePublishError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl std::fmt::Display for PresencePublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 用户可见文案保持原样：发布闭包过去直接返回这些字符串。
+        match self {
+            Self::LibraryDeleting => f.write_str("library is deleting"),
+            Self::ScopeChanged => f.write_str("library scope changed"),
+            Self::Cancelled => f.write_str("Library work cancelled"),
+            Self::Store(error) => write!(f, "store: {error}"),
+        }
+    }
+}
+
+/// Map a typed barrier failure onto the caller-facing [`PresenceError`].
+///
+/// Deliberately never inspects the rendered message: a store failure whose text
+/// happens to contain `"library is deleting"` stays a store failure.
+fn classify_publish_failure(error: PresencePublishError) -> PresenceError {
+    match error {
+        PresencePublishError::LibraryDeleting => PresenceError::Deleting,
+        // 租约被取消同样意味着该 Library 已冻结/正在删除。
+        PresencePublishError::Cancelled => PresenceError::Deleting,
+        PresencePublishError::ScopeChanged => PresenceError::ScopeChanged,
+        PresencePublishError::Store(error) => PresenceError::Store(error),
+    }
+}
+
+/// Run the publication barrier and classify its failure by type.
+///
+/// `LibraryWorkLease::publish` (and the `marker::WorkControl` under it) only
+/// speak `String`, and they can reject *before* the closure runs. The closure's
+/// typed error is therefore captured on the side, and a lease-level rejection is
+/// recognised from the lease's own cancellation flag — never by matching text.
+pub(crate) fn publish_presence<T>(
+    lease: &crate::library_lifecycle::LibraryWorkLease,
+    publish: impl FnOnce() -> Result<T, PresencePublishError>,
+) -> Result<T, PresenceError> {
+    let mut typed: Option<PresencePublishError> = None;
+    let outcome = lease.publish(|| match publish() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let text = error.to_string();
+            typed = Some(error);
+            Err(text)
+        }
+    });
+    outcome.map_err(|text| match typed {
+        Some(error) => classify_publish_failure(error),
+        // 闭包没跑：租约包装层的取消没有类型可用，读它自己的取消标志。
+        None if lease.control().is_cancelled() => {
+            classify_publish_failure(PresencePublishError::Cancelled)
+        }
+        // 既没跑闭包、又没有取消标志（例如发布闸门 poison）：真实故障，保持 500。
+        None => PresenceError::Store(StoreError::Invalid(text)),
+    })
+}
+
 pub(crate) fn verify(
     state: &ApiState,
     library_id: &str,
@@ -238,28 +331,72 @@ fn reconcile_presence(
     };
 
     // 4. In publication barrier, check scope matches and apply presence in a single Immediate transaction.
-    lease.publish(|| {
+    //    失败按 `PresencePublishError` 的类型分类，不再匹配错误文案。
+    publish_presence(&lease, || {
         let guard = state.store.lock();
-        let current_snapshot = guard.library_ownership().map_err(|e| e.to_string())?;
+        let current_snapshot = guard.library_ownership()?;
         if !current_snapshot.accepts_work(library_id) {
-            return Err("library is deleting".to_string());
+            return Err(PresencePublishError::LibraryDeleting);
         }
         if !candidate_scope.matches(&current_snapshot) {
-            return Err("library scope changed".to_string());
+            return Err(PresencePublishError::ScopeChanged);
         }
 
         let now = crate::job_loop::unix_now();
         guard
             .apply_ledger_presence(&observations, mode, now)
-            .map_err(|e| format!("store: {}", e))
+            .map_err(PresencePublishError::from)
     })
-    .map_err(|err_str| {
-        if err_str.contains("library is deleting") {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 分类只看类型：Store 故障即使文案里出现 `library is deleting`，也不能被
+    /// 当成生命周期竞争 —— 旧实现正是 `err_str.contains("library is deleting")`。
+    #[test]
+    fn publish_failure_is_classified_by_variant_not_message() {
+        let disguised =
+            PresencePublishError::Store(StoreError::Invalid("library is deleting".to_string()));
+        assert!(matches!(
+            classify_publish_failure(disguised),
+            PresenceError::Store(_)
+        ));
+        assert!(matches!(
+            classify_publish_failure(PresencePublishError::ScopeChanged),
+            PresenceError::ScopeChanged
+        ));
+        assert!(matches!(
+            classify_publish_failure(PresencePublishError::LibraryDeleting),
             PresenceError::Deleting
-        } else {
-            PresenceError::Store(StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(
-                Box::new(std::io::Error::other(err_str)),
-            )))
-        }
-    })
+        ));
+        // 租约取消 = Library 已冻结/正在删除。
+        assert!(matches!(
+            classify_publish_failure(PresencePublishError::Cancelled),
+            PresenceError::Deleting
+        ));
+    }
+
+    /// 发布闭包看到的文案保持原样（用户可见消息不变）。
+    #[test]
+    fn publish_failure_messages_are_unchanged() {
+        assert_eq!(
+            PresencePublishError::LibraryDeleting.to_string(),
+            "library is deleting"
+        );
+        assert_eq!(
+            PresencePublishError::ScopeChanged.to_string(),
+            "library scope changed"
+        );
+        assert_eq!(
+            PresencePublishError::Cancelled.to_string(),
+            "Library work cancelled"
+        );
+        assert!(
+            PresencePublishError::Store(StoreError::Invalid("boom".into()))
+                .to_string()
+                .starts_with("store: ")
+        );
+    }
 }

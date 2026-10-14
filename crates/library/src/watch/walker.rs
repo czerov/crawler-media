@@ -132,22 +132,9 @@ impl ScanWalker {
                             } else if meta.is_dir() {
                                 self.dir_stack.push(path);
                             } else if meta.is_file() {
-                                if is_video_file(&path) {
-                                    let (parsed, nfo_identity) =
-                                        identify(&path, &self.roots, self.kind);
-                                    // 与递归 in-place 扫描一致：文件名解析置信度低时不入账，
-                                    // 不能靠猜把 Unidentified 文件塞进 Library。
-                                    if parsed.confidence == Confidence::Low {
-                                        skipped += 1;
-                                    } else {
-                                        files.push(TransferredFile {
-                                            path,
-                                            identified_release: Some(parsed),
-                                            nfo_identity,
-                                        });
-                                    }
-                                } else {
-                                    skipped += 1;
+                                match file_entry(path, &self.roots, self.kind) {
+                                    Some(file) => files.push(file),
+                                    None => skipped += 1,
                                 }
                             }
                         }
@@ -178,6 +165,30 @@ impl ScanWalker {
             self.current_entries = None;
         }
     }
+}
+
+/// 一个普通文件 → 入账条目；`None` 表示按本库语义跳过。
+///
+/// Video（「其他」库）不做文件名识别、也不按解析置信度丢弃：每个视频文件都是
+/// 一个独立条目（标题 = 文件名主干，由登记层决定）。Movie/TV 沿用识别 + NFO
+/// 身份；置信度低时不入账，不靠猜把 Unidentified 文件塞进 Library。
+fn file_entry(path: PathBuf, roots: &[PathBuf], kind: MediaKind) -> Option<TransferredFile> {
+    if !is_video_file(&path) {
+        return None;
+    }
+    if kind == MediaKind::Video {
+        return Some(TransferredFile {
+            path,
+            identified_release: None,
+            nfo_identity: None,
+        });
+    }
+    let (parsed, nfo_identity) = identify(&path, roots, kind);
+    (parsed.confidence != Confidence::Low).then(|| TransferredFile {
+        path,
+        identified_release: Some(parsed),
+        nfo_identity,
+    })
 }
 
 /// `path` 所属的库根：取最长的前缀匹配，避免嵌套根互相抢占。

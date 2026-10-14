@@ -173,13 +173,10 @@ async fn beat(
     .await
 }
 
-/// 直接写一条 8 天前的完结播放日志，用来覆盖统计的 retention 边界。
-fn seed_old_playback_log(tmp: &tempfile::TempDir, media_id: &str) {
+/// 直接写一条完结播放日志（`started_at`/`ended_at` 为 unix 秒），
+/// 用来覆盖统计/历史的窗口边界。
+fn seed_playback_log(tmp: &tempfile::TempDir, media_id: &str, started_at: i64, ended_at: i64) {
     let conn = rusqlite::Connection::open(tmp.path().join("data/subscribe.db")).unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
     conn.execute(
         "INSERT INTO playback_logs (id, user_id, media_id, started_at, ended_at, watched_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -187,12 +184,21 @@ fn seed_old_playback_log(tmp: &tempfile::TempDir, media_id: &str) {
             uuid::Uuid::new_v4().to_string(),
             "00000000-0000-0000-0000-000000000001",
             media_id,
-            now - 8 * 86_400,
-            now - 8 * 86_400 + 60,
+            started_at,
+            ended_at,
             30_000
         ],
     )
     .unwrap();
+}
+
+/// 8 天前的完结日志：真实时钟下落在 7 天窗口外，只进 previous 窗口。
+fn seed_old_playback_log(tmp: &tempfile::TempDir, media_id: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    seed_playback_log(tmp, media_id, now - 8 * 86_400, now - 8 * 86_400 + 60);
 }
 
 #[tokio::test]
@@ -741,6 +747,94 @@ async fn stats_aggregate_and_policy_round_trip() {
 
 #[path = "playback_subtitles.rs"]
 mod subtitles;
+
+/// `POST /playback/sessions` 的签发时间必须来自注入时钟（秒）。
+///
+/// 假时钟比真实时钟慢 1 小时：任一回退到 `unix_now()` 都会让落库的
+/// `issued_at` 与注入时钟相差 3600 秒。
+#[tokio::test]
+async fn session_issue_uses_injected_clock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base_ms = (api::job_loop::unix_now() - 3_600) * 1000;
+    let clock = Arc::new(FakePlaybackClock(std::sync::atomic::AtomicI64::new(base_ms)));
+    let fetcher = Arc::new(Fixtures {
+        requests: Mutex::new(Vec::new()),
+        bodies: HashMap::new(),
+    });
+    let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("stage")));
+    let st = state(tmp.path(), fetcher, downloader);
+    let app = router(st.clone().with_playback_clock(clock.clone()));
+    let media_id = seed_movie(&app, &tmp).await;
+
+    let response = post_async(
+        &app,
+        "/api/v1/playback/sessions",
+        json!({ "media_item_id": media_id, "device_id": "clock-device" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let session_id = body["data"]["play_session_id"]
+        .as_str()
+        .expect("会话必须签发 play_session_id")
+        .to_string();
+
+    let store = st.store();
+    let user = {
+        let guard = store.lock();
+        guard
+            .user_by_token("management-secret")
+            .unwrap()
+            .unwrap()
+            .id
+    };
+    let binding = store
+        .lock()
+        .play_session_binding(user, "clock-device", &session_id)
+        .unwrap()
+        .expect("签发的会话必须落库");
+    assert_eq!(
+        binding.issued_at,
+        base_ms / 1000,
+        "会话签发时间必须来自注入时钟（秒）"
+    );
+}
+
+/// 统计/历史的窗口起点必须来自注入时钟（秒）。
+///
+/// 假时钟比真实时钟快 40 天：真实时钟下两条日志都落在 7 天窗口内（未来时间
+/// 无上界），注入时钟下只有靠近假时钟的那条在内。断言 1 而非 2 即区分两者。
+#[tokio::test]
+async fn stats_and_history_windows_follow_injected_clock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real_now = api::job_loop::unix_now();
+    let base_ms = (real_now + 40 * 86_400) * 1000;
+    let clock = Arc::new(FakePlaybackClock(std::sync::atomic::AtomicI64::new(base_ms)));
+    let fetcher = Arc::new(Fixtures {
+        requests: Mutex::new(Vec::new()),
+        bodies: HashMap::new(),
+    });
+    let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("stage")));
+    let app = router(state(tmp.path(), fetcher, downloader).with_playback_clock(clock.clone()));
+    let media_id = seed_movie(&app, &tmp).await;
+
+    let base_secs = base_ms / 1000;
+    seed_playback_log(&tmp, &media_id, real_now, real_now + 60);
+    seed_playback_log(&tmp, &media_id, base_secs - 60, base_secs);
+
+    let stats = get_data(&app, "/api/v1/playback/stats/watch?days=7").await;
+    assert_eq!(
+        stats["current"]["plays"], 1,
+        "统计当前窗口必须以注入时钟为起点: {stats}"
+    );
+
+    let history = get_data(&app, "/api/v1/playback/history?days=7").await;
+    assert_eq!(
+        history["entries"].as_array().unwrap().len(),
+        1,
+        "历史 days 过滤必须以注入时钟为起点: {history}"
+    );
+}
 
 /// 注入的 `PlaybackClock` 必须按毫秒落库：心跳路径不得把 `last_report_at_ms`
 /// 量化回整秒（B3 复核：`now * 1000` 会丢掉亚秒精度）。

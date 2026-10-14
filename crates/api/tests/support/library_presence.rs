@@ -28,14 +28,26 @@ impl downloader::Downloader for MemoryDownloader {
     }
 }
 
+type RootReadHook = Box<dyn Fn(&Path) + Send + Sync>;
+
 #[derive(Default)]
 pub struct MockLibraryFiles {
     pub unreadable_roots: Mutex<Vec<PathBuf>>,
     pub files: Mutex<std::collections::HashMap<PathBuf, Result<bool, std::io::ErrorKind>>>,
+    /// 可选钩子：在 `readable_root` 内执行（此时调用方不持任何 Store 锁）。
+    ///
+    /// 存在的理由：verify/prune 在「捕获 scope」与「发布屏障」之间会读一次根目录，
+    /// 测试需要在那个窗口里注入 Library 生命周期变化，才能确定性地触发发布竞争。
+    pub on_readable_root: Mutex<Option<RootReadHook>>,
 }
 
 impl LibraryFileRead for MockLibraryFiles {
     fn readable_root(&self, path: &Path) -> std::io::Result<()> {
+        let hook = self.on_readable_root.lock();
+        if let Some(hook) = hook.as_ref() {
+            hook(path);
+        }
+        drop(hook);
         let unreadable = self.unreadable_roots.lock();
         if unreadable.iter().any(|u| u == path) {
             return Err(std::io::Error::new(
