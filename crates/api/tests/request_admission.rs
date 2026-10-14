@@ -62,8 +62,8 @@ async fn site_over_capacity_degrades_to_per_site_failure() {
     let error = sites[0]["error"].as_str().unwrap_or_default();
     assert!(!error.is_empty(), "超预算站点必须报告失败原因: {body}");
     assert!(
-        error.contains("capacity"),
-        "失败原因应说明预算耗尽: {error}"
+        error.contains("并发"),
+        "用户可见的失败原因必须是可读中文（web/lib/api/search.ts 契约）: {error}"
     );
     assert!(body["data"]["items"].as_array().unwrap().is_empty());
 
@@ -79,6 +79,110 @@ async fn site_over_capacity_degrades_to_per_site_failure() {
     assert!(
         held_sites.iter().all(|site| site["error"].is_null()),
         "获得 permit 的站点不应报错: {held_body}"
+    );
+}
+
+/// 单个请求里站点数超过并发预算时，多出来的站点必须排队补位，而不是被本请求
+/// 自己的预算判成过载饿死（P1：搜索 fanout 自饥饿）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sites_beyond_the_window_are_still_searched_in_one_request() {
+    let fix = SearchAdmissionFixture::new(6);
+    let _release = ReleaseOnDrop(fix.fetcher.clone());
+    let app = fix.app();
+    let token = fix.admin_token.clone();
+    let handle = tokio::spawn(async move {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/search/torrents?keyword=matrix")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(request).await.unwrap()
+    });
+    assert!(
+        fix.fetcher.wait_started(4, Duration::from_secs(5)).await,
+        "窗口内的 4 个站点应先开始"
+    );
+    // 放行：前 4 个完成后，剩下 2 个必须补位；旧实现此时已把它们判成过载。
+    fix.fetcher.release();
+    let response = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("窗口补位不得让整请求挂起")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let sites = body["data"]["sites"].as_array().unwrap();
+    assert_eq!(
+        sites.len(),
+        6,
+        "每个启用站点都必须出现在 sites 报告里: {body}"
+    );
+    let failed: Vec<&str> = sites
+        .iter()
+        .filter_map(|site| site["error"].as_str())
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "同一请求内的站点不得互相饿死（旧实现只有前 4 个能搜）: {failed:?}"
+    );
+    assert_eq!(
+        fix.fetcher.started().len(),
+        6,
+        "6 个站点都必须真的发起过抓取: {:?}",
+        fix.fetcher.started()
+    );
+}
+
+/// SSE 客户端断开后，历史条目与快照必须成对：历史里有条目就必须能回放，
+/// 不能留下点开就 404 的死链（P2-1）。前端在换关键词/卸载时会正常 abort。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborted_stream_leaves_no_orphan_history_entry() {
+    let fix = SearchAdmissionFixture::new(2);
+    let _release = ReleaseOnDrop(fix.fetcher.clone());
+
+    let response = fix
+        .send("/api/v1/search/torrents/stream?keyword=matrix&save_history=true")
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        fix.fetcher.wait_started(2, Duration::from_secs(5)).await,
+        "两个站点都应在窗口内开始"
+    );
+    // 客户端中断：响应 body 被丢弃 → rx 关闭。
+    drop(response);
+    fix.fetcher.release();
+
+    // 服务端收尾后才会出现历史条目（快照先落盘、历史条目后写）。
+    let mut history_id = None;
+    for _ in 0..100 {
+        let history = fix.send("/api/v1/search/history").await;
+        let body = json_body(history).await;
+        if let Some(id) = body["data"]["items"]
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item["id"].as_str())
+        {
+            history_id = Some(id.to_string());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let Some(id) = history_id else {
+        panic!("被中断的流式搜索也应留下可回放的历史条目，而不是只留下关键词");
+    };
+
+    let snapshot = fix
+        .send(&format!("/api/v1/search/history/{id}?vertical=torrents"))
+        .await;
+    assert_ne!(
+        snapshot.status(),
+        StatusCode::NOT_FOUND,
+        "历史里有条目就必须能取到快照（不能是 404 死链）"
+    );
+    let body = json_body(snapshot).await;
+    assert_eq!(
+        body["data"]["partial"], true,
+        "客户端中断时落盘的快照必须标记为半截结果: {body}"
     );
 }
 

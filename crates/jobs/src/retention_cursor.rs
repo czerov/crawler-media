@@ -147,10 +147,19 @@ pub fn prune_terminal_window(
     let scanned = window_rows.len();
 
     let (candidates, protected, deleted) = process_window_deletion(&tx, &window_rows, dry_run)?;
-    let cycle_complete = !window_has_more && window_rows.is_empty();
+    // 窗口未满即说明这个 keyset 范围内已经没有更多候选：cycle 到此结束，清游标。
+    // 旧实现只在**下一个空窗口**才结束 cycle，每个 cycle 都会多空跑一次。
+    let cycle_complete = !window_has_more;
 
     if !dry_run {
-        if let Some(last) = window_rows.last() {
+        if cycle_complete {
+            // cycle 结束：清游标，下一轮从新 cutoff 从头检查新超龄/迟到插入，
+            // 不需要再空跑一个空窗口来收尾。
+            tx.execute(
+                "DELETE FROM retention_cursors WHERE def_id = ?1",
+                params![cursor_key],
+            )?;
+        } else if let Some(last) = window_rows.last() {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -159,11 +168,6 @@ pub fn prune_terminal_window(
                 "INSERT OR REPLACE INTO retention_cursors (def_id, cutoff, finished_at, last_rowid, cycle_started_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![cursor_key, active_cutoff, last.finished_at, last.rowid, now],
-            )?;
-        } else if cycle_complete {
-            tx.execute(
-                "DELETE FROM retention_cursors WHERE def_id = ?1",
-                params![cursor_key],
             )?;
         }
     }

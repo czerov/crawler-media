@@ -179,8 +179,57 @@ async fn progress_persistence_failure_is_returned_to_the_client() {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
-pub(super) async fn items_for(app: &axum::Router, token: &str) -> Value {
-    let response = app
+/// 管理员结束会话后，即使会话随后被清理（sweep 关闭并写日志），
+/// 迟到的 Progress 也不得把会话复活；只有客户端显式重新起播才可以。
+#[tokio::test]
+async fn admin_ended_session_is_not_resurrected_by_a_late_progress_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let now = now_secs();
+    let clock = Arc::new(FakeClock(std::sync::atomic::AtomicI64::new(now * 1000)));
+    let (app, _, item_id) = app_with_clock(tmp.path(), clock.clone());
+    let user_id = domain::UserId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+
+    assert_eq!(
+        post_session_event(&app, "/Sessions/Playing", &item_id, 10_000_000).await,
+        StatusCode::NO_CONTENT
+    );
+
+    // 管理员在 web 管理接口结束该设备会话。
+    let ended = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/playback/activity/sessions/infuse-bedroom/end?user_id={user_id}"
+                ))
+                .header("authorization", "Bearer admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ended.status(), StatusCode::OK);
+
+    // 会话随后被清理（等价于 sweep 关闭并写 admin_ended=1 的播放日志）。
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    store.close_session(user_id, "infuse-bedroom", now + 1).unwrap();
+    assert!(store.active_sessions(now + 1, 60).unwrap().is_empty());
+
+    // 迟到 progress：不得复活会话。
+    clock.0.store((now + 2) * 1000, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        post_session_event(&app, "/Sessions/Playing/Progress", &item_id, 30_000_000).await,
+        StatusCode::NO_CONTENT
+    );
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    assert!(
+        store.active_sessions(now + 2, 60).unwrap().is_empty(),
+        "管理员已结束的会话不得被迟到的 progress 复活"
+    );
+}
+
+pub(super) async fn items_for(app: &axum::Router, token: &str) -> Value {    let response = app
         .clone()
         .oneshot(
             Request::builder()

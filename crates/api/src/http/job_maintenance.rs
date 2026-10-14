@@ -204,23 +204,26 @@ pub(crate) async fn preview_maintenance(
                 MaintenancePolicy::Jobs(policy) => {
                     let cutoff = cutoff(now, policy.retention_days)
                         .map_err(|e| (StatusCode::BAD_REQUEST, "job.invalid_config", e))?;
-                    let batch = state_for_blocking
+                    // 预览必须与实跑同口径：都走「原始窗口（含保护行）+ keyset 游标」，
+                    // 只是 dry_run 不写游标、不删行。旧实现用 `prune_terminal_jobs`
+                    // 的过滤窗口，同一个数据会给出与实跑不同的候选/保护数字。
+                    let cursor_key = def.id.to_string();
+                    let window = state_for_blocking
                         .jobs
                         .lock()
-                        .prune_terminal_jobs(cutoff, BATCH_SIZE, true)
+                        .prune_terminal_window(&cursor_key, cutoff, BATCH_SIZE, true)
                         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "job.preview_failed", e.to_string()))?;
-                    let truncated = batch.has_more || batch.protected_truncated;
                     Ok(json!({
                         "kind": def.kind.as_str(),
                         "policy_version": policy.version,
                         "retention_days": policy.retention_days,
                         "cutoff": cutoff,
-                        "scanned": batch.scanned,
-                        "candidates": batch.candidates,
-                        "protected": batch.protected,
-                        "protected_truncated": batch.protected_truncated,
-                        "truncated": truncated,
-                        "note": "只读预览：只统计服务端固定预算窗口内的候选，不执行任何删除。",
+                        "scanned": window.scanned,
+                        "candidates": window.candidates,
+                        "protected": window.protected,
+                        "protected_truncated": window.window_has_more,
+                        "truncated": window.window_has_more,
+                        "note": "只读预览：只统计一个原始窗口（含受保护行）内的行数，不写游标、不执行任何删除。",
                     }))
                 }
                 MaintenancePolicy::PlaybackHistory(policy) => {

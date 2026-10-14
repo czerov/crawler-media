@@ -31,6 +31,10 @@ pub const MAINTENANCE_TIMEOUT_SECS: u32 = 900;
 pub const BATCH_SIZE: usize = 500;
 pub const MAX_BATCHES: usize = 20;
 
+/// B3 §5.1：单次 retention「最多 20 批或 2 秒（先到先停）」。单条 SQL 步不可
+/// 中断，所以时间预算只在批间判定，日志区分预算与实际 elapsed。
+pub const MAX_BATCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// VACUUM 准入阈值（固定，不可配置）：冷却、空闲空间、空闲页比例。
 pub const VACUUM_MIN_INTERVAL_SECS: u64 = 604_800;
 pub const VACUUM_MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;

@@ -459,6 +459,20 @@ impl Store {
         Ok(active)
     }
 
+    /// 这个台账行是否**曾经**被排入 probe（不区分当前状态）。
+    ///
+    /// `is_probe_queued` 只反映"此刻是否仍在队列里"，探测 worker 可能在调用方
+    /// 观察之前就把它跑完；需要断言"扫描确实登记了探测"时用这个，避免把调度
+    /// 时序当成业务结果。
+    pub fn probe_unit_recorded_for_ledger(&self, ledger_id: &str) -> Result<bool, StoreError> {
+        let recorded = self.library.query_row(
+            "SELECT EXISTS(SELECT 1 FROM probe_job_units WHERE ledger_id = ?1)",
+            [ledger_id],
+            |row| row.get(0),
+        )?;
+        Ok(recorded)
+    }
+
     pub fn active_probe_unit_for_ledger(
         &self,
         ledger_id: &str,

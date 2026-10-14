@@ -115,7 +115,12 @@ async fn public_scan_recovers_existing_media_from_local_work_alias() {
         std::fs::read(root.join("fanart.jpg")).unwrap(),
         b"local-fanart"
     );
-    assert!(store.is_probe_queued(&row.id.to_string()).unwrap());
+    // probe worker 可能已经把这个 unit 跑完，所以断言"登记过 probe"而非"此刻仍在队列"。
+    assert!(
+        store
+            .probe_unit_recorded_for_ledger(&row.id.to_string())
+            .unwrap()
+    );
     assert!(store.get_file_meta(&row.id.to_string()).unwrap().is_none());
     assert_eq!(row.media_id, old.id);
     assert_eq!((row.season, row.episode), (Some(1), Some(3)));
@@ -228,7 +233,15 @@ async fn incomplete_nfo_online_alias_rebinds_only_new_scanned_rows() {
             .unwrap()
             .unwrap();
         assert_eq!(row.media_id, old.id);
-        assert!(store.is_probe_queued(&row.id.to_string()).unwrap());
+        // probe worker 可能在断言前就跑完这个 unit，所以断言"曾经排入过 probe"
+        // 而不是"此刻仍在队列里"。
+        assert!(
+            store
+                .probe_unit_recorded_for_ledger(&row.id.to_string())
+                .unwrap(),
+            "扫描必须为台账行 {} 登记 probe",
+            row.id
+        );
     }
     let untouched = store.ledger_by_path(&unrelated.path).unwrap().unwrap();
     assert_eq!(untouched.id, unrelated.id);

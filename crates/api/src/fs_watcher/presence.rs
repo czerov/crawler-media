@@ -124,12 +124,27 @@ fn publish_event_observations(
                 total_result.skipped += res.skipped;
             }
             Err(err) => {
-                tracing::error!(library_id = %lib_id, error = %err, "发布 watcher presence 失败");
+                // 「library 正在删除 / scope 变化」是 watcher 的预期竞争：管理员冻结
+                // Library 时 watcher 可能正在发布旧观察，这不是故障，不能打成 ERROR。
+                if is_expected_presence_race(&err) {
+                    tracing::debug!(library_id = %lib_id, error = %err, "watcher presence 发布被生命周期/scope 变化取消");
+                } else {
+                    tracing::error!(library_id = %lib_id, error = %err, "发布 watcher presence 失败");
+                }
             }
         }
     }
 
     total_result
+}
+
+/// 预期竞争（Library 冻结/删除、scope 换代）与真实故障的区分：
+/// 前者是生命周期管理的正常结果，只记 debug/warn，不打 ERROR。
+fn is_expected_presence_race(error: &str) -> bool {
+    error.contains("library is deleting")
+        || error.contains("scope changed")
+        || error.contains("Library work cancelled")
+        || error.contains("Library 正在删除或已不存在")
 }
 
 /// Observe a file event path and apply presence to matching active realtime libraries.

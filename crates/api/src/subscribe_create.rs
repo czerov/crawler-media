@@ -100,8 +100,12 @@ fn rollback_store(
     match store.undo_ensured_media(media, previous) {
         Ok(true) => {}
         Ok(false) => {
-            // CAS 拒绝：并发的成功请求已经改写了这行身份，保留它的结果。
-            tracing::warn!(media_id = %media.id, "回滚 Media 被 CAS 拒绝，保留并发写入的身份");
+            // `false` 有两种含义，都不能盲目回滚：
+            // (a) 这行仍被 Subscribe/ledger 引用；(b) 身份已被并发请求改写（CAS 拒绝）。
+            tracing::warn!(
+                media_id = %media.id,
+                "回滚 Media 被拒绝（仍被引用或身份已被并发改写），保留当前内容"
+            );
         }
         Err(error) => {
             tracing::error!(media_id = %media.id, error = %error, "回滚 Media 失败");

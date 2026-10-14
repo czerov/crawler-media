@@ -80,7 +80,9 @@ async fn protected_count_in_preview_and_run_does_not_double_count_and_marks_trun
     let def = state.jobs().lock().list_defs().unwrap()
         .into_iter().find(|d| d.kind == JobKind::JobsRetention).unwrap();
 
-    // 先做一次 preview：600 个保护行（超出了 batch_size=500 的探测窗口），应当截断并标注 protected_truncated / truncated
+    // 先做一次 preview：与实跑同口径 —— 都取「原始窗口（含受保护行）」的第一窗。
+    // 本 fixture 里 600 条保护行的 finished_at/rowid 都更靠前，所以第一窗整窗受保护：
+    // scanned=500、protected=500、candidates=0，且窗口外仍有行 → truncated=true。
     let app = router(state.clone());
     let (status, resp) = call_api(
         &app,
@@ -91,9 +93,18 @@ async fn protected_count_in_preview_and_run_does_not_double_count_and_marks_trun
     ).await;
     assert_eq!(status, axum::http::StatusCode::OK, "preview 响应失败: {resp}");
     let data = &resp["data"];
-    assert_eq!(data["candidates"], 500, "候选取预算上限 500: {data}");
-    assert_eq!(data["protected"], 500, "保护探测最多 500（下界）: {data}");
-    assert_eq!(data["truncated"], true, "因为窗口外还有候选/保护行，必须为 true: {data}");
+    assert_eq!(data["scanned"], 500, "预览只检视一个原始窗口: {data}");
+    assert_eq!(
+        data["protected"], 500,
+        "原始窗口把保护行也算 visited（与实跑第一批同口径）: {data}"
+    );
+    assert_eq!(data["candidates"], 0, "第一窗全是受保护行: {data}");
+    assert_eq!(
+        data["candidates"].as_u64().unwrap() + data["protected"].as_u64().unwrap(),
+        data["scanned"].as_u64().unwrap(),
+        "原始窗口每一行要么可删要么受保护，两者必须等于 scanned: {data}"
+    );
+    assert_eq!(data["truncated"], true, "因为窗口外还有行，必须为 true: {data}");
     assert_eq!(data["protected_truncated"], true, "保护行超限必须明确标注截断: {data}");
 
     // 然后执行任务（1200 条可删任务会分 3 批：500，500，200）
@@ -121,7 +132,7 @@ async fn protected_count_in_preview_and_run_does_not_double_count_and_marks_trun
         "本 cycle 已检视保护行数为 600，不得跨批重复累加: reported={reported_protected}, {report}"
     );
     assert_eq!(
-        report["protected_is_lower_bound"], true,
-        "窗口外仍有未检视行时必须明确报告为下界: {report}"
+        report["protected_is_lower_bound"], false,
+        "整个 cycle 已扫完（最后一批未满），600 是精确值而不是下界: {report}"
     );
 }

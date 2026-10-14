@@ -17,7 +17,9 @@ use jobs::{Job, JobStatus};
 use super::database::{
     DatabaseName, MaintenanceContext, database_targets, missing_optional_targets,
 };
-use super::policy::{BATCH_SIZE, DatabaseMaintenancePolicy, MAX_BATCHES, MaintenancePolicy};
+use super::policy::{
+    BATCH_SIZE, DatabaseMaintenancePolicy, MAX_BATCHES, MAX_BATCH_BUDGET, MaintenancePolicy,
+};
 use super::report::{DatabaseOutcome, DatabaseReport, MaintenanceReport};
 use crate::management::ApiState;
 
@@ -389,7 +391,7 @@ impl BatchCounts {
 /// - **dry_run**：只检视一批，然后把 `has_more` 如实映射成 `budget_exhausted`。
 ///   试运行不删除，再取下一批只会重复检视同一批行（会虚报候选数），所以不能循环；
 ///   但也**不能**把 `has_more` 吞掉说"已完成"——用户开 dry_run 就是为了先看规模。
-/// - **实删**：窗口耗尽（`!has_more`）、stop、或批数/预算用尽。
+/// - **实删**：窗口耗尽（`!has_more`）、stop、或批数/2 秒预算用尽（先到先停）。
 ///   **不能**用 `deleted == 0` 提前停止：原始窗口可以整窗都是受保护行，此时后面
 ///   仍有可删历史（B3 §5.1）。游标会推进，所以不会空转死循环。
 fn run_batches(
@@ -400,10 +402,22 @@ fn run_batches(
 ) -> Result<(), String> {
     let mut batches = 0usize;
     let mut more_remains = false;
+    let mut time_exhausted = false;
+    let started = Instant::now();
     while batches < MAX_BATCHES {
         let stop = check_stop();
         if let Some(note) = stop.stop_note("批") {
             report.note = Some(note);
+            break;
+        }
+        // 单条 SQL 步不可中断，所以 2 秒预算只在批间判定（先到先停）。
+        if batches > 0 && started.elapsed() >= MAX_BATCH_BUDGET {
+            time_exhausted = true;
+            more_remains = true;
+            report.note = Some(format!(
+                "已达到 {} 秒预算，剩余候选留到下一轮",
+                MAX_BATCH_BUDGET.as_secs()
+            ));
             break;
         }
         let batch = next()?;
@@ -412,9 +426,9 @@ fn run_batches(
         report.deleted += batch.deleted;
         // 原始窗口互不重叠，保护行只被检视一次，因此按 cycle 累加即"已检视保护行数"。
         report.protected += batch.protected;
-        if batch.protected_truncated {
-            report.protected_is_lower_bound = true;
-        }
+        // 下界标记只看**最后一批**：最后一批未截断说明整个 cycle 已扫完，
+        // 此时累计的保护行数是精确值，不能再沿用中途的"下界"。
+        report.protected_is_lower_bound = batch.protected_truncated;
         batches += 1;
         if dry_run {
             more_remains = batch.has_more;
@@ -430,6 +444,15 @@ fn run_batches(
         more_remains = true;
     }
     report.batches = batches;
-    report.budget_exhausted = more_remains && (dry_run || batches >= MAX_BATCHES);
+    report.budget_exhausted =
+        more_remains && (dry_run || batches >= MAX_BATCHES || time_exhausted);
+    if time_exhausted {
+        tracing::info!(
+            batches,
+            elapsed_ms = started.elapsed().as_millis() as i64,
+            budget_ms = MAX_BATCH_BUDGET.as_millis() as i64,
+            "retention 因时间预算停止（与批数上限区分）"
+        );
+    }
     Ok(())
 }

@@ -11,10 +11,15 @@ use std::collections::HashMap;
 use crate::http::playback::session_timeout_secs;
 use crate::http::playback_device_target::{DeviceTargetQuery, resolve_device_target};
 use crate::http::{err, ok, ok_list};
-use crate::job_loop::unix_now;
 use crate::management::ApiState;
 use crate::playback_read::PlaybackRead;
 use crate::store::SessionRow;
+
+/// 统一使用注入的 `PlaybackClock`：测试可用假时钟推进活动/设备/结束/撤销路径，
+/// 生产下与 `unix_now()` 等价。
+fn playback_now(state: &ApiState) -> i64 {
+    state.playback_clock.now_ms() / 1000
+}
 
 fn session_json(session: &SessionRow, media: Value, member_name: &str) -> Value {
     let percent = session
@@ -67,7 +72,7 @@ pub(crate) async fn activity(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let scope = query.get("scope").map(String::as_str).unwrap_or("visible");
-    let now = unix_now();
+    let now = playback_now(&state);
     let store = state.store.lock();
     let admin = user_id
         .and_then(|id| store.user_role(id).ok())
@@ -159,7 +164,7 @@ pub(crate) async fn end_session(
     Path(device_id): Path<String>,
     Query(query): Query<DeviceTargetQuery>,
 ) -> Response {
-    let now = unix_now();
+    let now = playback_now(&state);
     let store = state.store.lock();
     let target_user = match resolve_device_target(&store, user_id, &device_id, &query) {
         Ok(target_user) => target_user,
@@ -189,7 +194,7 @@ pub(crate) async fn devices(
     State(state): State<ApiState>,
     axum::Extension(user_id): axum::Extension<domain::UserId>,
 ) -> Response {
-    let now = unix_now();
+    let now = playback_now(&state);
     let store = state.store.lock();
     let admin = store
         .user_role(user_id)
@@ -264,7 +269,7 @@ pub(crate) async fn revoke_device(
     Path(device_id): Path<String>,
     Query(query): Query<DeviceTargetQuery>,
 ) -> Response {
-    let now = unix_now();
+    let now = playback_now(&state);
     let store = state.store.lock();
     let target_user = match resolve_device_target(&store, user_id, &device_id, &query) {
         Ok(target_user) => target_user,

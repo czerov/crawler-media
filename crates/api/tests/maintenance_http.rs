@@ -411,9 +411,9 @@ async fn preview_is_read_only_and_reports_bounded_counts() {
     )
     .await;
     assert_eq!(preview["kind"], "jobs_retention", "{preview}");
-    // 种子 job 是该 def 的最新终态 → 属于 last-child 保护组。修复 C1 后受保护行
-    // **不进候选窗口**，因此可删候选为 0，保护数单独由 `protected` 报告。
-    assert_eq!(preview["scanned"], 0, "{preview}");
+    // 预览与实跑同口径：都取「原始窗口（含受保护行）」。种子 job 是该 def 的最新
+    // 终态 → 属于 last-child 保护组：窗口检视 1 行、可删候选 0、保护 1。
+    assert_eq!(preview["scanned"], 1, "{preview}");
     assert_eq!(preview["candidates"], 0, "{preview}");
     assert_eq!(preview["protected"], 1, "{preview}");
     assert_eq!(preview["truncated"], false, "{preview}");

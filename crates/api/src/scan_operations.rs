@@ -63,16 +63,13 @@ impl ScanCoordinator {
             drop(running);
             let state_clone = state.clone();
             tokio::spawn(async move {
-                // 即使 worker panic，也要释放 running 槽位，否则两次 panic 之后
-                // 全局 2 个扫描额度会被永久占满。
-                let guard = RunningGuard {
-                    coordinator: state_clone.scan_coordinator.clone(),
+                // 无论 worker 正常结束还是 panic，都会释放 running 槽位并唤醒下一个
+                // 排队 operation，避免两次 panic 就把全局 2 个扫描额度永久占满。
+                let _guard = RunningGuard {
+                    state: state_clone.clone(),
                     op_id: op.id.clone(),
-                    released: false,
                 };
                 run_operation(&state_clone, &op.id, &op.library_id).await;
-                guard.release();
-                state_clone.scan_coordinator.trigger_next(&state_clone);
             });
         }
     }
@@ -128,28 +125,26 @@ impl ScanCoordinator {
 }
 
 /// 释放 running 槽位的 RAII guard：worker 正常结束或 panic 都会移除 op id。
+/// worker 结束（正常或 panic）都释放 running 槽位，并唤醒下一个排队 operation。
 struct RunningGuard {
-    coordinator: std::sync::Arc<ScanCoordinator>,
+    state: ApiState,
     op_id: String,
-    released: bool,
-}
-
-impl RunningGuard {
-    fn release(mut self) {
-        self.released = true;
-        self.coordinator.running_ops.lock().remove(&self.op_id);
-    }
 }
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        self.coordinator.running_ops.lock().remove(&self.op_id);
-        if !self.released && std::thread::panicking() {
+        self.state
+            .scan_coordinator
+            .running_ops
+            .lock()
+            .remove(&self.op_id);
+        if std::thread::panicking() {
             tracing::error!(
                 op_id = %self.op_id,
-                "扫描 worker 异常退出；operation 保持 running，等待下次启动恢复"
+                "扫描 worker 异常退出；本次 operation 未写终态，槽位已释放并继续排队"
             );
         }
+        self.state.scan_coordinator.trigger_next(&self.state);
     }
 }
 

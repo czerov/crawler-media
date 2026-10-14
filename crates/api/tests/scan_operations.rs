@@ -71,6 +71,17 @@ async fn cancel_scan_does_not_break_subsequent_library_work_leases() {
     assert_eq!(cancel_status, StatusCode::OK);
     assert_eq!(cancel_res["ok"], true);
 
+    // 3b. 取消是幂等的：同一个操作再取消一次仍须 200（cancelled=false），不是 404。
+    let (again_status, again_res) = fix
+        .request(
+            "POST",
+            &format!("/api/v1/libraries/{}/scan-operations/{}/cancel", fix.library_id, op_id),
+            Some(&fix.admin_token),
+        )
+        .await;
+    assert_eq!(again_status, StatusCode::OK, "重复取消必须幂等: {again_res}");
+    assert_eq!(again_res["data"]["cancelled"], false);
+
     // 4. Critical: library work lease must NOT be permanently broken!
     let lease_res = fix.state.acquire_library_work(&fix.library_id);
     assert!(lease_res.is_ok(), "Canceling a scan must not freeze the library permanently");

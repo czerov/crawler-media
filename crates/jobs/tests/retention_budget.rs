@@ -1,5 +1,47 @@
 use jobs::{JobKind, NewDef, Queue};
 
+/// B3 §5.1：窗口未满即 cycle 结束并清游标；旧实现只在**下一个空窗口**才结束，
+/// 每个 cycle 都要多空跑一次，而且游标会一直挂着。
+#[test]
+fn retention_cycle_completes_on_the_last_partial_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("jobs.db");
+    drop(Queue::open(&db).unwrap());
+
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for i in 0..3i64 {
+            conn.execute(
+                "INSERT INTO jobs (id, def_id, kind, payload, status, attempt, run_after, started_at, finished_at)
+                 VALUES (?1, NULL, 'scrape', '{}', 'succeeded', 0, ?2, ?2, ?2)",
+                rusqlite::params![format!("deletable-{i}"), 100 + i],
+            )
+            .unwrap();
+        }
+    }
+
+    let queue = Queue::open(&db).unwrap();
+    let win = queue
+        .prune_terminal_window("test-def", 1_000_000, 500, false)
+        .unwrap();
+    assert_eq!(win.deleted, 3);
+    assert!(!win.window_has_more);
+    assert!(
+        win.cycle_complete,
+        "窗口未满就说明没有更多候选，cycle 到此结束: {win:?}"
+    );
+
+    let cursors: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM retention_cursors WHERE def_id = 'test-def'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cursors, 0, "cycle 结束后必须清掉游标，不留空跑收尾");
+}
+
 #[test]
 fn retention_cursor_window_bounds_and_cleans_older_jobs() {
     let tmp = tempfile::tempdir().unwrap();

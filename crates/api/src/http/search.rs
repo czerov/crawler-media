@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::extract::{Query, RawQuery, State};
 use axum::http::StatusCode;
@@ -18,10 +18,6 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::http::{err, ok, ok_list};
 use crate::management::ApiState;
-use indexer::{SearchOutcome, SiteFailure};
-
-/// B3 §6：单个 Site / Catalog blocking 搜索单元的运行 deadline。
-const SEARCH_DEADLINE: Duration = Duration::from_secs(12);
 
 fn release_json(torrent: &Torrent) -> Value {
     let release = release::parse(&torrent.title);
@@ -106,126 +102,36 @@ pub(crate) async fn search_torrents(
         .map(|k| k.trim().to_string())
         .unwrap_or_default();
     let page = query.page.unwrap_or(1).clamp(1, 100);
-    let snapshot_id =
-        if !keyword.is_empty() && query.save_history && !query.skip_history && page == 1 {
-            let store = state.store.lock();
-            record_history(&store, user_id, &keyword, "torrents")
-        } else {
-            None
-        };
+    let history = (!keyword.is_empty() && query.save_history && !query.skip_history && page == 1)
+        .then(|| history::next_history_target(user_id));
     let sites = {
         let store = state.store.lock();
         scoped_sites(&store, &sites_requested)
     };
-    // Site fetches are blocking HTTP; run each Site off the async worker under the
-    // shared search budget, so one slow Site cannot exceed the B3 §6 deadline and
-    // cannot exceed the pool. Cross-site parallelism lives inside indexer.search.
-    // 并发执行各站点搜索：避免单站耗时或超时累加阻塞全流程，与流式搜索保持一致的并发性能表现
-    let mut tasks = Vec::new();
-    for site in sites {
-        let state = state.clone();
-        let kw = keyword.clone();
-        let categories = categories.clone();
-        tasks.push(tokio::spawn(async move {
-            search_site_json(&state, site, kw, page, categories).await
-        }));
-    }
-
-    let mut items = Vec::new();
-    let mut statuses = Vec::new();
-    for task in tasks {
-        if let Ok((site_items, status)) = task.await {
-            items.extend(site_items);
-            statuses.push(status);
-        }
-    }
-    if let Some(id) = &snapshot_id {
-        let payload = json!({
-            "keyword": keyword,
-            "snapshot_at": chrono_like_now(),
-            "total": items.len() as i64,
-            "elapsed_ms": null,
-            "items": items.clone(),
-            "sites": statuses.clone(),
-        });
-        let store = state.store.lock();
-        let _ = store.insert_search_snapshot(
-            id,
-            "torrents",
-            &keyword,
-            &payload.to_string(),
-            crate::job_loop::unix_now(),
-        );
-    }
+    // Site fetches are blocking HTTP; run them under the shared search budget in a
+    // window of the currently available permits, mirroring the SSE path. Spawning
+    // every Site at once used to make Sites beyond the 4 permits fail with
+    // "capacity exhausted" inside the very same request.
+    let state = Arc::new(state);
+    let (total, items, statuses) =
+        fanout::collect_site_results(&state, sites, &keyword, page, &categories, None).await;
+    history::save_torrents_history(
+        &state,
+        history.as_ref(),
+        &keyword,
+        total,
+        None,
+        &items,
+        &statuses,
+        false,
+    );
     ok(json!({
         "keyword": keyword,
-        "total": items.len() as i64,
+        "total": total,
         "items": items,
         "sites": statuses,
     }))
     .into_response()
-}
-
-/// 单个 Site 的 JSON 搜索：预算准入失败降级为该站点的失败条目（B3 §6）。
-async fn search_site_json(
-    state: &ApiState,
-    site: domain::Site,
-    keyword: String,
-    page: u32,
-    categories: Vec<String>,
-) -> (Vec<Value>, Value) {
-    let indexer = state.indexer.clone();
-    let budget = state.search_work.clone();
-    let started = Instant::now();
-    let site_id = site.id.to_string();
-    let site_name = site.name.clone();
-    let site_for_search = site.clone();
-    let outcome = budget
-        .run(SEARCH_DEADLINE, move || {
-            indexer.search_page_categories(
-                std::slice::from_ref(&site_for_search),
-                &keyword,
-                page,
-                &categories,
-            )
-        })
-        .await;
-    let elapsed_ms = started.elapsed().as_millis() as i64;
-    match outcome {
-        Ok(site_outcome) => {
-            let items: Vec<_> = site_outcome
-                .torrents
-                .iter()
-                .map(|t| torrent_json(t, &site_name))
-                .collect();
-            let status = json!({
-                "site_id": site_id,
-                "site_name": site_name,
-                "count": site_outcome.torrents.len(),
-                "error": site_outcome.failures.into_iter().next().map(|f| f.error),
-                "elapsed_ms": elapsed_ms,
-            });
-            (items, status)
-        }
-        Err(error) => {
-            tracing::warn!(
-                site_id = %site_id,
-                site = %site_name,
-                %error,
-                "站点搜索未获搜索预算准入，按单站失败返回"
-            );
-            (
-                Vec::new(),
-                json!({
-                    "site_id": site_id,
-                    "site_name": site_name,
-                    "count": 0,
-                    "error": error.to_string(),
-                    "elapsed_ms": elapsed_ms,
-                }),
-            )
-        }
-    }
 }
 
 pub(crate) async fn search_stream(
@@ -239,13 +145,8 @@ pub(crate) async fn search_stream(
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
     let keyword = query.keyword.clone().unwrap_or_default().trim().to_string();
     let page = query.page.unwrap_or(1).clamp(1, 100);
-    let snapshot_id =
-        if !keyword.is_empty() && query.save_history && !query.skip_history && page == 1 {
-            let store = state.store.lock();
-            record_history(&store, user_id, &keyword, "torrents")
-        } else {
-            None
-        };
+    let history = (!keyword.is_empty() && query.save_history && !query.skip_history && page == 1)
+        .then(|| history::next_history_target(user_id));
     let sites = {
         let store = state.store.lock();
         scoped_sites(&store, &sites_requested)
@@ -255,7 +156,7 @@ pub(crate) async fn search_stream(
         tx,
         keyword,
         page,
-        snapshot_id,
+        history,
         sites,
         categories,
     ));
@@ -264,40 +165,36 @@ pub(crate) async fn search_stream(
         .into_response()
 }
 
-struct SiteSearchResult {
-    site_id: String,
-    site_name: String,
-    outcome: indexer::SearchOutcome,
-    elapsed_ms: i64,
-}
-
 async fn stream_search_events(
     state: Arc<ApiState>,
     tx: mpsc::Sender<Result<Event, Infallible>>,
     keyword: String,
     page: u32,
-    snapshot_id: Option<String>,
+    history: Option<history::HistoryTarget>,
     sites: Vec<domain::Site>,
     categories: Vec<String>,
 ) {
     send_search_start(&tx, &keyword, &sites).await;
     let started = Instant::now();
     let (total, items, statuses) =
-        collect_site_results(&state, sites, &keyword, page, &categories, &tx).await;
+        fanout::collect_site_results(&state, sites, &keyword, page, &categories, Some(&tx)).await;
     let elapsed_ms = started.elapsed().as_millis() as i64;
-    // 客户端已断开：不再排新 Site（见 collect_site_results），也不落盘半截快照。
-    if tx.is_closed() {
-        return;
-    }
-    save_stream_snapshot(
+    // 客户端断开也要落盘已收集结果：历史条目与快照必须成对，否则回放只能拿到
+    // 404 死链（历史里有条目 ⇒ 快照一定可取）。
+    let partial = tx.is_closed();
+    history::save_torrents_history(
         &state,
-        snapshot_id.as_deref(),
+        history.as_ref(),
         &keyword,
         total,
-        elapsed_ms,
+        Some(elapsed_ms),
         &items,
         &statuses,
+        partial,
     );
+    if partial {
+        return;
+    }
     send_search_done(&tx, total, elapsed_ms, statuses).await;
 }
 
@@ -315,188 +212,6 @@ async fn send_search_start(
             json!({"keyword": keyword, "sites": site_list}).to_string(),
         )))
         .await;
-}
-
-/// 启动单个 Site 搜索：阻塞工作经搜索预算准入，失败降级为该 Site 的失败结果。
-fn spawn_site_search(
-    tasks: &mut tokio::task::JoinSet<SiteSearchResult>,
-    state: &Arc<ApiState>,
-    site: domain::Site,
-    keyword: &str,
-    page: u32,
-    categories: &[String],
-) {
-    let budget = Arc::clone(&state.search_work);
-    let indexer = Arc::clone(&state.indexer);
-    let keyword = keyword.to_string();
-    let categories = categories.to_vec();
-    let site_id = site.id.to_string();
-    let site_name = site.name.clone();
-    let site_for_search = site.clone();
-    tasks.spawn(async move {
-        let started = Instant::now();
-        let outcome = budget
-            .run(SEARCH_DEADLINE, move || {
-                indexer.search_page_categories(
-                    std::slice::from_ref(&site_for_search),
-                    &keyword,
-                    page,
-                    &categories,
-                )
-            })
-            .await;
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                tracing::warn!(
-                    site_id = %site_id,
-                    site = %site_name,
-                    %error,
-                    "流式搜索站点未获搜索预算准入，按单站失败报告"
-                );
-                SearchOutcome {
-                    torrents: Vec::new(),
-                    failures: vec![SiteFailure {
-                        site_id: site.id,
-                        error: error.to_string(),
-                    }],
-                }
-            }
-        };
-        SiteSearchResult {
-            site_id,
-            site_name,
-            outcome,
-            elapsed_ms: started.elapsed().as_millis() as i64,
-        }
-    });
-}
-
-/// 按当前可用 permit 开窗并发搜索各 Site；客户端断开后不再排新 Site（B3 §6）。
-async fn collect_site_results(
-    state: &Arc<ApiState>,
-    sites: Vec<domain::Site>,
-    keyword: &str,
-    page: u32,
-    categories: &[String],
-    tx: &mpsc::Sender<Result<Event, Infallible>>,
-) -> (i64, Vec<Value>, Vec<Value>) {
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut pending = sites.into_iter();
-    let window = state.search_work.available_permits().max(1);
-    let mut statuses = Vec::new();
-    let mut items_all = Vec::new();
-    let mut total = 0i64;
-    loop {
-        if tx.is_closed() {
-            break;
-        }
-        while tasks.len() < window {
-            let Some(site) = pending.next() else { break };
-            spawn_site_search(&mut tasks, state, site, keyword, page, categories);
-        }
-        let Some(result) = tasks.join_next().await else {
-            break;
-        };
-        let Ok(result) = result else { continue };
-        let SiteSearchResult {
-            site_id,
-            site_name,
-            outcome,
-            elapsed_ms,
-        } = result;
-        total += outcome.torrents.len() as i64;
-        let event = if outcome.failures.is_empty() {
-            "site_result"
-        } else {
-            "site_error"
-        };
-        let error = outcome
-            .failures
-            .first()
-            .map(|failure| failure.error.clone());
-        let items = outcome
-            .torrents
-            .iter()
-            .map(|t| torrent_json(t, &site_name))
-            .collect::<Vec<_>>();
-        items_all.extend(items.clone());
-        send_site_result(
-            tx,
-            event,
-            &site_id,
-            &site_name,
-            outcome.torrents.len(),
-            error.clone(),
-            elapsed_ms,
-            items,
-        )
-        .await;
-        statuses.push(json!({
-            "site_id": site_id,
-            "site_name": site_name,
-            "count": outcome.torrents.len(),
-            "elapsed_ms": elapsed_ms,
-            "error": error,
-        }));
-    }
-    (total, items_all, statuses)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn send_site_result(
-    tx: &mpsc::Sender<Result<Event, Infallible>>,
-    event: &str,
-    site_id: &str,
-    site_name: &str,
-    count: usize,
-    error: Option<String>,
-    elapsed_ms: i64,
-    items: Vec<Value>,
-) {
-    let _ = tx
-        .send(Ok(Event::default().event(event).data(
-            json!({
-                "site_id": site_id,
-                "site_name": site_name,
-                "count": count,
-                "error": error,
-                "elapsed_ms": elapsed_ms,
-                "items": items,
-            })
-            .to_string(),
-        )))
-        .await;
-}
-
-fn save_stream_snapshot(
-    state: &ApiState,
-    snapshot_id: Option<&str>,
-    keyword: &str,
-    total: i64,
-    elapsed_ms: i64,
-    items: &[Value],
-    sites: &[Value],
-) {
-    let Some(id) = snapshot_id else { return };
-    let payload = json!({
-        "keyword": keyword,
-        "snapshot_at": chrono_like_now(),
-        "total": total,
-        "elapsed_ms": elapsed_ms,
-        "items": items,
-        "sites": sites,
-    });
-    let store = state.store.lock();
-    if let Err(error) = store.insert_search_snapshot(
-        id,
-        "torrents",
-        keyword,
-        &payload.to_string(),
-        crate::job_loop::unix_now(),
-    ) {
-        tracing::error!(%error, history_id = %id, "保存流式搜索结果快照失败");
-    }
 }
 
 async fn send_search_done(
@@ -574,53 +289,6 @@ fn search_catalog_source(
     (hits, ok, count, err_msg)
 }
 
-/// 汇总各源结果到 `titles` / `providers` 响应字段。
-async fn collect_title_results(
-    set: &mut tokio::task::JoinSet<
-        Result<(String, Vec<CatalogHit>, bool, i64, Option<String>), (String, String)>,
-    >,
-) -> (Vec<Value>, Vec<Value>) {
-    let mut titles = Vec::new();
-    let mut providers = Vec::new();
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok(Ok((source, hits, ok, count, err_msg))) => {
-                titles.extend(hits.iter().map(|hit| title_hit_json(hit, &source)));
-                if ok {
-                    providers.push(json!({
-                        "provider": source,
-                        "ok": true,
-                        "count": count,
-                    }));
-                } else {
-                    providers.push(json!({
-                        "provider": source,
-                        "ok": false,
-                        "count": count,
-                        "message": err_msg.unwrap_or_else(|| "搜索失败".into()),
-                    }));
-                }
-            }
-            Ok(Err((source, err_msg))) => {
-                providers.push(json!({
-                    "provider": source,
-                    "ok": false,
-                    "count": 0,
-                    "message": err_msg,
-                }));
-            }
-            Err(join_err) => {
-                providers.push(json!({
-                    "provider": "unknown",
-                    "ok": false,
-                    "count": 0,
-                    "message": format!("调度异常: {join_err}"),
-                }));
-            }
-        }
-    }
-    (titles, providers)
-}
 
 pub(crate) async fn search_titles(
     State(state): State<ApiState>,
@@ -652,63 +320,19 @@ pub(crate) async fn search_titles(
     } else {
         catalog.sources().into_iter().map(str::to_string).collect()
     };
-    let snapshot_id = {
-        let store = state.store.lock();
-        record_history(&store, user_id, &keyword, "titles")
-    };
-
-    // 并发 fanout 搜索各元数据源：每个源独立经搜索预算准入并在 12 秒内返回。
-    // 单源失败或超时绝不阻塞其他正常源（如 TMDB、豆瓣通常在 1 秒内返回）。
-    let mut set: tokio::task::JoinSet<
-        Result<(String, Vec<CatalogHit>, bool, i64, Option<String>), (String, String)>,
-    > = tokio::task::JoinSet::new();
-
-    for source in sources {
-        let state_clone = state.clone();
-        let keyword_clone = keyword.clone();
-        let source_name = source.clone();
-        set.spawn(async move {
-            let budget = Arc::clone(&state_clone.search_work);
-            let catalog = Arc::clone(&state_clone.catalog);
-            let search_source = source_name.clone();
-            let outcome = budget
-                .run(SEARCH_DEADLINE, move || {
-                    search_catalog_source(catalog.as_ref(), &search_source, &keyword_clone)
-                })
-                .await;
-            match outcome {
-                Ok((hits, ok, count, err_msg)) => Ok((source_name, hits, ok, count, err_msg)),
-                Err(error) => {
-                    tracing::warn!(
-                        provider = %source_name,
-                        %error,
-                        "标题搜索数据源未获搜索预算准入，按单源失败报告"
-                    );
-                    Err((source_name, error.to_string()))
-                }
-            }
-        });
-    }
-
-    let (titles, providers) = collect_title_results(&mut set).await;
-    if let Some(id) = &snapshot_id {
-        let payload = json!({
-            "query": keyword,
-            "provider": provider,
-            "snapshot_at": chrono_like_now(),
-            "total": titles.len() as i64,
-            "titles": titles.clone(),
-            "providers": providers.clone(),
-        });
-        let store = state.store.lock();
-        let _ = store.insert_search_snapshot(
-            id,
-            "titles",
-            &keyword,
-            &payload.to_string(),
-            crate::job_loop::unix_now(),
-        );
-    }
+    let history_target = history::next_history_target(user_id);
+    // Fanout 各元数据源：与 Site 搜索共用「可用 permit 开窗 + 请求级 deadline」
+    // 策略，所以默认 5 个源不会再恒定有一个被本请求自己的并发预算判成过载。
+    let state = Arc::new(state);
+    let (titles, providers) = fanout::search_title_sources(&state, sources, &keyword).await;
+    history::save_titles_history(
+        &state,
+        Some(&history_target),
+        &keyword,
+        &provider,
+        &titles,
+        &providers,
+    );
     ok(json!({
         "query": keyword,
         "provider": provider,
@@ -726,7 +350,7 @@ pub(crate) async fn search_library_items(
     let keyword = query.get("keyword").cloned().unwrap_or_default();
     let res = state
         .search_work
-        .run(SEARCH_DEADLINE, move || {
+        .run(fanout::SEARCH_DEADLINE, move || {
             let store = state.store.lock();
             let rows = store.list_ledger().unwrap_or_default();
             let mut items = Vec::new();
@@ -766,8 +390,8 @@ pub(crate) async fn search_library_items(
     }
 }
 
+mod fanout;
 mod history;
-use history::{chrono_like_now, record_history};
 pub(crate) use history::{
     clear_search_history_route, delete_history_entry_route, get_history_snapshot, get_presets,
     put_presets, search_history,

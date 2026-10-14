@@ -231,6 +231,139 @@ async fn title_search_default_fanout_reports_each_source() {
     );
 }
 
+/// 受闸门的多源 fake catalog：占住搜索预算，直到测试放行。
+struct GatedCatalog {
+    name: &'static str,
+    started: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl GatedCatalog {
+    fn search(&self) -> Result<Vec<media::CatalogHit>, String> {
+        self.started.lock().unwrap().push(self.name);
+        let (lock, cv) = &*self.gate;
+        let mut open = lock.lock().unwrap();
+        while !*open {
+            open = cv.wait(open).unwrap();
+        }
+        Ok(Vec::new())
+    }
+}
+
+impl api::catalog::Catalog for GatedCatalog {
+    fn source_name(&self) -> &'static str {
+        self.name
+    }
+    fn search_movie(&self, _query: &str) -> Result<Vec<media::CatalogHit>, String> {
+        self.search()
+    }
+    fn search_tv(&self, _query: &str) -> Result<Vec<media::CatalogHit>, String> {
+        Ok(Vec::new())
+    }
+    fn popular_movie(&self) -> Result<Vec<media::CatalogHit>, String> {
+        Ok(Vec::new())
+    }
+    fn popular_tv(&self) -> Result<Vec<media::CatalogHit>, String> {
+        Ok(Vec::new())
+    }
+    fn details(
+        &self,
+        _kind: domain::MediaKind,
+        _tmdb_id: &str,
+    ) -> Result<Option<domain::Media>, String> {
+        Ok(None)
+    }
+}
+
+/// 断言失败/提前返回时也放行闸门，避免 runtime 关闭时卡在 blocking 线程上。
+struct OpenGate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl Drop for OpenGate {
+    fn drop(&mut self) {
+        *self.0 .0.lock().unwrap() = true;
+        self.0 .1.notify_all();
+    }
+}
+
+/// 单请求内元数据源超过并发预算时，多出来的源必须排队补位，而不是被本请求
+/// 自己的预算判成过载（P1：标题搜索 fanout 自饥饿，默认 5 源恒定挂一个）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn title_search_beyond_the_window_still_searches_every_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let _open = OpenGate(gate.clone());
+    let sources: Vec<Arc<dyn api::catalog::Catalog>> = ["tmdb", "douban", "tvdb", "bangumi", "anilist"]
+        .into_iter()
+        .map(|name| {
+            Arc::new(GatedCatalog {
+                name,
+                started: started.clone(),
+                gate: gate.clone(),
+            }) as Arc<dyn api::catalog::Catalog>
+        })
+        .collect();
+    let fanout = api::catalog::FanoutCatalog::new(sources);
+    let app = router(
+        state(
+            tmp.path(),
+            Arc::new(Fixtures {
+                requests: Mutex::new(Vec::new()),
+                bodies: HashMap::new(),
+            }),
+            Arc::new(MemoryDownloader::new(tmp.path().join("stage"))),
+        )
+        .with_catalog(fanout),
+    );
+
+    let token = "management-secret".to_string();
+    let handle = tokio::spawn(async move {
+        send(
+            &app,
+            "GET",
+            "/api/v1/search/titles?keyword=inception",
+            Some(&token),
+            Value::Null,
+        )
+        .await
+    });
+    // 4 个 permit：窗口内只应开始 4 个源。
+    for _ in 0..500 {
+        if started.lock().unwrap().len() >= 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        started.lock().unwrap().len(),
+        4,
+        "窗口内只应开始 4 个源: {:?}",
+        started.lock().unwrap()
+    );
+    // 放行：已完成 4 个之后，剩下 1 个必须补位；旧实现此时已把它判成过载。
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("窗口补位不得让整请求挂起")
+        .unwrap();
+    let body = json_body(response).await;
+    let providers = body["data"]["providers"].as_array().unwrap();
+    assert_eq!(providers.len(), 5, "5 个源都要报告: {body}");
+    let failed: Vec<&Value> = providers.iter().filter(|p| p["ok"] != true).collect();
+    assert!(
+        failed.is_empty(),
+        "同一请求内的数据源不得互相饿死: {failed:?}"
+    );
+    assert_eq!(
+        started.lock().unwrap().len(),
+        5,
+        "5 个源都必须真的搜过: {:?}",
+        started.lock().unwrap()
+    );
+}
+
 #[tokio::test]
 async fn search_history_snapshot_round_trip_and_delete() {
     let tmp = tempfile::tempdir().unwrap();

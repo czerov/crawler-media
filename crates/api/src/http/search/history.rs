@@ -23,16 +23,17 @@ fn history_items(store: &crate::Store, user_id: domain::UserId) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-pub(super) fn record_history(
-    store: &crate::Store,
-    user_id: domain::UserId,
-    query: &str,
-    provider: &str,
-) -> Option<String> {
-    if query.trim().is_empty() {
-        return None;
-    }
-    let mut history = history_items(store, user_id);
+/// 一次搜索要写的历史/快照目标。
+///
+/// 顺序是**先写快照、再写历史条目**：这样「历史里有条目 ⇒ 快照一定可取」，
+/// 客户端中断或快照落盘失败都不会留下点开就 404 的死链。
+pub(super) struct HistoryTarget {
+    pub id: String,
+    pub user_id: domain::UserId,
+}
+
+/// 预先分配快照 id（不做任何写库动作），真正的历史条目在快照落盘后才写入。
+pub(super) fn next_history_target(user_id: domain::UserId) -> HistoryTarget {
     let id = format!(
         "{user_id}:{:x}",
         std::time::SystemTime::now()
@@ -40,6 +41,18 @@ pub(super) fn record_history(
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
+    HistoryTarget { id, user_id }
+}
+
+/// 写入关键词历史条目（快照已经落盘时才调用）。
+fn record_history_entry(
+    store: &crate::Store,
+    user_id: domain::UserId,
+    query: &str,
+    provider: &str,
+    id: &str,
+) {
+    let mut history = history_items(store, user_id);
     history.retain(|item| item["query"].as_str() != Some(query));
     history.insert(
         0,
@@ -55,7 +68,84 @@ pub(super) fn record_history(
         &user_setting_key("search.history", user_id),
         &serde_json::json!(history).to_string(),
     );
-    Some(id)
+}
+
+/// 落盘 torrents 快照并在成功后补写历史条目；失败时不写历史（宁可不记录也不留死链）。
+pub(super) fn save_torrents_history(
+    state: &ApiState,
+    target: Option<&HistoryTarget>,
+    keyword: &str,
+    total: i64,
+    elapsed_ms: Option<i64>,
+    items: &[Value],
+    sites: &[Value],
+    partial: bool,
+) -> bool {
+    let Some(target) = target else { return false };
+    let payload = json!({
+        "keyword": keyword,
+        "snapshot_at": chrono_like_now(),
+        "total": total,
+        "elapsed_ms": elapsed_ms,
+        "items": items,
+        "sites": sites,
+        "partial": partial,
+    });
+    let store = state.store.lock();
+    match store.insert_search_snapshot(
+        &target.id,
+        "torrents",
+        keyword,
+        &payload.to_string(),
+        crate::job_loop::unix_now(),
+    ) {
+        Ok(()) => {
+            record_history_entry(&store, target.user_id, keyword, "torrents", &target.id);
+            true
+        }
+        Err(error) => {
+            tracing::error!(%error, history_id = %target.id, "保存搜索结果快照失败，不写历史条目");
+            false
+        }
+    }
+}
+
+/// 落盘 titles 快照并在成功后补写历史条目（与 torrents 同一不变式）。
+pub(super) fn save_titles_history(
+    state: &ApiState,
+    target: Option<&HistoryTarget>,
+    keyword: &str,
+    provider: &str,
+    titles: &[Value],
+    providers: &[Value],
+) -> bool {
+    let Some(target) = target else { return false };
+    let payload = json!({
+        "query": keyword,
+        "provider": provider,
+        "snapshot_at": chrono_like_now(),
+        "total": titles.len() as i64,
+        "titles": titles,
+        "providers": providers,
+        "partial": false,
+    });
+    let store = state.store.lock();
+    match store.insert_search_snapshot(
+        &target.id,
+        "titles",
+        keyword,
+        &payload.to_string(),
+        crate::job_loop::unix_now(),
+    ) {
+        Ok(()) => {
+            record_history_entry(&store, target.user_id, keyword, "titles", &target.id);
+            true
+        }
+        Err(error) => {
+            tracing::error!(%error, history_id = %target.id, "保存标题搜索快照失败，不写历史条目");
+            false
+        }
+    }
 }
 
 /// 按 id 删除一条关键词历史（连同结果快照）。
@@ -196,6 +286,8 @@ pub(crate) async fn get_history_snapshot(
             "sites": value.get("sites").cloned().unwrap_or_else(|| json!([])),
             "keyword": value.get("keyword").cloned().or_else(|| value.get("query").cloned()).unwrap_or_else(|| json!(null)),
             "elapsed_ms": value.get("elapsed_ms").cloned().unwrap_or(Value::Null),
+            // 客户端中断时落盘的半截快照：可回放，但要如实告诉调用方结果不完整。
+            "partial": value.get("partial").cloned().unwrap_or(json!(false)),
         }))
         .into_response(),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", "快照损坏"),

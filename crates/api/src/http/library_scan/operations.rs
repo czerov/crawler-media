@@ -51,7 +51,24 @@ pub(crate) async fn cancel_scan_operation(
             state.scan_coordinator.cancel_operation(&op_id);
             ok(json!({ "cancelled": true })).into_response()
         }
-        Ok(false) => err(StatusCode::NOT_FOUND, "scan_operation.missing", "未找到可取消的扫描操作"),
+        Ok(false) => {
+            // 幂等：操作存在但已处于终态（completed/failed/cancelled）时不再改状态，
+            // 也不该报 404 —— 重复取消同一个操作是合法请求。
+            let store = state.store.lock();
+            match store.scan_operation(&op_id) {
+                Ok(Some(op)) if op.library_id == lib_id => ok(json!({
+                    "cancelled": false,
+                    "status": op.status.as_str(),
+                }))
+                .into_response(),
+                Ok(_) => err(
+                    StatusCode::NOT_FOUND,
+                    "scan_operation.missing",
+                    "未找到可取消的扫描操作",
+                ),
+                Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &e.to_string()),
+            }
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &e.to_string()),
     }
 }

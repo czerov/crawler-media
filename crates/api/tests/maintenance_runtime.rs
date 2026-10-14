@@ -347,8 +347,8 @@ fn jobs_retention_does_not_loop_when_all_candidates_are_protected() {
         "protected 为本 cycle 已检视保护行数（每行只计一次）: {report}"
     );
     assert_eq!(
-        report["protected_is_lower_bound"], true,
-        "第一个窗口外仍有未检视行时必须标记为下界: {report}"
+        report["protected_is_lower_bound"], false,
+        "窗口已扫完（最后一批未满），累计的保护行数是精确值、不再是下界: {report}"
     );
     assert_eq!(
         report["budget_exhausted"], false,

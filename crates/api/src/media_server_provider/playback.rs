@@ -198,6 +198,25 @@ fn persist_event(
     if current.as_ref().is_some_and(|s| s.admin_ended) {
         return Ok(());
     }
+    // 会话已被管理员结束（此时 current 为 None）时，迟到的 Progress/Stopped 不得
+    // 把会话复活；只有客户端显式重新起播（Playing）才允许新建会话。与 web 心跳
+    // 路径的 `device_was_admin_ended` 守卫保持同一语义。
+    if current.is_none() && event != PlaybackEvent::Playing {
+        match store.device_was_admin_ended(user_id, &client.device_id, now, 10) {
+            Ok(true) => {
+                tracing::debug!(
+                    %user_id,
+                    device_id = %client.device_id,
+                    "管理员已结束该设备会话，忽略迟到事件"
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, %user_id, device_id = %client.device_id, "查询管理员结束标记失败");
+            }
+        }
+    }
     // 验证目标所属媒体库未处于删除冻结中且台账未被清理，防止已删除文件在心跳中复活
     if let Some(row) = store.get_ledger(&target.ledger_id)? {
         if let Some(owner) = store.library_for_path_strict(std::path::Path::new(&row.path), target.media.kind)? {

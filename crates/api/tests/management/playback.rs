@@ -144,6 +144,57 @@ async fn post_async(app: &axum::Router, uri: &str, body: Value) -> axum::respons
         .unwrap()
 }
 
+/// 带管理员 token 的 GET，返回信封里的 `data`。
+async fn get_data(app: &axum::Router, uri: &str) -> Value {
+    let body = json_body(
+        app.clone()
+            .oneshot(request("GET", uri, Some("management-secret"), Value::Null))
+            .await
+            .unwrap(),
+    )
+    .await;
+    body["data"].clone()
+}
+
+/// 一次真实节奏的进度心跳：时钟与位置都按 20 秒步进，避免被判成 seek。
+async fn beat(
+    app: &axum::Router,
+    clock: &Arc<FakePlaybackClock>,
+    media_id: &str,
+    step: u32,
+) -> axum::response::Response {
+    clock.0.fetch_add(20_000, std::sync::atomic::Ordering::SeqCst);
+    post_async(
+        app,
+        "/api/v1/playback/progress",
+        json!({ "media_item_id": media_id, "event": "progress", "device_id": "web-1",
+                "position_ms": step * 20_000, "paused": false }),
+    )
+    .await
+}
+
+/// 直接写一条 8 天前的完结播放日志，用来覆盖统计的 retention 边界。
+fn seed_old_playback_log(tmp: &tempfile::TempDir, media_id: &str) {
+    let conn = rusqlite::Connection::open(tmp.path().join("data/subscribe.db")).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT INTO playback_logs (id, user_id, media_id, started_at, ended_at, watched_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            uuid::Uuid::new_v4().to_string(),
+            "00000000-0000-0000-0000-000000000001",
+            media_id,
+            now - 8 * 86_400,
+            now - 8 * 86_400 + 60,
+            30_000
+        ],
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn progress_lifecycle_writes_session_log_and_unit() {
     let tmp = tempfile::tempdir().unwrap();

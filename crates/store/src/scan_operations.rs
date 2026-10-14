@@ -278,40 +278,6 @@ impl Store {
         Ok(None)
     }
 
-    /// Retrieve the oldest queued scan operation without claiming it.
-    pub fn next_queued_scan(&self) -> Result<Option<ScanOperation>, StoreError> {
-        self.library
-            .query_row(
-                "SELECT id, library_id, scope_signature, status, generation, report_json
-                 FROM scan_operations
-                 WHERE status = 'queued'
-                 ORDER BY created_at_ms ASC, rowid ASC
-                 LIMIT 1",
-                [],
-                |r| {
-                    let id: String = r.get(0)?;
-                    let library_id: String = r.get(1)?;
-                    let scope_signature: String = r.get(2)?;
-                    let status_str: String = r.get(3)?;
-                    let generation: i64 = r.get(4)?;
-                    let report_json: String = r.get(5)?;
-                    let status = ScanOperationStatus::from_str(&status_str)
-                        .unwrap_or(ScanOperationStatus::Queued);
-                    let report = serde_json::from_str(&report_json).unwrap_or_default();
-                    Ok(ScanOperation {
-                        id,
-                        library_id,
-                        scope_signature,
-                        status,
-                        generation,
-                        report,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
     /// Recover orphaned running scans on startup: validates if the library still accepts work;
     /// if deleted/deleting, marks cancelled, otherwise re-queues.
     pub fn recover_orphaned_scans(&self) -> Result<usize, StoreError> {
