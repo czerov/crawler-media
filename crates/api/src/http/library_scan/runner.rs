@@ -146,7 +146,10 @@ impl ScanContext<'_> {
     }
 }
 
-/// 断点续扫：丢掉本 operation 已经处理过的文件。
+/// 断点续扫：丢掉本 operation 已经处理过、且仍然有效的文件。
+///
+/// 「有效」= 台账行仍存在、未标记 missing、文件版本（size/mtime）与记录一致。
+/// 恢复的文件与内容变化的文件必须重新处理（P2-3）。
 ///
 /// 读检查点失败时按「未处理」继续——宁可重复一遍，也不能因为检查点读不出来而漏文件。
 fn checkpoint_fresh(
@@ -162,7 +165,7 @@ fn checkpoint_fresh(
     let mut skipped = 0usize;
     for file in files {
         let path = file.path.display().to_string();
-        match store.is_scan_seen(op_id, &path) {
+        match store.scan_seen_is_current(op_id, &path) {
             Ok(true) => skipped += 1,
             Ok(false) => fresh.push(file),
             Err(error) => {
@@ -176,9 +179,14 @@ fn checkpoint_fresh(
 
 /// 把库根与增量目标映射成 (身份解析根, 起始目录) 列表。
 ///
-/// `targets` 为空 = 整库；非空时只走目标子目录，库根仍用于 NFO 身份解析。
-fn scan_starts(roots: &[PathBuf], targets: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
-    if targets.is_empty() {
+/// `scope_kind == full`（或 `targets` 为空）= 整库；`targeted` 时只走目标子目录，
+/// 库根仍用于 NFO 身份解析。Full 支配 Targeted：整库意图绝不会被目标列表缩小。
+fn scan_starts(
+    roots: &[PathBuf],
+    targets: &[PathBuf],
+    full_scope: bool,
+) -> Vec<(PathBuf, PathBuf)> {
+    if full_scope || targets.is_empty() {
         return roots
             .iter()
             .map(|root| (root.clone(), root.clone()))
@@ -245,12 +253,14 @@ fn publish_error(error: String) -> Response {
     err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &error)
 }
 
-/// 可断点续扫的扫描入口：`targets` 非空只扫这些子目录，`op_id` 存在时启用 `scan_seen` 断点。
+/// 可断点续扫的扫描入口：`scope_kind == targeted` 时只扫 `targets` 子目录，
+/// `full` 时忽略 `targets` 走整库；`op_id` 存在时启用 `scan_seen` 断点。
 pub(crate) fn scan_library_leased_resumable(
     state: &ApiState,
     id: &str,
     lease: &crate::library_lifecycle::LibraryWorkLease,
     targets: &[PathBuf],
+    full_scope: bool,
     op_id: Option<&str>,
 ) -> Result<(library::ScanReport, Value), Response> {
     let (kind, roots, scrape) = {
@@ -263,12 +273,12 @@ pub(crate) fn scan_library_leased_resumable(
         (library.kind, library.root_paths.clone(), nfo)
     };
     if kind == domain::MediaKind::Video {
-        if !targets.is_empty() {
+        if !full_scope && !targets.is_empty() {
             tracing::warn!(library_id = id, "Video Library 暂不支持增量目标扫描，按整库执行");
         }
         return scan_video_library(state, &roots, id, lease);
     }
-    let starts = scan_starts(&roots, targets);
+    let starts = scan_starts(&roots, targets, full_scope);
     if starts.is_empty() {
         return Err(err(
             StatusCode::BAD_REQUEST,

@@ -176,41 +176,58 @@ pub(crate) async fn list_libraries(
     axum::Extension(user_id): axum::Extension<Option<domain::UserId>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let store = state.store.lock();
-    let libraries = match store.list_libraries() {
-        Ok(libraries) => libraries,
-        Err(error) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "store.error",
-                &error.to_string(),
-            );
-        }
-    };
-    let is_admin = user_id
-        .and_then(|uid| store.user_role(uid).ok())
-        .as_deref()
-        .map(|r| r == "admin")
-        .unwrap_or(false);
-    let manage_scope = query.get("scope").is_some_and(|s| s == "admin")
-        || query.get("manage").is_some_and(|s| s == "1" || s == "true");
-    let libraries: Vec<Library> = libraries
-        .into_iter()
-        .filter(|library| {
-            if is_admin && manage_scope {
-                true
-            } else {
-                library_visible(&store, library, user_id)
+    // 锁内只收集 owned DB 事实（ledger 行 / removal / 封面候选路径）；逐文件
+    // `stat`、root `is_dir`、封面 `is_file` 一律放到锁外、受 http_work 预算约束，
+    // 慢挂载不再阻塞共享 Store 和 Tokio worker。
+    let facts: Vec<assets::LibraryFacts> = {
+        let store = state.store.lock();
+        let libraries = match store.list_libraries() {
+            Ok(libraries) => libraries,
+            Err(error) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "store.error",
+                    &error.to_string(),
+                );
             }
+        };
+        let is_admin = user_id
+            .and_then(|uid| store.user_role(uid).ok())
+            .as_deref()
+            .map(|r| r == "admin")
+            .unwrap_or(false);
+        let manage_scope = query.get("scope").is_some_and(|s| s == "admin")
+            || query.get("manage").is_some_and(|s| s == "1" || s == "true");
+        let kind = query.get("kind").and_then(|k| MediaKind::from_str(k).ok());
+        libraries
+            .into_iter()
+            .filter(|library| {
+                if is_admin && manage_scope {
+                    true
+                } else {
+                    library_visible(&store, library, user_id)
+                }
+            })
+            .filter(|library| kind.is_none_or(|k| library.kind == k))
+            .map(|library| assets::library_facts(&store, &library))
+            .collect()
+    };
+    match state
+        .http_work
+        .run(selection::BROWSE_DEADLINE, move || {
+            facts
+                .iter()
+                .map(assets::library_json_from_facts)
+                .collect::<Vec<Value>>()
         })
-        .collect();
-    let kind = query.get("kind").and_then(|k| MediaKind::from_str(k).ok());
-    let items: Vec<Value> = libraries
-        .iter()
-        .filter(|library| kind.is_none_or(|k| library.kind == k))
-        .map(|library| library_json(&store, library))
-        .collect();
-    ok_list(items).into_response()
+        .await
+    {
+        Ok(items) => ok_list(items).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "媒体库列表的文件观察任务失败");
+            selection::browse_work_error(error)
+        }
+    }
 }
 
 /// GET /libraries/{id}/items — one item per Media owned under this library's roots.

@@ -45,6 +45,8 @@ mod scan_probe_obligations;
 mod scan_operations;
 pub use scan_operations::{ScanOperation, ScanOperationStatus};
 pub use scan_probe_obligations::ScanProbeObligation;
+mod search_history;
+pub use search_history::{HistoryDeleteOutcome, HistoryDeletePlan};
 mod sites;
 mod subscribe_wanted;
 mod subscribe_library;

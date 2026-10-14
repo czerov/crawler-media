@@ -12,7 +12,10 @@ pub fn migrate_scan_operations(conn: &Connection) -> Result<(), StoreError> {
              generation INTEGER NOT NULL,
              created_at_ms INTEGER NOT NULL,
              report_json TEXT NOT NULL DEFAULT '{}',
-             targets_json TEXT NOT NULL DEFAULT '[]'
+             targets_json TEXT NOT NULL DEFAULT '[]',
+             scope_kind TEXT NOT NULL DEFAULT 'full',
+             dirty_rev INTEGER NOT NULL DEFAULT 0,
+             consumed_rev INTEGER NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS scan_operations_lib_status_idx
              ON scan_operations (library_id, status);
@@ -30,5 +33,25 @@ pub fn migrate_scan_operations(conn: &Connection) -> Result<(), StoreError> {
         "targets_json",
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
+    super::ensure_column(
+        conn,
+        "scan_operations",
+        "scope_kind",
+        "TEXT NOT NULL DEFAULT 'full'",
+    )?;
+    super::ensure_column(
+        conn,
+        "scan_operations",
+        "dirty_rev",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    super::ensure_column(
+        conn,
+        "scan_operations",
+        "consumed_rev",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    super::ensure_column(conn, "scan_seen", "mtime_ms", "INTEGER NOT NULL DEFAULT 0")?;
+    super::ensure_column(conn, "scan_seen", "file_size", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(())
 }

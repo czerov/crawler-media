@@ -444,6 +444,108 @@ async fn history_delete_reports_failure_and_keeps_entry_when_snapshot_delete_fai
     );
 }
 
+/// 历史删除是**单事务**：settings 写失败时，已删的快照必须一起回滚。
+///
+/// 旧顺序（先删快照、成功后再写设置）在这里会留下「条目在、快照 404」的死链，
+/// 也就是 P3-1 复现的「点开历史返回 404」。断言写成「条目与快照同生同死」，
+/// 而不是只断言条目还在——后者在死链状态下也成立。
+#[tokio::test]
+async fn history_delete_rolls_back_snapshot_when_settings_write_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = authed_app(&tmp);
+    let id = save_empty_search(&app).await;
+    // 基线：删除前快照是可回放的。
+    assert_empty_snapshot(&app, &id).await;
+
+    // 只拦 settings 写入，让快照删除「成功」而设置写失败。
+    let conn = rusqlite::Connection::open(tmp.path().join("data").join("app.db")).unwrap();
+    conn.execute(
+        "CREATE TRIGGER reject_settings_write BEFORE INSERT ON settings
+         BEGIN SELECT RAISE(FAIL, 'nope'); END;",
+        [],
+    )
+    .unwrap();
+
+    let deleted = send(
+        &app,
+        "DELETE",
+        &format!("/api/v1/search/history/{id}"),
+        Some("management-secret"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        deleted.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "设置写失败必须回 500"
+    );
+
+    let history = json_body(
+        send(
+            &app,
+            "GET",
+            "/api/v1/search/history",
+            Some("management-secret"),
+            Value::Null,
+        )
+        .await,
+    )
+    .await;
+    let entry_present = history["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"].as_str() == Some(id.as_str()));
+    let snapshot = send(
+        &app,
+        "GET",
+        &format!("/api/v1/search/history/{id}?vertical=torrents"),
+        Some("management-secret"),
+        Value::Null,
+    )
+    .await;
+    let snapshot_present = snapshot.status() == StatusCode::OK;
+    assert_eq!(
+        entry_present, snapshot_present,
+        "条目与快照必须同生同死：不允许「条目在、快照 404」的死链"
+    );
+    assert!(entry_present, "设置写失败时条目与快照都必须原样保留");
+
+    // 清空路径同理：删除设置键失败时，已经删掉的快照必须一起回滚。
+    conn.execute(
+        "CREATE TRIGGER reject_settings_delete BEFORE DELETE ON settings
+         BEGIN SELECT RAISE(FAIL, 'nope'); END;",
+        [],
+    )
+    .unwrap();
+    let cleared = send(
+        &app,
+        "DELETE",
+        "/api/v1/search/history",
+        Some("management-secret"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        cleared.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "清空时设置删除失败必须回 500"
+    );
+    let replay = send(
+        &app,
+        "GET",
+        &format!("/api/v1/search/history/{id}?vertical=torrents"),
+        Some("management-secret"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        replay.status(),
+        StatusCode::OK,
+        "清空失败后快照必须仍可回放（不能只删掉一半）"
+    );
+}
+
 #[tokio::test]
 async fn title_search_snapshot_captures_results() {
     let tmp = tempfile::tempdir().unwrap();

@@ -50,6 +50,51 @@ impl ScanOperationStatus {
     }
 }
 
+/// 扫描意图：`full` 表示走完整库根，`targeted` 表示只走 `targets`。
+///
+/// 之所以要把它和 `targets` 分开持久化：空 `targets` 既可能表示「整库」，
+/// 也可能表示「本轮没有新增目标」，只靠数组无法区分（P2-1）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ScanScopeKind {
+    Full,
+    Targeted,
+}
+
+impl ScanScopeKind {
+    fn from_targets(targets: &[PathBuf]) -> Self {
+        if targets.is_empty() {
+            Self::Full
+        } else {
+            Self::Targeted
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Targeted => "targeted",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "full" => Some(Self::Full),
+            "targeted" => Some(Self::Targeted),
+            _ => None,
+        }
+    }
+
+    /// 合并规则：Full 支配 Targeted（整库请求永远不会被增量目标缩小）。
+    fn merge(self, incoming: Self) -> Self {
+        if self == Self::Full || incoming == Self::Full {
+            Self::Full
+        } else {
+            Self::Targeted
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScanOperation {
     pub id: String,
@@ -58,8 +103,25 @@ pub struct ScanOperation {
     pub status: ScanOperationStatus,
     pub generation: i64,
     pub report: serde_json::Value,
-    /// 增量扫描目标（空 = 整个 Library）。watch 事件把变动子目录并进同一 operation。
+    /// 增量扫描目标（`scope_kind == targeted` 时生效）。
     pub targets: Vec<PathBuf>,
+    scope_kind: ScanScopeKind,
+    /// 每次并入请求（含重复 target）都自增；worker 据此判断是否需要补扫一轮。
+    pub dirty_rev: i64,
+    /// worker 已消费到的 `dirty_rev`。
+    pub consumed_rev: i64,
+}
+
+impl ScanOperation {
+    /// 是否整库扫描（`scope_kind == full`）。
+    pub fn is_full_scope(&self) -> bool {
+        self.scope_kind == ScanScopeKind::Full
+    }
+
+    /// 持久化的扫描意图字符串（`full` / `targeted`）。
+    pub fn scope_kind_str(&self) -> &'static str {
+        self.scope_kind.as_str()
+    }
 }
 
 fn parse_targets(raw: &str) -> Vec<PathBuf> {
@@ -70,11 +132,13 @@ fn targets_json(targets: &[PathBuf]) -> String {
     serde_json::to_string(targets).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// 列顺序固定为：id, library_id, scope_signature, status, generation, report_json, targets_json。
+/// 列顺序固定为：id, library_id, scope_signature, status, generation, report_json,
+/// targets_json, scope_kind, dirty_rev, consumed_rev。
 fn map_scan_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanOperation> {
     let status_str: String = row.get(3)?;
     let report_json: String = row.get(5)?;
     let targets_raw: String = row.get(6)?;
+    let kind_raw: String = row.get(7)?;
     Ok(ScanOperation {
         id: row.get(0)?,
         library_id: row.get(1)?,
@@ -84,14 +148,24 @@ fn map_scan_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanOperation
         generation: row.get(4)?,
         report: serde_json::from_str(&report_json).unwrap_or_default(),
         targets: parse_targets(&targets_raw),
+        // 老库没有 scope_kind：默认 full 是安全方向（整库多扫，绝不缩小）。
+        scope_kind: ScanScopeKind::from_str(&kind_raw).unwrap_or(ScanScopeKind::Full),
+        dirty_rev: row.get(8)?,
+        consumed_rev: row.get(9)?,
     })
 }
+
+/// 所有 `ScanOperation` 查询共用的列清单。
+const SCAN_OPERATION_COLUMNS: &str =
+    "id, library_id, scope_signature, status, generation, report_json, targets_json, \
+     scope_kind, dirty_rev, consumed_rev";
 
 impl Store {
     /// Enqueue a scan operation. If an active scan exists for this library, returns the existing operation.
     ///
-    /// `targets` 非空时只扫描这些子目录。命中已有 active operation 时把新目标并进去
-    /// （持久化到行上），这样 watch 增量目标不会因为单飞而被丢掉。
+    /// `targets` 非空 = 只扫描这些子目录（`targeted`），空 = 整库（`full`）。命中已有 active
+    /// operation 时按「Full 支配 Targeted」合并意图，并把新目标并进去（持久化到行上）；
+    /// 每次并入（含重复 target）都自增 `dirty_rev`，worker 据此补扫一轮，重复事件不会被吞。
     pub fn enqueue_scan(
         &self,
         library_id: &str,
@@ -104,13 +178,17 @@ impl Store {
             rusqlite::TransactionBehavior::Immediate,
         )?;
 
+        let incoming_kind = ScanScopeKind::from_targets(targets);
+
         // Check if an active scan operation exists for this library
-        let active_opt: Option<(String, String, String, i64, String, String)> = tx
+        let active_opt: Option<(String, String, String, String, i64, String, String, String, i64, i64)> = tx
             .query_row(
-                "SELECT id, scope_signature, status, generation, report_json, targets_json
-                 FROM scan_operations
-                 WHERE library_id = ?1 AND status IN ('queued', 'running', 'yielded')
-                 LIMIT 1",
+                &format!(
+                    "SELECT {SCAN_OPERATION_COLUMNS}
+                     FROM scan_operations
+                     WHERE library_id = ?1 AND status IN ('queued', 'running', 'yielded')
+                     LIMIT 1"
+                ),
                 [library_id],
                 |r| {
                     Ok((
@@ -120,31 +198,64 @@ impl Store {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
                     ))
                 },
             )
             .optional()?;
 
-        if let Some((id, scope_signature, status_str, generation, report_json, targets_raw)) =
-            active_opt
+        if let Some((
+            id,
+            _library_id,
+            scope_signature,
+            status_str,
+            generation,
+            report_json,
+            targets_raw,
+            kind_raw,
+            dirty_rev,
+            consumed_rev,
+        )) = active_opt
         {
             let status = ScanOperationStatus::from_str(&status_str).unwrap_or(ScanOperationStatus::Running);
             let report = serde_json::from_str(&report_json).unwrap_or_default();
-            let mut merged = parse_targets(&targets_raw);
+            let existing_kind = ScanScopeKind::from_str(&kind_raw).unwrap_or(ScanScopeKind::Full);
+            let merged_kind = existing_kind.merge(incoming_kind);
+            // Full 支配 Targeted：整库语义下 target 列表没有意义，清空以免被误读为缩小范围。
+            let mut merged = if merged_kind == ScanScopeKind::Full {
+                Vec::new()
+            } else {
+                parse_targets(&targets_raw)
+            };
             let mut added = 0usize;
-            for target in targets {
-                if !merged.contains(target) {
-                    merged.push(target.clone());
-                    added += 1;
+            if merged_kind == ScanScopeKind::Targeted {
+                for target in targets {
+                    if !merged.contains(target) {
+                        merged.push(target.clone());
+                        added += 1;
+                    }
                 }
             }
-            if added > 0 {
-                tx.execute(
-                    "UPDATE scan_operations SET targets_json = ?1 WHERE id = ?2",
-                    params![targets_json(&merged), id],
-                )?;
-                tracing::info!(%library_id, op_id = %id, added, "增量扫描目标已并入进行中的扫描操作");
-            }
+            // 即使 target 重复、即使意图被 Full 吸收，也必须自增版本：
+            // 这是「同一 target 的后续事件不被吞掉」的唯一依据。
+            let next_dirty = dirty_rev + 1;
+            tx.execute(
+                "UPDATE scan_operations
+                 SET targets_json = ?1, scope_kind = ?2, dirty_rev = ?3
+                 WHERE id = ?4",
+                params![targets_json(&merged), merged_kind.as_str(), next_dirty, id],
+            )?;
+            tracing::info!(
+                %library_id,
+                op_id = %id,
+                added,
+                scope_kind = merged_kind.as_str(),
+                dirty_rev = next_dirty,
+                "扫描请求已并入进行中的扫描操作"
+            );
             tx.commit()?;
             return Ok(ScanOperation {
                 id,
@@ -154,6 +265,9 @@ impl Store {
                 generation,
                 report,
                 targets: merged,
+                scope_kind: merged_kind,
+                dirty_rev: next_dirty,
+                consumed_rev,
             });
         }
 
@@ -170,9 +284,18 @@ impl Store {
 
         tx.execute(
             "INSERT INTO scan_operations
-                (id, library_id, scope_signature, status, generation, created_at_ms, report_json, targets_json)
-             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, '{}', ?6)",
-            params![op_id, library_id, signature, generation, now_ms, targets_json(targets)],
+                (id, library_id, scope_signature, status, generation, created_at_ms, report_json,
+                 targets_json, scope_kind, dirty_rev, consumed_rev)
+             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, '{}', ?6, ?7, 0, 0)",
+            params![
+                op_id,
+                library_id,
+                signature,
+                generation,
+                now_ms,
+                targets_json(targets),
+                incoming_kind.as_str()
+            ],
         )?;
 
         tx.commit()?;
@@ -185,6 +308,10 @@ impl Store {
             generation,
             report: serde_json::json!({}),
             targets: targets.to_vec(),
+            scope_kind: incoming_kind,
+            // 新建 operation 尚未执行，不需要补扫版本；后续并入请求才会自增。
+            dirty_rev: 0,
+            consumed_rev: 0,
         })
     }
 
@@ -192,8 +319,7 @@ impl Store {
     pub fn scan_operation(&self, id: &str) -> Result<Option<ScanOperation>, StoreError> {
         self.library
             .query_row(
-                "SELECT id, library_id, scope_signature, status, generation, report_json, targets_json
-                 FROM scan_operations WHERE id = ?1",
+                &format!("SELECT {SCAN_OPERATION_COLUMNS} FROM scan_operations WHERE id = ?1"),
                 [id],
                 map_scan_operation,
             )
@@ -206,25 +332,40 @@ impl Store {
         &self,
         library_id: &str,
     ) -> Result<Vec<ScanOperation>, StoreError> {
-        let mut stmt = self.library.prepare(
-            "SELECT id, library_id, scope_signature, status, generation, report_json, targets_json
+        let mut stmt = self.library.prepare(&format!(
+            "SELECT {SCAN_OPERATION_COLUMNS}
              FROM scan_operations WHERE library_id = ?1
-             ORDER BY created_at_ms DESC, rowid DESC",
-        )?;
+             ORDER BY created_at_ms DESC, rowid DESC"
+        ))?;
         let rows = stmt.query_map([library_id], map_scan_operation)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// 推进已消费的 `dirty_rev`：只前进不后退，保证单调。
+    pub fn advance_scan_consumed_rev(&self, id: &str, rev: i64) -> Result<bool, StoreError> {
+        let changed = self.library.execute(
+            "UPDATE scan_operations SET consumed_rev = ?1 WHERE id = ?2 AND consumed_rev < ?1",
+            params![rev, id],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Record paths seen during an operation chunk within an Immediate transaction.
+    ///
+    /// 同时记录文件版本（mtime_ms/file_size），恢复时据此复核「文件是否变化」。
     pub fn record_scan_seen(&self, operation_id: &str, paths: &[PathBuf]) -> Result<(), StoreError> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.library,
             rusqlite::TransactionBehavior::Immediate,
         )?;
         for p in paths {
+            let (mtime_ms, file_size) = file_version(p);
             tx.execute(
-                "INSERT OR IGNORE INTO scan_seen (operation_id, path) VALUES (?1, ?2)",
-                params![operation_id, p.display().to_string()],
+                "INSERT INTO scan_seen (operation_id, path, mtime_ms, file_size)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(operation_id, path)
+                 DO UPDATE SET mtime_ms = excluded.mtime_ms, file_size = excluded.file_size",
+                params![operation_id, p.display().to_string(), mtime_ms, file_size],
             )?;
         }
         tx.commit()?;
@@ -239,6 +380,43 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(found)
+    }
+
+    /// 断点命中复核：只有「台账行仍存在、未标记 missing、文件版本未变化」时才可以跳过。
+    ///
+    /// 恢复的文件（missing_at 已清除/曾标记）与内容变化的文件必须重新处理（P2-3）。
+    pub fn scan_seen_is_current(&self, operation_id: &str, path: &str) -> Result<bool, StoreError> {
+        let seen: Option<(i64, i64)> = self
+            .library
+            .query_row(
+                "SELECT mtime_ms, file_size FROM scan_seen WHERE operation_id = ?1 AND path = ?2",
+                params![operation_id, path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((seen_mtime, seen_size)) = seen else {
+            return Ok(false);
+        };
+        // 台账行必须还在，且没有被标记为 missing：文件被删过又恢复时，
+        // 单看路径会误判「已处理」，导致 missing 永远清不掉、文件也不重新入账。
+        let missing: Option<Option<i64>> = self
+            .library
+            .query_row(
+                "SELECT missing_at FROM ledger WHERE path = ?1 LIMIT 1",
+                params![path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match missing {
+            None | Some(Some(_)) => return Ok(false),
+            Some(None) => {}
+        }
+        // 0/0 视为「版本未知」（老断点行）：只做台账复核，保持向后兼容。
+        if seen_mtime == 0 && seen_size == 0 {
+            return Ok(true);
+        }
+        let (mtime_ms, file_size) = file_version(std::path::Path::new(path));
+        Ok(mtime_ms == seen_mtime && file_size == seen_size)
     }
 
     /// Clear seen entries when operation completes or is cancelled.
@@ -283,9 +461,11 @@ impl Store {
             &self.library,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        let mut query = "SELECT id, library_id, scope_signature, status, generation, report_json, targets_json
-                         FROM scan_operations
-                         WHERE status = 'queued'".to_string();
+        let mut query = format!(
+            "SELECT {SCAN_OPERATION_COLUMNS}
+             FROM scan_operations
+             WHERE status = 'queued'"
+        );
         if !excluding.is_empty() {
             let placeholders: Vec<String> = (1..=excluding.len()).map(|i| format!("?{}", i)).collect();
             query.push_str(&format!(" AND id NOT IN ({})", placeholders.join(",")));
@@ -358,10 +538,25 @@ impl Store {
     }
 }
 
+/// 文件版本：mtime 毫秒 + 字节数；读不到时返回 0/0（视为「版本未知」）。
+fn file_version(path: &std::path::Path) -> (i64, i64) {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let mtime_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            (mtime_ms, meta.len() as i64)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
 trait RusqliteOptionalExt<T> {
     fn optional(self) -> Result<Option<T>, rusqlite::Error>;
 }
-
 impl<T> RusqliteOptionalExt<T> for Result<T, rusqlite::Error> {
     fn optional(self) -> Result<Option<T>, rusqlite::Error> {
         match self {

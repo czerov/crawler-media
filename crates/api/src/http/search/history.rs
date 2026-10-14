@@ -15,11 +15,18 @@ fn user_setting_key(base: &str, user_id: domain::UserId) -> String {
 }
 
 fn history_items(store: &crate::Store, user_id: domain::UserId) -> Vec<Value> {
-    store
-        .get_setting(&user_setting_key("search.history", user_id))
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
+    parse_history(
+        store
+            .get_setting(&user_setting_key("search.history", user_id))
+            .ok()
+            .flatten()
+            .as_deref(),
+    )
+}
+
+/// 解析历史设置原文；坏值/缺键都退化成空列表（与旧行为一致）。
+fn parse_history(raw: Option<&str>) -> Vec<Value> {
+    raw.and_then(|raw| serde_json::from_str(raw).ok())
         .unwrap_or_default()
 }
 
@@ -151,45 +158,52 @@ pub(super) fn save_titles_history(
     }
 }
 
+/// 单条删除的事务计划：历史里没有这个 id 就返回 `None`（不删快照、不改设置）。
+fn single_delete_plan(
+    current: Option<&str>,
+    id: &str,
+) -> Option<crate::store::HistoryDeletePlan> {
+    let mut history = parse_history(current);
+    let before = history.len();
+    history.retain(|item| item["id"].as_str() != Some(id));
+    if history.len() == before {
+        return None;
+    }
+    Some(crate::store::HistoryDeletePlan {
+        snapshot_ids: vec![id.to_string()],
+        settings_value: Some(serde_json::json!(history).to_string()),
+    })
+}
+
+/// 清空的事务计划：删掉当前历史里的全部快照，再删掉设置键本身。
+fn clear_plan(current: Option<&str>) -> Option<crate::store::HistoryDeletePlan> {
+    let snapshot_ids = parse_history(current)
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_string))
+        .collect();
+    Some(crate::store::HistoryDeletePlan {
+        snapshot_ids,
+        settings_value: None,
+    })
+}
+
 /// 按 id 删除一条关键词历史（连同结果快照）。
 ///
-/// 顺序是**先删快照、确认成功，再改历史设置**：快照删除失败就立即中止，历史条目
-/// 原样保留，不会在删除动作失败后仍返回成功。任一步失败都返回 `Err`，路由层回 500。
-///
-/// 残余风险：快照删成功后写设置仍可能失败，此时条目还在而快照已没（死链）。要彻底
-/// 消除需要把两步放进同一个 SQLite 事务（store 层新方法），不在本次改动范围内。
+/// 快照行与历史设置都在 app.db，删除由 store 的**单个事务**完成：要么条目和快照
+/// 一起删掉，要么都保留。任一步失败整体回滚并返回 `Err`，路由层回 500，绝不会
+/// 出现「条目还在、快照已删」的点开即 404。
 fn delete_history_entry(
     store: &crate::Store,
     user_id: domain::UserId,
     id: &str,
 ) -> Result<bool, crate::store::StoreError> {
-    let mut history = history_items(store, user_id);
-    let before = history.len();
-    history.retain(|item| item["id"].as_str() != Some(id));
-    if history.len() == before {
-        return Ok(false);
+    let key = user_setting_key("search.history", user_id);
+    let outcome = store.delete_search_history(&key, |current| single_delete_plan(current, id))?;
+    if outcome.deleted && outcome.snapshots_removed == 0 {
+        // 快照本就不在（历史条目在旧版本里可能没落盘快照）：不算失败，但要说清。
+        tracing::warn!(history_id = %id, "历史条目没有对应快照，仅清理条目");
     }
-    match store.delete_search_snapshot(id) {
-        Ok(true) => {}
-        Ok(false) => {
-            // 快照本就不在（历史条目在旧版本里可能没落盘快照）：不算失败，但要说清。
-            tracing::warn!(history_id = %id, "历史条目没有对应快照，仅清理条目");
-        }
-        Err(error) => {
-            tracing::error!(%error, history_id = %id, "删除历史快照失败，保留历史条目");
-            return Err(error);
-        }
-    }
-    store
-        .put_setting(
-            &user_setting_key("search.history", user_id),
-            &serde_json::json!(history).to_string(),
-        )
-        .map_err(|error| {
-            tracing::error!(%error, history_id = %id, "快照已删但写入历史条目失败");
-            error
-        })?;
-    Ok(true)
+    Ok(outcome.deleted)
 }
 
 pub(super) fn chrono_like_now() -> String {
@@ -345,31 +359,23 @@ pub(crate) async fn delete_history_entry_route(
 
 /// DELETE /search/history — 清空关键词历史与全部快照。
 ///
-/// 与单条删除同序：先把快照删干净，再清历史设置；任一快照删失败就中止并回 500，
-/// 不改设置，避免留下「条目在、快照没了」的死链。
+/// 与单条删除同源：删快照与删设置键在**同一个 app.db 事务**里完成，任一步失败
+/// 整体回滚并回 500，不会留下「条目在、快照没了」的死链，也不会只删掉一半快照。
 pub(crate) async fn clear_search_history_route(
     State(state): State<ApiState>,
     axum::Extension(user_id): axum::Extension<domain::UserId>,
 ) -> Response {
     let store = state.store.lock();
-    let history = history_items(&store, user_id);
-    for id in history.iter().filter_map(|item| item["id"].as_str()) {
-        if let Err(error) = store.delete_search_snapshot(id) {
-            tracing::error!(%error, history_id = %id, "清空搜索历史时删除快照失败");
-            return err(
+    let key = user_setting_key("search.history", user_id);
+    match store.delete_search_history(&key, clear_plan) {
+        Ok(_) => ok(json!({ "cleared": true })).into_response(),
+        Err(error) => {
+            tracing::error!(%error, %user_id, "清空搜索历史失败");
+            err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "store.error",
                 "清空搜索历史失败，请稍后重试",
-            );
+            )
         }
     }
-    if let Err(error) = store.delete_setting(&user_setting_key("search.history", user_id)) {
-        tracing::error!(%error, %user_id, "清空搜索历史设置失败");
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store.error",
-            "清空搜索历史失败，请稍后重试",
-        );
-    }
-    ok(json!({ "cleared": true })).into_response()
 }

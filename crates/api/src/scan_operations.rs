@@ -20,6 +20,16 @@ pub struct ScanCoordinator {
     active_controls: Mutex<HashMap<String, library::WorkControl>>,
 }
 
+/// 扫描 scope 的持久化指纹：Library 种类 + 根数量 + 排序后的根路径。
+///
+/// 入队时写入 `scan_operations.scope_signature`，执行/恢复前用它做准入比对：
+/// 配置变过的旧 operation 必须取消，而不是拿旧 scope 继续扫（B3 design:99）。
+pub fn scan_scope_signature(lib: &store::Library) -> String {
+    let mut roots: Vec<_> = lib.root_paths.iter().map(|p| p.display().to_string()).collect();
+    roots.sort();
+    format!("{}:{}:{}", lib.kind.as_str(), lib.root_paths.len(), roots.join(","))
+}
+
 impl ScanCoordinator {
     pub fn new() -> Self {
         Self {
@@ -63,6 +73,7 @@ impl ScanCoordinator {
             drop(running);
             let state_clone = state.clone();
             let targets = op.targets.clone();
+            let full_scope = op.is_full_scope();
             tokio::spawn(async move {
                 // 无论 worker 正常结束还是 panic，都会释放 running 槽位并唤醒下一个
                 // 排队 operation，避免两次 panic 就把全局 2 个扫描额度永久占满。
@@ -70,7 +81,7 @@ impl ScanCoordinator {
                     state: state_clone.clone(),
                     op_id: op.id.clone(),
                 };
-                run_operation(&state_clone, &op.id, &op.library_id, &targets).await;
+                run_operation(&state_clone, &op.id, &op.library_id, &targets, full_scope).await;
             });
         }
     }
@@ -94,9 +105,7 @@ impl ScanCoordinator {
             {
                 return Err(ScanEnqueueError::Conflict("Library 正在删除或已冻结".to_string()));
             }
-            let mut roots: Vec<_> = lib.root_paths.iter().map(|p| p.display().to_string()).collect();
-            roots.sort();
-            format!("{}:{}:{}", lib.kind.as_str(), lib.root_paths.len(), roots.join(","))
+            scan_scope_signature(&lib)
         };
 
         if state.acquire_library_work(library_id).is_err() {
@@ -171,37 +180,40 @@ fn write_terminal_status(
     }
 }
 
-/// 本轮扫描期间又有新的增量目标并入（watch 事件）→ 不写终态，改回 `queued`，
-/// 让 coordinator 用合并后的目标再跑一轮。
+/// 本轮扫描期间又有新的请求并入（watch 事件，哪怕 target 重复）→ 不写终态，改回 `queued`，
+/// 让 coordinator 用合并后的意图再跑一轮。
 ///
-/// 保留 `scan_seen` 断点：下一轮只处理新目标，已处理过的文件不会重复入账/探测。
+/// 用 `dirty_rev > consumed_rev` 而不是「目标列表变长」判断：同一 target 的第二次变动
+/// 不会让列表增长，但必须补扫（P2-2）。版本单调，因此不会无限循环。
+///
+/// 保留 `scan_seen` 断点：下一轮只处理新目标/新文件，已处理过的文件不会重复入账/探测。
 /// 返回 `true` 表示本轮已重排，调用方不得再写终态。
-fn requeue_if_targets_grew(
-    store: &crate::Store,
-    op_id: &str,
-    round_targets: &[PathBuf],
-) -> bool {
+fn requeue_if_dirty(store: &crate::Store, op_id: &str) -> bool {
     let current = match store.scan_operation(op_id) {
-        Ok(Some(op)) => op.targets,
+        Ok(Some(op)) => op,
         Ok(None) => return false,
         Err(error) => {
-            tracing::error!(%error, %op_id, "读取扫描目标失败，无法判断是否需要补扫");
+            tracing::error!(%error, %op_id, "读取扫描版本失败，无法判断是否需要补扫");
             return false;
         }
     };
-    if current.len() <= round_targets.len() {
+    if current.dirty_rev <= current.consumed_rev {
         return false;
     }
+    let consumed = current.dirty_rev;
     match store.update_scan_operation_status(
         op_id,
         ScanOperationStatus::Queued,
         &serde_json::json!({}),
     ) {
         Ok(true) => {
+            if let Err(error) = store.advance_scan_consumed_rev(op_id, consumed) {
+                tracing::error!(%error, %op_id, consumed, "推进扫描已消费版本失败");
+            }
             tracing::info!(
                 %op_id,
-                merged = current.len() - round_targets.len(),
-                "扫描期间并入新的增量目标，回到队列补扫一轮"
+                consumed_rev = consumed,
+                "扫描期间并入新的请求，回到队列补扫一轮"
             );
             true
         }
@@ -213,7 +225,62 @@ fn requeue_if_targets_grew(
     }
 }
 
-async fn run_operation(state: &ApiState, op_id: &str, library_id: &str, targets: &[PathBuf]) {
+/// 执行准入：持久化的 scope signature 与当前 scope 不一致时返回取消原因。
+///
+/// 读失败（库不存在/查询出错）不在这里取消：让后续的 `acquire_library_work` 与
+/// `ScanScope::validate` 按既有语义处理，避免把瞬时读错误当成配置变化。
+fn stale_scope_reason(state: &ApiState, op_id: &str, library_id: &str) -> Option<String> {
+    let store = state.store.lock();
+    let op = match store.scan_operation(op_id) {
+        Ok(Some(op)) => op,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::error!(%error, %op_id, "读取扫描 operation 失败，跳过 scope 准入复核");
+            return None;
+        }
+    };
+    let lib = match store.get_library(library_id) {
+        Ok(Some(lib)) => lib,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::error!(%error, %library_id, %op_id, "读取 Library 失败，跳过 scope 准入复核");
+            return None;
+        }
+    };
+    let current = scan_scope_signature(&lib);
+    if current == op.scope_signature {
+        return None;
+    }
+    Some(format!(
+        "library scope changed: persisted={} current={}",
+        op.scope_signature, current
+    ))
+}
+
+async fn run_operation(
+    state: &ApiState,
+    op_id: &str,
+    library_id: &str,
+    targets: &[PathBuf],
+    full_scope: bool,
+) {
+    // B3 design:99：入队时写下的 scope 与当前 scope 不一致，就取消而不是照旧执行。
+    if let Some(reason) = stale_scope_reason(state, op_id, library_id) {
+        tracing::warn!(%op_id, %library_id, %reason, "扫描 scope 已变化，取消过期 operation");
+        let store = state.store.lock();
+        if let Err(error) = store.update_scan_operation_status(
+            op_id,
+            ScanOperationStatus::Cancelled,
+            &serde_json::json!({ "error": "library.scope_changed", "reason": reason }),
+        ) {
+            tracing::error!(%error, %op_id, "取消过期扫描 operation 失败");
+        }
+        if let Err(error) = store.clear_scan_seen(op_id) {
+            tracing::error!(%error, %op_id, "清理过期扫描断点失败");
+        }
+        return;
+    }
+
     let lease = match state.acquire_library_work(library_id) {
         Ok(lease) => lease,
         Err(e) => {
@@ -243,8 +310,7 @@ async fn run_operation(state: &ApiState, op_id: &str, library_id: &str, targets:
 
     let state_clone = state.clone();
     let lib_id = library_id.to_string();
-    let round_targets = targets.to_vec();
-    let scan_targets = round_targets.clone();
+    let scan_targets = targets.to_vec();
     let op_id_owned = op_id.to_string();
     let scan_res = tokio::task::spawn_blocking(move || {
         // op_id 同时是 scan_seen 断点的归属：中断重排后同一 operation 从断点续扫。
@@ -253,6 +319,7 @@ async fn run_operation(state: &ApiState, op_id: &str, library_id: &str, targets:
             &lib_id,
             &lease,
             &scan_targets,
+            full_scope,
             Some(&op_id_owned),
         )
     })
@@ -263,7 +330,7 @@ async fn run_operation(state: &ApiState, op_id: &str, library_id: &str, targets:
     let store = state.store.lock();
     match scan_res {
         Ok(Ok((scan_report, report_data))) => {
-            if requeue_if_targets_grew(&store, op_id, &round_targets) {
+            if requeue_if_dirty(&store, op_id) {
                 return;
             }
             let any_partial_or_unreachable = scan_report

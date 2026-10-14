@@ -548,3 +548,102 @@ async fn created_library_keeps_intro_and_fingerprint_off_until_edited() {
     assert_eq!(patched["data"]["detect_intros"], true);
     assert_eq!(patched["data"]["enable_fingerprint"], true);
 }
+
+/// `/libraries` 的逐文件 `stat` / root `is_dir` / 封面 `is_file` 必须在 Store 锁
+/// **外**、且在 http_work 有界预算内执行（P2-6）。
+///
+/// 证据形状：占住唯一 permit 后，列表请求必须**不再原地做 IO**，而是被预算拒绝
+/// （503 runtime.busy）——说明文件观察已经搬到预算后面、离开了请求路径；放行预算
+/// 后同一个请求返回与基线**逐字段一致**的 JSON。旧实现在锁内直接 stat，预算被占住
+/// 也照常回 200，因此本测试对旧实现是红的。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn library_list_file_io_runs_under_the_bounded_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("movies");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let budget = Arc::new(api::blocking_budget::BlockingBudget::new(1));
+    let st = state(
+        tmp.path(),
+        Arc::new(Fixtures {
+            requests: Mutex::new(Vec::new()),
+            bodies: HashMap::new(),
+        }),
+        Arc::new(MemoryDownloader::new(tmp.path().join("stage"))),
+    )
+    .with_http_work(budget.clone());
+    let app = router(st);
+    let _ = create_library(&app, "电影", "movie", &[root.display().to_string()]).await;
+
+    // 基线：预算空闲时列表正常返回，root 存在、无文件。
+    let baseline = get(&app, "/api/v1/libraries").await;
+    let before = baseline["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|library| library["name"] == "电影")
+        .expect("列表必须包含刚建的库")
+        .clone();
+    assert_eq!(before["root_missing"], false);
+    assert_eq!(before["stats"]["file_count"], 0);
+
+    // 占住唯一 permit：文件观察此刻无法进入 blocking 预算。
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = tokio::spawn({
+        let budget = budget.clone();
+        async move {
+            budget
+                .run_to_completion(move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                })
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+
+    let blocked = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/api/v1/libraries",
+            Some("management-secret"),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "文件观察必须走 http_work 预算，不能在请求路径上原地执行"
+    );
+    assert_eq!(json_body(blocked).await["error"]["code"], "runtime.busy");
+
+    // 预算被占住期间 Store 锁必须空闲：另一个要锁的请求照常返回。
+    let other = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.clone().oneshot(request(
+            "GET",
+            "/api/v1/search/history",
+            Some("management-secret"),
+            Value::Null,
+        )),
+    )
+    .await
+    .expect("文件观察不得持有 Store 锁")
+    .unwrap();
+    assert_eq!(other.status(), StatusCode::OK);
+
+    // 放行预算：同一请求恢复，字段与基线一致（含 root_missing 与 stats）。
+    release_tx.send(()).unwrap();
+    holder.await.unwrap().unwrap();
+    let after = get(&app, "/api/v1/libraries").await;
+    let after_library = after["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|library| library["name"] == "电影")
+        .expect("列表必须包含刚建的库");
+    assert_eq!(after_library, &before, "预算恢复后列表 JSON 必须与基线一致");
+}

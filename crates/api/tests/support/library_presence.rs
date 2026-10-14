@@ -134,6 +134,31 @@ impl PresenceFixture {
         }
     }
 
+    /// 当前 Library 的扫描 scope 指纹（与生产 `ScanCoordinator::enqueue` 同一构造）。
+    pub fn scope_signature(&self) -> String {
+        let store = self.state.store();
+        let guard = store.lock();
+        let library = guard
+            .get_library(&self.library_id)
+            .unwrap()
+            .expect("library must exist");
+        api::scan_operations::scan_scope_signature(&library)
+    }
+
+    /// 轮询 store 直到 operation 进入终态，返回落库的 operation（含 report）。
+    pub async fn wait_scan_terminal_op(&self, op_id: &str) -> store::ScanOperation {
+        for _ in 0..200 {
+            let op = self.state.store().lock().scan_operation(op_id).unwrap();
+            if let Some(op) = op
+                && !op.status.is_active()
+            {
+                return op;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("scan operation {op_id} 未在预期时间内进入终态");
+    }
+
     pub fn insert_media_and_ledger(&self, rel_path: &str) -> (MediaId, LedgerRow) {
         let media_id = MediaId::new();
         let media = Media {
