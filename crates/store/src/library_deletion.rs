@@ -332,12 +332,7 @@ impl Store {
             [],
         )?;
         // Library-scoped settings die with the Library.
-        for prefix in LIBRARY_SETTING_KEY_PREFIXES {
-            tx.execute(
-                "DELETE FROM settings WHERE key = ?1",
-                [format!("{prefix}{}", removal.library_id)],
-            )?;
-        }
+        delete_library_scoped_settings(&tx, &removal.library_id)?;
         // The per-file snapshot only exists to recover an interrupted removal;
         // drop it now that this operation is terminal. The boundary roots stay.
         tx.execute(
@@ -503,6 +498,44 @@ impl Store {
         }
         Ok(closed)
     }
+}
+
+/// Delete every `settings` row owned by `library_id`, per the prefix registry.
+fn delete_library_scoped_settings(
+    conn: &Connection,
+    library_id: &str,
+) -> Result<usize, StoreError> {
+    let mut deleted = 0;
+    for prefix in LIBRARY_SETTING_KEY_PREFIXES {
+        deleted += conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            [format!("{prefix}{library_id}")],
+        )?;
+    }
+    Ok(deleted)
+}
+
+/// One-shot repair for databases written before removal deleted Library-scoped
+/// settings: drop the settings of Libraries whose removal already succeeded.
+///
+/// A pending removal keeps its Library row, so its settings are left alone.
+pub(crate) fn repair_removed_library_settings(conn: &Connection) -> Result<usize, StoreError> {
+    let removed: Vec<String> = conn
+        .prepare(
+            "SELECT library_id FROM library_removals r
+             WHERE r.state = 'succeeded'
+               AND NOT EXISTS (SELECT 1 FROM libraries l WHERE l.id = r.library_id)",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut deleted = 0;
+    for library_id in removed {
+        deleted += delete_library_scoped_settings(conn, &library_id)?;
+    }
+    if deleted > 0 {
+        tracing::info!(deleted, "已清理已删除媒体库的专属设置");
+    }
+    Ok(deleted)
 }
 
 /// Backfill `library_removal_roots` from snapshots written before the roots table
@@ -690,6 +723,41 @@ mod tests {
         assert_eq!(
             reopened.removal_roots(&removal.operation_id).unwrap(),
             roots
+        );
+    }
+
+    #[test]
+    fn opening_a_pre_fix_database_cleans_settings_of_removed_libraries() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let store = Store::open(&data).unwrap();
+        let (library, _row) = fixture(&store, &temp.path().join("tv"));
+        let kept = store
+            .list_libraries()
+            .unwrap()
+            .iter()
+            .find(|l| l.kind == MediaKind::Tv && l.id != library.id)
+            .unwrap()
+            .id
+            .clone();
+        let removed_key = format!("library_cover_checked.{}", library.id);
+        let kept_key = format!("library_cover_checked.{kept}");
+        let removal = store.begin_library_removal(&library.id).unwrap();
+        store
+            .set_removal_state(&removal.operation_id, "cleaning", None)
+            .unwrap();
+        store.clean_library_removal(&removal.operation_id).unwrap();
+        // Pre-fix residue: the removal succeeded but the Library's setting stayed.
+        store.put_setting(&removed_key, "checked-v2").unwrap();
+        store.put_setting(&kept_key, "checked-v2").unwrap();
+        store.app.pragma_update(None, "user_version", 6).unwrap();
+        drop(store);
+
+        let reopened = Store::open(&data).unwrap();
+        assert!(reopened.get_setting(&removed_key).unwrap().is_none());
+        assert_eq!(
+            reopened.get_setting(&kept_key).unwrap().as_deref(),
+            Some("checked-v2")
         );
     }
 }

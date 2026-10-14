@@ -61,9 +61,11 @@ pub fn migrate_app(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(tables::APP_TABLES)?;
     conn.execute_batch(library_deletion::TABLES)?;
     // app schema 7：删除边界根目录从 `snapshot_json` 迁到 `library_removal_roots`，
-    // 让路径边界检查不再反序列化整份快照。回填幂等（INSERT OR IGNORE）。
+    // 让路径边界检查不再反序列化整份快照；并补清已删除 Library 遗留的专属设置。
+    // 两步都幂等。
     if previous < APP_SCHEMA_VERSION {
         crate::library_deletion::backfill_library_removal_roots(conn)?;
+        crate::library_deletion::repair_removed_library_settings(conn)?;
     }
     ensure_column(conn, "downloaders", "path_maps", "TEXT")?;
     // downloaders.enabled：停用的下载器不参与自动投递（手动提交仍可用）。
