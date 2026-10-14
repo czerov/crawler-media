@@ -69,6 +69,9 @@ pub struct ApiState {
     pub obscura: Arc<crate::obscura_manager::ObscuraManager>,
     /// 异步媒体探测队列（streamdetails + 声纹指纹后台采集）。
     pub probe: Arc<crate::probe_manager::ProbeManager>,
+    /// 测试 seam：gallery 实际展开图片 JSON 的组数（生产只读计数，无副作用）。
+    /// 用来证明「先按图片存在性剔除空组、再分页」后只渲染本页图片集合。
+    pub(crate) gallery_expansions: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn apply_admin_bootstrap(
@@ -253,6 +256,7 @@ impl ApiState {
             log_buffer: LogBuffer::new(DEFAULT_CAPACITY),
             obscura: Arc::new(crate::obscura_manager::ObscuraManager::new(&data_dir)),
             probe,
+            gallery_expansions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             crate::library_lifecycle::resume_library_removals(&state)
@@ -314,6 +318,20 @@ impl ApiState {
     ) -> Self {
         self.browse_files = files;
         self
+    }
+
+    /// 替换 gallery 展开计数 seam（测试注入自有计数器以观察只渲染本页）。
+    pub fn with_gallery_expansions(
+        mut self,
+        counter: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.gallery_expansions = counter;
+        self
+    }
+
+    /// gallery 展开计数（每次为一组图片构建 JSON 记 1）。
+    pub fn gallery_expansions(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.gallery_expansions.clone()
     }
 
     /// 替换 notify 发送实现（测试注入阻塞实现以验证预算准入）。

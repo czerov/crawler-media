@@ -44,10 +44,18 @@ impl Store {
         }
     }
 
+    /// All catalog cache rows, newest first.
+    ///
+    /// `rowid ASC` is the stable tie-break for equal `fetched_at` (e.g. two
+    /// languages of one detail fetched in the same second): the first-inserted
+    /// row wins, which is also what the targeted
+    /// [`Store::catalog_details_for_prefixes`] read returns. The two paths must
+    /// agree because the browse fallback and the projection builder both keep
+    /// the first row per cache-key base.
     pub fn list_catalog_cache(&self) -> Result<Vec<CatalogCacheRow>, StoreError> {
         let mut stmt = self.catalog.prepare(
             "SELECT source, cache_key, body, fetched_at, expires_at FROM catalog_cache
-             ORDER BY fetched_at DESC",
+             ORDER BY fetched_at DESC, rowid ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(CatalogCacheRow {

@@ -16,7 +16,7 @@ use api::browse_projection::ProjectionService;
 use api::router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use domain::{Confidence, LedgerId, LedgerRow, Media, MediaId, MediaKind, QualitySource};
+use domain::{Confidence, LedgerId, LedgerRow, Media, MediaId, MediaKind, QualitySource, UserId};
 use serde_json::Value;
 use support::library_presence::PresenceFixture;
 use tower::ServiceExt;
@@ -201,6 +201,17 @@ fn seeded_fixture() -> PresenceFixture {
                 None,
             )
             .unwrap();
+        // 同一详情、同一 fetched_at 的第二个 language：定向读取与全量读取必须
+        // 用同一个稳定并列键选中同一行（P2-NEW-2）。
+        guard
+            .put_catalog_cache(
+                "tmdb",
+                "/movie/424242?language=en-US",
+                "{\"vote_average\":9.9,\"runtime\":88,\"original_language\":\"en\",\"genres\":[{\"id\":35}],\"origin_country\":[\"US\"]}",
+                1000,
+                None,
+            )
+            .unwrap();
     }
     let _ = delta;
     seed_missing_movie(&fix, "Echo");
@@ -329,6 +340,72 @@ async fn hot_browse_requests_do_zero_file_io() {
     assert!(
         files.total() > 0,
         "旧全量路径必须有文件 IO（否则计数 seam 失效）"
+    );
+}
+
+/// P2-NEW-4：用户 `playback_units` 心跳只影响用户派生观看状态，不得让公共
+/// 图片/NFO 投影失效；热浏览仍必须零文件 IO。
+#[tokio::test]
+async fn playback_unit_write_does_not_invalidate_public_projection() {
+    let fix = PresenceFixture::new();
+    let media_id = seed_movie(&fix, "Gamma", None, None, true);
+    let files = Arc::new(CountingFiles::default());
+    let state = fix
+        .state
+        .clone()
+        .with_browse_file_read(files.clone())
+        .with_projection_service(Arc::new(ProjectionService::new()));
+
+    // 预热公共投影（首次构建允许文件 IO）。
+    state
+        .projection
+        .ensure(state.clone(), fix.library_id.clone())
+        .await
+        .expect("projection build");
+    assert!(!state.projection.is_dirty(&fix.library_id));
+    let before = fix
+        .state
+        .store()
+        .lock()
+        .browse_projection(&fix.library_id)
+        .unwrap()
+        .expect("warm projection");
+    // 让重建（若发生）落在不同的毫秒，refreshed_at 才能区分「重建」与「未重建」。
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    // 另一个用户的播放心跳：只写 playback_units（subscribe revision 递增）。
+    let user = UserId::new();
+    fix.state
+        .store()
+        .lock()
+        .set_playback_state(user, media_id, 5_000, Some(true), Some(true), None, None)
+        .unwrap();
+    assert!(
+        !state.projection.is_dirty(&fix.library_id),
+        "播放写入不得标脏公共投影"
+    );
+
+    // 热浏览：不得重跑 NFO/stat。
+    files.reset();
+    let url = format!("/api/v1/libraries/{}/items", fix.library_id);
+    let _ = get(&state, &url, &fix.admin_token).await;
+    assert_eq!(
+        files.total(),
+        0,
+        "playback_units 写入后热浏览仍必须零文件 IO"
+    );
+
+    // 公共投影不得重建（refreshed_at 是发布时刻；重建会晚于 5ms 的间隔）。
+    let after = fix
+        .state
+        .store()
+        .lock()
+        .browse_projection(&fix.library_id)
+        .unwrap()
+        .expect("projection still published");
+    assert_eq!(
+        before.refreshed_at_ms, after.refreshed_at_ms,
+        "playback_units 写入后公共投影不得重建"
     );
 }
 

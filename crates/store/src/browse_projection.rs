@@ -15,6 +15,19 @@ pub struct ReadRevisions {
     pub subscribe: i64,
 }
 
+impl ReadRevisions {
+    /// Whether the two revision sets imply the same **public** browse projection.
+    ///
+    /// The shared image/NFO projection stores only public facts (Media, ledger,
+    /// catalog metadata, artwork presence). Per-user watch state is read live
+    /// per request, so `subscribe` DML (`playback_units` heartbeats) must not
+    /// invalidate or discard a public projection; only user-derived watch
+    /// aggregates are invalidated by those writes.
+    pub fn public_matches(&self, other: &Self) -> bool {
+        self.app == other.app && self.library == other.library && self.catalog == other.catalog
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrowseFileFacts {
     pub ledger_id: LedgerId,
@@ -105,8 +118,10 @@ impl Store {
             rusqlite::TransactionBehavior::Immediate,
         )?;
 
+        // 只核对公共事实 revision：构建期间的 `playback_units` 写入不应丢弃
+        // 已经建好的公共图片/NFO 投影（用户 unit 每请求实时批量读取）。
         let cur_revs = self.read_revisions()?;
-        if cur_revs != build.revisions {
+        if !cur_revs.public_matches(&build.revisions) {
             return Ok(false);
         }
 
@@ -320,8 +335,9 @@ impl Store {
     ///
     /// The browse metadata reader indexes rows by the part before `?`, keeping the
     /// newest per base; this mirrors that lookup without scanning every catalog
-    /// body. `ORDER BY fetched_at DESC` keeps the same "newest first" tie order as
-    /// `list_catalog_cache`.
+    /// body. `ORDER BY fetched_at DESC, rowid ASC` is the **same stable tie-break**
+    /// as `list_catalog_cache`, so a tied `fetched_at` (two languages of one
+    /// detail) resolves to the same row on both the targeted and the full read.
     pub fn catalog_details_for_prefixes(
         &self,
         source: &str,
@@ -345,7 +361,7 @@ impl Store {
                 values.push(rusqlite::types::Value::from(prefix.clone()));
                 values.push(rusqlite::types::Value::from(format!("{prefix}?%")));
             }
-            sql.push_str(") ORDER BY fetched_at DESC");
+            sql.push_str(") ORDER BY fetched_at DESC, rowid ASC");
             let mut stmt = self.catalog.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
                 Ok(CatalogCacheRow {

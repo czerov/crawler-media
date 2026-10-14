@@ -40,6 +40,7 @@ pub(crate) async fn gallery(
             Err(response) => return response,
         };
     let files = state.browse_files.clone();
+    let expansions = state.gallery_expansions.clone();
     let work = state
         .http_work
         .run(selection::BROWSE_DEADLINE, move || {
@@ -49,8 +50,12 @@ pub(crate) async fn gallery(
                 Err(response) => return response,
             };
             let art = selection::BrowseArtwork::new(artwork.as_ref(), files.as_ref());
-            let mut groups = Vec::new();
-            for item in selected {
+            // 先按图片存在性剔除空组、再分页：只扫描到填满本页窗口为止，
+            // 且只为本页构建图片 JSON（不再为每个过滤后的 Media 都建一遍）。
+            let page_items = gallery_page_items(&selected, page, &art);
+            let mut groups = Vec::with_capacity(page_items.len());
+            for item in page_items {
+                expansions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let images = gallery_images(&library_id, &item.media, &item.rows, &art);
                 if images.is_empty() {
                     continue;
@@ -63,15 +68,55 @@ pub(crate) async fn gallery(
                     "images": images,
                 }));
             }
-            // 空图组已在上面剔除，分页必须发生在剔除之后；bounds 对 offset+limit 溢出免疫。
-            let bounds = page.bounds(groups.len());
-            ok_list(groups[bounds].to_vec()).into_response()
+            ok_list(groups).into_response()
         })
         .await;
     match work {
         Ok(response) => response,
         Err(error) => selection::browse_work_error(error),
     }
+}
+
+/// 先按图片存在性剔除空组，再取分页窗口。
+///
+/// 只扫描到填满 `offset + limit` 个非空组为止（省略 limit 时扫描全部），因此
+/// 空组不会造成短页，而图集 JSON 只为本页构建。旧实现为每个过滤后的 Media 都
+/// 先建完整图片数组再分页，本函数把该成本压到页大小。
+fn gallery_page_items<'a>(
+    selected: &'a [selection::LibrarySelection],
+    page: page::PageWindow,
+    art: &selection::BrowseArtwork<'_>,
+) -> Vec<&'a selection::LibrarySelection> {
+    let end = match page.limit {
+        Some(limit) => page.offset.saturating_add(limit),
+        None => usize::MAX,
+    };
+    let mut out = Vec::new();
+    let mut non_empty_seen = 0usize;
+    for item in selected {
+        if !has_gallery_images(item, art) {
+            continue;
+        }
+        if non_empty_seen >= page.offset {
+            out.push(item);
+        }
+        non_empty_seen += 1;
+        if non_empty_seen >= end {
+            break;
+        }
+    }
+    out
+}
+
+/// 与 [`gallery_images`] 同一图片存在性口径：海报 / 背景 / 任一单元剧照。
+fn has_gallery_images(
+    item: &selection::LibrarySelection,
+    art: &selection::BrowseArtwork<'_>,
+) -> bool {
+    let facts = art.media(item.media.id, &item.rows);
+    facts.has_poster
+        || facts.has_backdrop
+        || item.rows.iter().any(|row| art.has_still(row))
 }
 
 /// 图组里的一类图片。每类自带 URL 前缀、宽高比与展示名，调用方不必再传一

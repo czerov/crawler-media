@@ -29,7 +29,8 @@ pub struct ScanCoordinator {
 /// `["/x/a,/x/b","/x/c"]` 与 `["/x/a","/x/b,/x/c"]` 不能碰撞（P2-4）。
 ///
 /// 旧构建写下的 `v1` 编码（`kind:count:root1,root2,...`）由
-/// [`match_legacy_scope_signature`] 在准入时识别并升级，不会被误判为配置变化（P2-NEW-1）。
+/// [`match_legacy_scope_signature`] 在准入时识别：只有与「当前配置重新编码出的旧格式」
+/// 逐字节相同的旧签名才可就地升级；有歧义或与当前配置不同的旧签名一律取消（P2-NEW-1）。
 pub fn scan_scope_signature(lib: &store::Library) -> String {
     let mut roots: Vec<_> = lib.root_paths.iter().map(|p| p.display().to_string()).collect();
     roots.sort();
@@ -217,29 +218,55 @@ struct ScanAdmission {
     signature_upgrade: Option<String>,
 }
 
+/// 旧（v1）scope 签名的编码：`kind:count:root1,root2,...`（排序后逗号拼接）。
+///
+/// 只用于把**当前**配置重新编码成旧格式，与持久化的旧签名做逐字节等价性证明。
+/// 绝不能反过来用 `split(',')` 反解旧签名里的根路径：根路径本身含逗号时该编码不可
+/// 唯一还原，反解会把「配置已变」误判成「只是格式不同」（P2-NEW-1）。
+fn legacy_scope_signature(library: &store::Library) -> String {
+    let mut roots: Vec<String> = library
+        .root_paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    roots.sort();
+    format!(
+        "{}:{}:{}",
+        library.kind.as_str(),
+        roots.len(),
+        roots.join(",")
+    )
+}
+
 /// 旧（v1）scope 签名与当前配置的比对结果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LegacySignatureMatch {
-    /// 可无歧义解码，且语义与当前配置一致：就地把签名升级成新编码。
+    /// 与「当前配置重新编码出的旧格式」逐字节相同：这行确实来自同一配置，可就地升级。
     Same,
-    /// 旧编码本身有歧义（根路径含分隔符），无法安全比对：升级并留痕，
-    /// 保留扫描意图而不是静默丢弃（P2-NEW-1）。
+    /// 旧编码不可唯一还原（根路径含分隔符），且与当前配置的旧编码不同：无法证明等价，
+    /// 必须取消。理由字符串只是留痕，不能替代这个安全判定（P2-NEW-1）。
     Ambiguous,
-    /// 可解码但与当前配置不一致：这是真实的 scope 变化，必须取消。
+    /// 可无歧义解码，但与当前配置不一致：真实的 scope 变化，必须取消。
     Different,
 }
 
 /// 解析旧格式签名 `kind:count:root1,root2,...` 并与当前 Library 配置比对。
 ///
 /// 返回 `None` = 不是可识别的旧格式（空串、损坏值、已是新格式），调用方按 scope
-/// 变化处理。旧编码用逗号拼接根路径：根路径本身含逗号时 `split(',')` 的段数会多于
-/// `count`，无法唯一还原，判为 [`LegacySignatureMatch::Ambiguous`]（P2-NEW-1）。
+/// 变化处理。
+///
+/// 安全判据只有一个：把**当前**配置重新编码成旧格式后，是否与持久化值逐字节相同。
+/// 只有 [`LegacySignatureMatch::Same`] 允许就地升级；`Ambiguous` 与 `Different` 都必须
+/// 取消——「旧编码有歧义」不是放行理由，恰恰是无法证明等价的证据。
 fn match_legacy_scope_signature(
     persisted: &str,
     library: &store::Library,
 ) -> Option<LegacySignatureMatch> {
     if persisted.starts_with("v2:") {
         return None;
+    }
+    if persisted == legacy_scope_signature(library) {
+        return Some(LegacySignatureMatch::Same);
     }
     let mut parts = persisted.splitn(3, ':');
     let kind = parts.next()?;
@@ -248,25 +275,15 @@ fn match_legacy_scope_signature(
     if kind != library.kind.as_str() {
         return Some(LegacySignatureMatch::Different);
     }
-    let mut persisted_roots: Vec<String> = if joined.is_empty() {
-        Vec::new()
+    let segments = if joined.is_empty() {
+        0
     } else {
-        joined.split(',').map(str::to_string).collect()
+        joined.split(',').count()
     };
-    if persisted_roots.len() != count {
-        return Some(LegacySignatureMatch::Ambiguous);
-    }
-    let mut current: Vec<String> = library
-        .root_paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect();
-    persisted_roots.sort();
-    current.sort();
-    Some(if persisted_roots == current {
-        LegacySignatureMatch::Same
-    } else {
+    Some(if segments == count {
         LegacySignatureMatch::Different
+    } else {
+        LegacySignatureMatch::Ambiguous
     })
 }
 
@@ -274,8 +291,19 @@ fn stale_scope_reason(persisted: &str, current: &str) -> String {
     format!("library scope changed: persisted={persisted} current={current}")
 }
 
+/// 旧编码有歧义且与当前配置的旧编码不同：无法证明等价，按 scope 变化取消。
+fn unprovable_legacy_reason(persisted: &str, current: &str) -> String {
+    format!(
+        "legacy scope signature is ambiguous and not provably equivalent to current config: \
+         persisted={persisted} current={current}"
+    )
+}
+
 /// 准入签名判定：`Ok(Some(reason))` = 旧格式已升级；`Ok(None)` = 与新编码一致；
 /// `Err(reason)` = 真实的 scope 变化，调用方必须取消。
+///
+/// 只有「当前配置重新编码成旧格式后与持久化值逐字节相同」才允许升级（P2-NEW-1）；
+/// 有歧义或可解码但不一致的旧签名一律取消，绝不升级成当前配置去扫新 scope。
 ///
 /// 升级走 store 的 CAS（同一 IMMEDIATE 事务内比对+写入）；CAS 失败说明签名被并发
 /// 改写，重读一次再判定，绝不覆盖别人的值。
@@ -288,23 +316,19 @@ fn reconcile_scan_scope_signature(
     if current == op.scope_signature {
         return Ok(None);
     }
-    let Some(legacy) = match_legacy_scope_signature(&op.scope_signature, library) else {
-        return Err(stale_scope_reason(&op.scope_signature, &current));
-    };
-    if legacy == LegacySignatureMatch::Different {
-        return Err(stale_scope_reason(&op.scope_signature, &current));
+    let legacy = match_legacy_scope_signature(&op.scope_signature, library);
+    if legacy != Some(LegacySignatureMatch::Same) {
+        return Err(match legacy {
+            Some(LegacySignatureMatch::Ambiguous) => {
+                unprovable_legacy_reason(&op.scope_signature, &current)
+            }
+            _ => stale_scope_reason(&op.scope_signature, &current),
+        });
     }
-    let reason = if legacy == LegacySignatureMatch::Ambiguous {
-        format!(
-            "signature format upgraded (legacy encoding ambiguous): persisted={} current={}",
-            op.scope_signature, current
-        )
-    } else {
-        format!(
-            "signature format upgraded: persisted={} current={}",
-            op.scope_signature, current
-        )
-    };
+    let reason = format!(
+        "signature format upgraded: persisted={} current={}",
+        op.scope_signature, current
+    );
     match store.upgrade_scan_scope_signature(&op.id, &op.scope_signature, &current) {
         Ok(true) => {
             tracing::warn!(op_id = %op.id, %reason, "扫描 scope 签名已升级，保留扫描意图");

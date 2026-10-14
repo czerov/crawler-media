@@ -16,13 +16,17 @@ use axum::response::Response;
 use domain::{LedgerRow, Media, MediaId, UserId};
 
 use crate::browse_file_read::BrowseFileRead;
+use crate::browse_projection::ProjectionError;
 use crate::http::err;
 use crate::management::ApiState;
 use crate::store::{CatalogCacheRow, Store, UnitState};
 
 use super::metadata::{self, BrowseMetadata, CacheIndex};
 use super::projected::{self, ProjectedFacts};
-use super::{LibraryFilter, LibrarySelection, file_stats, watch_state_from_units};
+use super::{
+    BROWSE_DEADLINE, LibraryFilter, LibrarySelection, browse_work_error, file_stats,
+    projection_error_response, watch_state_from_units,
+};
 
 /// 一个 Media 及其在**当前 Library** 名下的 ledger 行。
 pub(crate) struct BrowseGroup {
@@ -98,6 +102,8 @@ pub(crate) fn load_browse_snapshot(
 /// 优先读投影；投影不可用（未就绪 / 过期 / 事实不可解析）时回退全量读取。
 ///
 /// 回退必须留痕：投影读路径与旧路径的语义由 API 级等价测试守住。
+/// 容量不足 / 等待超时 / 取消**不回退**：它们不代表「投影事实不可用」，静默走全量
+/// 读取只会放大慢路径；按设计返回 503/504。
 pub(crate) async fn load_browse_snapshot_or_projection(
     state: &ApiState,
     library: &crate::store::Library,
@@ -109,24 +115,54 @@ pub(crate) async fn load_browse_snapshot_or_projection(
         .await
     {
         Ok(snapshot) => {
-            let store = state.store.lock();
-            match projected::snapshot_from_projection(&store, &snapshot, user) {
-                Ok(loaded) => return Ok((loaded.0, Some(loaded.1))),
-                Err(error) => tracing::warn!(
+            let state_clone = state.clone();
+            // 投影 → 请求级快照的 DB 读（units）与组装放到 blocking 预算，
+            // 不在 async worker 上持 Store 锁。
+            let work = state
+                .http_work
+                .run(BROWSE_DEADLINE, move || {
+                    let store = state_clone.store.lock();
+                    projected::snapshot_from_projection(&store, &snapshot, user)
+                })
+                .await;
+            match work {
+                Ok(Ok((snapshot, facts))) => return Ok((snapshot, Some(facts))),
+                Ok(Err(error)) => tracing::warn!(
                     library_id = %library.id,
                     %error,
                     "浏览投影事实不可用，回退到全量读取"
                 ),
+                Err(error) => return Err(browse_work_error(error)),
             }
         }
-        Err(error) => tracing::warn!(
-            library_id = %library.id,
-            ?error,
-            "浏览投影未就绪，回退到全量读取"
-        ),
+        Err(error) => {
+            if matches!(
+                error,
+                ProjectionError::Busy | ProjectionError::Timeout | ProjectionError::Cancelled
+            ) {
+                return Err(projection_error_response(error));
+            }
+            tracing::warn!(
+                library_id = %library.id,
+                ?error,
+                "浏览投影未就绪，回退到全量读取"
+            );
+        }
     }
-    let store = state.store.lock();
-    load_browse_snapshot(&store, library, user).map(|snapshot| (snapshot, None))
+    // 回退路径的同步 DB 读同样移出 async worker。
+    let state_clone = state.clone();
+    let library = library.clone();
+    let work = state
+        .http_work
+        .run(BROWSE_DEADLINE, move || {
+            let store = state_clone.store.lock();
+            load_browse_snapshot(&store, &library, user)
+        })
+        .await;
+    match work {
+        Ok(result) => result.map(|snapshot| (snapshot, None)),
+        Err(error) => Err(browse_work_error(error)),
+    }
 }
 
 fn read_units(

@@ -59,37 +59,30 @@ pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, Proj
 /// 必须用 [`store::LibraryOwnership::owner`]（未命中任何根时回退到该 kind 的默认
 /// Library），而不是 scan 用的 strict scope：旧 `load_browse_snapshot` 就是这个口径，
 /// 换成 strict 会把「不在任何根下」的 ledger 行整批丢掉，浏览输出随之变化。
+///
+/// 候选行由 [`store::Store::ledger_candidates_for_library`] 定向读取：无关 Library
+/// 的 ledger 行不进入内存，缺失标记也只查本库路径，因此无关台账增长不再增加本库
+/// 构建的 DB 行数、锁持有时间与内存。
 fn collect_owned(state: &ApiState, library_id: &str) -> Result<Owned, ProjectionError> {
-    let (library, snapshot, candidate_rows, missing, revisions) = {
-        let store = state.store.lock();
-        let snapshot = store
-            .library_ownership()
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
-        let library = snapshot
-            .library(library_id)
-            .cloned()
-            .ok_or(ProjectionError::Cancelled)?;
-        if !snapshot.accepts_work(library_id) {
-            return Err(ProjectionError::Cancelled);
-        }
-        let rows = store
-            .list_ledger()
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
-        let missing = store
-            .missing_at_by_path()
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?
-            .into_keys()
-            .collect();
-        let revs = store
-            .read_revisions()
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
-        (library, snapshot, rows, missing, revs)
-    };
+    let store = state.store.lock();
+    let snapshot = store
+        .library_ownership()
+        .map_err(|e| ProjectionError::Failed(e.to_string()))?;
+    let library = snapshot
+        .library(library_id)
+        .cloned()
+        .ok_or(ProjectionError::Cancelled)?;
+    if !snapshot.accepts_work(library_id) {
+        return Err(ProjectionError::Cancelled);
+    }
+    let candidates = store
+        .ledger_candidates_for_library(&snapshot, library_id)
+        .map_err(|e| ProjectionError::Failed(e.to_string()))?;
 
     let mut rows = Vec::new();
     let mut seen = HashSet::new();
     let mut media_ids = Vec::new();
-    for row in candidate_rows {
+    for row in candidates {
         let owner = snapshot.owner(Path::new(&row.path), library.kind);
         if owner.is_some_and(|owner| owner.id == library_id) {
             if seen.insert(row.media_id) {
@@ -98,6 +91,15 @@ fn collect_owned(state: &ApiState, library_id: &str) -> Result<Owned, Projection
             rows.push(row);
         }
     }
+    let paths: Vec<String> = rows.iter().map(|row| row.path.clone()).collect();
+    let missing = store
+        .missing_at_for_paths(&paths)
+        .map_err(|e| ProjectionError::Failed(e.to_string()))?;
+    let revisions = store
+        .read_revisions()
+        .map_err(|e| ProjectionError::Failed(e.to_string()))?;
+    drop(store);
+
     Ok(Owned {
         library,
         rows,

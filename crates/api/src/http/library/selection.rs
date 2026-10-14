@@ -56,6 +56,38 @@ pub(crate) fn browse_work_error(error: crate::blocking_budget::BlockingError) ->
     }
 }
 
+/// 投影不可用且**不可静默回退**的失败 → HTTP 响应。
+///
+/// 只有容量不足 / 等待超时 / 取消映射为 503/504；facts 不可解析或 DB 错误仍由调用方
+/// 回退到旧的全量读取（并 `warn!` 留痕），不能把「没建好」当成「没有授权事实」。
+pub(crate) fn projection_error_response(
+    error: crate::browse_projection::ProjectionError,
+) -> Response {
+    use crate::browse_projection::ProjectionError;
+    match error {
+        ProjectionError::Busy => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime.busy",
+            "投影构建容量不足，请重试",
+        ),
+        ProjectionError::Timeout => err(
+            StatusCode::GATEWAY_TIMEOUT,
+            "library.timeout",
+            "浏览投影构建超时",
+        ),
+        ProjectionError::Cancelled => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime.busy",
+            "媒体库暂不可用，请重试",
+        ),
+        error => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime.worker",
+            &format!("{error:?}"),
+        ),
+    }
+}
+
 /// 一部作品的观看状态。首页库行/收藏行的「未看优先」分级、筛选条的「未观看 / 在看 /
 /// 已看完」三档，都读这一份，避免同一部作品在两个地方被分成不同的档。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

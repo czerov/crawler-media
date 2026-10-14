@@ -441,3 +441,40 @@ async fn favorites_view_respects_title_sort_order() {
         .collect();
     assert_eq!(titles_desc, vec!["Movie 3", "Movie 2", "Movie 1"]);
 }
+
+/// P3-NEW-5：gallery 先剔除空组再分页，并且只为本页构建图片 JSON。
+#[tokio::test]
+async fn library_gallery_expands_only_the_current_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (api_state, app) = gallery_app(&tmp);
+    let lib_id = seed_gallery(&tmp, &api_state, &app).await;
+
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let api_state = api_state.with_gallery_expansions(counter.clone());
+    let app = router(api_state.clone());
+
+    let page1 = fetch_gallery_json(
+        &app,
+        &format!("/api/v1/libraries/{lib_id}/gallery?limit=1&offset=0"),
+    )
+    .await;
+    assert_eq!(page1.as_array().unwrap().len(), 1);
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "3 个非空组里 limit=1 只渲染本页 1 组，而不是为全部组构建图片 JSON"
+    );
+
+    counter.store(0, std::sync::atomic::Ordering::SeqCst);
+    let page2 = fetch_gallery_json(
+        &app,
+        &format!("/api/v1/libraries/{lib_id}/gallery?limit=1&offset=1"),
+    )
+    .await;
+    assert_eq!(page2.as_array().unwrap().len(), 1);
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "第二页同样只渲染本页"
+    );
+}

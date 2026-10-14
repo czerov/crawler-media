@@ -297,10 +297,10 @@ async fn legacy_signature_with_unchanged_config_is_upgraded_not_cancelled() {
     assert_eq!(fix.state.store().lock().list_ledger().unwrap().len(), 1);
 }
 
-/// P2-NEW-1：旧编码本身有歧义（根路径含逗号）无法安全比对时，仍要保留扫描意图、
-/// 显式报告升级原因，而不是静默取消。
+/// P2-NEW-1：旧编码有歧义（根路径含逗号），但**逐字节等于**当前配置重新编码出的旧格式时，
+/// 这行确实来自同一配置：允许就地升级并照常扫描。
 #[tokio::test]
-async fn ambiguous_legacy_signature_is_upgraded_and_intent_preserved() {
+async fn legacy_signature_equal_to_current_legacy_encoding_is_upgraded() {
     let fix = PresenceFixture::new();
     // 第二个根路径带逗号：v1 的逗号拼接无法唯一还原（`split(',')` 段数多于 count）。
     let comma_root = fix.dir.path().join("movies,alt");
@@ -322,6 +322,11 @@ async fn ambiguous_legacy_signature_is_upgraded_and_intent_preserved() {
 
     let legacy = fix.legacy_scope_signature();
     let current = fix.scope_signature();
+    assert_ne!(legacy, current, "测试前提：旧编码与新编码不同");
+    assert!(
+        legacy.split(',').count() > 2,
+        "测试前提：旧编码按逗号切分多于 count，无法唯一还原: {legacy}"
+    );
     let op = {
         let store = fix.state.store();
         let guard = store.lock();
@@ -335,20 +340,104 @@ async fn ambiguous_legacy_signature_is_upgraded_and_intent_preserved() {
     assert_eq!(
         done.status,
         store::ScanOperationStatus::Completed,
-        "有歧义的旧编码必须保留扫描意图: {}",
+        "可证明等价的旧编码必须保留扫描意图: {}",
         done.report
     );
-    assert_eq!(done.scope_signature, current, "旧编码必须被升级");
-    let reason = done.report["signature_upgrade"]
-        .as_str()
-        .unwrap_or_else(|| panic!("必须显式报告升级原因: {}", done.report));
+    assert_eq!(done.scope_signature, current, "旧编码必须被就地升级");
     assert!(
-        reason.contains("ambiguous"),
-        "有歧义的升级必须说明原因: {reason}"
+        done.report["signature_upgrade"].is_string(),
+        "升级必须留下显式原因: {}",
+        done.report
     );
     assert_eq!(
         fix.state.store().lock().list_ledger().unwrap().len(),
         2,
         "升级后按当前配置扫描，两个根的文件都要入账"
+    );
+}
+
+/// P2-NEW-1（安全）：旧编码有歧义、且与当前配置重新编码出的旧格式**不同**时，无法证明
+/// 等价，必须取消，绝不能升级成当前配置去扫新 scope。
+///
+/// 场景：旧根 `/old,movies`（签名 `movie:1:/old,movies`），根随后改成 `/new`；
+/// 逗号切分 2 段 ≠ count 1。修复前会被判为「只是格式歧义」并升级成 `/new` 的签名，
+/// 于是照扫新 scope 并把 `/new` 的文件登记进台账。
+#[tokio::test]
+async fn ambiguous_legacy_signature_after_scope_change_is_cancelled() {
+    let fix = PresenceFixture::new();
+    let old_root = fix.dir.path().join("old,movies");
+    let new_root = fix.dir.path().join("new");
+    std::fs::create_dir_all(&old_root).unwrap();
+    std::fs::create_dir_all(&new_root).unwrap();
+    std::fs::write(old_root.join("Old (2024).mkv"), b"old").unwrap();
+    std::fs::write(new_root.join("New (2024).mkv"), b"new").unwrap();
+
+    // 1. 旧配置：唯一根路径里含逗号 → 旧编码 `movie:1:<old_root>` 有歧义。
+    {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .update_library(
+                &fix.library_id,
+                None,
+                Some(&[old_root.to_str().unwrap()]),
+                None,
+            )
+            .unwrap();
+    }
+    let legacy = fix.legacy_scope_signature();
+    assert!(
+        legacy.contains("old,movies"),
+        "测试前提：旧签名来自含逗号的旧根: {legacy}"
+    );
+    assert_eq!(
+        legacy.split(',').count(),
+        2,
+        "测试前提：旧编码逗号切分 2 段 ≠ count 1: {legacy}"
+    );
+
+    // 2. operation 入队前配置已经改成另一个根。
+    {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .update_library(
+                &fix.library_id,
+                None,
+                Some(&[new_root.to_str().unwrap()]),
+                None,
+            )
+            .unwrap();
+    }
+
+    // 3. 遗留 operation 仍带着旧签名。
+    let op = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .enqueue_scan(&fix.library_id, &legacy, &[], 1000)
+            .unwrap()
+    };
+
+    fix.state.scan_coordinator.trigger_next(&fix.state);
+    let done = fix.wait_scan_terminal_op(&op.id).await;
+    assert_eq!(
+        done.status,
+        store::ScanOperationStatus::Cancelled,
+        "无法证明等价的旧签名必须取消，而不是升级到当前配置: {}",
+        done.report
+    );
+    assert_eq!(done.report["error"], "library.scope_changed");
+    assert!(
+        done.report["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("not provably equivalent")),
+        "取消原因必须说明旧编码无法证明等价: {}",
+        done.report
+    );
+    assert_eq!(done.scope_signature, legacy, "取消时不得改写签名");
+    assert!(
+        fix.state.store().lock().list_ledger().unwrap().is_empty(),
+        "取消的 operation 不得登记任何文件（尤其不能扫新根）"
     );
 }
