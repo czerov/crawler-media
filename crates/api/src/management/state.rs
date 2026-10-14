@@ -259,7 +259,11 @@ impl ApiState {
                 .map_err(std::io::Error::other)?;
             state.probe.try_start_workers();
             crate::scan_probe_dispatch::start_dispatcher(state.clone());
-            let _ = state.store.lock().recover_orphaned_scans();
+            match state.store.lock().recover_orphaned_scans() {
+                Ok(n) if n > 0 => tracing::info!(count = n, "已恢复未完成的扫描操作"),
+                Ok(_) => {}
+                Err(e) => tracing::error!(%e, "恢复未完成的扫描操作失败"),
+            }
             state.scan_coordinator.trigger_next(&state);
         }
         Ok(state)

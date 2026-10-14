@@ -143,8 +143,8 @@ impl Store {
             "INSERT INTO playback_logs
                 (id, user_id, media_id, season, episode, client, device_name, play_method,
                  started_at, ended_at, watched_ms, start_position_ms, end_position_ms,
-                 duration_ms, completed, device_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 duration_ms, completed, device_id, admin_ended)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 log.id,
                 log.user_id.to_string(),
@@ -162,6 +162,7 @@ impl Store {
                 log.duration_ms,
                 log.completed as i64,
                 log.device_id,
+                session.admin_ended as i64,
             ],
         )?;
         Ok(Some(log))
@@ -184,8 +185,8 @@ impl Store {
         Ok(self.close_session(user_id, device_id, now)?.is_some())
     }
 
-    /// Check if a session was recently ended/closed on this device within window_secs.
-    pub fn recently_ended_device_session(
+    /// Check if a session was explicitly ended by admin on this device within window_secs.
+    pub fn device_was_admin_ended(
         &self,
         user_id: UserId,
         device_id: &str,
@@ -196,7 +197,7 @@ impl Store {
         let exists: bool = self.subscribe.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM playback_logs
-                 WHERE user_id = ?1 AND device_id = ?2 AND ended_at >= ?3
+                 WHERE user_id = ?1 AND device_id = ?2 AND ended_at >= ?3 AND admin_ended != 0
              )",
             params![user_id.to_string(), device_id, cutoff],
             |r| r.get(0),

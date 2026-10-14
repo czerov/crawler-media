@@ -75,14 +75,7 @@ async fn cancel_scan_does_not_break_subsequent_library_work_leases() {
     let lease_res = fix.state.acquire_library_work(&fix.library_id);
     assert!(lease_res.is_ok(), "Canceling a scan must not freeze the library permanently");
 
-    // 5. Subsequent scan must be accepted
-    let (next_status, next_res) = fix
-        .request(
-            "POST",
-            &format!("/api/v1/libraries/{}/scan", fix.library_id),
-            Some(&fix.admin_token),
-        )
-        .await;
-    assert_eq!(next_status, StatusCode::ACCEPTED);
-    assert_eq!(next_res["ok"], true);
+    // 5. Subsequent scan must be accepted and successfully complete
+    let (next_status, next_res) = fix.scan_and_wait(&fix.library_id).await;
+    assert_eq!(next_status, StatusCode::OK);
 }

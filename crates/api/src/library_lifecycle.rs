@@ -127,7 +127,6 @@ pub struct LibraryWorkRegistry {
 struct Entry {
     cancelled: bool,
     controls: HashMap<String, library::WorkControl>,
-    control: library::WorkControl,
 }
 
 pub struct LibraryWorkLease {
@@ -168,7 +167,7 @@ impl LibraryWorkRegistry {
             return Err("Library 正在删除或已不存在".into());
         }
         let lease_id = uuid::Uuid::new_v4().to_string();
-        let control = entry.control.clone();
+        let control = library::WorkControl::default();
         entry.controls.insert(lease_id.clone(), control.clone());
         Ok(LibraryWorkLease { registry: self.clone(), library_id: library_id.into(), lease_id, control })
     }
@@ -180,7 +179,6 @@ impl LibraryWorkRegistry {
         let operation = store.lock().begin_library_removal(library_id)?;
         let entry = entries.entry(library_id.into()).or_default();
         entry.cancelled = true;
-        entry.control.cancel();
         for control in entry.controls.values() { control.cancel(); }
         Ok(operation)
     }
@@ -204,7 +202,6 @@ impl LibraryWorkRegistry {
         let mut entries = self.entries.lock();
         let entry = entries.entry(library_id.into()).or_default();
         entry.cancelled = true;
-        entry.control.cancel();
         for control in entry.controls.values() { control.cancel(); }
     }
 

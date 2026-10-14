@@ -436,6 +436,36 @@ async fn remove(f: &Fixture, app: &Router) {
     drop(store);
     f.assert_preserved();
 }
+async fn scan_library_op(app: &Router, library_id: &str) {
+    let operation = call(
+        app,
+        "POST",
+        &format!("/api/v1/libraries/{library_id}/scan"),
+        Value::Null,
+        StatusCode::ACCEPTED,
+    )
+    .await;
+    let op_id = operation["operation_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = call(
+                app,
+                "GET",
+                &format!("/api/v1/libraries/{library_id}/scan-operations/{op_id}"),
+                Value::Null,
+                StatusCode::OK,
+            )
+            .await;
+            if status["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 async fn reimport(f: &Fixture, app: &Router) -> LedgerRow {
     let created = call(
         app,
@@ -450,14 +480,7 @@ async fn reimport(f: &Fixture, app: &Router) -> LedgerRow {
     .await;
     let id = created["id"].as_str().unwrap();
     assert_ne!(id, f.library_id);
-    call(
-        app,
-        "POST",
-        &format!("/api/v1/libraries/{id}/scan"),
-        Value::Null,
-        StatusCode::OK,
-    )
-    .await;
+    scan_library_op(app, id).await;
     let shared = f.state.store();
     let store = shared.lock();
     let library = store.get_library(id).unwrap().unwrap();
@@ -558,7 +581,7 @@ fn online_identity_rebind_succeeds_when_reimported_library_reuses_removed_root()
                 StatusCode::OK,
             ).await;
             let library_id = created["id"].as_str().unwrap();
-            call(&app, "POST", &format!("/api/v1/libraries/{library_id}/scan"), Value::Null, StatusCode::OK).await;
+            scan_library_op(&app, library_id).await;
             // 建库会自动调度首次扫描（见 library_config::create_library），它与这次
             // 显式扫描并发：先返回的那次看到 ledger 行已存在（inserted=0），不会重绑，
             // 而真正做重绑的那次可能还没跑完 —— 之前就是在这里读到临时 MediaId 而假失败。

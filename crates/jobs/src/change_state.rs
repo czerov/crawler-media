@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::types::JobError;
 
@@ -80,6 +80,12 @@ pub fn migrate_job_change_state(conn: &Connection) -> Result<(), JobError> {
 }
 
 pub fn get_job_change_state(conn: &Connection) -> Result<JobChangeState, JobError> {
+    // Verify that jobs table is accessible
+    let _: Option<i64> = conn
+        .query_row("SELECT 1 FROM jobs LIMIT 1", [], |r| r.get(0))
+        .optional()
+        .map_err(|e| JobError::Sqlite(e))?;
+
     conn.query_row(
         "SELECT revision, finished_count FROM job_change_state WHERE id = 1",
         [],

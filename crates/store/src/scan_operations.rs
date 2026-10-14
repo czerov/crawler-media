@@ -218,7 +218,61 @@ impl Store {
         Ok(changed > 0)
     }
 
-    /// Retrieve the oldest queued scan operation.
+    /// Atomically claim the oldest queued scan operation, setting its status to running.
+    pub fn claim_next_queued_scan(&self, excluding: &[String]) -> Result<Option<ScanOperation>, StoreError> {
+        let tx = self.library.unchecked_transaction()?;
+        let mut query = "SELECT id, library_id, scope_signature, status, generation, report_json
+                         FROM scan_operations
+                         WHERE status = 'queued'".to_string();
+        if !excluding.is_empty() {
+            let placeholders: Vec<String> = (1..=excluding.len()).map(|i| format!("?{}", i)).collect();
+            query.push_str(&format!(" AND id NOT IN ({})", placeholders.join(",")));
+        }
+        query.push_str(" ORDER BY created_at_ms ASC, rowid ASC LIMIT 1");
+
+        let mut stmt = tx.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        for id in excluding {
+            params.push(id);
+        }
+        let op_opt = stmt
+            .query_row(rusqlite::params_from_iter(params), |r| {
+                let id: String = r.get(0)?;
+                let library_id: String = r.get(1)?;
+                let scope_signature: String = r.get(2)?;
+                let status_str: String = r.get(3)?;
+                let generation: i64 = r.get(4)?;
+                let report_json: String = r.get(5)?;
+                let status = ScanOperationStatus::from_str(&status_str)
+                    .unwrap_or(ScanOperationStatus::Queued);
+                let report = serde_json::from_str(&report_json).unwrap_or_default();
+                Ok(ScanOperation {
+                    id,
+                    library_id,
+                    scope_signature,
+                    status,
+                    generation,
+                    report,
+                })
+            })
+            .optional()?;
+        drop(stmt);
+
+        if let Some(mut op) = op_opt {
+            let updated = tx.execute(
+                "UPDATE scan_operations SET status = 'running' WHERE id = ?1 AND status = 'queued'",
+                params![op.id],
+            )?;
+            if updated > 0 {
+                tx.commit()?;
+                op.status = ScanOperationStatus::Running;
+                return Ok(Some(op));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Retrieve the oldest queued scan operation without claiming it.
     pub fn next_queued_scan(&self) -> Result<Option<ScanOperation>, StoreError> {
         self.library
             .query_row(
@@ -252,13 +306,38 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Recover orphaned running scans on startup by placing them back into queued state.
+    /// Recover orphaned running scans on startup: validates if the library still accepts work;
+    /// if deleted/deleting, marks cancelled, otherwise re-queues.
     pub fn recover_orphaned_scans(&self) -> Result<usize, StoreError> {
-        let changed = self.library.execute(
-            "UPDATE scan_operations SET status = 'queued' WHERE status = 'running'",
-            [],
-        )?;
-        Ok(changed)
+        let running: Vec<(String, String)> = {
+            let mut stmt = self.library.prepare(
+                "SELECT id, library_id FROM scan_operations WHERE status = 'running'",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let mut list = Vec::new();
+            for r in rows {
+                list.push(r?);
+            }
+            list
+        };
+
+        let mut recovered = 0;
+        for (op_id, lib_id) in running {
+            let accepts = self.library_accepts_work(&lib_id).unwrap_or(false);
+            if accepts {
+                let updated = self.library.execute(
+                    "UPDATE scan_operations SET status = 'queued' WHERE id = ?1 AND status = 'running'",
+                    params![op_id],
+                )?;
+                recovered += updated;
+            } else {
+                let _ = self.library.execute(
+                    "UPDATE scan_operations SET status = 'cancelled' WHERE id = ?1 AND status = 'running'",
+                    params![op_id],
+                );
+            }
+        }
+        Ok(recovered)
     }
 }
 

@@ -51,13 +51,16 @@ fn watcher_preserves_media_still_targeted_by_subscribe() {
         wash_cut_filter_id: None, keep_old_versions: false, full_season_pack: false,
         downloader_id: None, library_id: None, tracking_state: "active".into(),
         follow_future: false, search_interval_secs: 1800 };
-    { let handle = state.store(); let s = handle.lock(); s.insert_media(&media).unwrap();
+    { let handle = state.store(); let s = handle.lock();
+      s.create_library(MediaKind::Tv, "TV", &[tmp.path().to_str().unwrap()], "everyone", true, &[]).unwrap();
+      s.insert_media(&media).unwrap();
       s.insert_ledger(&row).unwrap(); s.insert_subscribe(&sub).unwrap(); }
     std::fs::remove_file(&row.path).unwrap(); deleted(&state, &row.path);
     let handle = state.store(); let s = handle.lock();
     assert!(s.get_subscribe(sub.id).unwrap().is_some());
     assert!(s.get_media(media.id).unwrap().is_some(), "file deletion must not orphan Subscribe");
-    assert!(s.ledger_by_path(&row.path).unwrap().is_none());
+    assert!(s.missing_at_by_path().unwrap().contains_key(&row.path), "file deletion marks missing rather than deleting ledger row");
+    assert!(s.ledger_by_path(&row.path).unwrap().is_some(), "ledger row preserved until admin prune");
 }
 
 #[test]

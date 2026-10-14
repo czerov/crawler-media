@@ -99,16 +99,8 @@ async fn public_scan_recovers_existing_media_from_local_work_alias() {
     std::fs::write(root.join("tvshow.nfo"), nfo).unwrap();
     std::fs::write(root.join("poster.jpg"), b"local-poster").unwrap();
     std::fs::write(root.join("fanart.jpg"), b"local-fanart").unwrap();
-    let response = api::router(state)
-        .oneshot(common::request(
-            "POST",
-            &format!("/api/v1/libraries/{id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let app = api::router(state);
+    common::scan_and_wait(&app, &id).await;
     let store = shared.lock();
     let row = store
         .ledger_by_path(&path.display().to_string())
@@ -223,16 +215,8 @@ async fn incomplete_nfo_online_alias_rebinds_only_new_scanned_rows() {
         )
         .unwrap();
     }
-    let response = api::router(state)
-        .oneshot(common::request(
-            "POST",
-            &format!("/api/v1/libraries/{id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let app = api::router(state);
+    common::scan_and_wait(&app, &id).await;
     assert!(
         catalog
             .requests

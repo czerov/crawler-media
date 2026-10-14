@@ -282,15 +282,15 @@ fn persist_heartbeat(
         Err(_) => return Ok((store.unit_state(heartbeat.user_id, heartbeat.media_id, heartbeat.season, heartbeat.episode)?.unwrap_or_default(), true)),
     };
 
-    let recently_ended = if previous.is_none() && event != "start" {
+    let was_admin_ended = if previous.is_none() && event != "start" {
         store
-            .recently_ended_device_session(heartbeat.user_id, device, heartbeat.now, 10)
+            .device_was_admin_ended(heartbeat.user_id, device, heartbeat.now, 10)
             .unwrap_or(false)
     } else {
         false
     };
 
-    let decision = if recently_ended {
+    let decision = if was_admin_ended {
         crate::playback_events::EventDecision::Ignore
     } else {
         crate::playback_events::classify_event(
@@ -304,9 +304,7 @@ fn persist_heartbeat(
 
     match decision {
         crate::playback_events::EventDecision::Ignore => {
-            let admin_ended = previous.as_ref().is_some_and(|p| p.admin_ended)
-                || recently_ended
-                || binding.as_ref().is_some_and(|b| b.state == store::PlaySessionIdState::Closed);
+            let admin_ended = previous.as_ref().is_some_and(|p| p.admin_ended) || was_admin_ended;
             return Ok((
                 store
                     .unit_state(heartbeat.user_id, heartbeat.media_id, heartbeat.season, heartbeat.episode)?

@@ -339,6 +339,7 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(conn, "playback_sessions", "last_event_sequence", "INTEGER")?;
+    ensure_column(conn, "playback_logs", "admin_ended", "INTEGER NOT NULL DEFAULT 0")?;
     conn.execute_batch(
         "UPDATE playback_sessions SET last_report_at_ms = last_report_at * 1000 WHERE last_report_at_ms = 0;
          CREATE TABLE IF NOT EXISTS playback_session_ids (

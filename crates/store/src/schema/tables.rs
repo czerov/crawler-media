@@ -316,7 +316,8 @@ pub(super) const SUBSCRIBE_TABLES: &str = r#"
             start_position_ms INTEGER NOT NULL DEFAULT 0,
             end_position_ms INTEGER NOT NULL DEFAULT 0,
             duration_ms INTEGER,
-            completed INTEGER NOT NULL DEFAULT 0
+            completed INTEGER NOT NULL DEFAULT 0,
+            admin_ended INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS playback_metrics (
             id TEXT PRIMARY KEY,

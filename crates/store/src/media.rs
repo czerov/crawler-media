@@ -61,8 +61,26 @@ impl Store {
 
         let id_str = media_id.to_string();
         let matches_expected: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM media WHERE id = ?1 AND title = ?2 AND kind = ?3)",
-            params![id_str, expected.title, expected.kind.as_str()],
+            "SELECT EXISTS(
+                 SELECT 1 FROM media
+                 WHERE id = ?1 AND title = ?2 AND kind = ?3
+                   AND year IS ?4 AND original_title IS ?5
+                   AND tmdb_id IS ?6 AND douban_id IS ?7
+                   AND tvdb_id IS ?8 AND bangumi_id IS ?9
+                   AND anilist_id IS ?10
+             )",
+            params![
+                id_str,
+                expected.title,
+                expected.kind.as_str(),
+                expected.year,
+                expected.original_title,
+                expected.tmdb_id,
+                expected.douban_id,
+                expected.tvdb_id,
+                expected.bangumi_id,
+                expected.anilist_id,
+            ],
             |r| r.get(0),
         )?;
         if !matches_expected {
@@ -345,8 +363,26 @@ impl Store {
                 rusqlite::TransactionBehavior::Immediate,
             )?;
             let current_matches: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM media WHERE id = ?1 AND title = ?2 AND kind = ?3)",
-                params![media.id.to_string(), media.title, media.kind.as_str()],
+                "SELECT EXISTS(
+                     SELECT 1 FROM media
+                     WHERE id = ?1 AND title = ?2 AND kind = ?3
+                       AND year IS ?4 AND original_title IS ?5
+                       AND tmdb_id IS ?6 AND douban_id IS ?7
+                       AND tvdb_id IS ?8 AND bangumi_id IS ?9
+                       AND anilist_id IS ?10
+                 )",
+                params![
+                    media.id.to_string(),
+                    media.title,
+                    media.kind.as_str(),
+                    media.year,
+                    media.original_title,
+                    media.tmdb_id,
+                    media.douban_id,
+                    media.tvdb_id,
+                    media.bangumi_id,
+                    media.anilist_id,
+                ],
                 |r| r.get(0),
             )?;
             if !current_matches {

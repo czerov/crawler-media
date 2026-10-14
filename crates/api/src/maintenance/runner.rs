@@ -57,10 +57,10 @@ pub fn run(state: &ApiState, job: &Job) -> Result<(), String> {
             report.dry_run = policy.dry_run;
             let dry_run = policy.dry_run;
             run_batches(&mut report, dry_run, &check_stop, || {
-                let mut queue = state.jobs.lock();
+                let queue = state.jobs.lock();
                 queue
-                    .prune_terminal_window(cutoff, BATCH_SIZE, dry_run)
-                    .map(BatchCounts::from_jobs_window)
+                    .prune_terminal_jobs(cutoff, BATCH_SIZE, dry_run)
+                    .map(BatchCounts::from_jobs)
                     .map_err(|error| error.to_string())
             })
         }
@@ -353,17 +353,6 @@ struct BatchCounts {
 }
 
 impl BatchCounts {
-    fn from_jobs_window(win: jobs::RetentionWindow) -> Self {
-        Self {
-            scanned: win.scanned,
-            candidates: win.candidates,
-            deleted: win.deleted,
-            protected: win.protected,
-            protected_truncated: false,
-            has_more: win.window_has_more,
-        }
-    }
-
     fn from_jobs(batch: jobs::RetentionBatch) -> Self {
         Self {
             scanned: batch.scanned,
@@ -413,7 +402,7 @@ fn run_batches(
         report.scanned += batch.scanned;
         report.candidates += batch.candidates;
         report.deleted += batch.deleted;
-        report.protected += batch.protected;
+        report.protected = report.protected.max(batch.protected);
         if batch.protected_truncated {
             report.protected_is_lower_bound = true;
         }
@@ -425,7 +414,7 @@ fn run_batches(
             }
             break;
         }
-        if !batch.has_more {
+        if !batch.has_more || batch.deleted == 0 {
             more_remains = false;
             break;
         }

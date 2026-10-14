@@ -43,21 +43,24 @@ impl ScanCoordinator {
     }
 
     pub fn trigger_next(&self, state: &ApiState) {
-        let next_op = {
-            let running = self.running_ops.lock();
-            if running.len() >= 2 {
+        let mut running = self.running_ops.lock();
+        if running.len() >= 2 {
+            return;
+        }
+        let excluding: Vec<String> = running.iter().cloned().collect();
+        let store = state.store.lock();
+        let op_opt = match store.claim_next_queued_scan(&excluding) {
+            Ok(op) => op,
+            Err(e) => {
+                tracing::error!(%e, "Failed to claim next queued scan operation");
                 None
-            } else {
-                let store = state.store.lock();
-                match store.next_queued_scan() {
-                    Ok(Some(op)) if !running.contains(&op.id) => Some(op),
-                    _ => None,
-                }
             }
         };
+        drop(store);
 
-        if let Some(op) = next_op {
-            self.running_ops.lock().insert(op.id.clone());
+        if let Some(op) = op_opt {
+            running.insert(op.id.clone());
+            drop(running);
             let state_clone = state.clone();
             tokio::spawn(async move {
                 run_operation(&state_clone, &op.id, &op.library_id).await;
