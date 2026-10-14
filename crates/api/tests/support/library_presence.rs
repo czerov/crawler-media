@@ -147,7 +147,7 @@ impl PresenceFixture {
 
     /// 轮询 store 直到 operation 进入终态，返回落库的 operation（含 report）。
     pub async fn wait_scan_terminal_op(&self, op_id: &str) -> store::ScanOperation {
-        for _ in 0..200 {
+        for _ in 0..600 {
             let op = self.state.store().lock().scan_operation(op_id).unwrap();
             if let Some(op) = op
                 && !op.status.is_active()

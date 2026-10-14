@@ -215,6 +215,79 @@ async fn changed_file_is_reprocessed_despite_checkpoint() {
     );
 }
 
+/// P2-3 端到端：STRM 同 size/同 mtime 的 URL 替换必须被识别为变化，并失效派生事实、
+/// 重排探测（obligation 合同）。
+#[tokio::test]
+async fn changed_strm_url_with_same_size_and_mtime_is_reprocessed_and_reprobed() {
+    let fix = PresenceFixture::new();
+    let rel = "Movie1 (2024).strm";
+    let file = fix.root.join(rel);
+    std::fs::write(&file, "https://a/video").unwrap();
+    let (_, row) = fix.insert_media_and_ledger(rel);
+    let ledger_id = row.id.to_string();
+    let sig = fix.scope_signature();
+
+    let op = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        // 预置派生探测事实：内容变化后必须失效。
+        let tracks = library::Tracks {
+            video: Some(library::VideoTrack {
+                codec: Some("h264".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        guard
+            .put_file_meta_versioned(&ledger_id, &tracks, Some("v1"), Some(1000))
+            .unwrap();
+        assert!(guard.get_file_meta(&ledger_id).unwrap().is_some(), "前置事实应存在");
+        let op = guard
+            .enqueue_scan(&fix.library_id, &sig, &[], 1000)
+            .unwrap();
+        guard.record_scan_seen(&op.id, &[file.clone()]).unwrap();
+        op
+    };
+    // 同长度 URL 替换 + 恢复原 mtime：size/mtime 完全一致。
+    let original_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+    std::fs::write(&file, "https://b/video").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(original_mtime)
+        .unwrap();
+
+    fix.state.scan_coordinator.trigger_next(&fix.state);
+    let done = fix.wait_scan_terminal_op(&op.id).await;
+    assert_eq!(done.status, store::ScanOperationStatus::Completed, "{:?}", done.report);
+    assert_eq!(
+        done.report["scanned"], 1,
+        "同 size/同 mtime 的 STRM URL 变化必须重新处理: {}",
+        done.report
+    );
+
+    let store = fix.state.store();
+    let guard = store.lock();
+    assert!(
+        guard.get_file_meta(&ledger_id).unwrap().is_none(),
+        "变化文件的派生探测事实必须失效"
+    );
+    assert!(
+        guard
+            .scan_probe_obligations(100)
+            .unwrap()
+            .iter()
+            .any(|obligation| obligation.ledger_id.to_string() == ledger_id),
+        "变化文件必须重挂 durable probe 义务"
+    );
+    drop(guard);
+    assert!(
+        fix.state.probe.is_queued(&ledger_id),
+        "变化文件必须重新进入探测队列"
+    );
+}
+
 /// P2-4 端到端：持久化 scope signature 与当前 scope 不一致的 operation 必须取消，
 /// 且不得登记任何文件。
 #[tokio::test]

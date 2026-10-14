@@ -315,30 +315,9 @@ impl Store {
 
         // marker_refresh remains "running" until complete_marker_refresh atomically finishes it
         let all_done = completed >= total;
-        let job_status = if kind == "marker_refresh" {
-            if all_done && failed > 0 {
-                "failed"
-            } else {
-                "running"
-            }
-        } else if all_done {
-            if failed > 0 {
-                "failed"
-            } else if partial > 0 {
-                "partial"
-            } else {
-                "succeeded"
-            }
-        } else {
-            "running"
-        };
-        let finished_at = if all_done && kind != "marker_refresh" {
-            Some(now_ms())
-        } else if all_done && failed > 0 {
-            Some(now_ms())
-        } else {
-            None
-        };
+        let terminal = probe_job_terminal_status(&kind, total, completed, failed, partial);
+        let job_status = terminal.unwrap_or("running");
+        let finished_at = terminal.map(|_| now_ms());
 
         // Only an active job may be driven to a new terminal state by a unit
         // finishing: a unit that completes after the job was cancelled (Library
@@ -534,6 +513,35 @@ fn is_constraint(error: &rusqlite::Error) -> bool {
         rusqlite::Error::SqliteFailure(code, _)
             if code.code == rusqlite::ErrorCode::ConstraintViolation
     )
+}
+
+/// Terminal status a probe job takes once every remaining unit is terminal.
+///
+/// `None` means the job must stay active. Every kind terminalizes as soon as
+/// its last unit finishes, except `marker_refresh`, which only becomes
+/// `succeeded` together with its marker results inside
+/// `complete_marker_refresh` — unless a unit already failed.
+///
+/// Both the normal unit-completion path and ledger-retirement resync share this
+/// decision so the two cannot disagree about when a job is done.
+pub(crate) fn probe_job_terminal_status(
+    kind: &str,
+    total: usize,
+    completed: usize,
+    failed: usize,
+    partial: usize,
+) -> Option<&'static str> {
+    if completed < total {
+        return None;
+    }
+    if failed > 0 {
+        return Some("failed");
+    }
+    match kind {
+        "marker_refresh" => None,
+        _ if partial > 0 => Some("partial"),
+        _ => Some("succeeded"),
+    }
 }
 
 fn now_ms() -> i64 {

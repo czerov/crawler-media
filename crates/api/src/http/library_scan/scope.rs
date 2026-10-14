@@ -36,23 +36,26 @@ pub struct ScanScope {
     pub library_id: String,
     pub kind: domain::MediaKind,
     scope: LibraryPathScope,
+    /// 捕获时的 Library scope 指纹：发布前用它复核持久化 signature（P2-4）。
+    signature: String,
 }
 
 impl ScanScope {
     /// Capture and resolve the strict scope for a library outside the Store lock.
     pub fn capture(state: &ApiState, library_id: &str) -> Result<Self, PresenceError> {
-        let (snapshot, kind) = {
+        let (snapshot, kind, signature) = {
             let store_arc = state.store();
             let guard = store_arc.lock();
             let snapshot = guard.library_ownership()?;
-            let kind = snapshot
+            let library = snapshot
                 .library(library_id)
-                .ok_or(PresenceError::Missing)?
-                .kind;
+                .ok_or(PresenceError::Missing)?;
+            let kind = library.kind;
+            let signature = crate::scan_operations::scan_scope_signature(library);
             if !snapshot.accepts_work(library_id) {
                 return Err(PresenceError::Deleting);
             }
-            (snapshot, kind)
+            (snapshot, kind, signature)
         };
 
         let scope = LibraryPathScope::resolve(snapshot)?;
@@ -64,7 +67,13 @@ impl ScanScope {
             library_id: library_id.to_string(),
             kind,
             scope,
+            signature,
         })
+    }
+
+    /// 捕获 scope 的指纹（与持久化的 `scope_signature` 同一编码）。
+    pub fn signature(&self) -> &str {
+        &self.signature
     }
 
     /// Filter paths to retain only those strictly owned by this library.

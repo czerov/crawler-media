@@ -229,3 +229,115 @@ fn scan_seen_requires_current_ledger_and_file_version() {
         "恢复的文件必须清掉 missing 并重新处理"
     );
 }
+
+/// P2-3：STRM 只有 URL 文本，同 size/同 mtime 的替换必须靠内容指纹识别。
+#[test]
+fn strm_url_change_with_same_size_and_mtime_is_not_current() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("media");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("Movie (2024).strm");
+    std::fs::write(&file, "https://a/video").unwrap();
+    let path = file.display().to_string();
+
+    let op = store.enqueue_scan("lib1", "sig1", &[], 1000).unwrap();
+    insert_ledger_row(&store, &file);
+    store.record_scan_seen(&op.id, &[file.clone()]).unwrap();
+    assert!(
+        store.scan_seen_is_current(&op.id, &path).unwrap(),
+        "URL 未变化时断点应命中"
+    );
+
+    let original_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+    // 同长度 URL 替换，并把 mtime 恢复成原值：size + mtime 完全一致。
+    std::fs::write(&file, "https://b/video").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(original_mtime)
+        .unwrap();
+    assert!(
+        !store.scan_seen_is_current(&op.id, &path).unwrap(),
+        "同 size/同 mtime 的 STRM URL 变化必须视为变化"
+    );
+}
+
+/// P2-3：老断点行的 0/0 是「版本未知」，绝不视为 current。
+#[test]
+fn unknown_zero_version_checkpoint_is_not_current() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("media");
+    let missing_file = root.join("Gone (2024).mkv");
+    let path = missing_file.display().to_string();
+
+    let op = store.enqueue_scan("lib1", "sig1", &[], 1000).unwrap();
+    // 台账行存在，但文件读不到 metadata → 断点版本 0/0（等价于老断点行）。
+    insert_ledger_row(&store, &missing_file);
+    store
+        .record_scan_seen(&op.id, &[missing_file.clone()])
+        .unwrap();
+    assert!(
+        !store.scan_seen_is_current(&op.id, &path).unwrap(),
+        "版本未知的断点行绝不视为 current"
+    );
+}
+
+/// P3-1：终态判定必须与写入同一事务；有新事件时补扫而不是覆盖。
+#[test]
+fn finalize_scan_refuses_to_overwrite_new_dirty_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let show_a = PathBuf::from("/media/tv/Show A");
+    let op = store
+        .enqueue_scan("lib1", "sig1", &[show_a.clone()], 1000)
+        .unwrap();
+    let claimed = store.claim_next_queued_scan(&[]).unwrap().unwrap();
+    assert_eq!(claimed.id, op.id);
+    assert_eq!(claimed.dirty_rev, 0, "本轮消费的版本");
+
+    // worker 判定之后、写终态之前，另一请求并入同一 operation。
+    let merged = store
+        .enqueue_scan("lib1", "sig1", &[show_a.clone()], 1001)
+        .unwrap();
+    assert_eq!(merged.id, op.id);
+    assert_eq!(merged.dirty_rev, 1);
+
+    let report = serde_json::json!({ "scanned": 3, "inserted": 2 });
+    let outcome = store
+        .finalize_or_requeue_scan(&op.id, 0, ScanOperationStatus::Completed, &report)
+        .unwrap();
+    assert_eq!(outcome, Some(1), "有新事件时必须补扫而不是写终态");
+    let requeued = store.scan_operation(&op.id).unwrap().unwrap();
+    assert_eq!(requeued.status, ScanOperationStatus::Queued);
+    assert_eq!(requeued.consumed_rev, 1);
+    assert_eq!(requeued.report, report, "累计报告必须保留到下一轮");
+
+    // 补扫轮消费到当前版本后，才允许写终态并清理断点。
+    let claimed = store.claim_next_queued_scan(&[]).unwrap().unwrap();
+    assert_eq!(claimed.dirty_rev, 1);
+    let seen_file = tmp.path().join("seen.mkv");
+    std::fs::write(&seen_file, b"x").unwrap();
+    store.record_scan_seen(&op.id, &[seen_file.clone()]).unwrap();
+    assert!(store
+        .is_scan_seen(&op.id, &seen_file.display().to_string())
+        .unwrap());
+    assert_eq!(
+        store
+            .finalize_or_requeue_scan(&op.id, 1, ScanOperationStatus::Completed, &report)
+            .unwrap(),
+        None
+    );
+    let done = store.scan_operation(&op.id).unwrap().unwrap();
+    assert_eq!(done.status, ScanOperationStatus::Completed);
+    assert_eq!(done.report, report);
+    assert!(
+        !store
+            .is_scan_seen(&op.id, &seen_file.display().to_string())
+            .unwrap(),
+        "写终态必须同时清理断点"
+    );
+}
+

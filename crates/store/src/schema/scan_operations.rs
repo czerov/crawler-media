@@ -53,5 +53,7 @@ pub fn migrate_scan_operations(conn: &Connection) -> Result<(), StoreError> {
     )?;
     super::ensure_column(conn, "scan_seen", "mtime_ms", "INTEGER NOT NULL DEFAULT 0")?;
     super::ensure_column(conn, "scan_seen", "file_size", "INTEGER NOT NULL DEFAULT 0")?;
+    // P2-3：STRM 只有 URL 文本，size/mtime 无法建立身份；受限内容指纹单独持久化。
+    super::ensure_column(conn, "scan_seen", "content_digest", "TEXT")?;
     Ok(())
 }

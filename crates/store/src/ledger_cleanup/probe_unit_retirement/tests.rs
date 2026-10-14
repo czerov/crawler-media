@@ -200,3 +200,137 @@ fn opening_a_pre_fix_database_repairs_orphan_probe_units() {
     assert_eq!(job.status, "cancelled");
     assert_eq!(job.total, 0);
 }
+
+/// Two-unit job whose first unit is already terminal while the second is still
+/// outstanding, so a later deletion of the second ledger retires the last
+/// unfinished unit of an otherwise finished prefix.
+///
+/// Returns the store plus the two ledger paths, so a test can delete whichever
+/// one it wants to retire.
+fn prefix_job(
+    root: &std::path::Path,
+    kind: &str,
+    job_id: &str,
+    prefix_status: &str,
+) -> (Store, String, String) {
+    let store = Store::open(root.join("data")).unwrap();
+    let (media, first, second) = fixture(&store, &root.join("tv"));
+    let first_id = first.id.to_string();
+    let second_id = second.id.to_string();
+    let units = [unit(&first_id), unit(&second_id)];
+    store
+        .create_probe_job(
+            job_id,
+            kind,
+            &media.id.to_string(),
+            Some(1),
+            &format!("ledger:{job_id}"),
+            &units,
+        )
+        .unwrap();
+    store.start_probe_unit(job_id, &first_id).unwrap();
+    store
+        .finish_probe_unit_with_status(
+            job_id,
+            &first_id,
+            prefix_status,
+            None,
+            (prefix_status != "succeeded").then_some("prefix unit did not succeed"),
+        )
+        .unwrap();
+    store.start_probe_unit(job_id, &second_id).unwrap();
+    (store, first.path.clone(), second.path.clone())
+}
+
+#[test]
+fn deleting_the_last_outstanding_unit_finishes_a_job_with_a_completed_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, _first_path, second_path) =
+        prefix_job(temp.path(), "media_probe", "job-5", "succeeded");
+
+    store.delete_ledger_path(&second_path).unwrap();
+
+    let job = store.get_probe_job("job-5").unwrap().unwrap();
+    assert_eq!((job.total, job.completed, job.succeeded), (1, 1, 1));
+    assert_eq!(job.status, "succeeded");
+    assert!(!job.is_active());
+    assert!(job.finished_at_ms.is_some());
+}
+
+#[test]
+fn deleting_the_last_outstanding_unit_fails_a_job_with_a_failed_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, _first_path, second_path) =
+        prefix_job(temp.path(), "media_probe", "job-6", "failed");
+
+    store.delete_ledger_path(&second_path).unwrap();
+
+    let job = store.get_probe_job("job-6").unwrap().unwrap();
+    assert_eq!((job.total, job.completed, job.failed), (1, 1, 1));
+    assert_eq!(job.status, "failed");
+    assert!(!job.is_active());
+    assert!(job.finished_at_ms.is_some());
+}
+
+#[test]
+fn deleting_the_last_outstanding_unit_partializes_a_job_with_a_partial_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, _first_path, second_path) =
+        prefix_job(temp.path(), "media_probe", "job-10", "partial");
+
+    store.delete_ledger_path(&second_path).unwrap();
+
+    let job = store.get_probe_job("job-10").unwrap().unwrap();
+    assert_eq!((job.total, job.completed, job.failed), (1, 1, 0));
+    assert_eq!(job.status, "partial");
+    assert!(!job.is_active());
+    assert!(job.finished_at_ms.is_some());
+}
+
+#[test]
+fn deleting_the_last_outstanding_unit_keeps_a_finished_marker_refresh_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, _first_path, second_path) =
+        prefix_job(temp.path(), "marker_refresh", "job-7", "succeeded");
+
+    store.delete_ledger_path(&second_path).unwrap();
+
+    // A marker refresh is published atomically with its results; the counters
+    // are resynced so `complete_marker_refresh` can still publish, but the job
+    // must not be declared succeeded before those results exist.
+    let job = store.get_probe_job("job-7").unwrap().unwrap();
+    assert_eq!((job.total, job.completed, job.succeeded), (1, 1, 1));
+    assert_eq!(job.status, "running");
+    assert!(job.is_active());
+}
+
+#[test]
+fn deleting_the_last_outstanding_unit_fails_a_marker_refresh_with_a_failed_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, _first_path, second_path) =
+        prefix_job(temp.path(), "marker_refresh", "job-8", "failed");
+
+    store.delete_ledger_path(&second_path).unwrap();
+
+    let job = store.get_probe_job("job-8").unwrap().unwrap();
+    assert_eq!((job.total, job.completed, job.failed), (1, 1, 1));
+    assert_eq!(job.status, "failed");
+    assert!(!job.is_active());
+    assert!(job.finished_at_ms.is_some());
+}
+
+#[test]
+fn retiring_a_finished_unit_leaves_a_job_with_outstanding_work_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, first_path, _second_path) =
+        prefix_job(temp.path(), "media_probe", "job-9", "succeeded");
+
+    // Retire the finished unit, not the outstanding one.
+    store.delete_ledger_path(&first_path).unwrap();
+
+    let job = store.get_probe_job("job-9").unwrap().unwrap();
+    assert_eq!((job.total, job.completed), (1, 0));
+    assert_eq!(job.status, "running");
+    assert!(job.is_active());
+    assert!(job.finished_at_ms.is_none());
+}

@@ -8,7 +8,7 @@
 //! The same derivation is enforced whenever a ledger row disappears, and once
 //! from the library schema migration for databases written before that.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::StoreError;
 
@@ -35,7 +35,13 @@ pub(crate) fn retire_probe_units_for_ledger(
 }
 
 /// Recompute `probe_jobs` counters from the live units, and terminalize an
-/// active job that has no work items left instead of leaving it `running`.
+/// active job whose remaining work is all terminal instead of leaving it
+/// `running` with a completion predicate nothing can satisfy.
+///
+/// A job with no units left at all is cancelled (`file_deleted`): its whole
+/// scope disappeared. A job that still has a genuinely outstanding unit is
+/// untouched; one whose remaining units all finished takes the same per-kind
+/// terminal state as the normal completion path.
 pub(crate) fn resync_probe_job(conn: &Connection, job_id: &str) -> Result<(), StoreError> {
     conn.execute(
         "UPDATE probe_jobs SET
@@ -49,13 +55,57 @@ pub(crate) fn resync_probe_job(conn: &Connection, job_id: &str) -> Result<(), St
          WHERE id = ?1",
         [job_id],
     )?;
+    let job: Option<(String, String, i64, i64, i64, i64)> = conn
+        .query_row(
+            "SELECT kind, status, total, completed, failed,
+                    (SELECT COUNT(*) FROM probe_job_units
+                     WHERE job_id = probe_jobs.id AND status = 'partial')
+             FROM probe_jobs WHERE id = ?1",
+            [job_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((kind, status, total, completed, failed, partial)) = job else {
+        return Ok(());
+    };
+    if status != "queued" && status != "running" {
+        return Ok(());
+    }
+    if total == 0 {
+        conn.execute(
+            "UPDATE probe_jobs SET status = 'cancelled',
+                 error = COALESCE(error, 'file_deleted'),
+                 finished_at_ms = COALESCE(finished_at_ms, ?2)
+             WHERE id = ?1 AND status IN ('queued', 'running')",
+            params![job_id, crate::unix_now() * 1000],
+        )?;
+        return Ok(());
+    }
+    let Some(terminal) = crate::probe_tasks::probe_job_terminal_status(
+        &kind,
+        total as usize,
+        completed as usize,
+        failed as usize,
+        partial as usize,
+    ) else {
+        return Ok(());
+    };
     conn.execute(
-        "UPDATE probe_jobs SET status = 'cancelled',
-             error = COALESCE(error, 'file_deleted'),
-             finished_at_ms = COALESCE(finished_at_ms, ?2)
-         WHERE id = ?1 AND status IN ('queued', 'running')
-           AND NOT EXISTS (SELECT 1 FROM probe_job_units WHERE job_id = ?1)",
-        params![job_id, crate::unix_now() * 1000],
+        "UPDATE probe_jobs SET status = ?2,
+             finished_at_ms = COALESCE(finished_at_ms, ?3),
+             error = COALESCE((SELECT error FROM probe_job_units
+                               WHERE job_id = ?1 AND error IS NOT NULL LIMIT 1), error)
+         WHERE id = ?1 AND status IN ('queued', 'running')",
+        params![job_id, terminal, crate::unix_now() * 1000],
     )?;
     Ok(())
 }

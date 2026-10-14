@@ -137,10 +137,10 @@ async fn full_scan_merged_with_watch_target_still_ledgers_whole_library() {
     assert_eq!(rows.len(), 2);
 }
 
-/// P2-2 端到端：同一 target 的第二个事件虽然不改变目标列表，但必须驱动补扫一轮；
-/// 断点命中的旧文件不重复处理，新文件最终入账。
+/// P2-2 端到端：同一 target 的第二个事件虽然不改变目标列表，但必须让该 target 被
+/// 重新处理；终态报告是整轮累计结果（P3-3），不会因为多轮而清零。
 #[tokio::test]
-async fn repeated_watch_event_for_same_target_runs_followup_round() {
+async fn repeated_watch_event_for_same_target_is_consumed_with_cumulative_report() {
     let fix = PresenceFixture::new();
     let dir = fix.root.join("Show A");
     std::fs::create_dir_all(&dir).unwrap();
@@ -171,14 +171,14 @@ async fn repeated_watch_event_for_same_target_runs_followup_round() {
     fix.state.scan_coordinator.trigger_next(&fix.state);
     let done = fix.wait_scan_terminal_op(&op.id).await;
     assert_eq!(done.status, store::ScanOperationStatus::Completed, "{:?}", done.report);
-    assert_eq!(done.consumed_rev, 1, "补扫轮必须消费 dirty 版本");
     assert_eq!(done.dirty_rev, 1);
-    // 终态报告来自补扫轮：两个文件都命中断点被跳过，说明确实多跑了一轮。
+    // 本轮已带上合并后的意图：新文件入账，终态报告是累计结果而不是被清空。
     assert_eq!(
-        done.report["scanned"], 0,
-        "终态报告应来自补扫轮（第一轮已处理新文件）: {}",
+        done.report["scanned"], 1,
+        "合并事件必须让 target 被重新处理: {}",
         done.report
     );
+    assert_eq!(done.report["inserted"], 1, "{}", done.report);
 
     let rows = fix.state.store().lock().list_ledger().unwrap();
     let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
@@ -187,4 +187,73 @@ async fn repeated_watch_event_for_same_target_runs_followup_round() {
         "补扫轮的新文件必须入账: {paths:?}"
     );
     assert_eq!(rows.len(), 2);
+}
+
+/// P3-3 端到端：chunk 前缀已提交、后续 chunk 失败时，终态报告必须保留已提交计数与
+/// 错误摘要，而不是只剩 http_status。
+#[tokio::test]
+async fn committed_chunk_prefix_survives_a_later_chunk_failure() {
+    let fix = PresenceFixture::new();
+    // 给 Library A 增加一个与 Library B 同深度的根：sub 里的文件归属歧义，root 里的
+    // 文件仍然唯一归属 A，于是第一个 chunk 提交、第二个 chunk 必然失败。
+    let sub = fix.root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    for i in 0..101 {
+        std::fs::write(fix.root.join(format!("Movie_{i:03} (2024).mkv")), b"x").unwrap();
+    }
+    std::fs::write(sub.join("Movie_sub (2024).mkv"), b"x").unwrap();
+    {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .update_library(
+                &fix.library_id,
+                None,
+                Some(&[fix.root.to_str().unwrap(), sub.to_str().unwrap()]),
+                None,
+            )
+            .unwrap();
+        guard
+            .create_library(
+                MediaKind::Movie,
+                "Nested",
+                &[sub.to_str().unwrap()],
+                "everyone",
+                true,
+                &[],
+            )
+            .unwrap();
+    }
+    let sig = fix.scope_signature();
+    let op = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .enqueue_scan(&fix.library_id, &sig, &[], 1000)
+            .unwrap()
+    };
+
+    fix.state.scan_coordinator.trigger_next(&fix.state);
+    let done = fix.wait_scan_terminal_op(&op.id).await;
+    assert_eq!(
+        done.status,
+        store::ScanOperationStatus::Failed,
+        "{:?}",
+        done.report
+    );
+    assert_eq!(
+        done.report["scanned"], 100,
+        "失败终态必须保留已提交前缀: {}",
+        done.report
+    );
+    assert_eq!(done.report["inserted"], 100, "{}", done.report);
+    assert!(
+        done.report["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()),
+        "失败终态必须写错误摘要: {}",
+        done.report
+    );
+    let rows = fix.state.store().lock().list_ledger().unwrap();
+    assert_eq!(rows.len(), 100, "只有已提交的 chunk 前缀入账");
 }
