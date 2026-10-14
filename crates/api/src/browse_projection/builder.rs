@@ -60,9 +60,14 @@ pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, Proj
 /// Library），而不是 scan 用的 strict scope：旧 `load_browse_snapshot` 就是这个口径，
 /// 换成 strict 会把「不在任何根下」的 ledger 行整批丢掉，浏览输出随之变化。
 ///
-/// 候选行由 [`store::Store::ledger_candidates_for_library`] 定向读取：无关 Library
-/// 的 ledger 行不进入内存，缺失标记也只查本库路径，因此无关台账增长不再增加本库
-/// 构建的 DB 行数、锁持有时间与内存。
+/// 候选行由 [`store::Store::ledger_candidates_for_library`] 定向读取：**非默认**
+/// Library 的无关 ledger 行不进入内存，缺失标记也只查本库路径，因此无关台账增长
+/// 不再增加非默认库构建的 DB 行数、锁持有时间与内存。
+///
+/// 默认 Library 是例外：它的回退分支是「不属于任何同 kind 根」的 `NOT (...)` 补集，
+/// SQLite 无法 seek，成本仍随整个 ledger 增长（P3-D 已记录的限制，见
+/// [`store::Store::ledger_candidates_for_library`] 文档与
+/// `browse_reads::tests::default_library_candidate_read_is_not_bounded`）。
 fn collect_owned(state: &ApiState, library_id: &str) -> Result<Owned, ProjectionError> {
     let store = state.store.lock();
     let snapshot = store

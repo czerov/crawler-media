@@ -337,88 +337,252 @@ fn candidate_paths(store: &Store, library_id: &str) -> Vec<String> {
     paths
 }
 
-/// P2-B：候选读必须与旧 `owner()` 的组件级 `Path::starts_with` 等价。根写成
-/// `/movies/./`、`/movies//`、`/movies/` 时，干净路径（扫描外部工具写入的
-/// ledger）仍必须进入候选；相邻前缀 `/movies` vs `/movies2` 不得误配。
+/// 旧全量路径的最终行集：`list_ledger` + `owner()` 过滤（投影修复前的语义）。
+fn owner_rows_for(
+    store: &Store,
+    ownership: &store::LibraryOwnership,
+    library_id: &str,
+) -> Vec<String> {
+    let mut rows: Vec<String> = store
+        .list_ledger()
+        .unwrap()
+        .into_iter()
+        .filter(|row| {
+            ownership
+                .owner(std::path::Path::new(&row.path), domain::MediaKind::Movie)
+                .is_some_and(|owner| owner.id == library_id)
+        })
+        .map(|row| row.path)
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// 候选读再经内存 `owner()` 过滤后的最终行集（投影构建器实际看到的行）。
+fn candidate_rows_for(
+    store: &Store,
+    ownership: &store::LibraryOwnership,
+    library_id: &str,
+) -> Vec<String> {
+    let mut rows: Vec<String> = store
+        .ledger_candidates_for_library(ownership, library_id)
+        .unwrap()
+        .into_iter()
+        .filter(|row| {
+            ownership
+                .owner(std::path::Path::new(&row.path), domain::MediaKind::Movie)
+                .is_some_and(|owner| owner.id == library_id)
+        })
+        .map(|row| row.path)
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// P2-residual：规范/非规范根 × 规范/非规范存库路径交叉组合下，候选读的最终行集
+/// 必须等于旧全量路径（`list_ledger` + `owner()`）的结果，目标库与默认库回退都算。
+///
+/// 旧修法只规范化了**配置根**一侧；存库路径把根本身写成 `/a/./b/x`、`/a//b/x`
+/// 时文本前缀永不匹配，行到不了内存里的 `owner()` 过滤，条目静默消失。
 #[test]
-fn ledger_candidates_match_component_ownership_for_non_canonical_roots() {
+fn candidate_final_rows_match_owner_for_non_canonical_root_and_path_spellings() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().to_str().unwrap().to_string();
-    struct Case {
-        root: String,
-        path: String,
-        owned_by_target: bool,
-    }
-    let cases = vec![
-        Case {
-            root: format!("{base}/movies/./"),
-            path: format!("{base}/movies/Visible.mkv"),
-            owned_by_target: true,
-        },
-        Case {
-            root: format!("{base}//movies//"),
-            path: format!("{base}/movies/Visible.mkv"),
-            owned_by_target: true,
-        },
-        Case {
-            root: format!("{base}/movies/"),
-            path: format!("{base}/movies/Visible.mkv"),
-            owned_by_target: true,
-        },
-        // 扫描自己写下的路径同样带非规范拼写。
-        Case {
-            root: format!("{base}/movies/./"),
-            path: format!("{base}/movies/./Visible.mkv"),
-            owned_by_target: true,
-        },
-        Case {
-            root: format!("{base}//movies//"),
-            path: format!("{base}//movies//Visible.mkv"),
-            owned_by_target: true,
-        },
-        // 相邻前缀：`/movies2` 不属于 `/movies`，必须回退到默认库而不是目标库。
-        Case {
-            root: format!("{base}/movies"),
-            path: format!("{base}/movies2/Visible.mkv"),
-            owned_by_target: false,
-        },
+    let leading_double = |path: &str| format!("//{}", path.trim_start_matches('/'));
+    let leading_dot = |path: &str| format!("/./{}", path.trim_start_matches('/'));
+    let canonical = format!("{base}/movies/Ok.mkv");
+    let cases: Vec<(String, String, bool)> = vec![
+        (format!("{base}/movies"), canonical.clone(), true),
+        (
+            format!("{base}/movies"),
+            format!("{base}/./movies/Ok.mkv"),
+            true,
+        ),
+        (
+            format!("{base}/movies"),
+            format!("{base}//movies/Ok.mkv"),
+            true,
+        ),
+        (
+            format!("{base}/movies"),
+            format!("{base}/./movies//Ok.mkv"),
+            true,
+        ),
+        (format!("{base}/movies"), leading_double(&canonical), true),
+        (format!("{base}/movies"), leading_dot(&canonical), true),
+        (format!("{base}/./movies"), canonical.clone(), true),
+        (
+            format!("{base}/./movies"),
+            format!("{base}//movies/Ok.mkv"),
+            true,
+        ),
+        (format!("{base}//movies"), canonical.clone(), true),
+        (
+            format!("{base}//movies"),
+            format!("{base}/./movies/Ok.mkv"),
+            true,
+        ),
+        // `owner()` 按组件比较：`..` 仍属于该根。
+        (
+            format!("{base}/movies"),
+            format!("{base}/movies/../elsewhere/Ok.mkv"),
+            true,
+        ),
+        // 相邻前缀与无关根不属于目标库：必须留给默认库回退。
+        (
+            format!("{base}/movies"),
+            format!("{base}/movies2/No.mkv"),
+            false,
+        ),
+        (
+            format!("{base}/movies"),
+            format!("{base}/other/No.mkv"),
+            false,
+        ),
     ];
 
-    for (index, case) in cases.iter().enumerate() {
+    for (index, (root, path, owned)) in cases.iter().enumerate() {
         let store = Store::open(tmp.path().join(format!("case{index}"))).unwrap();
-        let library = store
+        let target = store
             .create_library(
                 domain::MediaKind::Movie,
                 "Target",
-                &[case.root.as_str()],
+                &[root.as_str()],
                 "everyone",
                 true,
                 &[],
             )
             .unwrap();
-        insert_ledger_row(&store, std::path::Path::new(&case.path));
+        let default = store
+            .default_library(domain::MediaKind::Movie)
+            .unwrap()
+            .expect("seeded default movie library");
+        // 每个 case 都放一条规范拼写的行，最终行集比较才有非空基准。
+        insert_ledger_row(&store, std::path::Path::new(&canonical));
+        insert_ledger_row(&store, std::path::Path::new(path));
 
         let ownership = store.library_ownership().unwrap();
-        let owner_id = ownership
-            .owner(std::path::Path::new(&case.path), domain::MediaKind::Movie)
-            .map(|owner| owner.id.clone());
+        let expected = if *owned { &target } else { &default };
         assert_eq!(
-            owner_id.as_deref() == Some(library.id.as_str()),
-            case.owned_by_target,
-            "case {index}: 旧 owner() 口径与用例前提不一致（root={}, path={}）",
-            case.root,
-            case.path
+            ownership
+                .owner(std::path::Path::new(path), domain::MediaKind::Movie)
+                .map(|owner| owner.id.as_str()),
+            Some(expected.id.as_str()),
+            "case {index}: 旧 owner() 口径与用例前提不一致（root={root}, path={path}）"
         );
-
-        let candidates = candidate_paths(&store, &library.id);
-        assert_eq!(
-            candidates.contains(&case.path),
-            case.owned_by_target,
-            "case {index}: 候选读必须与 owner() 等价（root={}, path={}）",
-            case.root,
-            case.path
-        );
+        for library in [&target, &default] {
+            assert_eq!(
+                candidate_rows_for(&store, &ownership, &library.id),
+                owner_rows_for(&store, &ownership, &library.id),
+                "case {index}: 库 {} 的最终行集必须等于 owner() 全量路径（root={root}, path={path}）",
+                library.id
+            );
+        }
     }
+}
+
+/// 默认库自身根的非规范拼写：别的同 kind **祖先根**的窄谓词会先命中该行，把它从
+/// 默认库的 `NOT (...)` 回退里挡掉，所以默认库的正向谓词同样必须用宽谓词。
+#[test]
+fn default_library_keeps_non_canonical_rows_blocked_by_an_ancestor_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let default = store
+        .default_library(domain::MediaKind::Movie)
+        .unwrap()
+        .expect("seeded default movie library");
+    let default_root = default
+        .root_paths
+        .first()
+        .expect("default movie root")
+        .display()
+        .to_string();
+    // 同 kind 祖先根：它的窄谓词（`path >= '<ancestor>/'`）会先命中非规范拼写的行。
+    let ancestor = default
+        .root_paths
+        .first()
+        .and_then(|root| root.parent())
+        .expect("default root parent")
+        .display()
+        .to_string();
+    store
+        .create_library(
+            domain::MediaKind::Movie,
+            "Ancestor",
+            &[ancestor.as_str()],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+    // 偏差落在**祖先根之内、默认根之外**：行仍以祖先根文本开头（窄谓词先命中），
+    // 但不再是默认根文本的规范拼写。
+    let leaf = default_root
+        .strip_prefix(&format!("{ancestor}/"))
+        .expect("default root under ancestor");
+    let spelled = format!("{ancestor}/./{leaf}");
+    insert_ledger_row(&store, std::path::Path::new(&spelled));
+
+    let ownership = store.library_ownership().unwrap();
+    assert_eq!(
+        ownership
+            .owner(std::path::Path::new(&spelled), domain::MediaKind::Movie)
+            .map(|owner| owner.id.as_str()),
+        Some(default.id.as_str()),
+        "最深根仍是默认库（premise）"
+    );
+    assert_eq!(
+        candidate_rows_for(&store, &ownership, &default.id),
+        owner_rows_for(&store, &ownership, &default.id),
+        "默认库最终行集必须等于 owner() 全量路径：祖先根的窄谓词不得挡掉非规范拼写的行"
+    );
+}
+
+/// 根为 `/` 时所有绝对路径都属于该库；空路径不属于任何根，必须仍回退默认库。
+///
+/// `Path::new("").starts_with(Path::new("/"))` 为 false，所以 `owner()` 把空路径
+/// 判给默认库；`/` 前缀的谓词若带上 `path = ''` 相等分支，就会把空路径从默认库的
+/// `NOT (...)` 回退里排掉，条目静默消失。
+#[test]
+fn empty_ledger_path_falls_back_to_default_library_with_slash_root_library() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let slash = store
+        .create_library(
+            domain::MediaKind::Movie,
+            "Root",
+            &["/"],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+    let default = store
+        .default_library(domain::MediaKind::Movie)
+        .unwrap()
+        .expect("seeded default movie library");
+    insert_ledger_row(&store, std::path::Path::new(""));
+
+    let ownership = store.library_ownership().unwrap();
+    assert_eq!(
+        ownership
+            .owner(std::path::Path::new(""), domain::MediaKind::Movie)
+            .map(|owner| owner.id.as_str()),
+        Some(default.id.as_str()),
+        "空路径不属于 `/` 根，必须回退到默认库"
+    );
+    assert!(
+        candidate_paths(&store, &default.id)
+            .iter()
+            .any(String::is_empty),
+        "空路径行必须在默认库候选里"
+    );
+    assert!(
+        !candidate_paths(&store, &slash.id)
+            .iter()
+            .any(String::is_empty),
+        "`/` 根不得把空路径算进候选"
+    );
 }
 
 /// 根为 `/` 时所有绝对路径都属于该库；`/` 前缀不能被文本比较漏掉。

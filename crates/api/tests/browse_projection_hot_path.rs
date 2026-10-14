@@ -604,3 +604,161 @@ async fn scope_change_after_warm_projection_never_serves_stale_rows() {
         .expect("child owns its row");
     assert_eq!(child_alpha["file_count"], 1);
 }
+
+/// 建一个自定义根拼写的 Library，并插入一条挂在该路径下的 Media + ledger 行。
+fn seed_library_row(fix: &PresenceFixture, root: &str, path: &str, title: &str) -> String {
+    let library = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .create_library(MediaKind::Movie, title, &[root], "everyone", true, &[])
+            .unwrap()
+    };
+    insert_path_row(fix, path, title);
+    library.id
+}
+
+/// 插入一条不落盘的自定义路径 Media + ledger 行。
+fn insert_path_row(fix: &PresenceFixture, path: &str, title: &str) -> MediaId {
+    let media_id = MediaId::new();
+    let store = fix.state.store();
+    let guard = store.lock();
+    guard
+        .insert_media(&Media {
+            id: media_id,
+            kind: MediaKind::Movie,
+            title: title.into(),
+            year: Some(2024),
+            original_title: None,
+            tmdb_id: None,
+            douban_id: None,
+            tvdb_id: None,
+            bangumi_id: None,
+            anilist_id: None,
+        })
+        .unwrap();
+    guard
+        .insert_ledger(&LedgerRow {
+            id: LedgerId::new(),
+            media_id,
+            path: path.to_string(),
+            season: None,
+            episode: None,
+            resolution: None,
+            codec: None,
+            hdr: None,
+            quality_source: QualitySource::Release,
+            confidence: Confidence::High,
+            filter_score: None,
+        })
+        .unwrap();
+    media_id
+}
+
+/// P2-residual：规范/非规范根 × 规范/非规范存库路径交叉组合下，投影的最终行集必须
+/// 与旧 `owner()` 全量路径逐字段一致。旧修法只规范化了配置根一侧，存库路径把根本身
+/// 写成 `/a/./b/x`、`/a//b/x` 时条目会从投影里静默消失。
+#[tokio::test]
+async fn projected_rows_match_live_path_for_non_canonical_root_and_path_spellings() {
+    let fix = PresenceFixture::new();
+    let base = fix.dir.path().to_str().unwrap().to_string();
+    // `{base}` 模板在循环里展开，避免每个用例写两遍长路径。
+    let cases = [
+        ("{base}/c0/movies", "{base}/c0/movies/Ok.mkv"),
+        ("{base}/c1/movies", "{base}/c1/./movies/Ok.mkv"),
+        ("{base}/c2/movies", "{base}/c2//movies/Ok.mkv"),
+        ("{base}/c3/./movies", "{base}/c3/movies/Ok.mkv"),
+        ("{base}/c4/./movies", "{base}/c4//movies/Ok.mkv"),
+        ("{base}/c5//movies", "{base}/c5/./movies/Ok.mkv"),
+    ];
+    let projected = fix
+        .state
+        .clone()
+        .with_projection_service(Arc::new(ProjectionService::new()));
+    let live = fix
+        .state
+        .clone()
+        .with_projection_service(Arc::new(ProjectionService::disabled()));
+
+    for (index, (root, path)) in cases.iter().enumerate() {
+        let title = format!("Case {index}");
+        let root = root.replace("{base}", &base);
+        let path = path.replace("{base}", &base);
+        let library_id = seed_library_row(&fix, &root, &path, &title);
+        let url = format!("/api/v1/libraries/{library_id}/items");
+        let projected_body = get(&projected, &url, &fix.admin_token).await;
+        let live_body = get(&live, &url, &fix.admin_token).await;
+        assert_eq!(
+            projected_body, live_body,
+            "case {index}: 投影必须与旧全量读取一致（root={root}, path={path}）"
+        );
+        assert!(
+            projected_body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["title"] == title),
+            "case {index}: 非规范拼写的行必须出现在投影里：{projected_body}"
+        );
+        assert!(
+            projected
+                .store()
+                .lock()
+                .browse_projection(&library_id)
+                .unwrap()
+                .is_some(),
+            "case {index}: 必须有已发布投影，否则比较是空转"
+        );
+    }
+}
+
+/// P3：`/` 根库存在时，空 ledger 路径仍必须由默认库投影返回。
+///
+/// `Path::new("").starts_with(Path::new("/"))` 为 false，`owner()` 把空路径回退给
+/// 默认库；`/` 前缀若带上 `path = ''` 相等分支，就会把空路径从默认库的
+/// `NOT (...)` 回退里排掉，条目从默认库投影消失。
+#[tokio::test]
+async fn empty_ledger_path_stays_in_default_library_projection_with_slash_root() {
+    let fix = PresenceFixture::new();
+    {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .create_library(MediaKind::Movie, "Root", &["/"], "everyone", true, &[])
+            .unwrap();
+    }
+    insert_path_row(&fix, "", "Empty Path");
+    let default_id = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .default_library(MediaKind::Movie)
+            .unwrap()
+            .expect("seeded default movie library")
+            .id
+    };
+    let projected = fix
+        .state
+        .clone()
+        .with_projection_service(Arc::new(ProjectionService::new()));
+    let live = fix
+        .state
+        .clone()
+        .with_projection_service(Arc::new(ProjectionService::disabled()));
+
+    let url = format!("/api/v1/libraries/{default_id}/items");
+    let projected_body = get(&projected, &url, &fix.admin_token).await;
+    let live_body = get(&live, &url, &fix.admin_token).await;
+    assert_eq!(
+        projected_body, live_body,
+        "空路径条目的投影必须与旧全量读取一致"
+    );
+    assert!(
+        projected_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["title"] == "Empty Path"),
+        "空 ledger 路径必须仍回退到默认库投影：{projected_body}"
+    );
+}

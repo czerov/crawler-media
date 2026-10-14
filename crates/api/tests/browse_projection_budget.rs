@@ -3,7 +3,10 @@
 //!
 //! 覆盖：
 //! - 构建容量饱和 → 目标 Library 的浏览请求立刻 503（不挂起等 30 秒）；
-//! - leader 构建超过 deadline → 504（而不是无界等待）。
+//! - leader 构建超过 deadline → 504（而不是无界等待）；
+//! - P3：终态已发布、inflight 条目尚未移除时进入的 follower，必须重放真实终态
+//!   （`Ready` 含紧随其后的新脏标记、`Failed`、`StaleScope`），而不是伪造
+//!   `Cancelled`/`Timeout`。
 
 #[path = "support/mod.rs"]
 mod support;
@@ -367,5 +370,255 @@ async fn a_different_library_still_builds_while_one_is_blocked() {
     assert!(
         leader_result.is_ok(),
         "放行后被阻塞的构建必须成功发布：{leader_result:?}"
+    );
+}
+
+/// 终态发布屏障：leader 发布终态后通知测试并阻塞，直到测试放行，从而把
+/// follower 确定性地放进「终态已发布、inflight 条目尚未移除」的窗口。
+struct PublishGate {
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl PublishGate {
+    fn new() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new(Self {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        (gate, entered_rx, release_tx)
+    }
+
+    fn barrier(self: &Arc<Self>) -> Arc<dyn Fn(&str) + Send + Sync> {
+        let gate = self.clone();
+        Arc::new(move |_library_id: &str| {
+            if let Some(tx) = gate.entered.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = gate.release.lock().unwrap().take() {
+                let _ = rx.recv();
+            }
+        })
+    }
+}
+
+/// 构建在文件 stat 处 panic：走 blocking worker 失败 → `Failed` 终态。
+struct PanicFiles;
+
+impl BrowseFileRead for PanicFiles {
+    fn read_nfo(&self, path: &Path) -> Option<library::NfoMeta> {
+        library::read_nfo(path)
+    }
+
+    fn metadata(&self, _path: &Path) -> std::io::Result<std::fs::Metadata> {
+        panic!("projection build fault injection");
+    }
+
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+}
+
+/// 在「终态已发布、条目尚未移除」窗口内进入的 follower，必须重放 leader 的
+/// `Ready` 终态 —— 即使紧随其后到达的新脏标记让 freshness 复查落空。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_follower_replays_ready_outcome_after_a_new_dirty_mark() {
+    let fix = PresenceFixture::new();
+    fix.insert_media_and_ledger("Gated.mkv");
+    let (gate, entered_rx, release_tx) = PublishGate::new();
+    let state = fix.state.clone().with_projection_service(Arc::new(
+        ProjectionService::new()
+            .with_build_capacity(2)
+            .with_deadline(Duration::from_secs(10))
+            .with_publish_barrier(gate.barrier()),
+    ));
+
+    let leader_state = state.clone();
+    let leader_lib = fix.library_id.clone();
+    let leader = tokio::spawn(async move {
+        leader_state
+            .projection
+            .ensure(leader_state.clone(), leader_lib)
+            .await
+    });
+    entered_rx.await.expect("leader 必须发布终态并到达屏障");
+
+    // 终态已发布、条目尚未移除：此刻到达的新脏标记让 follower 的 freshness
+    // 复查落空，只能靠重放终态拿到结果。
+    state.projection.mark_dirty(&fix.library_id);
+    assert!(state.projection.is_dirty(&fix.library_id));
+
+    let follower = tokio::time::timeout(
+        Duration::from_secs(2),
+        state
+            .projection
+            .ensure(state.clone(), fix.library_id.clone()),
+    )
+    .await;
+    release_tx.send(()).unwrap();
+
+    let follower = follower.expect("follower 不得等 leader 移除条目才拿到结果");
+    let snapshot = follower.expect("follower 必须重放 Ready 终态，而不是伪造 Cancelled/Timeout");
+    assert_eq!(snapshot.library_id, fix.library_id);
+    assert!(leader.await.unwrap().is_ok(), "leader 必须成功发布投影");
+}
+
+/// HTTP 面：窗口内进入的 follower 请求必须拿到真实 `Ready` 结果（200），而不是
+/// 被伪造的 `Cancelled` 映射成 503 `runtime.busy`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_follower_http_request_gets_ready_not_spurious_503() {
+    let fix = PresenceFixture::new();
+    fix.insert_media_and_ledger("Gated.mkv");
+    let (gate, entered_rx, release_tx) = PublishGate::new();
+    let state = fix.state.clone().with_projection_service(Arc::new(
+        ProjectionService::new()
+            .with_build_capacity(2)
+            .with_deadline(Duration::from_secs(10))
+            .with_publish_barrier(gate.barrier()),
+    ));
+
+    let leader_state = state.clone();
+    let leader_lib = fix.library_id.clone();
+    let leader = tokio::spawn(async move {
+        leader_state
+            .projection
+            .ensure(leader_state.clone(), leader_lib)
+            .await
+    });
+    entered_rx.await.expect("leader 必须发布终态并到达屏障");
+
+    state.projection.mark_dirty(&fix.library_id);
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        get(
+            &state,
+            &format!("/api/v1/libraries/{}/items", fix.library_id),
+            &fix.admin_token,
+        ),
+    )
+    .await;
+    release_tx.send(()).unwrap();
+
+    let (status, body) = response.expect("HTTP follower 不得等 leader 移除条目才拿到结果");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "窗口内 follower 必须拿到真实 Ready 结果，而不是伪造 503：{body}"
+    );
+    assert!(leader.await.unwrap().is_ok(), "leader 必须成功发布投影");
+}
+
+/// 构建 panic → `Failed` 终态。窗口内进入的 follower 必须重放该 `Failed`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_follower_replays_failed_outcome() {
+    let fix = PresenceFixture::new();
+    fix.insert_media_and_ledger("Boom.mkv");
+    let (gate, entered_rx, release_tx) = PublishGate::new();
+    let state = fix
+        .state
+        .clone()
+        .with_browse_file_read(Arc::new(PanicFiles))
+        .with_projection_service(Arc::new(
+            ProjectionService::new()
+                .with_build_capacity(2)
+                .with_deadline(Duration::from_secs(10))
+                .with_publish_barrier(gate.barrier()),
+        ));
+
+    let leader_state = state.clone();
+    let leader_lib = fix.library_id.clone();
+    let leader = tokio::spawn(async move {
+        leader_state
+            .projection
+            .ensure(leader_state.clone(), leader_lib)
+            .await
+    });
+    entered_rx.await.expect("leader 必须以 Failed 终态到达屏障");
+
+    let follower = tokio::time::timeout(
+        Duration::from_secs(2),
+        state
+            .projection
+            .ensure(state.clone(), fix.library_id.clone()),
+    )
+    .await;
+    release_tx.send(()).unwrap();
+
+    let follower = follower.expect("follower 不得等 leader 移除条目才拿到结果");
+    assert!(
+        matches!(follower, Err(ProjectionError::Failed(_))),
+        "follower 必须重放 Failed，而不是伪造 Cancelled/Timeout：{follower:?}"
+    );
+    assert!(
+        matches!(leader.await.unwrap(), Err(ProjectionError::Failed(_))),
+        "leader 必须回报 Failed"
+    );
+}
+
+/// 构建期间公共事实变化 → publish 判定过期 → `StaleScope` 终态。窗口内进入的
+/// follower 必须重放该 `StaleScope`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_follower_replays_stale_scope_outcome() {
+    let fix = PresenceFixture::new();
+    fix.insert_media_and_ledger("Gated.mkv");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (build_release_tx, build_release_rx) = std::sync::mpsc::channel::<()>();
+    let files = Arc::new(GatedFiles {
+        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(Some(build_release_rx)),
+    });
+    let (gate, entered_rx, gate_release_tx) = PublishGate::new();
+    let state = fix
+        .state
+        .clone()
+        .with_browse_file_read(files)
+        .with_projection_service(Arc::new(
+            ProjectionService::new()
+                .with_build_capacity(2)
+                .with_deadline(Duration::from_secs(10))
+                .with_publish_barrier(gate.barrier()),
+        ));
+
+    let leader_state = state.clone();
+    let leader_lib = fix.library_id.clone();
+    let leader = tokio::spawn(async move {
+        leader_state
+            .projection
+            .ensure(leader_state.clone(), leader_lib)
+            .await
+    });
+    started_rx.await.expect("leader build must reach file IO");
+
+    // 构建已抓取 revision；此刻写公共事实 → publish 判定 scope 已过期。
+    fix.insert_media_and_ledger("Extra.mkv");
+    build_release_tx.send(()).unwrap();
+
+    entered_rx
+        .await
+        .expect("leader 必须以 StaleScope 终态到达屏障");
+
+    let follower = tokio::time::timeout(
+        Duration::from_secs(2),
+        state
+            .projection
+            .ensure(state.clone(), fix.library_id.clone()),
+    )
+    .await;
+    gate_release_tx.send(()).unwrap();
+
+    let follower = follower.expect("follower 不得等 leader 移除条目才拿到结果");
+    assert!(
+        matches!(follower, Err(ProjectionError::StaleScope)),
+        "follower 必须重放 StaleScope，而不是伪造 Cancelled/Timeout：{follower:?}"
+    );
+    assert!(
+        matches!(leader.await.unwrap(), Err(ProjectionError::StaleScope)),
+        "leader 必须回报 StaleScope"
     );
 }
