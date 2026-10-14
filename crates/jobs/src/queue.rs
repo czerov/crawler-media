@@ -219,11 +219,12 @@ impl Queue {
 
     pub fn prune_terminal_window(
         &self,
+        cursor_key: &str,
         cutoff: i64,
         limit: usize,
         dry_run: bool,
     ) -> Result<crate::retention_cursor::RetentionWindow, JobError> {
-        crate::retention_cursor::prune_terminal_window(&self.conn, cutoff, limit, dry_run)
+        crate::retention_cursor::prune_terminal_window(&self.conn, cursor_key, cutoff, limit, dry_run)
     }
 
     pub fn change_state(&self) -> Result<crate::change_state::JobChangeState, JobError> {

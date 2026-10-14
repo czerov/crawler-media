@@ -19,8 +19,16 @@ pub fn record_paths(
             .map_err(|e| e.to_string())?
             .is_some()
         {
-            if let Ok(true) = store.clear_ledger_missing(&path_str) {
-                inserted.push(dest);
+            match store.clear_ledger_missing(&path_str) {
+                Ok(true) => inserted.push(dest),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        path = %path_str,
+                        "清除台账缺失标记失败：该路径不会进入本次新增/探测队列"
+                    );
+                }
             }
             continue;
         }
@@ -85,8 +93,16 @@ pub fn record_video_paths(
             .map_err(|e| e.to_string())?
             .is_some()
         {
-            if let Ok(true) = store.clear_ledger_missing(&path_str) {
-                inserted.push(dest);
+            match store.clear_ledger_missing(&path_str) {
+                Ok(true) => inserted.push(dest),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        path = %path_str,
+                        "清除台账缺失标记失败：该路径不会进入本次新增/探测队列"
+                    );
+                }
             }
             continue;
         }

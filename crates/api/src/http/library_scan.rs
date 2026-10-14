@@ -60,6 +60,27 @@ pub(crate) fn scan_library_root(state: &ApiState, root: &std::path::Path) -> Res
     scan_library_subdir(state, root, root)
 }
 
+fn ledger_row_by_path(store: &crate::Store, path: &str) -> Option<domain::LedgerRow> {
+    store.ledger_by_path(path).unwrap_or_else(|error| {
+        tracing::warn!(%error, path, "扫描期间读取台账行失败");
+        None
+    })
+}
+
+fn media_by_id(store: &crate::Store, media_id: domain::MediaId) -> Option<domain::Media> {
+    store.get_media(media_id).unwrap_or_else(|error| {
+        tracing::warn!(%error, media_id = %media_id, "扫描期间读取 Media 失败");
+        None
+    })
+}
+
+fn library_by_id(store: &crate::Store, id: &str) -> Option<store::Library> {
+    store.get_library(id).unwrap_or_else(|error| {
+        tracing::warn!(%error, library_id = id, "扫描期间读取 Library 失败");
+        None
+    })
+}
+
 pub(crate) fn scan_library_subdir(
     state: &ApiState,
     root: &std::path::Path,
@@ -125,10 +146,13 @@ pub(crate) fn scan_library_subdir(
         let store = state.store.lock();
         let mut map = HashMap::new();
         for file in &filtered_transferred {
-            if let Ok(Some(row)) = store.ledger_by_path(&file.path.display().to_string())
-                && let Ok(Some(media)) = store.get_media(row.media_id)
-                && media.kind != domain::MediaKind::Video
-            {
+            let Some(row) = ledger_row_by_path(&store, &file.path.display().to_string()) else {
+                continue;
+            };
+            let Some(media) = media_by_id(&store, row.media_id) else {
+                continue;
+            };
+            if media.kind != domain::MediaKind::Video {
                 map.entry(media.id)
                     .or_insert((media, PathBuf::from(row.path)));
             }
@@ -146,7 +170,7 @@ pub(crate) fn scan_library_subdir(
     crate::http::library::enqueue_probes_for_paths(state, inserted);
     {
         let store = state.store.lock();
-        if let Ok(Some(library)) = store.get_library(&library_id) {
+        if let Some(library) = library_by_id(&store, &library_id) {
             crate::http::library::clear_library_cover_checked(&store, &library.id);
             let _ = crate::http::library::library_cover_path(&store, &library);
         }
@@ -221,13 +245,19 @@ fn resolve_and_scrape_subdir(
             return Err(error);
         }
         if scrape && let Some(resolved_media) = resolved {
+            // 真实失败（取路径租约失败、落盘失败）由 poster_fetch 内部按 warn 记录；
+            // None 也包含"本来就没有可写的图"，不是错误。
             let _ = crate::poster_fetch::attach_poster(state, &resolved_media, &path);
             let _ = crate::poster_fetch::attach_backdrop(state, &resolved_media, &path);
             let (target_row, all_rows) = {
                 let store = state.store.lock();
-                let rows = store
-                    .ledger_for_media(resolved_media.id)
-                    .unwrap_or_default();
+                let rows = match store.ledger_for_media(resolved_media.id) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        tracing::warn!(%error, media_id = %resolved_media.id, "读取 Media 台账行失败");
+                        Vec::new()
+                    }
+                };
                 let path_str = path.display().to_string();
                 let row = rows.iter().find(|r| r.path == path_str).cloned();
                 (row, rows)
@@ -307,7 +337,7 @@ pub(crate) fn scan_library_leased_result(
 ) -> Result<(library::ScanReport, Value), Response> {
     let (kind, roots, scrape) = {
         let store = state.store.lock();
-        let Some(library) = store.get_library(&id).ok().flatten() else {
+        let Some(library) = library_by_id(&store, &id) else {
             return Err(missing_library());
         };
         let cfg = store.get_scrape_config().ok();
@@ -369,12 +399,14 @@ pub(crate) fn scan_library_leased_result(
         let store = state.store.lock();
         let mut map = std::collections::HashMap::new();
         for file in &filtered_transferred {
-            if let Ok(Some(row)) = store.ledger_by_path(&file.path.display().to_string()) {
-                if let Ok(Some(m)) = store.get_media(row.media_id) {
-                    if m.kind != domain::MediaKind::Video {
-                        map.entry(m.id).or_insert((m, row));
-                    }
-                }
+            let Some(row) = ledger_row_by_path(&store, &file.path.display().to_string()) else {
+                continue;
+            };
+            let Some(m) = media_by_id(&store, row.media_id) else {
+                continue;
+            };
+            if m.kind != domain::MediaKind::Video {
+                map.entry(m.id).or_insert((m, row));
             }
         }
         map
@@ -386,7 +418,7 @@ pub(crate) fn scan_library_leased_result(
     crate::http::library::enqueue_probes_for_paths(&state, inserted.clone());
     {
         let store = state.store.lock();
-        if let Ok(Some(lib)) = store.get_library(&id) {
+        if let Some(lib) = library_by_id(&store, &id) {
             crate::http::library::clear_library_cover_checked(&store, &lib.id);
             let _ = crate::http::library::library_cover_path(&store, &lib);
         }
@@ -438,20 +470,14 @@ fn resolve_scan_metadata(
             ));
         }
         if scrape {
+            // 见上：真实失败由 poster_fetch 内部记录，None 不是错误。
             let _ = crate::poster_fetch::attach_poster(state, &resolved, path);
             let _ = crate::poster_fetch::attach_backdrop(state, &resolved, path);
             // Reread after alias convergence; stale rows still contain the provisional ID.
             let (row, rows) = {
                 let store = state.store.lock();
-                let row = store
-                    .ledger_by_path(&row.path)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(row);
-                let rows = store
-                    .get_library(id)
-                    .ok()
-                    .flatten()
+                let row = ledger_row_by_path(&store, &row.path).unwrap_or(row);
+                let rows = library_by_id(&store, id)
                     .map(|library| rows_in_library(&store, &library))
                     .unwrap_or_default();
                 (row, rows)
@@ -475,7 +501,7 @@ pub(crate) async fn refresh_metadata(
         Err(error) => return err(StatusCode::CONFLICT, "library.deleting", &error),
     };
     let store = state.store.lock();
-    let Some(library) = store.get_library(&id).ok().flatten() else {
+    let Some(library) = library_by_id(&store, &id) else {
         return missing_library();
     };
     let owned_rows = rows_in_library(&store, &library);
@@ -485,7 +511,7 @@ pub(crate) async fn refresh_metadata(
     }
     let mut work = Vec::new();
     for (media_id, media_rows) in grouped {
-        let Some(media) = store.get_media(media_id).ok().flatten() else {
+        let Some(media) = media_by_id(&store, media_id) else {
             continue;
         };
         let live_rows: Vec<_> = media_rows
@@ -505,6 +531,7 @@ pub(crate) async fn refresh_metadata(
         if crate::poster_fetch::attach_poster(&state, &media, &path).is_some() {
             refreshed += 1;
         }
+        // 真实失败由 poster_fetch 内部记录；None 表示没有可写的图。
         let _ = crate::poster_fetch::force_attach_backdrop(&state, &media, &path);
         // TMDB 详情 + 演职员写入 NFO（无 NFO 时也补一份），供条目详情页读取。
         scrape_library_metadata(&state, &media, &row, &path, &owned_rows);

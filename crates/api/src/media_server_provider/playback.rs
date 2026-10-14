@@ -92,14 +92,8 @@ pub(super) fn update_progress(
 ) -> Result<(), String> {
     let target = resolve_target(provider, user_id, id)?
         .ok_or_else(|| format!("Jellyfin playback item {id} is missing or not visible"))?;
-    persist_position(
-        provider,
-        user_id,
-        &target,
-        position_ms,
-        false,
-        crate::job_loop::unix_now(),
-    )
+    let now = provider.state.playback_clock.now_ms() / 1000;
+    persist_position(provider, user_id, &target, position_ms, false, now)
 }
 
 pub(super) fn report_event(

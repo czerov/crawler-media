@@ -63,8 +63,15 @@ impl ScanCoordinator {
             drop(running);
             let state_clone = state.clone();
             tokio::spawn(async move {
+                // 即使 worker panic，也要释放 running 槽位，否则两次 panic 之后
+                // 全局 2 个扫描额度会被永久占满。
+                let guard = RunningGuard {
+                    coordinator: state_clone.scan_coordinator.clone(),
+                    op_id: op.id.clone(),
+                    released: false,
+                };
                 run_operation(&state_clone, &op.id, &op.library_id).await;
-                state_clone.scan_coordinator.running_ops.lock().remove(&op.id);
+                guard.release();
                 state_clone.scan_coordinator.trigger_next(&state_clone);
             });
         }
@@ -120,12 +127,61 @@ impl ScanCoordinator {
     }
 }
 
+/// 释放 running 槽位的 RAII guard：worker 正常结束或 panic 都会移除 op id。
+struct RunningGuard {
+    coordinator: std::sync::Arc<ScanCoordinator>,
+    op_id: String,
+    released: bool,
+}
+
+impl RunningGuard {
+    fn release(mut self) {
+        self.released = true;
+        self.coordinator.running_ops.lock().remove(&self.op_id);
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.coordinator.running_ops.lock().remove(&self.op_id);
+        if !self.released && std::thread::panicking() {
+            tracing::error!(
+                op_id = %self.op_id,
+                "扫描 worker 异常退出；operation 保持 running，等待下次启动恢复"
+            );
+        }
+    }
+}
+
+/// 写终态；写失败会让 operation 永远停在 running，所以必须留痕。
+fn write_terminal_status(
+    store: &crate::Store,
+    op_id: &str,
+    status: ScanOperationStatus,
+    report: &serde_json::Value,
+) {
+    match store.update_scan_operation_status(op_id, status, report) {
+        Ok(true) => {
+            if let Err(error) = store.clear_scan_seen(op_id) {
+                tracing::error!(%error, %op_id, "清理 scan_seen 检查点失败");
+            }
+        }
+        Ok(false) => {
+            tracing::warn!(%op_id, status = status.as_str(), "扫描终态未写入：operation 已是终态");
+        }
+        Err(error) => {
+            tracing::error!(%error, %op_id, status = status.as_str(), "写入扫描终态失败");
+        }
+    }
+}
+
 async fn run_operation(state: &ApiState, op_id: &str, library_id: &str) {
     let lease = match state.acquire_library_work(library_id) {
         Ok(lease) => lease,
         Err(e) => {
             let store = state.store.lock();
-            let _ = store.update_scan_operation_status(
+            write_terminal_status(
+                &store,
                 op_id,
                 ScanOperationStatus::Failed,
                 &serde_json::json!({ "error": e }),
@@ -138,11 +194,13 @@ async fn run_operation(state: &ApiState, op_id: &str, library_id: &str) {
 
     {
         let store = state.store.lock();
-        let _ = store.update_scan_operation_status(
+        if let Err(error) = store.update_scan_operation_status(
             op_id,
             ScanOperationStatus::Running,
             &serde_json::json!({}),
-        );
+        ) {
+            tracing::error!(%error, %op_id, "标记扫描为 running 失败");
+        }
     }
 
     let state_clone = state.clone();
@@ -166,18 +224,19 @@ async fn run_operation(state: &ApiState, op_id: &str, library_id: &str) {
             } else {
                 ScanOperationStatus::Completed
             };
-            let _ = store.update_scan_operation_status(op_id, status, &report_data);
+            write_terminal_status(&store, op_id, status, &report_data);
         }
         Ok(Err(resp)) => {
-            let status = ScanOperationStatus::Failed;
-            let _ = store.update_scan_operation_status(
+            write_terminal_status(
+                &store,
                 op_id,
-                status,
+                ScanOperationStatus::Failed,
                 &serde_json::json!({ "http_status": resp.status().as_u16() }),
             );
         }
         Err(e) => {
-            let _ = store.update_scan_operation_status(
+            write_terminal_status(
+                &store,
                 op_id,
                 ScanOperationStatus::Failed,
                 &serde_json::json!({ "error": e.to_string() }),

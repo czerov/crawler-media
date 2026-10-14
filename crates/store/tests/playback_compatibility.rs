@@ -231,3 +231,128 @@ fn retargeted_subscribe_does_not_treat_previous_library_as_owned() {
     assert!(loaded.movie().is_none(), "Library A 的文件不能算作空 Library B 的已拥有内容");
     assert!(path.is_file(), "切换目标不得删除原 Library 文件");
 }
+
+fn closed_session(
+    user: UserId,
+    media: MediaId,
+    device: &str,
+    started: i64,
+    admin_ended: bool,
+) -> store::SessionRow {
+    store::SessionRow {
+        device_id: device.into(),
+        user_id: user,
+        media_id: media,
+        season: None,
+        episode: None,
+        client: Some("fixture".into()),
+        device_name: None,
+        client_version: None,
+        play_method: "local".into(),
+        position_ms: 500,
+        start_position_ms: 0,
+        duration_ms: Some(1000),
+        paused: false,
+        watched_ms: 10,
+        rate_bps: 0,
+        bytes_sent: 0,
+        connections: 0,
+        admin_ended,
+        started_at: started,
+        last_report_at: started,
+        ledger_id: None,
+        play_session_id: None,
+        last_report_at_ms: started * 1000,
+        last_event_sequence: None,
+    }
+}
+
+/// 只有管理员结束的会话才写 `admin_ended = 1`；用户自行停止必须是 0，
+/// 否则迟到的心跳会让前端弹出"管理员已结束播放"。
+#[test]
+fn only_admin_end_records_admin_ended_in_playback_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let user = UserId::new();
+    let media = MediaId::new();
+
+    store
+        .upsert_session(&closed_session(user, media, "dev-user-stop", 10, false))
+        .unwrap();
+    store.close_session(user, "dev-user-stop", 20).unwrap();
+    store
+        .upsert_session(&closed_session(user, media, "dev-admin-end", 30, true))
+        .unwrap();
+    store.close_session(user, "dev-admin-end", 40).unwrap();
+
+    let db = Connection::open(tmp.path().join("subscribe.db")).unwrap();
+    let user_stop: i64 = db
+        .query_row(
+            "SELECT admin_ended FROM playback_logs WHERE device_id = 'dev-user-stop'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let admin_end: i64 = db
+        .query_row(
+            "SELECT admin_ended FROM playback_logs WHERE device_id = 'dev-admin-end'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(user_stop, 0, "用户自行停止不得被记为管理员结束");
+    assert_eq!(admin_end, 1, "管理员结束必须落库");
+
+    assert!(
+        !store.device_was_admin_ended(user, "dev-user-stop", 25, 60).unwrap(),
+        "用户停止后的迟到心跳不得被判定为管理员结束"
+    );
+    assert!(
+        store.device_was_admin_ended(user, "dev-admin-end", 45, 60).unwrap(),
+        "管理员结束后的心跳必须被告知已结束"
+    );
+}
+
+/// 老库没有 `admin_ended` 列：重开 Store 必须幂等地补列，且默认 0。
+#[test]
+fn reopening_legacy_db_restores_admin_ended_column_with_default_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(Store::open(tmp.path()).unwrap());
+    let user = UserId::new();
+    let media = MediaId::new();
+    {
+        let db = Connection::open(tmp.path().join("subscribe.db")).unwrap();
+        db.execute_batch("ALTER TABLE playback_logs DROP COLUMN admin_ended;")
+            .unwrap();
+        db.execute(
+            "INSERT INTO playback_logs (id,user_id,media_id,play_method,started_at,ended_at)
+             VALUES ('legacy',?1,?2,'local',1,2)",
+            params![user.to_string(), media.to_string()],
+        )
+        .unwrap();
+    }
+
+    for _ in 0..2 {
+        let reopened = Store::open(tmp.path()).unwrap();
+        let logs = reopened
+            .list_logs(10, None, None, None, 10, Some(user))
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(
+            !reopened
+                .device_was_admin_ended(user, "jf-legacy", 3, 60)
+                .unwrap(),
+            "老日志不得被当成管理员结束"
+        );
+    }
+
+    let db = Connection::open(tmp.path().join("subscribe.db")).unwrap();
+    let value: i64 = db
+        .query_row(
+            "SELECT admin_ended FROM playback_logs WHERE id = 'legacy'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(value, 0, "补列后老行默认 0");
+}

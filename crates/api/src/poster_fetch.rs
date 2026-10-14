@@ -48,7 +48,13 @@ fn attach_poster_with(
     if !crate::scrape_metadata::targets::video_present(video) {
         return None;
     }
-    let lease = state.acquire_path_work(video, media.kind).ok()?;
+    let lease = match state.acquire_path_work(video, media.kind) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(%error, media = %media.title, video = %video.display(), "获取路径工作租约失败，跳过海报");
+            return None;
+        }
+    };
     // 刮削与整理设置：写入图片总开关（mirror_images）。
     let mirror_images = state
         .store
@@ -196,7 +202,13 @@ fn write_frame_poster(
     if is_strm || !thumbnails_allowed(state, video) || !crate::scrape_metadata::targets::video_present(video) {
         return false;
     }
-    let Ok(lease) = state.acquire_path_work(video, media.kind) else { return false };
+    let lease = match state.acquire_path_work(video, media.kind) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(%error, media = %media.title, video = %video.display(), "获取路径工作租约失败，跳过截帧海报");
+            return false;
+        }
+    };
     match frame_poster_with(video, frame) {
         Ok(bytes) if !bytes.is_empty() => {
             if !crate::scrape_metadata::targets::video_present(video) {
@@ -383,7 +395,13 @@ fn attach_backdrop_opts(
     video: &Path,
     force: bool,
 ) -> Option<Vec<u8>> {
-    let lease = state.acquire_path_work(video, media.kind).ok()?;
+    let lease = match state.acquire_path_work(video, media.kind) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(%error, media = %media.title, video = %video.display(), "获取路径工作租约失败，跳过背景图");
+            return None;
+        }
+    };
     let Some(config) = state.store.lock().get_scrape_config().ok() else {
         tracing::warn!(media = %media.title, "读取刮削配置失败，跳过背景图");
         return None;

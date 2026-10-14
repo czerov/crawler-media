@@ -26,20 +26,31 @@ pub(crate) fn delete_ledger_by_id_str_in_tx(
     id_str: &str,
 ) -> Result<bool, StoreError> {
     // Look up media_id and library_ids associated with this ledger row
-    let media_id_opt: Option<String> = tx
-        .query_row(
-            "SELECT media_id FROM ledger WHERE id = ?1",
-            [id_str],
-            |r| r.get(0),
-        )
-        .ok();
+    let media_id_opt: Option<String> = match tx.query_row(
+        "SELECT media_id FROM ledger WHERE id = ?1",
+        [id_str],
+        |r| r.get(0),
+    ) {
+        Ok(media_id) => Some(media_id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => {
+            tracing::warn!(%error, ledger_id = id_str, "读取台账行 media_id 失败，跳过孤儿 browse_media 清理");
+            None
+        }
+    };
 
     // Mark affected browse generations dirty
-    let _ = tx.execute(
+    if let Err(error) = tx.execute(
         "UPDATE browse_generations SET state = 'dirty'
          WHERE library_id IN (SELECT library_id FROM browse_files WHERE ledger_id = ?1)",
         [id_str],
-    );
+    ) {
+        tracing::error!(
+            %error,
+            ledger_id = id_str,
+            "标记 browse_generations 为 dirty 失败：投影可能保留已删除的台账 id"
+        );
+    }
 
     // Delete probe obligations in library.db
     tx.execute(

@@ -206,6 +206,9 @@ impl PresenceFixture {
         (status, json)
     }
 
+    /// 等待扫描终态。`completed` 与 `partial` 都返回 200（旧调用方需要接受
+    /// "部分根不可达" 的既有合同）；需要断言"真的全部完成"的调用方请用
+    /// [`Self::scan_and_wait_completed`]，否则失败/部分完成会被掩盖。
     pub async fn scan_and_wait(&self, library_id: &str) -> (StatusCode, Value) {
         let (status, res) = self
             .request(
@@ -238,5 +241,21 @@ impl PresenceFixture {
             }
         }
         panic!("scan operation timed out");
+    }
+
+    /// 严格等待：只有 `completed` 才算成功；`partial`/`failed`/`cancelled` 都会
+    /// panic。断言"后续扫描真的恢复正常"必须用这个，不能用宽容版本。
+    pub async fn scan_and_wait_completed(&self, library_id: &str) -> Value {
+        let (status, res) = self.scan_and_wait(library_id).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "扫描未成功结束（HTTP {status}）: {res}"
+        );
+        assert_eq!(
+            res["status"], "completed",
+            "扫描必须真正完成，而不是 partial/failed: {res}"
+        );
+        res
     }
 }

@@ -155,9 +155,12 @@ async fn job_stream_reports_failure_when_first_count_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let app = router(state);
-    // 破坏 jobs 表：计数查询必然失败。
+    // 破坏计数来源：SSE 计数读的是 job_change_state 单行，不是重 COUNT(jobs)。
+    // 计数查询失败时，首个事件必须报错，而不是伪造 count=0。
     let connection = rusqlite::Connection::open(tmp.path().join("data/jobs.db")).unwrap();
-    connection.execute_batch("DROP TABLE jobs;").unwrap();
+    connection
+        .execute_batch("DROP TABLE job_change_state;")
+        .unwrap();
 
     let request = Request::builder()
         .method("GET")

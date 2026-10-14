@@ -150,6 +150,7 @@ pub(crate) fn scan_video_library(
             bangumi_id: None,
             anilist_id: None,
         };
+        // 真实失败由 poster_fetch 内部记录；None 表示没有可写的图。
         let _ = crate::poster_fetch::attach_poster(state, &media, &file);
         let _ = crate::poster_fetch::attach_backdrop(state, &media, &file);
     }

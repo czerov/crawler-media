@@ -95,7 +95,10 @@ fn publish_event_observations(
     for (lib_id, observations) in observations_by_lib {
         let lease = match state.acquire_library_work(&lib_id) {
             Ok(l) => l,
-            Err(_) => continue,
+            Err(error) => {
+                tracing::warn!(%error, library_id = %lib_id, "获取 Library 工作租约失败，跳过本次 watcher presence 发布");
+                continue;
+            }
         };
 
         let sub_res = lease.publish(|| {
@@ -121,7 +124,7 @@ fn publish_event_observations(
                 total_result.skipped += res.skipped;
             }
             Err(err) => {
-                tracing::warn!(library_id = %lib_id, %err, "Failed to publish watcher presence");
+                tracing::error!(library_id = %lib_id, error = %err, "发布 watcher presence 失败");
             }
         }
     }

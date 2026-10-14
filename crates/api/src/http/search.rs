@@ -18,6 +18,10 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::http::{err, ok, ok_list};
 use crate::management::ApiState;
+use indexer::{SearchOutcome, SiteFailure};
+
+/// B3 §6：单个 Site / Catalog blocking 搜索单元的运行 deadline。
+const SEARCH_DEADLINE: Duration = Duration::from_secs(12);
 
 fn release_json(torrent: &Torrent) -> Value {
     let release = release::parse(&torrent.title);
@@ -113,31 +117,17 @@ pub(crate) async fn search_torrents(
         let store = state.store.lock();
         scoped_sites(&store, &sites_requested)
     };
-    // Site fetches are blocking HTTP; run them off the async worker via
-    // spawn_blocking. Cross-site parallelism lives inside indexer.search.
+    // Site fetches are blocking HTTP; run each Site off the async worker under the
+    // shared search budget, so one slow Site cannot exceed the B3 §6 deadline and
+    // cannot exceed the pool. Cross-site parallelism lives inside indexer.search.
     // 并发执行各站点搜索：避免单站耗时或超时累加阻塞全流程，与流式搜索保持一致的并发性能表现
     let mut tasks = Vec::new();
     for site in sites {
-        let indexer = state.indexer.clone();
+        let state = state.clone();
         let kw = keyword.clone();
         let categories = categories.clone();
-        tasks.push(tokio::task::spawn_blocking(move || {
-            let started = Instant::now();
-            let site_outcome =
-                indexer.search_page_categories(std::slice::from_ref(&site), &kw, page, &categories);
-            let status = json!({
-                "site_id": site.id.to_string(),
-                "site_name": site.name,
-                "count": site_outcome.torrents.len(),
-                "error": site_outcome.failures.into_iter().next().map(|f| f.error),
-                "elapsed_ms": started.elapsed().as_millis() as i64,
-            });
-            let items: Vec<_> = site_outcome
-                .torrents
-                .iter()
-                .map(|t| torrent_json(t, &site.name))
-                .collect();
-            (items, status)
+        tasks.push(tokio::spawn(async move {
+            search_site_json(&state, site, kw, page, categories).await
         }));
     }
 
@@ -174,6 +164,68 @@ pub(crate) async fn search_torrents(
         "sites": statuses,
     }))
     .into_response()
+}
+
+/// 单个 Site 的 JSON 搜索：预算准入失败降级为该站点的失败条目（B3 §6）。
+async fn search_site_json(
+    state: &ApiState,
+    site: domain::Site,
+    keyword: String,
+    page: u32,
+    categories: Vec<String>,
+) -> (Vec<Value>, Value) {
+    let indexer = state.indexer.clone();
+    let budget = state.search_work.clone();
+    let started = Instant::now();
+    let site_id = site.id.to_string();
+    let site_name = site.name.clone();
+    let site_for_search = site.clone();
+    let outcome = budget
+        .run(SEARCH_DEADLINE, move || {
+            indexer.search_page_categories(
+                std::slice::from_ref(&site_for_search),
+                &keyword,
+                page,
+                &categories,
+            )
+        })
+        .await;
+    let elapsed_ms = started.elapsed().as_millis() as i64;
+    match outcome {
+        Ok(site_outcome) => {
+            let items: Vec<_> = site_outcome
+                .torrents
+                .iter()
+                .map(|t| torrent_json(t, &site_name))
+                .collect();
+            let status = json!({
+                "site_id": site_id,
+                "site_name": site_name,
+                "count": site_outcome.torrents.len(),
+                "error": site_outcome.failures.into_iter().next().map(|f| f.error),
+                "elapsed_ms": elapsed_ms,
+            });
+            (items, status)
+        }
+        Err(error) => {
+            tracing::warn!(
+                site_id = %site_id,
+                site = %site_name,
+                %error,
+                "站点搜索未获搜索预算准入，按单站失败返回"
+            );
+            (
+                Vec::new(),
+                json!({
+                    "site_id": site_id,
+                    "site_name": site_name,
+                    "count": 0,
+                    "error": error.to_string(),
+                    "elapsed_ms": elapsed_ms,
+                }),
+            )
+        }
+    }
 }
 
 pub(crate) async fn search_stream(
@@ -230,9 +282,13 @@ async fn stream_search_events(
 ) {
     send_search_start(&tx, &keyword, &sites).await;
     let started = Instant::now();
-    let mut tasks = spawn_site_searches(state.clone(), keyword.clone(), page, sites, categories);
-    let (total, items, statuses) = collect_site_results(&mut tasks, &tx).await;
+    let (total, items, statuses) =
+        collect_site_results(&state, sites, &keyword, page, &categories, &tx).await;
     let elapsed_ms = started.elapsed().as_millis() as i64;
+    // 客户端已断开：不再排新 Site（见 collect_site_results），也不落盘半截快照。
+    if tx.is_closed() {
+        return;
+    }
     save_stream_snapshot(
         &state,
         snapshot_id.as_deref(),
@@ -261,58 +317,87 @@ async fn send_search_start(
         .await;
 }
 
-fn spawn_site_searches(
-    state: Arc<ApiState>,
-    keyword: String,
+/// 启动单个 Site 搜索：阻塞工作经搜索预算准入，失败降级为该 Site 的失败结果。
+fn spawn_site_search(
+    tasks: &mut tokio::task::JoinSet<SiteSearchResult>,
+    state: &Arc<ApiState>,
+    site: domain::Site,
+    keyword: &str,
     page: u32,
-    sites: Vec<domain::Site>,
-    categories: Vec<String>,
-) -> tokio::task::JoinSet<SiteSearchResult> {
-    let mut tasks = tokio::task::JoinSet::new();
-    for site in sites {
-        let state = Arc::clone(&state);
-        let keyword = keyword.clone();
-        let categories = categories.clone();
-        let site_id = site.id.to_string();
-        let site_name = site.name.clone();
-        let site_for_search = site.clone();
-        tasks.spawn(async move {
-            let started = Instant::now();
-            let outcome = tokio::task::spawn_blocking(move || {
-                state.indexer.search_page_categories(
+    categories: &[String],
+) {
+    let budget = Arc::clone(&state.search_work);
+    let indexer = Arc::clone(&state.indexer);
+    let keyword = keyword.to_string();
+    let categories = categories.to_vec();
+    let site_id = site.id.to_string();
+    let site_name = site.name.clone();
+    let site_for_search = site.clone();
+    tasks.spawn(async move {
+        let started = Instant::now();
+        let outcome = budget
+            .run(SEARCH_DEADLINE, move || {
+                indexer.search_page_categories(
                     std::slice::from_ref(&site_for_search),
                     &keyword,
                     page,
                     &categories,
                 )
             })
-            .await
-            .unwrap_or_else(|err| indexer::SearchOutcome {
-                torrents: Vec::new(),
-                failures: vec![indexer::SiteFailure {
-                    site_id: site.id,
-                    error: err.to_string(),
-                }],
-            });
-            SiteSearchResult {
-                site_id,
-                site_name,
-                outcome,
-                elapsed_ms: started.elapsed().as_millis() as i64,
+            .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(
+                    site_id = %site_id,
+                    site = %site_name,
+                    %error,
+                    "流式搜索站点未获搜索预算准入，按单站失败报告"
+                );
+                SearchOutcome {
+                    torrents: Vec::new(),
+                    failures: vec![SiteFailure {
+                        site_id: site.id,
+                        error: error.to_string(),
+                    }],
+                }
             }
-        });
-    }
-    tasks
+        };
+        SiteSearchResult {
+            site_id,
+            site_name,
+            outcome,
+            elapsed_ms: started.elapsed().as_millis() as i64,
+        }
+    });
 }
 
+/// 按当前可用 permit 开窗并发搜索各 Site；客户端断开后不再排新 Site（B3 §6）。
 async fn collect_site_results(
-    tasks: &mut tokio::task::JoinSet<SiteSearchResult>,
+    state: &Arc<ApiState>,
+    sites: Vec<domain::Site>,
+    keyword: &str,
+    page: u32,
+    categories: &[String],
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) -> (i64, Vec<Value>, Vec<Value>) {
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut pending = sites.into_iter();
+    let window = state.search_work.available_permits().max(1);
     let mut statuses = Vec::new();
     let mut items_all = Vec::new();
     let mut total = 0i64;
-    while let Some(result) = tasks.join_next().await {
+    loop {
+        if tx.is_closed() {
+            break;
+        }
+        while tasks.len() < window {
+            let Some(site) = pending.next() else { break };
+            spawn_site_search(&mut tasks, state, site, keyword, page, categories);
+        }
+        let Some(result) = tasks.join_next().await else {
+            break;
+        };
         let Ok(result) = result else { continue };
         let SiteSearchResult {
             site_id,
@@ -457,6 +542,86 @@ fn title_hit_json(hit: &CatalogHit, provider: &str) -> Value {
     })
 }
 
+/// 单个元数据源的 blocking 搜索：返回 (hits, ok, count, error)。
+fn search_catalog_source(
+    catalog: &dyn crate::catalog::Catalog,
+    source: &str,
+    keyword: &str,
+) -> (Vec<CatalogHit>, bool, i64, Option<String>) {
+    let Some(source_catalog) = catalog.source(source) else {
+        return (
+            Vec::new(),
+            false,
+            0,
+            Some("未配置或不存在该数据源".to_string()),
+        );
+    };
+    let movies = source_catalog.search_movie(keyword);
+    let shows = source_catalog.search_tv(keyword);
+    let mut hits = Vec::new();
+    let mut ok = true;
+    let mut err_msg = None;
+    for result in [movies, shows] {
+        match result {
+            Ok(found) => hits.extend(found),
+            Err(error) => {
+                ok = false;
+                err_msg = Some(error);
+            }
+        }
+    }
+    let count = hits.len() as i64;
+    (hits, ok, count, err_msg)
+}
+
+/// 汇总各源结果到 `titles` / `providers` 响应字段。
+async fn collect_title_results(
+    set: &mut tokio::task::JoinSet<
+        Result<(String, Vec<CatalogHit>, bool, i64, Option<String>), (String, String)>,
+    >,
+) -> (Vec<Value>, Vec<Value>) {
+    let mut titles = Vec::new();
+    let mut providers = Vec::new();
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(Ok((source, hits, ok, count, err_msg))) => {
+                titles.extend(hits.iter().map(|hit| title_hit_json(hit, &source)));
+                if ok {
+                    providers.push(json!({
+                        "provider": source,
+                        "ok": true,
+                        "count": count,
+                    }));
+                } else {
+                    providers.push(json!({
+                        "provider": source,
+                        "ok": false,
+                        "count": count,
+                        "message": err_msg.unwrap_or_else(|| "搜索失败".into()),
+                    }));
+                }
+            }
+            Ok(Err((source, err_msg))) => {
+                providers.push(json!({
+                    "provider": source,
+                    "ok": false,
+                    "count": 0,
+                    "message": err_msg,
+                }));
+            }
+            Err(join_err) => {
+                providers.push(json!({
+                    "provider": "unknown",
+                    "ok": false,
+                    "count": 0,
+                    "message": format!("调度异常: {join_err}"),
+                }));
+            }
+        }
+    }
+    (titles, providers)
+}
+
 pub(crate) async fn search_titles(
     State(state): State<ApiState>,
     axum::Extension(user_id): axum::Extension<domain::UserId>,
@@ -491,10 +656,8 @@ pub(crate) async fn search_titles(
         let store = state.store.lock();
         record_history(&store, user_id, &keyword, "titles")
     };
-    let mut titles = Vec::new();
-    let mut providers = Vec::new();
 
-    // 并发 fanout 搜索各元数据源：每个源独立放入 spawn_blocking 并在 6 秒内超时。
+    // 并发 fanout 搜索各元数据源：每个源独立经搜索预算准入并在 12 秒内返回。
     // 单源失败或超时绝不阻塞其他正常源（如 TMDB、豆瓣通常在 1 秒内返回）。
     let mut set: tokio::task::JoinSet<
         Result<(String, Vec<CatalogHit>, bool, i64, Option<String>), (String, String)>,
@@ -505,85 +668,29 @@ pub(crate) async fn search_titles(
         let keyword_clone = keyword.clone();
         let source_name = source.clone();
         set.spawn(async move {
-            let task_source = source_name.clone();
-            match tokio::time::timeout(
-                Duration::from_secs(6),
-                tokio::task::spawn_blocking(move || {
-                    let catalog = state_clone.catalog.as_ref();
-                    let Some(source_catalog) = catalog.source(&task_source) else {
-                        return (
-                            task_source,
-                            Vec::new(),
-                            false,
-                            0i64,
-                            Some("未配置或不存在该数据源".to_string()),
-                        );
-                    };
-                    let movies = source_catalog.search_movie(&keyword_clone);
-                    let shows = source_catalog.search_tv(&keyword_clone);
-                    let mut hits = Vec::new();
-                    let mut ok = true;
-                    let mut err_msg = None;
-                    for result in [movies, shows] {
-                        match result {
-                            Ok(h) => hits.extend(h),
-                            Err(e) => {
-                                ok = false;
-                                err_msg = Some(e);
-                            }
-                        }
-                    }
-                    let count = hits.len() as i64;
-                    (task_source, hits, ok, count, err_msg)
-                }),
-            )
-            .await
-            {
-                Ok(Ok(val)) => Ok(val),
-                Ok(Err(panic_err)) => Err((source_name, format!("任务执行异常: {panic_err}"))),
-                Err(_) => Err((source_name, "数据源响应超时(>6s)".to_string())),
+            let budget = Arc::clone(&state_clone.search_work);
+            let catalog = Arc::clone(&state_clone.catalog);
+            let search_source = source_name.clone();
+            let outcome = budget
+                .run(SEARCH_DEADLINE, move || {
+                    search_catalog_source(catalog.as_ref(), &search_source, &keyword_clone)
+                })
+                .await;
+            match outcome {
+                Ok((hits, ok, count, err_msg)) => Ok((source_name, hits, ok, count, err_msg)),
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %source_name,
+                        %error,
+                        "标题搜索数据源未获搜索预算准入，按单源失败报告"
+                    );
+                    Err((source_name, error.to_string()))
+                }
             }
         });
     }
 
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok(Ok((source, hits, ok, count, err_msg))) => {
-                if ok {
-                    titles.extend(hits.iter().map(|hit| title_hit_json(hit, &source)));
-                    providers.push(json!({
-                        "provider": source,
-                        "ok": true,
-                        "count": count,
-                    }));
-                } else {
-                    titles.extend(hits.iter().map(|hit| title_hit_json(hit, &source)));
-                    providers.push(json!({
-                        "provider": source,
-                        "ok": false,
-                        "count": count,
-                        "message": err_msg.unwrap_or_else(|| "搜索失败".into()),
-                    }));
-                }
-            }
-            Ok(Err((source, err_msg))) => {
-                providers.push(json!({
-                    "provider": source,
-                    "ok": false,
-                    "count": 0,
-                    "message": err_msg,
-                }));
-            }
-            Err(join_err) => {
-                providers.push(json!({
-                    "provider": "unknown",
-                    "ok": false,
-                    "count": 0,
-                    "message": format!("调度异常: {join_err}"),
-                }));
-            }
-        }
-    }
+    let (titles, providers) = collect_title_results(&mut set).await;
     if let Some(id) = &snapshot_id {
         let payload = json!({
             "query": keyword,
@@ -619,7 +726,7 @@ pub(crate) async fn search_library_items(
     let keyword = query.get("keyword").cloned().unwrap_or_default();
     let res = state
         .search_work
-        .run(std::time::Duration::from_secs(10), move || {
+        .run(SEARCH_DEADLINE, move || {
             let store = state.store.lock();
             let rows = store.list_ledger().unwrap_or_default();
             let mut items = Vec::new();
@@ -648,10 +755,14 @@ pub(crate) async fn search_library_items(
 
     match res {
         Ok(items) => ok_list(items).into_response(),
-        Err(crate::blocking_budget::BlockingError::Busy) => {
-            err(StatusCode::SERVICE_UNAVAILABLE, "search.busy", "搜索并发过载")
+        Err(error) => {
+            tracing::warn!(%error, "库内搜索未获搜索预算准入");
+            if matches!(error, crate::blocking_budget::BlockingError::Busy) {
+                err(StatusCode::SERVICE_UNAVAILABLE, "search.busy", "搜索并发过载")
+            } else {
+                err(StatusCode::INTERNAL_SERVER_ERROR, "search.failed", &error.to_string())
+            }
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "search.failed", &e.to_string()),
     }
 }
 

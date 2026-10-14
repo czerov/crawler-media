@@ -75,7 +75,8 @@ async fn cancel_scan_does_not_break_subsequent_library_work_leases() {
     let lease_res = fix.state.acquire_library_work(&fix.library_id);
     assert!(lease_res.is_ok(), "Canceling a scan must not freeze the library permanently");
 
-    // 5. Subsequent scan must be accepted and successfully complete
-    let (next_status, next_res) = fix.scan_and_wait(&fix.library_id).await;
-    assert_eq!(next_status, StatusCode::OK);
+    // 5. Subsequent scan must be accepted and **actually complete** — a
+    //    cancelled shared control would leave it failed/partial.
+    let next_res = fix.scan_and_wait_completed(&fix.library_id).await;
+    assert_eq!(next_res["status"], "completed");
 }

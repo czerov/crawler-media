@@ -107,8 +107,14 @@ fn process_window_deletion(
     Ok((candidates, protected, deleted))
 }
 
+/// 单个 keyset 窗口。
+///
+/// `cursor_key` 是 `retention_cursors.def_id`：按 job def 隔离游标（B3 §5.1
+/// "每 job_def 在 jobs.db 保存 retention_cursors"），避免两个 retention def
+/// 共用一条游标互相推进。
 pub fn prune_terminal_window(
     conn: &Connection,
+    cursor_key: &str,
     cutoff: i64,
     limit: usize,
     dry_run: bool,
@@ -116,13 +122,18 @@ pub fn prune_terminal_window(
     let limit = limit.clamp(1, 500);
     let tx = conn.unchecked_transaction()?;
 
-    let cursor_opt: Option<(i64, i64, i64)> = tx
-        .query_row(
-            "SELECT finished_at, last_rowid, cutoff FROM retention_cursors WHERE def_id = '__global__'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .ok();
+    let cursor_opt: Option<(i64, i64, i64)> = match tx.query_row(
+        "SELECT finished_at, last_rowid, cutoff FROM retention_cursors WHERE def_id = ?1",
+        params![cursor_key],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ) {
+        Ok(cursor) => Some(cursor),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => {
+            tracing::warn!(%error, cursor_key, "读取 retention 游标失败，本轮按新周期重新开始");
+            None
+        }
+    };
 
     // Fixed cycle cutoff: continue cycle if current cutoff is at least stored cutoff
     let (cur_finished_at, cur_rowid, active_cutoff) = match cursor_opt {
@@ -146,11 +157,14 @@ pub fn prune_terminal_window(
                 .unwrap_or(0);
             tx.execute(
                 "INSERT OR REPLACE INTO retention_cursors (def_id, cutoff, finished_at, last_rowid, cycle_started_at)
-                 VALUES ('__global__', ?1, ?2, ?3, ?4)",
-                params![active_cutoff, last.finished_at, last.rowid, now],
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![cursor_key, active_cutoff, last.finished_at, last.rowid, now],
             )?;
         } else if cycle_complete {
-            tx.execute("DELETE FROM retention_cursors WHERE def_id = '__global__'", [])?;
+            tx.execute(
+                "DELETE FROM retention_cursors WHERE def_id = ?1",
+                params![cursor_key],
+            )?;
         }
     }
 

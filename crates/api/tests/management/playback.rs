@@ -636,3 +636,58 @@ async fn stats_aggregate_and_policy_round_trip() {
 
 #[path = "playback_subtitles.rs"]
 mod subtitles;
+
+/// 注入的 `PlaybackClock` 必须按毫秒落库：心跳路径不得把 `last_report_at_ms`
+/// 量化回整秒（B3 复核：`now * 1000` 会丢掉亚秒精度）。
+#[tokio::test]
+async fn heartbeat_persists_sub_second_report_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base_ms = 1_700_000_000_000i64;
+    let clock = Arc::new(FakePlaybackClock(std::sync::atomic::AtomicI64::new(base_ms)));
+    let fetcher = Arc::new(Fixtures {
+        requests: Mutex::new(Vec::new()),
+        bodies: HashMap::new(),
+    });
+    let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("stage")));
+    let st = state(tmp.path(), fetcher, downloader);
+    let app = router(st.clone().with_playback_clock(clock.clone()));
+    let media_id = seed_movie(&app, &tmp).await;
+
+    let start = post_async(
+        &app,
+        "/api/v1/playback/progress",
+        json!({ "media_item_id": media_id, "event": "start", "device_id": "web-ms", "position_ms": 0 }),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+
+    // 只推进 500ms：若实现按秒量化，这个差值会丢失。
+    clock.0.fetch_add(500, std::sync::atomic::Ordering::SeqCst);
+    let beat = post_async(
+        &app,
+        "/api/v1/playback/progress",
+        json!({ "media_item_id": media_id, "event": "progress", "device_id": "web-ms", "position_ms": 0, "paused": false }),
+    )
+    .await;
+    assert_eq!(beat.status(), StatusCode::OK);
+
+    let store = st.store();
+    let user = {
+        let guard = store.lock();
+        guard
+            .user_by_token("management-secret")
+            .unwrap()
+            .unwrap()
+            .id
+    };
+    let session = store
+        .lock()
+        .get_session(user, "web-ms")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.last_report_at_ms,
+        base_ms + 500,
+        "心跳必须保留注入时钟的亚秒精度"
+    );
+}

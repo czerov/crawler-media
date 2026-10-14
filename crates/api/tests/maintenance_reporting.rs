@@ -108,18 +108,20 @@ async fn protected_count_in_preview_and_run_does_not_double_count_and_marks_trun
     api::maintenance::run(&state, &job).unwrap();
 
     let report = progress_of(&state, &job);
-    assert_eq!(report["batches"], 3, "共执行 3 批: {report}");
+    // B3 §5.1：原始窗口（含保护行）按 keyset 推进，1800 行 = 500+500+500+300 共 4 批；
+    // 窗口互不重叠，所以 protected 累加不会重复计数。
+    assert_eq!(report["batches"], 4, "共执行 4 批: {report}");
     assert_eq!(report["deleted"], 1200, "成功删除了 1200 条独立任务: {report}");
 
     // 关键断言：旧实现中每一批都 += 501 导致 protected 累加为 1503！
-    // 修复后：protected 只记录单次运行的诊断下界（至多 500/501），且标记 protected_is_lower_bound！
+    // 修复后：每个保护行只被检视一次，累加结果恰好是 600，而不是 1500+。
     let reported_protected = report["protected"].as_u64().unwrap();
-    assert!(
-        reported_protected <= 600,
-        "保护数量绝不得跨批重复累加至 1500+，实际只有 600 条受保护: reported={reported_protected}, {report}"
+    assert_eq!(
+        reported_protected, 600,
+        "本 cycle 已检视保护行数为 600，不得跨批重复累加: reported={reported_protected}, {report}"
     );
     assert_eq!(
         report["protected_is_lower_bound"], true,
-        "超过探测上限时必须明确报告为下界: {report}"
+        "窗口外仍有未检视行时必须明确报告为下界: {report}"
     );
 }

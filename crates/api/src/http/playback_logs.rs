@@ -40,6 +40,29 @@ fn millis(unix_secs: i64) -> String {
     (unix_secs as i128 * 1000).to_string()
 }
 
+/// 渲染一页历史条目；`read` 为 `None`（快照加载失败）时走未关联 media 的降级渲染。
+fn render_entries(
+    store: &crate::Store,
+    read: Option<&crate::playback_read::PlaybackRead>,
+    logs: &[PlayLogRow],
+) -> Vec<Value> {
+    logs.iter()
+        .map(|log| {
+            let (media, name) = match read {
+                Some(read) => (
+                    crate::playback_read::media_target(read, log.media_id, log.season, log.episode),
+                    read.member_name(log.user_id),
+                ),
+                None => (
+                    json!({ "media_item_id": log.media_id.to_string(), "title": "", "kind": "movie" }),
+                    member_name(store, log.user_id),
+                ),
+            };
+            log_json(media, log, &name)
+        })
+        .collect()
+}
+
 pub(super) fn member_name(store: &crate::Store, user_id: domain::UserId) -> String {
     store
         .get_user(user_id)
@@ -169,24 +192,19 @@ pub(crate) async fn history(
     // 本页所有 entry 的 media/成员名一次物化；渲染阶段不再查库。
     let media_ids: Vec<domain::MediaId> = page.entries.iter().map(|log| log.media_id).collect();
     let user_ids: Vec<domain::UserId> = page.entries.iter().map(|log| log.user_id).collect();
-    let read = crate::playback_read::PlaybackRead::load(&store, &media_ids, &user_ids).ok();
-    let entries: Vec<Value> = page
-        .entries
-        .iter()
-        .map(|log| {
-            let (media, name) = match &read {
-                Some(read) => (
-                    crate::playback_read::media_target(read, log.media_id, log.season, log.episode),
-                    read.member_name(log.user_id),
-                ),
-                None => (
-                    json!({ "media_item_id": log.media_id.to_string(), "title": "", "kind": "movie" }),
-                    member_name(&store, log.user_id),
-                ),
-            };
-            log_json(media, log, &name)
-        })
-        .collect();
+    let read = match crate::playback_read::PlaybackRead::load(&store, &media_ids, &user_ids) {
+        Ok(read) => Some(read),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                %user_id,
+                media_count = media_ids.len(),
+                "加载播放历史媒体快照失败，本次历史报告降级为未关联 media"
+            );
+            None
+        }
+    };
+    let entries: Vec<Value> = render_entries(&store, read.as_ref(), &page.entries);
     // Composite cursor: encode both started_at (ms) and id to avoid
     // skipping same-second records at the page boundary.
     let cursor_log = page.entries.last().filter(|_| page.has_more);

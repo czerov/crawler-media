@@ -210,7 +210,7 @@ fn next_session(
         last_report_at: heartbeat.now,
         ledger_id: Some(heartbeat.ledger_id.clone()),
         play_session_id: previous.and_then(|s| s.play_session_id.clone()),
-        last_report_at_ms: heartbeat.now * 1000,
+        last_report_at_ms: heartbeat.now_ms,
         last_event_sequence: previous.and_then(|s| s.last_event_sequence),
     }
 }

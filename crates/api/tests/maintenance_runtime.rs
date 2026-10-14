@@ -324,28 +324,35 @@ fn jobs_retention_does_not_loop_when_all_candidates_are_protected() {
             concurrency_key: Some("tied".into()),
         })
         .unwrap();
-    // 完全并列的 last-child 组：整组保留。修复 C1 后它们**不进候选窗口**，因此
-    // has_more=false、不会空转；protected 作为诊断计数上限为 batch_size+1。
+    // 完全并列的 last-child 组：整组保留。B3 §5.1 的原始窗口把保护行也算 visited，
+    // 所以 600 行会分两个窗口（500 + 100）走完，**不能**用 deleted==0 提前停止，
+    // 也不能因此空转；protected 累计为本 cycle 已检视保护行数。
     raw_terminal_jobs(&data, Some(&def.id.to_string()), 600, now - 10 * DAY);
 
     let job = enqueue_claim(&state, JobKind::JobsRetention, KEEP, now);
     run(&state, &job).unwrap();
 
     let report = progress_of(&state, &job);
-    assert_eq!(report["batches"], 1, "没有可删候选时只跑一批: {report}");
+    assert_eq!(
+        report["batches"], 2,
+        "保护行占满窗口时按 keyset 窗口推进，不会空转也不会提前停止: {report}"
+    );
     assert_eq!(report["deleted"], 0);
     assert_eq!(
         report["candidates"], 0,
-        "并列 last-child 组不进候选窗口: {report}"
+        "并列 last-child 组不可删: {report}"
     );
-    assert_eq!(report["protected"], 500, "诊断计数上限 batch_size (500)");
+    assert_eq!(
+        report["protected"], 600,
+        "protected 为本 cycle 已检视保护行数（每行只计一次）: {report}"
+    );
     assert_eq!(
         report["protected_is_lower_bound"], true,
-        "超过 batch_size 探测上限时必须标记为下界: {report}"
+        "第一个窗口外仍有未检视行时必须标记为下界: {report}"
     );
     assert_eq!(
         report["budget_exhausted"], false,
-        "没有更多可删候选，不是预算耗尽: {report}"
+        "窗口已耗尽，不是预算耗尽: {report}"
     );
     assert_eq!(terminal_count(&data), 600, "并列 last-child 组必须全部保留");
 }

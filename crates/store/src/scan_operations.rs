@@ -219,8 +219,14 @@ impl Store {
     }
 
     /// Atomically claim the oldest queued scan operation, setting its status to running.
+    ///
+    /// 用 `BEGIN IMMEDIATE`：SELECT 与 UPDATE 必须在同一个写事务里，否则多连接下
+    /// 两个 worker 可以同时读到同一行 queued（B3 §6）。
     pub fn claim_next_queued_scan(&self, excluding: &[String]) -> Result<Option<ScanOperation>, StoreError> {
-        let tx = self.library.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.library,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let mut query = "SELECT id, library_id, scope_signature, status, generation, report_json
                          FROM scan_operations
                          WHERE status = 'queued'".to_string();
@@ -323,18 +329,25 @@ impl Store {
 
         let mut recovered = 0;
         for (op_id, lib_id) in running {
-            let accepts = self.library_accepts_work(&lib_id).unwrap_or(false);
+            let accepts = match self.library_accepts_work(&lib_id) {
+                Ok(accepts) => accepts,
+                Err(error) => {
+                    // 读不到冻结状态时保守地当作不可工作（cancel），但必须留痕。
+                    tracing::error!(%error, library_id = %lib_id, %op_id, "恢复扫描时读取 Library 工作状态失败，按不可工作处理");
+                    false
+                }
+            };
             if accepts {
                 let updated = self.library.execute(
                     "UPDATE scan_operations SET status = 'queued' WHERE id = ?1 AND status = 'running'",
                     params![op_id],
                 )?;
                 recovered += updated;
-            } else {
-                let _ = self.library.execute(
-                    "UPDATE scan_operations SET status = 'cancelled' WHERE id = ?1 AND status = 'running'",
-                    params![op_id],
-                );
+            } else if let Err(error) = self.library.execute(
+                "UPDATE scan_operations SET status = 'cancelled' WHERE id = ?1 AND status = 'running'",
+                params![op_id],
+            ) {
+                tracing::error!(%error, library_id = %lib_id, %op_id, "恢复扫描时取消失效 operation 失败");
             }
         }
         Ok(recovered)

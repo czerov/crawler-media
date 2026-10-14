@@ -35,7 +35,13 @@ fn dispatch_once_sync(state: &ApiState) -> Result<usize, String> {
         let Some(row) = row_opt else {
             // Ledger row no longer exists (pruned/deleted), ack obligation immediately
             let store = state.store.lock();
-            let _ = store.ack_scan_probe_obligation(ob.ledger_id);
+            if let Err(error) = store.ack_scan_probe_obligation(ob.ledger_id) {
+                tracing::warn!(
+                    %error,
+                    ledger_id = %ob.ledger_id,
+                    "台账行已不存在，确认探测义务失败（该义务将被反复重派）"
+                );
+            }
             acked += 1;
             continue;
         };
@@ -54,8 +60,15 @@ fn dispatch_once_sync(state: &ApiState) -> Result<usize, String> {
 
         if enqueued_or_active {
             let store = state.store.lock();
-            if store.ack_scan_probe_obligation(ob.ledger_id).is_ok() {
-                acked += 1;
+            match store.ack_scan_probe_obligation(ob.ledger_id) {
+                Ok(()) => acked += 1,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        ledger_id = %ob.ledger_id,
+                        "确认探测义务失败（该义务将被反复重派）"
+                    );
+                }
             }
         }
     }
@@ -67,7 +80,9 @@ fn dispatch_once_sync(state: &ApiState) -> Result<usize, String> {
 pub fn start_dispatcher(state: ApiState) {
     tokio::spawn(async move {
         // Initial dispatch on startup
-        let _ = dispatch_once(state.clone()).await;
+        if let Err(error) = dispatch_once(state.clone()).await {
+            tracing::error!(%error, "探测义务调度器启动首轮派发失败");
+        }
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             if let Err(e) = dispatch_once(state.clone()).await {

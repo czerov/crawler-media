@@ -1,13 +1,10 @@
 #[path = "management/common.rs"]
 mod common;
-use axum::http::StatusCode;
 use domain::{Media, MediaId, MediaKind};
 use parking_lot::Mutex;
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::{collections::HashMap, sync::Arc};
 use store::Store;
-use tower::ServiceExt;
 
 #[derive(Default)]
 struct ScanCatalog {

@@ -97,7 +97,14 @@ fn rollback_store(
             tracing::error!(filter_id = %filter.id, error = %error, "回滚规则组失败");
         }
     }
-    if let Err(error) = store.undo_ensured_media(media, previous) {
-        tracing::error!(media_id = %media.id, error = %error, "回滚 Media 失败");
+    match store.undo_ensured_media(media, previous) {
+        Ok(true) => {}
+        Ok(false) => {
+            // CAS 拒绝：并发的成功请求已经改写了这行身份，保留它的结果。
+            tracing::warn!(media_id = %media.id, "回滚 Media 被 CAS 拒绝，保留并发写入的身份");
+        }
+        Err(error) => {
+            tracing::error!(media_id = %media.id, error = %error, "回滚 Media 失败");
+        }
     }
 }

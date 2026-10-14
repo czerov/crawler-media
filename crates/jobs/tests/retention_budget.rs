@@ -28,19 +28,73 @@ fn retention_cursor_window_bounds_and_cleans_older_jobs() {
 
     // Now prune with limit 2 at cutoff in the future
     let cutoff = 1_000_000;
-    let win1 = queue.prune_terminal_window(cutoff, 2, false).unwrap();
+    let win1 = queue.prune_terminal_window("test-def", cutoff, 2, false).unwrap();
     assert_eq!(win1.scanned, 2);
     assert_eq!(win1.deleted, 2);
     assert!(win1.window_has_more);
 
     // Second window
-    let win2 = queue.prune_terminal_window(cutoff, 2, false).unwrap();
+    let win2 = queue.prune_terminal_window("test-def", cutoff, 2, false).unwrap();
     assert_eq!(win2.scanned, 2);
     assert_eq!(win2.deleted, 2);
 
     // Third window: only 1 job left (the latest one!), which is protected by latest child rule
-    let win3 = queue.prune_terminal_window(cutoff, 2, false).unwrap();
+    let win3 = queue.prune_terminal_window("test-def", cutoff, 2, false).unwrap();
     assert_eq!(win3.scanned, 1);
     assert_eq!(win3.protected, 1);
     assert_eq!(win3.deleted, 0);
+}
+
+/// 验收门槛（B3 §7）：连续多个"整窗都是受保护行"的窗口之后，游标仍必须推进到
+/// 后面的可删历史，不能被 protected 前缀饿死。
+#[test]
+fn retention_cursor_is_not_starved_by_a_protected_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("jobs.db");
+    drop(Queue::open(&db).unwrap());
+
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        // 20 个受保护行：各自属于独立 def，且是该 def 唯一的终态子任务。
+        for i in 0..20i64 {
+            conn.execute(
+                "INSERT INTO jobs (id, def_id, kind, payload, status, attempt, run_after, started_at, finished_at)
+                 VALUES (?1, ?2, 'scrape', '{}', 'succeeded', 0, ?3, ?3, ?3)",
+                rusqlite::params![format!("protected-{i}"), format!("def-{i}"), 100 + i],
+            )
+            .unwrap();
+        }
+        // 5 个可删行（def_id 为 NULL），finished_at 更晚。
+        for i in 0..5i64 {
+            conn.execute(
+                "INSERT INTO jobs (id, def_id, kind, payload, status, attempt, run_after, started_at, finished_at)
+                 VALUES (?1, NULL, 'scrape', '{}', 'succeeded', 0, ?2, ?2, ?2)",
+                rusqlite::params![format!("deletable-{i}"), 1000 + i],
+            )
+            .unwrap();
+        }
+    }
+
+    let queue = Queue::open(&db).unwrap();
+    let cutoff = 1_000_000;
+    let mut deleted = 0usize;
+    let mut protected = 0usize;
+    let mut windows = 0usize;
+    loop {
+        let win = queue.prune_terminal_window("test-def", cutoff, 2, false).unwrap();
+        deleted += win.deleted;
+        protected += win.protected;
+        windows += 1;
+        if !win.window_has_more {
+            break;
+        }
+        assert!(windows < 40, "游标没有推进：窗口数 {}", windows);
+    }
+
+    assert_eq!(protected, 20, "保护行也必须被检视并计数");
+    assert_eq!(
+        deleted, 5,
+        "受保护前缀之后的 5 条可删历史必须被清理（{} 个窗口）",
+        windows
+    );
 }

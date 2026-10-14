@@ -56,11 +56,16 @@ pub fn run(state: &ApiState, job: &Job) -> Result<(), String> {
             report.cutoff = Some(cutoff);
             report.dry_run = policy.dry_run;
             let dry_run = policy.dry_run;
+            // 游标按 job def 隔离（B3 §5.1）；没有 def 的临时任务共用一个键。
+            let cursor_key = job
+                .def_id
+                .map(|def_id| def_id.to_string())
+                .unwrap_or_else(|| "__adhoc__".to_string());
             run_batches(&mut report, dry_run, &check_stop, || {
                 let queue = state.jobs.lock();
                 queue
-                    .prune_terminal_jobs(cutoff, BATCH_SIZE, dry_run)
-                    .map(BatchCounts::from_jobs)
+                    .prune_terminal_window(&cursor_key, cutoff, BATCH_SIZE, dry_run)
+                    .map(BatchCounts::from_jobs_window)
                     .map_err(|error| error.to_string())
             })
         }
@@ -353,14 +358,16 @@ struct BatchCounts {
 }
 
 impl BatchCounts {
-    fn from_jobs(batch: jobs::RetentionBatch) -> Self {
+    /// 原始窗口（含保护行）路径：窗口内每一行都被检视，`window_has_more` 表示窗口外
+    /// 仍有未检视行，因此保护行计数只是下界。
+    fn from_jobs_window(window: jobs::RetentionWindow) -> Self {
         Self {
-            scanned: batch.scanned,
-            candidates: batch.candidates,
-            deleted: batch.deleted,
-            protected: batch.protected,
-            protected_truncated: batch.protected_truncated,
-            has_more: batch.has_more,
+            scanned: window.scanned,
+            candidates: window.candidates,
+            deleted: window.deleted,
+            protected: window.protected,
+            protected_truncated: window.window_has_more,
+            has_more: window.window_has_more,
         }
     }
 
@@ -382,8 +389,9 @@ impl BatchCounts {
 /// - **dry_run**：只检视一批，然后把 `has_more` 如实映射成 `budget_exhausted`。
 ///   试运行不删除，再取下一批只会重复检视同一批行（会虚报候选数），所以不能循环；
 ///   但也**不能**把 `has_more` 吞掉说"已完成"——用户开 dry_run 就是为了先看规模。
-/// - **实删**：`!has_more`（窗口已只含可删行，所以这是真正的"没有更多可删候选"），
-///   或 `deleted == 0`（本轮已无可删行），或批数用尽。
+/// - **实删**：窗口耗尽（`!has_more`）、stop、或批数/预算用尽。
+///   **不能**用 `deleted == 0` 提前停止：原始窗口可以整窗都是受保护行，此时后面
+///   仍有可删历史（B3 §5.1）。游标会推进，所以不会空转死循环。
 fn run_batches(
     report: &mut MaintenanceReport,
     dry_run: bool,
@@ -402,7 +410,8 @@ fn run_batches(
         report.scanned += batch.scanned;
         report.candidates += batch.candidates;
         report.deleted += batch.deleted;
-        report.protected = report.protected.max(batch.protected);
+        // 原始窗口互不重叠，保护行只被检视一次，因此按 cycle 累加即"已检视保护行数"。
+        report.protected += batch.protected;
         if batch.protected_truncated {
             report.protected_is_lower_bound = true;
         }
@@ -414,7 +423,7 @@ fn run_batches(
             }
             break;
         }
-        if !batch.has_more || batch.deleted == 0 {
+        if !batch.has_more {
             more_remains = false;
             break;
         }
