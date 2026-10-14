@@ -100,6 +100,11 @@ pub(crate) async fn delete_item(
         let _ = store.delete_playback_for_media(media_id);
         let _ = store.delete_collection_items_for_media(&media_id.to_string());
     }
+    drop(store);
+    if rows_deleted > 0 {
+        // ledger 行已删除：该 Library 的浏览投影必须重建。
+        state.projection.mark_dirty(&library_id);
+    }
     ok(json!({
         "removed_paths": removed_paths,
         "rows_deleted": rows_deleted,

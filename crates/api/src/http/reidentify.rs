@@ -267,6 +267,10 @@ fn reidentify_inner(state: &ApiState, body: &Value) -> Response {
                     }
                 }
             }
+            // Media 身份与 NFO/海报/背景都已改变：相关 Library 的投影必须重建。
+            for lease in &leases {
+                state.projection.mark_dirty(lease.library_id());
+            }
             ok(json!({ "claimed": claimed })).into_response()
         }
         Ok(None) => err(

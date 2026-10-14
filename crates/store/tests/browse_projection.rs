@@ -142,3 +142,39 @@ fn catalog_details_batch_respects_kind_id_boundaries() {
     assert_eq!(batch[0].source, "movie");
     assert_eq!(batch[0].cache_key, "tmdb:123");
 }
+
+#[test]
+fn catalog_details_for_prefixes_matches_kind_id_boundary_and_query_variants() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+
+    store
+        .put_catalog_cache("tmdb", "/movie/123", "{\"v\":1}", 100, None)
+        .unwrap();
+    store
+        .put_catalog_cache("tmdb", "/movie/123?language=zh-CN", "{\"v\":2}", 200, None)
+        .unwrap();
+    store
+        .put_catalog_cache("tmdb", "/movie/1234", "{\"v\":3}", 300, None)
+        .unwrap();
+    store
+        .put_catalog_cache("tmdb", "/movie/123/credits", "{\"v\":4}", 400, None)
+        .unwrap();
+    store
+        .put_catalog_cache("tmdb", "/tv/123", "{\"v\":5}", 500, None)
+        .unwrap();
+    store
+        .put_catalog_cache("other", "/movie/123", "{\"v\":6}", 600, None)
+        .unwrap();
+
+    let rows = store
+        .catalog_details_for_prefixes("tmdb", &["/movie/123".to_string()])
+        .unwrap();
+    let keys: Vec<&str> = rows.iter().map(|row| row.cache_key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["/movie/123?language=zh-CN", "/movie/123"],
+        "只匹配该 kind/id 前缀（含 ? 变体），按 fetched_at DESC 稳定排序"
+    );
+    assert!(rows.iter().all(|row| row.source == "tmdb"));
+}

@@ -259,6 +259,8 @@ impl ApiState {
                 .map_err(std::io::Error::other)?;
             state.probe.try_start_workers();
             crate::scan_probe_dispatch::start_dispatcher(state.clone());
+            // 已访问 Library 的投影周期刷新（外部 NFO/图片修改 ≤60 秒可见）。
+            state.projection.clone().start_periodic_refresh(state.clone());
             match state.store.lock().recover_orphaned_scans() {
                 Ok(n) if n > 0 => tracing::info!(count = n, "已恢复未完成的扫描操作"),
                 Ok(_) => {}
@@ -317,6 +319,15 @@ impl ApiState {
     /// 替换 notify 发送实现（测试注入阻塞实现以验证预算准入）。
     pub fn with_notify_transport(mut self, transport: Arc<dyn crate::NotifyTransport>) -> Self {
         self.notify_transport = transport;
+        self
+    }
+
+    /// 替换浏览投影服务（测试注入 `ProjectionService::disabled()` 验证回退等价性）。
+    pub fn with_projection_service(
+        mut self,
+        projection: Arc<crate::browse_projection::ProjectionService>,
+    ) -> Self {
+        self.projection = projection;
         self
     }
 

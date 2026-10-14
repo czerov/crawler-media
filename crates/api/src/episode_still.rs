@@ -11,6 +11,15 @@ pub(crate) fn path(video: &Path) -> PathBuf {
 
 /// Older libraries may have a shared `still.jpg` or Emby style `<stem>.jpg` / `<stem>-still.jpg`.
 pub(crate) fn existing(video: &Path) -> Option<PathBuf> {
+    existing_with(video, &crate::browse_file_read::LocalBrowseFileRead)
+}
+
+/// Same candidate order as [`existing`], but the existence check goes through the
+/// injected browse file seam so the projection builder can count / gate its IO.
+pub(crate) fn existing_with(
+    video: &Path,
+    files: &dyn crate::browse_file_read::BrowseFileRead,
+) -> Option<PathBuf> {
     let stem = video
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -22,7 +31,7 @@ pub(crate) fn existing(video: &Path) -> Option<PathBuf> {
         parent.join(format!("{stem}.jpg")),
         parent.join("still.jpg"),
     ] {
-        if candidate.is_file() {
+        if files.is_file(&candidate) {
             return Some(candidate);
         }
     }

@@ -414,6 +414,48 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// 只更新状态、**不动 `report_json`**（P3-NEW-1）。
+    ///
+    /// 补扫重排的事务刚把跨轮累计报告写进行里；worker 进入 `running` 时若用
+    /// [`Self::update_scan_operation_status`] 传空报告，会把这份已提交前缀抹掉，
+    /// 崩溃后只剩空报告。终态行（cancelled/completed/failed）不被覆盖。
+    pub fn set_scan_operation_status(
+        &self,
+        id: &str,
+        status: ScanOperationStatus,
+    ) -> Result<bool, StoreError> {
+        let changed = self.library.execute(
+            "UPDATE scan_operations SET status = ?1
+             WHERE id = ?2 AND status NOT IN ('cancelled', 'completed', 'failed')",
+            params![status.as_str(), id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// 原子升级持久化的 `scope_signature`（P2-NEW-1）。
+    ///
+    /// 旧构建写下的签名（`kind:count:root1,root2,...`）在新编码下会被误判为配置变化；
+    /// 语义一致时用 CAS 就地把行升级成新编码，而不是取消 operation。只有当前值仍等于
+    /// `expected` 才写入，因此与并发配置变更不会互相覆盖。
+    pub fn upgrade_scan_scope_signature(
+        &self,
+        id: &str,
+        expected: &str,
+        upgraded: &str,
+    ) -> Result<bool, StoreError> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.library,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let changed = tx.execute(
+            "UPDATE scan_operations SET scope_signature = ?1
+             WHERE id = ?2 AND scope_signature = ?3",
+            params![upgraded, id, expected],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
     /// 终态 CAS：只有 `dirty_rev` 仍等于本轮开始时消费的版本才写终态；否则补扫重排（P3-1）。
     ///
     /// 判定与写入在同一个 IMMEDIATE 事务里完成：另一连接在 worker 判定之后、写终态之前

@@ -272,6 +272,8 @@ pub(crate) async fn select_artwork(
                     let _ = crate::poster_fetch::attach_poster(&state, &media, &preferred_path);
                 }
             }
+            // 恢复自动图片：文件事实变化，标脏。
+            state.projection.mark_dirty(&id);
             ok(json!({ "locked": false, "automatic": true })).into_response()
         }
         Some(source) => {
@@ -303,6 +305,9 @@ pub(crate) async fn select_artwork(
                 &artwork_key(media_id),
                 &json!({ "poster_locked": true, "source": source }).to_string(),
             );
+            drop(store);
+            // 选定图片落盘：该 Library 的图片存在性事实变了。
+            state.projection.mark_dirty(&id);
             ok(json!({ "locked": true, "automatic": false })).into_response()
         }
     }
@@ -361,6 +366,8 @@ pub(crate) async fn upload_artwork(
         &artwork_key(media_id),
         &json!({ "poster_locked": true, "source": "upload" }).to_string(),
     );
+    // 自定义图片落盘：该 Library 的图片存在性事实变了。
+    state.projection.mark_dirty(&id);
     ok(json!({ "locked": true, "bytes": bytes.len() })).into_response()
 }
 

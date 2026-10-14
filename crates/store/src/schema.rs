@@ -61,12 +61,15 @@ pub fn migrate_app(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(tables::APP_TABLES)?;
     conn.execute_batch(library_deletion::TABLES)?;
     // app schema 7：删除边界根目录从 `snapshot_json` 迁到 `library_removal_roots`，
-    // 让路径边界检查不再反序列化整份快照；并补清已删除 Library 遗留的专属设置。
-    // 两步都幂等。
+    // 让路径边界检查不再反序列化整份快照。回填幂等（INSERT OR IGNORE），只对旧库执行。
     if previous < APP_SCHEMA_VERSION {
         crate::library_deletion::backfill_library_removal_roots(conn)?;
-        crate::library_deletion::repair_removed_library_settings(conn)?;
     }
+    // b3192f1 之前删除 Library 不清理 `library_cover_checked.{id}`。当时的修复被绑在
+    // `previous < APP_SCHEMA_VERSION` 上却没有升版本，于是已经处于 app schema 7 的库
+    // 永远跑不到它。这里改成每次打开都做一次幂等对账：按定义只删「removal 已成功且
+    // Library 行已不存在」的键，重复执行安全，对 v7 老库也不是空操作。
+    crate::library_deletion::repair_removed_library_settings(conn)?;
     ensure_column(conn, "downloaders", "path_maps", "TEXT")?;
     // downloaders.enabled：停用的下载器不参与自动投递（手动提交仍可用）。
     ensure_column(conn, "downloaders", "enabled", "INTEGER NOT NULL DEFAULT 1")?;

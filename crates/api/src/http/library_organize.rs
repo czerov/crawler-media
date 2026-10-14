@@ -169,7 +169,12 @@ fn organize_inner(state: &ApiState, id: &str, body: &Value) -> Response {
         .signal()
         .publish(|| Ok(apply_organize(&store, &library, renames)))
     {
-        Ok(response) => response,
+        Ok(response) => {
+            drop(store);
+            // 重命名/移动会改写 ledger path 与 NFO：该 Library 的投影必须重建。
+            state.projection.mark_dirty(id);
+            response
+        }
         Err(error) => err(StatusCode::CONFLICT, "library.frozen", &error),
     }
 }
@@ -385,6 +390,8 @@ fn refresh_item_metadata_inner(state: &ApiState, id: &str, item_id: &str) -> Res
             }
         }
     }
+    // 条目级 NFO/海报/背景已重写：文件事实变化，标脏。
+    state.projection.mark_dirty(&id);
     ok(json!({ "refreshed": refreshed })).into_response()
 }
 

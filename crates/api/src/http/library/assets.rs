@@ -153,12 +153,20 @@ where
 }
 
 pub(crate) fn poster_path(row: &domain::LedgerRow) -> Option<PathBuf> {
-    if let Some(poster) = crate::poster::poster_beside(&row.path) {
+    poster_path_with(row, &crate::browse_file_read::LocalBrowseFileRead)
+}
+
+/// 与 [`poster_path`] 同一套布局，存在性判断走注入的浏览文件 seam。
+pub(crate) fn poster_path_with(
+    row: &domain::LedgerRow,
+    files: &dyn crate::browse_file_read::BrowseFileRead,
+) -> Option<PathBuf> {
+    if let Some(poster) = crate::poster::poster_beside(&row.path, files) {
         return Some(poster);
     }
     let file_dir = FsPath::new(&row.path).parent()?;
     // 兼容两种布局：平铺（文件旁 poster.jpg）与模板整理后
     // （<show>/Season N/file → show 根 poster.jpg，向上找一层）。
-    let poster = file_dir.parent()?.join("poster.jpg");
-    poster.is_file().then_some(poster)
+    let up = file_dir.parent()?.join("poster.jpg");
+    files.is_file(&up).then_some(up)
 }

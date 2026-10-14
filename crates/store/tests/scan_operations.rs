@@ -341,3 +341,94 @@ fn finalize_scan_refuses_to_overwrite_new_dirty_event() {
     );
 }
 
+
+/// P3-NEW-1：补扫轮标记 Running 与崩溃恢复都不得清空 requeue 落库的累计报告。
+#[test]
+fn crash_recovery_keeps_requeued_round_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("media");
+    std::fs::create_dir_all(&root).unwrap();
+    let library = store
+        .create_library(
+            MediaKind::Movie,
+            "Movies",
+            &[root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+
+    let op = store.enqueue_scan(&library.id, "sig1", &[], 1000).unwrap();
+    assert!(store.claim_next_queued_scan(&[]).unwrap().is_some());
+
+    // 轮内并入事件 → 补扫重排，累计报告落库。
+    store.enqueue_scan(&library.id, "sig1", &[], 1001).unwrap();
+    let report = serde_json::json!({
+        "queued": true,
+        "transferred": true,
+        "status": "completed",
+        "scanned": 7,
+        "inserted": 3,
+        "restored": 0,
+        "probe_pending": 3,
+        "roots": [],
+        "error_count": 0,
+        "errors_truncated": false,
+        "issues": [],
+    });
+    assert_eq!(
+        store
+            .finalize_or_requeue_scan(&op.id, 0, ScanOperationStatus::Completed, &report)
+            .unwrap(),
+        Some(1)
+    );
+
+    // 第二轮认领（Running）→ 只改状态，不得覆盖报告。
+    assert!(store.claim_next_queued_scan(&[]).unwrap().is_some());
+    assert!(store
+        .set_scan_operation_status(&op.id, ScanOperationStatus::Running)
+        .unwrap());
+    assert_eq!(
+        store.scan_operation(&op.id).unwrap().unwrap().report,
+        report,
+        "Running 转换不得清空累计报告"
+    );
+
+    // 模拟崩溃恢复：running → queued，报告仍在。
+    assert_eq!(store.recover_orphaned_scans().unwrap(), 1);
+    let recovered = store.scan_operation(&op.id).unwrap().unwrap();
+    assert_eq!(recovered.status, ScanOperationStatus::Queued);
+    assert_eq!(recovered.report, report, "崩溃恢复后累计报告必须保留");
+}
+
+/// P2-NEW-1：签名升级是 CAS，旧值不匹配时不写入、也不会覆盖别人的值。
+#[test]
+fn scope_signature_upgrade_is_compare_and_swap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let op = store
+        .enqueue_scan("lib1", "movie:1:/old", &[], 1000)
+        .unwrap();
+
+    assert!(
+        !store
+            .upgrade_scan_scope_signature(&op.id, "movie:1:/other", "v2:movie:1:4:/old")
+            .unwrap(),
+        "期望值不匹配时不得写入"
+    );
+    assert!(store
+        .upgrade_scan_scope_signature(&op.id, "movie:1:/old", "v2:movie:1:4:/old")
+        .unwrap());
+    assert_eq!(
+        store.scan_operation(&op.id).unwrap().unwrap().scope_signature,
+        "v2:movie:1:4:/old"
+    );
+    assert!(
+        !store
+            .upgrade_scan_scope_signature(&op.id, "movie:1:/old", "v2:movie:1:4:/other")
+            .unwrap(),
+        "已升级的签名不得被重复升级覆盖"
+    );
+}

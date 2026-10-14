@@ -35,7 +35,7 @@ impl<'a> CacheIndex<'a> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct BrowseMetadata {
     pub genres: Vec<String>,
     pub countries: Vec<String>,

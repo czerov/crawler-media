@@ -145,6 +145,31 @@ impl PresenceFixture {
         api::scan_operations::scan_scope_signature(&library)
     }
 
+    /// 旧（v1）scope 指纹编码：`kind:count:root1,root2,...`。
+    ///
+    /// 上一个构建写下的就是这个格式；根路径用逗号拼接，因此根里含逗号时有歧义。
+    /// 用来构造「升级前遗留的 active operation」（P2-NEW-1）。
+    pub fn legacy_scope_signature(&self) -> String {
+        let store = self.state.store();
+        let guard = store.lock();
+        let library = guard
+            .get_library(&self.library_id)
+            .unwrap()
+            .expect("library must exist");
+        let mut roots: Vec<String> = library
+            .root_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        roots.sort();
+        format!(
+            "{}:{}:{}",
+            library.kind.as_str(),
+            roots.len(),
+            roots.join(",")
+        )
+    }
+
     /// 轮询 store 直到 operation 进入终态，返回落库的 operation（含 report）。
     pub async fn wait_scan_terminal_op(&self, op_id: &str) -> store::ScanOperation {
         for _ in 0..600 {

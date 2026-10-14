@@ -67,6 +67,10 @@ fn commit_transfer_outcome(
             error.to_string()
         })?;
     }
+    let library_id = lease.library_id().to_string();
+    drop(store);
+    // Transfer 写入新 ledger 行并可能删除旧文件：该 Library 的投影必须重建。
+    state.projection.mark_dirty(&library_id);
     Ok(())
 }
 

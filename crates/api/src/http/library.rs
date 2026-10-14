@@ -27,7 +27,7 @@ mod cover;
 pub(crate) mod facets;
 pub(crate) mod page;
 pub(crate) mod selection;
-pub(crate) use assets::{library_json, poster_path, preferred_row, rows_in_library};
+pub(crate) use assets::{library_json, poster_path, poster_path_with, preferred_row, rows_in_library};
 pub(crate) use cover::{default_cover_options, is_legacy_fanart_copy, render_cover_jpeg};
 
 /// Resolve one ledger row to exactly one Library. The longest matching root
@@ -119,10 +119,18 @@ pub(crate) fn require_visible_library(
 
 /// 长图（fanart.jpg）向上查找：与 poster_path 同一套布局兼容。
 pub(crate) fn backdrop_path(row: &domain::LedgerRow) -> Option<PathBuf> {
+    backdrop_path_with(row, &crate::browse_file_read::LocalBrowseFileRead)
+}
+
+/// 与 [`backdrop_path`] 同一套布局，存在性判断走注入的浏览文件 seam。
+pub(crate) fn backdrop_path_with(
+    row: &domain::LedgerRow,
+    files: &dyn crate::browse_file_read::BrowseFileRead,
+) -> Option<PathBuf> {
     let file_dir = FsPath::new(&row.path).parent()?;
     for dir in [file_dir, file_dir.parent().unwrap_or(file_dir)] {
         let art = dir.join("fanart.jpg");
-        if art.is_file() {
+        if files.is_file(&art) {
             return Some(art);
         }
     }
@@ -242,18 +250,20 @@ pub(crate) async fn list_items(
         Ok(page) => page,
         Err(message) => return err(StatusCode::BAD_REQUEST, "library.invalid", &message),
     };
-    // 锁内只取 owned 快照；NFO/stat/过滤/排序/渲染都在锁外的 blocking 预算内。
-    let snapshot = {
+    // 授权从当前配置判定；浏览事实优先取目标 Library 的 ready 投影（零文件 IO），
+    // 投影不可用时回退到旧的全量读取（已在 helper 内 warn）。
+    let library = {
         let store = state.store.lock();
-        let library = match require_visible_library(&store, &id, user_id) {
+        match require_visible_library(&store, &id, user_id) {
             Ok(library) => library,
-            Err(response) => return response,
-        };
-        match selection::load_browse_snapshot(&store, &library, user_id) {
-            Ok(snapshot) => snapshot,
             Err(response) => return response,
         }
     };
+    let (snapshot, artwork) =
+        match selection::load_browse_snapshot_or_projection(&state, &library, user_id).await {
+            Ok(loaded) => loaded,
+            Err(response) => return response,
+        };
     let files = state.browse_files.clone();
     let work = state
         .http_work
@@ -265,9 +275,10 @@ pub(crate) async fn list_items(
             };
             // 过滤与排序已在 select_snapshot 内完成，分页发生在其后。
             let bounds = page.bounds(selected.len());
+            let art = selection::BrowseArtwork::new(artwork.as_ref(), files.as_ref());
             let paged: Vec<_> = selected[bounds]
                 .iter()
-                .map(|item| wall_item_json(&library_id, item))
+                .map(|item| wall_item_json(&library_id, item, &art))
                 .collect();
             ok_list(paged).into_response()
         })
@@ -278,16 +289,21 @@ pub(crate) async fn list_items(
     }
 }
 
-fn wall_item_json(library_id: &str, item: &selection::LibrarySelection) -> Value {
+fn wall_item_json(
+    library_id: &str,
+    item: &selection::LibrarySelection,
+    art: &selection::BrowseArtwork<'_>,
+) -> Value {
     let row = preferred_row(&item.rows);
+    let facts = art.media(item.media.id, &item.rows);
     json!({
         "media_item_id": item.media.id.to_string(),
         "kind": item.media.kind.as_str(),
         "library_id": library_id,
         "title": item.media.title,
         "year": item.media.year,
-        "poster_url": row.filter(|r| poster_path(r).is_some()).map(|r| artwork_url("posters", r.id)),
-        "backdrop_url": row.filter(|r| backdrop_path(r).is_some()).map(|r| artwork_url("fanart", r.id)),
+        "poster_url": row.filter(|_| facts.has_poster).map(|r| artwork_url("posters", r.id)),
+        "backdrop_url": row.filter(|_| facts.has_backdrop).map(|r| artwork_url("fanart", r.id)),
         "file_count": item.rows.len(),
         "seasons": item.rows.iter().filter_map(|r| r.season).collect::<std::collections::BTreeSet<_>>(),
         "episode_count": item.rows.iter().filter_map(|r| r.season.zip(r.episode)).collect::<std::collections::HashSet<_>>().len(),

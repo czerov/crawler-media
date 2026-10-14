@@ -1,6 +1,6 @@
 //! Shared ownership-safe selection for wall and gallery.
 use crate::http::err;
-use crate::{Store, store::Library};
+use crate::Store;
 use axum::{http::StatusCode, response::Response};
 use domain::{LedgerRow, Media, MediaId, UserId};
 use std::collections::HashMap;
@@ -8,11 +8,15 @@ use std::time::SystemTime;
 
 mod file_stats;
 mod filters;
-mod metadata;
+pub(crate) mod metadata;
+pub(crate) mod projected;
 mod snapshot;
 pub(crate) use filters::LibraryFilter;
 use metadata::BrowseMetadata;
-pub(crate) use snapshot::{load_browse_snapshot, select_all_for_facets, select_snapshot};
+pub(crate) use projected::BrowseArtwork;
+pub(crate) use snapshot::{
+    load_browse_snapshot_or_projection, select_all_for_facets, select_snapshot,
+};
 
 pub(crate) struct LibrarySelection {
     pub media: Media,

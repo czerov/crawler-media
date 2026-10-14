@@ -42,10 +42,14 @@ struct ChunkTotals {
     inserted: usize,
 }
 
-/// 一个 chunk 处理失败：HTTP 语义 + 错误摘要，根报告与已提交计数由调用方补齐。
+/// 一个 chunk 处理失败：HTTP 语义 + 错误摘要，根报告由调用方补齐。
+///
+/// `totals` 是**本 chunk 在失败前已经提交的计数**（P3-3）：ledger 登记先于元数据
+/// 解析/重绑，后半段失败时调用方必须把这段已提交前缀算进失败报告。
 struct ChunkError {
     response: Response,
     error: String,
+    totals: ChunkTotals,
 }
 
 /// 扫描执行失败：保留已提交前缀的报告与错误摘要（P3-3）。
@@ -140,6 +144,10 @@ impl ScanContext<'_> {
                 match self.process_chunk(decision.fresh, &decision.stamps, &decision.changed) {
                     Ok(processed) => processed,
                     Err(error) => {
+                        // 失败 chunk 自己已提交的前缀也要计入，否则「ledger 已写入但
+                        // 后续阶段失败」的轮次会少报这部分计数（P3-3）。
+                        totals.scanned += error.totals.scanned;
+                        totals.inserted += error.totals.inserted;
                         return Err(ChunkFailure {
                             response: error.response,
                             error: error.error,
@@ -236,19 +244,31 @@ impl ScanContext<'_> {
             .collect();
         let affected = invalidate_changed_facts(self.state, &changed_in_scope);
         let scan_media = scan_media_for(self.state, &filtered);
+        // 到这里 ledger 已提交：任何后续失败都必须把这段前缀带回调用方（P3-3）。
+        let committed = ChunkTotals {
+            scanned,
+            inserted: inserted.len(),
+        };
+        // 测试屏障：注入「ledger 已提交、元数据解析失败」的故障（P3-3）。
+        #[cfg(test)]
+        if let Some(response) = test_metadata_hook::run(self.op_id.unwrap_or_default()) {
+            return Err(ChunkError {
+                response,
+                error: "library.scan_metadata".to_string(),
+                totals: committed,
+            });
+        }
         resolve_scan_metadata(self.state, self.id, self.lease, scan_media, &inserted, self.scrape)
             .map_err(|response| ChunkError {
                 response,
                 error: "library.scan_metadata".to_string(),
+                totals: committed,
             })?;
         let mut probe_paths = inserted.clone();
         probe_paths.extend(affected);
         crate::http::library::enqueue_probes_for_paths(self.state, probe_paths);
         self.record_seen(&filtered, stamps);
-        Ok(ChunkTotals {
-            scanned,
-            inserted: inserted.len(),
-        })
+        Ok(committed)
     }
 
     /// 把处理完成的路径写进本 operation 的 `scan_seen` 断点（复用锁外采集的版本事实）。
@@ -438,6 +458,7 @@ fn presence_failure(error: crate::library_presence::PresenceError) -> ChunkError
     ChunkError {
         response: presence_error(error),
         error: summary,
+        totals: ChunkTotals::default(),
     }
 }
 
@@ -446,6 +467,7 @@ fn publish_failure(error: String) -> ChunkError {
     ChunkError {
         response,
         error,
+        totals: ChunkTotals::default(),
     }
 }
 
@@ -534,7 +556,9 @@ pub(crate) fn scan_library_leased_resumable(
         if !full_scope && !targets.is_empty() {
             tracing::warn!(library_id = id, "Video Library 暂不支持增量目标扫描，按整库执行");
         }
-        return scan_video_library(state, &roots, id, lease)
+        // Video 也必须在发布任何文件之前把捕获 scope 绑定到持久化 signature（P2-4）。
+        let scan_scope = capture_and_verify_scope(state, id, op_id)?;
+        return scan_video_library(state, &roots, lease, &scan_scope)
             .map_err(|response| failed_response(response, "library.scan_video"));
     }
     let starts = scan_starts(&roots, targets, full_scope);
@@ -548,11 +572,7 @@ pub(crate) fn scan_library_leased_resumable(
             "library.scan_target",
         ));
     }
-    let scan_scope = ScanScope::capture(state, id).map_err(|error| {
-        let summary = format!("{error:?}");
-        failed_response(presence_error(error), summary)
-    })?;
-    verify_captured_scope(state, op_id, &scan_scope)?;
+    let scan_scope = capture_and_verify_scope(state, id, op_id)?;
     let mut run = ScanRun::default();
     for (root, start) in starts {
         if state.library_files.readable_root(&root).is_ok() {
@@ -619,10 +639,30 @@ pub(crate) fn scan_library_leased_resumable(
     Ok((scan_report, json!(report_data)))
 }
 
+/// 捕获 scope 并把它绑定到持久化 signature（P2-4）。
+///
+/// Movie/TV 与 Video 共用同一条绑定路径：任何发布之前都必须完成复核。
+fn capture_and_verify_scope(
+    state: &ApiState,
+    id: &str,
+    op_id: Option<&str>,
+) -> Result<ScanScope, ScanRunError> {
+    let scan_scope = ScanScope::capture(state, id).map_err(|error| {
+        let summary = format!("{error:?}");
+        failed_response(presence_error(error), summary)
+    })?;
+    verify_captured_scope(state, op_id, &scan_scope)?;
+    Ok(scan_scope)
+}
+
 /// 发布前复核：持久化 signature 必须等于刚捕获的 scope（P2-4）。
 ///
 /// 准入（`scan_admission`）释放 Store 锁之后、`ScanScope::capture` 之前，配置可能被
 /// PATCH；此时旧 operation 绝不能拿新 roots 登记文件。
+///
+/// 读不到 operation 或 operation 已消失时必须**失败关闭**（P2-4）：`ScanScope::validate`
+/// 只能证明捕获 scope 与当前配置一致，不能替代「捕获 scope == 持久化 signature」，
+/// 放行等于让一个无法对账的 operation 继续登记文件。
 fn verify_captured_scope(
     state: &ApiState,
     op_id: Option<&str>,
@@ -643,11 +683,24 @@ fn verify_captured_scope(
             tracing::warn!(%op_id, %reason, "捕获 scope 与持久化 signature 不一致，取消过期 operation");
             Err(ScanRunError::ScopeChanged { reason })
         }
-        Ok(_) => Ok(()),
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            tracing::error!(%op_id, "扫描 operation 已不存在，拒绝在无法对账的情况下发布");
+            Err(failed_response(
+                err(
+                    StatusCode::CONFLICT,
+                    "library.scan_operation_missing",
+                    "扫描 operation 不存在",
+                ),
+                "library.scan_operation_missing",
+            ))
+        }
         Err(error) => {
-            // 读失败不取消：`ScanScope::validate` 仍会在每个 chunk 发布时复核。
-            tracing::error!(%error, %op_id, "读取扫描 operation 失败，跳过捕获 scope 复核");
-            Ok(())
+            tracing::error!(%error, %op_id, "读取扫描 operation 失败，拒绝在无法对账的情况下发布");
+            Err(failed_response(
+                err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &error.to_string()),
+                format!("scan operation unreadable: {error}"),
+            ))
         }
     }
 }
@@ -763,5 +816,37 @@ pub(crate) mod test_observe_hook {
         if let Some(hook) = hook {
             hook();
         }
+    }
+}
+
+/// 测试专用屏障：在 chunk 台账已提交、元数据解析之前执行一次，可注入一个失败响应。
+///
+/// 用来复现「ledger 已提交但后续阶段失败」的故障，验证失败报告仍带上该 chunk 的
+/// 已提交前缀（P3-3 fault injection）。
+#[cfg(test)]
+pub(crate) mod test_metadata_hook {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use axum::response::Response;
+
+    type Hook = Box<dyn FnOnce() -> Option<Response> + Send + 'static>;
+    static HOOKS: Mutex<Option<HashMap<String, Hook>>> = Mutex::new(None);
+
+    pub(crate) fn set(op_id: &str, hook: Hook) {
+        HOOKS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(op_id.to_string(), hook);
+    }
+
+    pub(crate) fn run(op_id: &str) -> Option<Response> {
+        HOOKS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .remove(op_id)
+            .and_then(|hook| hook())
     }
 }

@@ -1,10 +1,15 @@
 //! 请求级浏览快照。
 //!
 //! 锁内**只**做数据库读取与 Clone；NFO 读取、文件 stat、过滤、排序全部在
-//! 锁外执行（调用方放进 blocking 预算）。这样一次浏览请求不再逐行重读
-//! Library 配置、不再每个 Media 打一次 `get_media`、也不在锁内碰磁盘。
+//! 锁外执行（调用方放进 blocking 预算）。两条来源共用同一份 [`BrowseSnapshot`]：
+//!
+//! - 投影就绪时由 [`projected::snapshot_from_projection`] 从目标 Library 的 ready
+//!   投影重建（零文件 IO）；
+//! - 投影缺失/过期/不可解析时回退到 [`load_browse_snapshot`]（旧的全量读取），
+//!   并打 `warn!` 留痕。
 
 use std::collections::HashMap;
+use std::time::SystemTime;
 
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -12,24 +17,36 @@ use domain::{LedgerRow, Media, MediaId, UserId};
 
 use crate::browse_file_read::BrowseFileRead;
 use crate::http::err;
-use crate::store::{CatalogCacheRow, LibraryOwnership, Store, UnitState};
+use crate::management::ApiState;
+use crate::store::{CatalogCacheRow, Store, UnitState};
 
-use super::metadata::{self, CacheIndex};
+use super::metadata::{self, BrowseMetadata, CacheIndex};
+use super::projected::{self, ProjectedFacts};
 use super::{LibraryFilter, LibrarySelection, file_stats, watch_state_from_units};
 
 /// 一个 Media 及其在**当前 Library** 名下的 ledger 行。
 pub(crate) struct BrowseGroup {
     pub media: Media,
     pub rows: Vec<LedgerRow>,
+    /// 投影来源时为 `Some`；旧的全量来源为 `None`。
+    pub projected: Option<ProjectedGroup>,
+}
+
+/// 投影里已经算好的展示事实：读路径不再做 NFO/stat。
+pub(crate) struct ProjectedGroup {
+    pub metadata: BrowseMetadata,
+    pub missing: bool,
+    pub added_at: Option<SystemTime>,
+    pub size_bytes: Option<u64>,
 }
 
 /// 锁内取到的 owned 事实；此后不再需要 Store 锁。
 pub(crate) struct BrowseSnapshot {
     pub library_id: String,
-    pub ownership: LibraryOwnership,
     pub groups: Vec<BrowseGroup>,
-    pub missing: HashMap<String, i64>,
     pub cache: Vec<CatalogCacheRow>,
+    /// path → missing_at；投影来源为空（missing 已按 Media 落到 `ProjectedGroup`）。
+    pub missing: HashMap<String, i64>,
     pub units: HashMap<(MediaId, i32, i32), UnitState>,
     pub user: Option<UserId>,
 }
@@ -54,33 +71,81 @@ pub(crate) fn load_browse_snapshot(
     }
     let ids: Vec<MediaId> = owned_by_media.keys().copied().collect();
     let media_by_id = store.media_batch(&ids).map_err(super::store_error)?;
+    let units = read_units(store, user, &ids)?;
 
-    let units = match user {
-        Some(user) => store
-            .playback_units_for_media(user, &ids)
-            .map_err(super::store_error)?
-            .into_iter()
-            .map(|unit| ((unit.media_id, unit.season, unit.episode), unit.state))
-            .collect(),
-        None => HashMap::new(),
-    };
     let mut groups = Vec::with_capacity(owned_by_media.len());
     for (id, rows) in owned_by_media {
         let Some(media) = media_by_id.get(&id).cloned() else {
             continue;
         };
-        groups.push(BrowseGroup { media, rows });
+        groups.push(BrowseGroup {
+            media,
+            rows,
+            projected: None,
+        });
     }
 
     Ok(BrowseSnapshot {
         library_id: library.id.clone(),
-        ownership,
         groups,
-        missing,
         cache,
+        missing,
         units,
         user,
     })
+}
+
+/// 优先读投影；投影不可用（未就绪 / 过期 / 事实不可解析）时回退全量读取。
+///
+/// 回退必须留痕：投影读路径与旧路径的语义由 API 级等价测试守住。
+pub(crate) async fn load_browse_snapshot_or_projection(
+    state: &ApiState,
+    library: &crate::store::Library,
+    user: Option<UserId>,
+) -> Result<(BrowseSnapshot, Option<ProjectedFacts>), Response> {
+    match state
+        .projection
+        .ensure(state.clone(), library.id.clone())
+        .await
+    {
+        Ok(snapshot) => {
+            let store = state.store.lock();
+            match projected::snapshot_from_projection(&store, &snapshot, user) {
+                Ok(loaded) => return Ok((loaded.0, Some(loaded.1))),
+                Err(error) => tracing::warn!(
+                    library_id = %library.id,
+                    %error,
+                    "浏览投影事实不可用，回退到全量读取"
+                ),
+            }
+        }
+        Err(error) => tracing::warn!(
+            library_id = %library.id,
+            ?error,
+            "浏览投影未就绪，回退到全量读取"
+        ),
+    }
+    let store = state.store.lock();
+    load_browse_snapshot(&store, library, user).map(|snapshot| (snapshot, None))
+}
+
+fn read_units(
+    store: &Store,
+    user: Option<UserId>,
+    ids: &[MediaId],
+) -> Result<HashMap<(MediaId, i32, i32), UnitState>, Response> {
+    match user {
+        Some(user) => store
+            .playback_units_for_media(user, ids)
+            .map_err(super::store_error)
+            .map(|units| {
+                units
+                    .into_iter()
+                    .map(|unit| ((unit.media_id, unit.season, unit.episode), unit.state))
+                    .collect()
+            }),
+        None => Ok(HashMap::new()),
+    }
 }
 
 /// 锁外执行：NFO/stat、过滤、排序。分页由调用方在排序之后做。
@@ -114,7 +179,7 @@ pub(crate) fn select_all_for_facets(
     collect_items(snapshot, files, false, false, true)
 }
 
-/// 锁外组装：NFO/stat 与观看状态都只在这里发生。
+/// 锁外组装：投影事实直接取用；旧路径才做 NFO/stat。
 fn collect_items(
     snapshot: BrowseSnapshot,
     files: &dyn BrowseFileRead,
@@ -132,26 +197,40 @@ fn collect_items(
     } = snapshot;
 
     let mut items = Vec::new();
-    for BrowseGroup { media, rows } in groups {
-        let metadata = metadata::load(&media, &rows, &cache, files);
+    for BrowseGroup {
+        media,
+        rows,
+        projected,
+    } in groups
+    {
+        let metadata = match &projected {
+            Some(facts) => facts.metadata.clone(),
+            None => metadata::load(&media, &rows, &cache, files),
+        };
+        let is_missing = match &projected {
+            Some(facts) => facts.missing,
+            None => rows.iter().any(|row| missing.contains_key(&row.path)),
+        };
+        let added_at = needs_added_at.then(|| match &projected {
+            Some(facts) => facts.added_at,
+            None => file_stats::added_at(&rows, files),
+        });
+        let size_bytes = needs_size.then(|| match &projected {
+            Some(facts) => facts.size_bytes,
+            None => file_stats::total_size(&rows, files),
+        });
         let mut item = LibrarySelection {
             media,
             metadata,
-            missing: rows.iter().any(|row| missing.contains_key(&row.path)),
-            added_at: None,
-            size_bytes: None,
+            missing: is_missing,
+            added_at: added_at.flatten(),
+            size_bytes: size_bytes.flatten(),
             last_played_at: None,
             rows,
             favorite: false,
             played: false,
             seen: false,
         };
-        if needs_added_at {
-            item.added_at = file_stats::added_at(&item.rows, files);
-        }
-        if needs_size {
-            item.size_bytes = file_stats::total_size(&item.rows, files);
-        }
         if let Some(_user) = user {
             // 收藏状态永远来自 whole unit；详细观看状态只在请求需要时才算。
             let whole = units.get(&(

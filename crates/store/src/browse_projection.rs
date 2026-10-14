@@ -315,6 +315,53 @@ impl Store {
         }
         Ok(results)
     }
+
+    /// Query the detail rows whose cache key is exactly `prefix` or `prefix?<params>`.
+    ///
+    /// The browse metadata reader indexes rows by the part before `?`, keeping the
+    /// newest per base; this mirrors that lookup without scanning every catalog
+    /// body. `ORDER BY fetched_at DESC` keeps the same "newest first" tie order as
+    /// `list_catalog_cache`.
+    pub fn catalog_details_for_prefixes(
+        &self,
+        source: &str,
+        prefixes: &[String],
+    ) -> Result<Vec<CatalogCacheRow>, StoreError> {
+        let mut results = Vec::new();
+        for chunk in prefixes.chunks(400) {
+            let mut sql = String::from(
+                "SELECT source, cache_key, body, fetched_at, expires_at
+                 FROM catalog_cache WHERE source = ?1 AND (",
+            );
+            let mut values: Vec<rusqlite::types::Value> =
+                vec![rusqlite::types::Value::from(source.to_string())];
+            for (index, prefix) in chunk.iter().enumerate() {
+                if index > 0 {
+                    sql.push_str(" OR ");
+                }
+                let exact = values.len() + 1;
+                let like = values.len() + 2;
+                sql.push_str(&format!("cache_key = ?{exact} OR cache_key LIKE ?{like}"));
+                values.push(rusqlite::types::Value::from(prefix.clone()));
+                values.push(rusqlite::types::Value::from(format!("{prefix}?%")));
+            }
+            sql.push_str(") ORDER BY fetched_at DESC");
+            let mut stmt = self.catalog.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
+                Ok(CatalogCacheRow {
+                    source: r.get(0)?,
+                    cache_key: r.get(1)?,
+                    body: r.get(2)?,
+                    fetched_at: r.get(3)?,
+                    expires_at: r.get(4)?,
+                })
+            })?;
+            for row in rows {
+                results.push(row?);
+            }
+        }
+        Ok(results)
+    }
 }
 
 trait RusqliteOptionalExt<T> {

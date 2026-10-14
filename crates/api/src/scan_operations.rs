@@ -27,6 +27,9 @@ pub struct ScanCoordinator {
 ///
 /// 编码必须无歧义：根路径长度前缀 + 分隔符，逗号只是路径里的普通字符，
 /// `["/x/a,/x/b","/x/c"]` 与 `["/x/a","/x/b,/x/c"]` 不能碰撞（P2-4）。
+///
+/// 旧构建写下的 `v1` 编码（`kind:count:root1,root2,...`）由
+/// [`match_legacy_scope_signature`] 在准入时识别并升级，不会被误判为配置变化（P2-NEW-1）。
 pub fn scan_scope_signature(lib: &store::Library) -> String {
     let mut roots: Vec<_> = lib.root_paths.iter().map(|p| p.display().to_string()).collect();
     roots.sort();
@@ -206,10 +209,116 @@ fn finalize_scan(
     }
 }
 
-/// 执行准入读到的持久化状态：累计报告 + scope 是否已过期。
+/// 执行准入读到的持久化状态：累计报告 + scope 是否已过期 + 签名升级原因。
 struct ScanAdmission {
     base_report: serde_json::Value,
     stale_reason: Option<String>,
+    /// 旧格式签名已在本次准入升级时的显式原因（P2-NEW-1），写进终态报告。
+    signature_upgrade: Option<String>,
+}
+
+/// 旧（v1）scope 签名与当前配置的比对结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacySignatureMatch {
+    /// 可无歧义解码，且语义与当前配置一致：就地把签名升级成新编码。
+    Same,
+    /// 旧编码本身有歧义（根路径含分隔符），无法安全比对：升级并留痕，
+    /// 保留扫描意图而不是静默丢弃（P2-NEW-1）。
+    Ambiguous,
+    /// 可解码但与当前配置不一致：这是真实的 scope 变化，必须取消。
+    Different,
+}
+
+/// 解析旧格式签名 `kind:count:root1,root2,...` 并与当前 Library 配置比对。
+///
+/// 返回 `None` = 不是可识别的旧格式（空串、损坏值、已是新格式），调用方按 scope
+/// 变化处理。旧编码用逗号拼接根路径：根路径本身含逗号时 `split(',')` 的段数会多于
+/// `count`，无法唯一还原，判为 [`LegacySignatureMatch::Ambiguous`]（P2-NEW-1）。
+fn match_legacy_scope_signature(
+    persisted: &str,
+    library: &store::Library,
+) -> Option<LegacySignatureMatch> {
+    if persisted.starts_with("v2:") {
+        return None;
+    }
+    let mut parts = persisted.splitn(3, ':');
+    let kind = parts.next()?;
+    let count: usize = parts.next()?.parse().ok()?;
+    let joined = parts.next()?;
+    if kind != library.kind.as_str() {
+        return Some(LegacySignatureMatch::Different);
+    }
+    let mut persisted_roots: Vec<String> = if joined.is_empty() {
+        Vec::new()
+    } else {
+        joined.split(',').map(str::to_string).collect()
+    };
+    if persisted_roots.len() != count {
+        return Some(LegacySignatureMatch::Ambiguous);
+    }
+    let mut current: Vec<String> = library
+        .root_paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    persisted_roots.sort();
+    current.sort();
+    Some(if persisted_roots == current {
+        LegacySignatureMatch::Same
+    } else {
+        LegacySignatureMatch::Different
+    })
+}
+
+fn stale_scope_reason(persisted: &str, current: &str) -> String {
+    format!("library scope changed: persisted={persisted} current={current}")
+}
+
+/// 准入签名判定：`Ok(Some(reason))` = 旧格式已升级；`Ok(None)` = 与新编码一致；
+/// `Err(reason)` = 真实的 scope 变化，调用方必须取消。
+///
+/// 升级走 store 的 CAS（同一 IMMEDIATE 事务内比对+写入）；CAS 失败说明签名被并发
+/// 改写，重读一次再判定，绝不覆盖别人的值。
+fn reconcile_scan_scope_signature(
+    store: &crate::Store,
+    op: &ScanOperation,
+    library: &store::Library,
+) -> Result<Option<String>, String> {
+    let current = scan_scope_signature(library);
+    if current == op.scope_signature {
+        return Ok(None);
+    }
+    let Some(legacy) = match_legacy_scope_signature(&op.scope_signature, library) else {
+        return Err(stale_scope_reason(&op.scope_signature, &current));
+    };
+    if legacy == LegacySignatureMatch::Different {
+        return Err(stale_scope_reason(&op.scope_signature, &current));
+    }
+    let reason = if legacy == LegacySignatureMatch::Ambiguous {
+        format!(
+            "signature format upgraded (legacy encoding ambiguous): persisted={} current={}",
+            op.scope_signature, current
+        )
+    } else {
+        format!(
+            "signature format upgraded: persisted={} current={}",
+            op.scope_signature, current
+        )
+    };
+    match store.upgrade_scan_scope_signature(&op.id, &op.scope_signature, &current) {
+        Ok(true) => {
+            tracing::warn!(op_id = %op.id, %reason, "扫描 scope 签名已升级，保留扫描意图");
+            Ok(Some(reason))
+        }
+        Ok(false) => match store.scan_operation(&op.id).ok().flatten() {
+            Some(fresh) if fresh.scope_signature == current => Ok(Some(reason)),
+            _ => Err(stale_scope_reason(&op.scope_signature, &current)),
+        },
+        Err(error) => {
+            tracing::error!(%error, op_id = %op.id, "升级扫描 scope 签名失败，按 scope 变化处理");
+            Err(stale_scope_reason(&op.scope_signature, &current))
+        }
+    }
 }
 
 /// 执行准入：持久化的 scope signature 与当前 scope 不一致时返回取消原因。
@@ -235,17 +344,18 @@ fn scan_admission(state: &ApiState, op_id: &str, library_id: &str) -> Option<Sca
             return None;
         }
     };
-    let current = scan_scope_signature(&lib);
-    let stale_reason = (current != op.scope_signature).then(|| {
-        format!(
-            "library scope changed: persisted={} current={}",
-            op.scope_signature, current
-        )
-    });
-    Some(ScanAdmission {
-        base_report,
-        stale_reason,
-    })
+    match reconcile_scan_scope_signature(&store, &op, &lib) {
+        Ok(signature_upgrade) => Some(ScanAdmission {
+            base_report,
+            stale_reason: None,
+            signature_upgrade,
+        }),
+        Err(stale_reason) => Some(ScanAdmission {
+            base_report,
+            stale_reason: Some(stale_reason),
+            signature_upgrade: None,
+        }),
+    }
 }
 
 /// 取消过期 operation：写 cancelled 并清理断点，零登记。
@@ -281,12 +391,20 @@ async fn run_operation(
         return;
     }
     let base_report = admission.base_report;
+    let signature_upgrade = admission.signature_upgrade;
 
     let lease = match state.acquire_library_work(library_id) {
         Ok(lease) => lease,
         Err(e) => {
             let store = state.store.lock();
-            let report = with_error(merge_scan_reports(&base_report, &serde_json::json!({})), &e);
+            let report = with_signature_upgrade(
+                with_error(
+                    merge_scan_reports(&base_report, &serde_json::json!({})),
+                    &e,
+                    None,
+                ),
+                signature_upgrade.as_deref(),
+            );
             finalize_scan(&store, op_id, expected_dirty_rev, ScanOperationStatus::Failed, &report);
             return;
         }
@@ -296,11 +414,8 @@ async fn run_operation(
 
     {
         let store = state.store.lock();
-        if let Err(error) = store.update_scan_operation_status(
-            op_id,
-            ScanOperationStatus::Running,
-            &serde_json::json!({}),
-        ) {
+        // 只改状态：requeue 事务刚写入的跨轮累计报告必须保留（P3-NEW-1）。
+        if let Err(error) = store.set_scan_operation_status(op_id, ScanOperationStatus::Running) {
             tracing::error!(%error, %op_id, "标记扫描为 running 失败");
         }
     }
@@ -328,7 +443,10 @@ async fn run_operation(
     match scan_res {
         Ok(Ok((_scan_report, report_data))) => {
             // 累计本轮报告：补扫轮不能丢掉第一轮已提交的计数（P3-3）。
-            let report = merge_scan_reports(&base_report, &report_data);
+            let report = with_signature_upgrade(
+                merge_scan_reports(&base_report, &report_data),
+                signature_upgrade.as_deref(),
+            );
             // 终态取累计报告的 status：前几轮的 partial/unreachable 不能被后续干净轮洗掉。
             let status = if report.get("status").and_then(serde_json::Value::as_str)
                 == Some("partial")
@@ -345,21 +463,45 @@ async fn run_operation(
             cancel_stale_operation(&store, op_id, &reason);
         }
         Ok(Err(crate::http::library_scan::runner::ScanRunError::Failed(failure))) => {
-            // 失败终态：已提交计数 + 错误摘要，另外保留 HTTP 状态便于排查。
+            // 失败终态：已提交计数 + 有界失败历史 + 错误摘要（P3-NEW-2）。
             let http_status = failure.response.status().as_u16();
-            let mut report =
-                with_error(merge_scan_reports(&base_report, &failure.report), &failure.error);
-            report["http_status"] = serde_json::json!(http_status);
+            let report = with_signature_upgrade(
+                with_error(
+                    merge_scan_reports(&base_report, &failure.report),
+                    &failure.error,
+                    Some(http_status),
+                ),
+                signature_upgrade.as_deref(),
+            );
             finalize_scan(&store, op_id, expected_dirty_rev, ScanOperationStatus::Failed, &report);
         }
         Err(e) => {
-            let report = with_error(
-                merge_scan_reports(&base_report, &serde_json::json!({})),
-                &e.to_string(),
+            let report = with_signature_upgrade(
+                with_error(
+                    merge_scan_reports(&base_report, &serde_json::json!({})),
+                    &e.to_string(),
+                    None,
+                ),
+                signature_upgrade.as_deref(),
             );
             finalize_scan(&store, op_id, expected_dirty_rev, ScanOperationStatus::Failed, &report);
         }
     }
+}
+
+/// 把签名升级原因写进终态报告（P2-NEW-1）：旧 operation 不得无声消失。
+fn with_signature_upgrade(
+    mut report: serde_json::Value,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    let Some(reason) = reason else {
+        return report;
+    };
+    if !report.is_object() {
+        report = serde_json::json!({});
+    }
+    report["signature_upgrade"] = serde_json::json!(reason);
+    report
 }
 
 fn is_nonempty_object(value: &serde_json::Value) -> bool {
@@ -419,9 +561,14 @@ fn merge_report_roots(base: &serde_json::Value, round: &serde_json::Value) -> Ve
     merged
 }
 
+/// 累计报告里保留的失败条数上限（P3-NEW-2）：历史有界，`failure_count` 仍记总数。
+const MAX_REPORT_FAILURES: usize = 5;
+
 /// 跨轮累计：把本轮报告并入已持久化的累计报告（P3-3）。
 ///
 /// 计数相加、roots 按路径合并、issues 截断到 20 条；status 由合并结果重算。
+/// 失败历史（`failures` / `failure_count`）与签名升级原因跨轮保留：一次成功的补扫
+/// 可以让 operation 以 `completed` 结束，但失败记录不能被抹掉（P3-NEW-2）。
 fn merge_scan_reports(
     base: &serde_json::Value,
     round: &serde_json::Value,
@@ -451,7 +598,8 @@ fn merge_scan_reports(
             Some("partial") | Some("unreachable")
         )
     });
-    serde_json::json!({
+    let failure_count = sum_report_field(base, round, "failure_count");
+    let mut merged = serde_json::json!({
         "queued": true,
         "transferred": true,
         "status": if any_bad_root || error_count > 0 { "partial" } else { "completed" },
@@ -463,339 +611,83 @@ fn merge_scan_reports(
         "error_count": error_count,
         "errors_truncated": error_count > 20,
         "issues": issues,
-    })
+    });
+    if failure_count > 0 {
+        merged["failure_count"] = serde_json::json!(failure_count);
+        let failures = merged_failures(base, round);
+        if let Some(last) = failures.last() {
+            merged["last_failure"] = last.clone();
+        }
+        merged["failures"] = serde_json::json!(failures);
+    }
+    if let Some(reason) = base
+        .get("signature_upgrade")
+        .or_else(|| round.get("signature_upgrade"))
+    {
+        merged["signature_upgrade"] = reason.clone();
+    }
+    merged
 }
 
-/// 失败终态：保留累计计数，并写入错误摘要（P3-3）。
-fn with_error(mut report: serde_json::Value, error: &str) -> serde_json::Value {
+/// 合并两侧的失败历史并截断到 [`MAX_REPORT_FAILURES`] 条（保留最近发生的）。
+fn merged_failures(base: &serde_json::Value, round: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut failures: Vec<serde_json::Value> = [base, round]
+        .into_iter()
+        .flat_map(|source| {
+            source
+                .get("failures")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    if failures.len() > MAX_REPORT_FAILURES {
+        let excess = failures.len() - MAX_REPORT_FAILURES;
+        failures.drain(0..excess);
+    }
+    failures
+}
+
+/// 失败终态：保留累计计数，记录有界失败历史与错误摘要（P3-3 / P3-NEW-2）。
+fn with_error(
+    mut report: serde_json::Value,
+    error: &str,
+    http_status: Option<u16>,
+) -> serde_json::Value {
     if !report.is_object() {
         report = serde_json::json!({});
     }
     report["status"] = serde_json::json!("failed");
     report["error"] = serde_json::json!(error);
+    if let Some(status) = http_status {
+        report["http_status"] = serde_json::json!(status);
+    }
+    let failure_count = report
+        .get("failure_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        + 1;
+    report["failure_count"] = serde_json::json!(failure_count);
+    let mut failures = report
+        .get("failures")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    failures.push(serde_json::json!({
+        "error": error,
+        "http_status": http_status,
+        "status": "failed",
+    }));
+    if failures.len() > MAX_REPORT_FAILURES {
+        let excess = failures.len() - MAX_REPORT_FAILURES;
+        failures.drain(0..excess);
+    }
+    if let Some(last) = failures.last() {
+        report["last_failure"] = last.clone();
+    }
+    report["failures"] = serde_json::json!(failures);
     report
 }
 
-
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use domain::{Confidence, LedgerId, LedgerRow, Media, MediaId, MediaKind, QualitySource};
-    use store::ScanOperation;
-
-    use super::*;
-
-    struct NoFetch;
-
-    impl indexer::Fetcher for NoFetch {
-        fn fetch(&self, _: &indexer::FetchRequest) -> Result<String, indexer::IndexerError> {
-            Err(indexer::IndexerError::Fetch("offline".into()))
-        }
-    }
-
-    struct Fixture {
-        _dir: tempfile::TempDir,
-        state: ApiState,
-        library_id: String,
-        root: PathBuf,
-    }
-
-    impl Fixture {
-        fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let store = crate::Store::open(dir.path().join("data")).unwrap();
-            let state = ApiState::new(
-                store,
-                "test-token".into(),
-                indexer::ProfileSet::load(None).unwrap(),
-                Arc::new(NoFetch),
-                Arc::new(downloader::MemoryDownloader::new(dir.path().join("stage"))),
-                dir.path().join("library"),
-            )
-            .unwrap();
-            let root = dir.path().join("movies");
-            std::fs::create_dir_all(&root).unwrap();
-            let library_id = {
-                let store = state.store();
-                let guard = store.lock();
-                guard
-                    .create_library(
-                        MediaKind::Movie,
-                        "Movies",
-                        &[root.to_str().unwrap()],
-                        "everyone",
-                        true,
-                        &[],
-                    )
-                    .unwrap()
-                    .id
-            };
-            Self {
-                _dir: dir,
-                state,
-                library_id,
-                root,
-            }
-        }
-
-        fn signature(&self) -> String {
-            let store = self.state.store();
-            let guard = store.lock();
-            let library = guard.get_library(&self.library_id).unwrap().unwrap();
-            scan_scope_signature(&library)
-        }
-
-        fn insert_media_and_ledger(&self, rel_path: &str) -> (MediaId, LedgerRow) {
-            let media = Media {
-                id: MediaId::new(),
-                kind: MediaKind::Movie,
-                title: "Test Movie".to_string(),
-                year: None,
-                original_title: None,
-                tmdb_id: None,
-                douban_id: None,
-                tvdb_id: None,
-                bangumi_id: None,
-                anilist_id: None,
-            };
-            let row = LedgerRow {
-                id: LedgerId::new(),
-                media_id: media.id,
-                path: self.root.join(rel_path).to_str().unwrap().to_string(),
-                season: None,
-                episode: None,
-                resolution: None,
-                codec: None,
-                hdr: None,
-                quality_source: QualitySource::Release,
-                confidence: Confidence::High,
-                filter_score: None,
-            };
-            let store = self.state.store();
-            let guard = store.lock();
-            guard.insert_media(&media).unwrap();
-            guard.insert_ledger(&row).unwrap();
-            (media.id, row)
-        }
-
-        async fn wait_terminal(&self, op_id: &str) -> ScanOperation {
-            for _ in 0..600 {
-                let op = self.state.store().lock().scan_operation(op_id).unwrap();
-                if let Some(op) = op
-                    && !op.status.is_active()
-                {
-                    return op;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            panic!("scan operation {op_id} 未在预期时间内进入终态");
-        }
-    }
-
-    /// P2-4：scope 指纹必须无歧义——根路径里的逗号不能造成不同配置碰撞。
-    #[test]
-    fn scope_signature_does_not_collide_on_commas_in_roots() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = crate::Store::open(dir.path().join("data")).unwrap();
-        let a = store
-            .create_library(
-                MediaKind::Movie,
-                "A",
-                &["/x/a,/x/b", "/x/c"],
-                "everyone",
-                true,
-                &[],
-            )
-            .unwrap();
-        let b = store
-            .create_library(
-                MediaKind::Movie,
-                "B",
-                &["/x/a", "/x/b,/x/c"],
-                "everyone",
-                true,
-                &[],
-            )
-            .unwrap();
-        assert_ne!(
-            scan_scope_signature(&a),
-            scan_scope_signature(&b),
-            "逗号拼接会让不同根配置碰撞: {}",
-            scan_scope_signature(&a)
-        );
-        // kind 也必须参与编码。
-        let tv = store
-            .create_library(
-                MediaKind::Tv,
-                "TV",
-                &["/x/a,/x/b", "/x/c"],
-                "everyone",
-                true,
-                &[],
-            )
-            .unwrap();
-        assert_ne!(scan_scope_signature(&a), scan_scope_signature(&tv));
-    }
-
-    /// P3-1 + P3-3：轮内并入的事件必须让本轮补扫，且终态报告是跨轮累计。
-    #[tokio::test]
-    async fn dirty_event_during_round_requeues_with_cumulative_report() {
-        let fix = Fixture::new();
-        let dir = fix.root.join("Show A");
-        std::fs::create_dir_all(&dir).unwrap();
-        let f1 = dir.join("Movie1 (2024).mkv");
-        std::fs::write(&f1, b"1").unwrap();
-        fix.insert_media_and_ledger("Show A/Movie1 (2024).mkv");
-        let sig = fix.signature();
-        let op = {
-            let store = fix.state.store();
-            let guard = store.lock();
-            let op = guard
-                .enqueue_scan(&fix.library_id, &sig, &[dir.clone()], 1000)
-                .unwrap();
-            guard.record_scan_seen(&op.id, &[f1.clone()]).unwrap();
-            op
-        };
-        let f2 = dir.join("Movie2 (2024).mkv");
-        std::fs::write(&f2, b"2").unwrap();
-
-        // 屏障：本轮已经开始（认领后），此时并入同一 target 的第二个事件。
-        let state = fix.state.clone();
-        let library_id = fix.library_id.clone();
-        let target = dir.clone();
-        let hook_sig = sig.clone();
-        let hook_op_id = op.id.clone();
-        crate::http::library_scan::runner::test_scope_hook::set(
-            &hook_op_id,
-            Box::new(move || {
-                let store = state.store();
-                let guard = store.lock();
-                guard
-                    .enqueue_scan(&library_id, &hook_sig, &[target.clone()], 1001)
-                    .unwrap();
-            }),
-        );
-
-        fix.state.scan_coordinator.trigger_next(&fix.state);
-        let done = fix.wait_terminal(&op.id).await;
-        assert_eq!(done.status, ScanOperationStatus::Completed, "{:?}", done.report);
-        assert_eq!(done.dirty_rev, 1);
-        assert_eq!(done.consumed_rev, 1, "轮内事件必须被补扫轮消费");
-        assert_eq!(
-            done.report["scanned"], 1,
-            "累计报告必须包含第一轮已处理的文件: {}",
-            done.report
-        );
-        assert_eq!(done.report["inserted"], 1, "{}", done.report);
-        let rows = fix.state.store().lock().list_ledger().unwrap();
-        assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .any(|row| row.path.ends_with("Movie2 (2024).mkv")));
-    }
-
-    /// P2-4：准入通过之后、scope 捕获之前 PATCH roots，旧 operation 必须取消且零登记。
-    #[tokio::test]
-    async fn scope_change_between_admission_and_capture_cancels_without_ledgering() {
-        let fix = Fixture::new();
-        let file = fix.root.join("Movie1 (2024).mkv");
-        std::fs::write(&file, b"1").unwrap();
-        let sig = fix.signature();
-        let op = {
-            let store = fix.state.store();
-            let guard = store.lock();
-            guard
-                .enqueue_scan(&fix.library_id, &sig, &[], 1000)
-                .unwrap()
-        };
-
-        // 屏障：准入已通过，但在捕获 scope 之前把 roots 换到别处。
-        let moved_root = fix.root.parent().unwrap().join("movies-moved");
-        std::fs::create_dir_all(&moved_root).unwrap();
-        let state = fix.state.clone();
-        let library_id = fix.library_id.clone();
-        let moved = moved_root.to_str().unwrap().to_string();
-        let hook_op_id = op.id.clone();
-        crate::http::library_scan::runner::test_scope_hook::set(
-            &hook_op_id,
-            Box::new(move || {
-                let store = state.store();
-                let guard = store.lock();
-                guard
-                    .update_library(&library_id, None, Some(&[moved.as_str()]), None)
-                    .unwrap();
-            }),
-        );
-
-        fix.state.scan_coordinator.trigger_next(&fix.state);
-        let done = fix.wait_terminal(&op.id).await;
-        assert_eq!(
-            done.status,
-            ScanOperationStatus::Cancelled,
-            "{:?}",
-            done.report
-        );
-        assert_eq!(done.report["error"], "library.scope_changed");
-        assert!(
-            done.report["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("captured scope changed")),
-            "取消原因必须来自捕获 scope 复核: {}",
-            done.report
-        );
-        assert!(
-            fix.state.store().lock().list_ledger().unwrap().is_empty(),
-            "取消的 operation 不得登记任何文件"
-        );
-    }
-
-    /// P2-NEW-2：文件版本观察（模拟慢 NAS stat）期间不得持有 Store 锁。
-    ///
-    /// 屏障阻塞在观察点；测试线程必须仍能立刻拿到 Store 锁，否则说明慢观察把共享
-    /// Store 拖住了（auth 等其他请求会被阻塞）。
-    #[tokio::test]
-    async fn slow_file_observation_keeps_the_store_lock_free() {
-        let fix = Fixture::new();
-        let file = fix.root.join("Movie1 (2024).mkv");
-        std::fs::write(&file, b"1").unwrap();
-        let sig = fix.signature();
-        let op = {
-            let store = fix.state.store();
-            let guard = store.lock();
-            guard
-                .enqueue_scan(&fix.library_id, &sig, &[], 1000)
-                .unwrap()
-        };
-
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let hook_op_id = op.id.clone();
-        crate::http::library_scan::runner::test_observe_hook::set(
-            &hook_op_id,
-            Box::new(move || {
-                let _ = entered_tx.send(());
-                // 模拟慢 NAS stat：观察窗口内一直阻塞。
-                let _ = release_rx.recv();
-            }),
-        );
-
-        fix.state.scan_coordinator.trigger_next(&fix.state);
-        entered_rx.await.expect("worker 必须进入慢观察屏障");
-
-        let store = fix.state.store();
-        let guard = store
-            .try_lock_for(std::time::Duration::from_secs(2))
-            .expect("慢文件观察期间 Store 锁必须可用（P2-NEW-2）");
-        assert!(
-            guard.scan_operation(&op.id).unwrap().is_some(),
-            "慢观察期间其他 Store 使用者必须仍能读"
-        );
-        drop(guard);
-        release_tx.send(()).unwrap();
-
-        let done = fix.wait_terminal(&op.id).await;
-        assert_eq!(done.status, ScanOperationStatus::Completed, "{:?}", done.report);
-        assert_eq!(done.report["scanned"], 1, "{}", done.report);
-    }
-}
+mod tests;

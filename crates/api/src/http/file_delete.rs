@@ -63,5 +63,10 @@ pub(crate) async fn remove_rows(
             }
         }
     }
+    drop(store);
+    if removed > 0 {
+        // ledger 行已删除：浏览投影的文件事实与归属都变了。
+        state.projection.mark_all_dirty();
+    }
     (removed, errors)
 }

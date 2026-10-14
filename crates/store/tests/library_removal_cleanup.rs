@@ -202,3 +202,43 @@ fn removal_boundary_survives_reopen_without_the_per_file_snapshot() {
     assert_eq!(reopened.removal_roots(&done.operation_id).unwrap().len(), 1);
     assert!(reopened.get_library(&library_id).unwrap().is_none());
 }
+
+/// 真实升级边界：库已经是当前 app schema（7），`previous < APP_SCHEMA_VERSION`
+/// 不成立。b3192f1 之前删除的 Library 留下的 `library_cover_checked.{id}` 仍然
+/// 必须在重开时被清掉，而不是因为「版本已经是最新」被跳过。
+#[test]
+fn reopen_at_current_app_schema_cleans_settings_of_already_removed_library() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let store = Store::open(&data).unwrap();
+    library(&store, "A", &temp.path().join("tv_a"));
+    library(&store, "B", &temp.path().join("tv_b"));
+    let (a, b) = {
+        let libs = store.list_libraries().unwrap();
+        let a = libs.iter().find(|l| l.name == "A").unwrap().id.clone();
+        let b = libs.iter().find(|l| l.name == "B").unwrap().id.clone();
+        (a, b)
+    };
+    let key_a = format!("library_cover_checked.{a}");
+    let key_b = format!("library_cover_checked.{b}");
+    remove(&store, &a);
+    // Pre-fix residue: the removal succeeded, but a build that never ran the
+    // repair wrote the Library's setting back (or never deleted it).
+    store.put_setting(&key_a, "checked-v2").unwrap();
+    store.put_setting(&key_b, "checked-v2").unwrap();
+    let app_version = store
+        .schema_versions()
+        .into_iter()
+        .find(|(name, _)| *name == "app")
+        .unwrap()
+        .1;
+    assert_eq!(app_version, 7, "本测试钉住真实边界：app schema 7");
+    drop(store);
+
+    let reopened = Store::open(&data).unwrap();
+    assert!(reopened.get_setting(&key_a).unwrap().is_none());
+    assert_eq!(
+        reopened.get_setting(&key_b).unwrap().as_deref(),
+        Some("checked-v2")
+    );
+}

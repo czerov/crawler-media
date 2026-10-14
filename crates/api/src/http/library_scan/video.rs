@@ -66,11 +66,15 @@ pub(crate) fn walk_video_files_reported(
     }
 }
 
+/// 扫描一个 Video Library 的库根。
+///
+/// `scan_scope` 由调用方（runner）捕获并完成「捕获 scope == 持久化 signature」复核后
+/// 传入：Video 与 Movie/TV 共用同一条绑定路径，发布前不得绕过（P2-4）。
 pub(crate) fn scan_video_library(
     state: &ApiState,
     roots: &[PathBuf],
-    library_id: &str,
     lease: &crate::library_lifecycle::LibraryWorkLease,
+    scan_scope: &ScanScope,
 ) -> Result<(library::ScanReport, serde_json::Value), Response> {
     let mut all_files = Vec::new();
     let mut root_reports = Vec::new();
@@ -98,17 +102,6 @@ pub(crate) fn scan_video_library(
         root_reports.push(report);
         all_files.extend(r_files);
     }
-
-    let scan_scope = match ScanScope::capture(state, library_id) {
-        Ok(s) => s,
-        Err(crate::library_presence::PresenceError::Deleting) => {
-            return Err(err(StatusCode::CONFLICT, "library.deleting", "Library 正在删除"));
-        }
-        Err(crate::library_presence::PresenceError::ScopeChanged) => {
-            return Err(err(StatusCode::CONFLICT, "library.scope_changed", "Library 配置变化"));
-        }
-        Err(e) => return Err(err(StatusCode::CONFLICT, "library.scan", &format!("{:?}", e))),
-    };
 
     let files = match scan_scope.filter_paths(all_files) {
         Ok(f) => f,

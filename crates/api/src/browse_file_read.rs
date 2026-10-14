@@ -14,6 +14,13 @@ pub trait BrowseFileRead: Send + Sync {
     /// 文件元数据（排序用的 added_at / size）。
     fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata>;
 
+    /// 普通文件存在性判断（海报 / 背景 / 剧照探测）。
+    ///
+    /// 投影构建与浏览回退路径都走这里，测试可注入计数实现。
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+
     /// 发现视频旁的 external 字幕轨（文件系统 IO）。
     ///
     /// 默认实现保持既有 implementor source-compatible；需要阻塞注入的测试

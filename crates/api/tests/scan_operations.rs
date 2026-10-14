@@ -257,3 +257,98 @@ async fn committed_chunk_prefix_survives_a_later_chunk_failure() {
     let rows = fix.state.store().lock().list_ledger().unwrap();
     assert_eq!(rows.len(), 100, "只有已提交的 chunk 前缀入账");
 }
+
+/// P2-NEW-1：上一个构建写下的 v1 签名，配置未变时不得被当成 scope 变化取消；
+/// 必须就地把持久化签名升级成新编码，并照常完成扫描。
+#[tokio::test]
+async fn legacy_signature_with_unchanged_config_is_upgraded_not_cancelled() {
+    let fix = PresenceFixture::new();
+    let file = fix.root.join("Movie1 (2024).mkv");
+    std::fs::write(&file, b"1").unwrap();
+    let legacy = fix.legacy_scope_signature();
+    let current = fix.scope_signature();
+    assert_ne!(legacy, current, "测试前提：旧编码与新编码不同");
+
+    let op = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .enqueue_scan(&fix.library_id, &legacy, &[], 1000)
+            .unwrap()
+    };
+
+    fix.state.scan_coordinator.trigger_next(&fix.state);
+    let done = fix.wait_scan_terminal_op(&op.id).await;
+    assert_eq!(
+        done.status,
+        store::ScanOperationStatus::Completed,
+        "配置未变时旧签名 operation 不得消失: {}",
+        done.report
+    );
+    assert_eq!(
+        done.scope_signature, current,
+        "旧签名必须就地升级成新编码"
+    );
+    assert!(
+        done.report["signature_upgrade"].is_string(),
+        "升级必须留下显式原因: {}",
+        done.report
+    );
+    assert_eq!(fix.state.store().lock().list_ledger().unwrap().len(), 1);
+}
+
+/// P2-NEW-1：旧编码本身有歧义（根路径含逗号）无法安全比对时，仍要保留扫描意图、
+/// 显式报告升级原因，而不是静默取消。
+#[tokio::test]
+async fn ambiguous_legacy_signature_is_upgraded_and_intent_preserved() {
+    let fix = PresenceFixture::new();
+    // 第二个根路径带逗号：v1 的逗号拼接无法唯一还原（`split(',')` 段数多于 count）。
+    let comma_root = fix.dir.path().join("movies,alt");
+    std::fs::create_dir_all(&comma_root).unwrap();
+    {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .update_library(
+                &fix.library_id,
+                None,
+                Some(&[fix.root.to_str().unwrap(), comma_root.to_str().unwrap()]),
+                None,
+            )
+            .unwrap();
+    }
+    std::fs::write(fix.root.join("Movie1 (2024).mkv"), b"1").unwrap();
+    std::fs::write(comma_root.join("Movie2 (2024).mkv"), b"2").unwrap();
+
+    let legacy = fix.legacy_scope_signature();
+    let current = fix.scope_signature();
+    let op = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .enqueue_scan(&fix.library_id, &legacy, &[], 1000)
+            .unwrap()
+    };
+
+    fix.state.scan_coordinator.trigger_next(&fix.state);
+    let done = fix.wait_scan_terminal_op(&op.id).await;
+    assert_eq!(
+        done.status,
+        store::ScanOperationStatus::Completed,
+        "有歧义的旧编码必须保留扫描意图: {}",
+        done.report
+    );
+    assert_eq!(done.scope_signature, current, "旧编码必须被升级");
+    let reason = done.report["signature_upgrade"]
+        .as_str()
+        .unwrap_or_else(|| panic!("必须显式报告升级原因: {}", done.report));
+    assert!(
+        reason.contains("ambiguous"),
+        "有歧义的升级必须说明原因: {reason}"
+    );
+    assert_eq!(
+        fix.state.store().lock().list_ledger().unwrap().len(),
+        2,
+        "升级后按当前配置扫描，两个根的文件都要入账"
+    );
+}

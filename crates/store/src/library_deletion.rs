@@ -515,8 +515,15 @@ fn delete_library_scoped_settings(
     Ok(deleted)
 }
 
-/// One-shot repair for databases written before removal deleted Library-scoped
-/// settings: drop the settings of Libraries whose removal already succeeded.
+/// Drop the settings of Libraries whose removal already succeeded.
+///
+/// Databases written before removal deleted Library-scoped settings keep
+/// `library_cover_checked.{id}` forever, and the setting is only read through
+/// `get_library`, so nothing else would ever drop it. Runs on every open rather
+/// than behind the schema-version gate: the version was never bumped for this
+/// repair, so a database already at the current version would otherwise never
+/// run it. Idempotent by construction — it only deletes keys whose Library row
+/// is already gone.
 ///
 /// A pending removal keeps its Library row, so its settings are left alone.
 pub(crate) fn repair_removed_library_settings(conn: &Connection) -> Result<usize, StoreError> {

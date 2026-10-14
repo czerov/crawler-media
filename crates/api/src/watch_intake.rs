@@ -87,6 +87,11 @@ pub fn run(state: &ApiState) -> Result<(), String> {
     };
 
     finish_intake_metadata(state, &transferred, inserted, &movie_lease, tv_lease.as_ref(), nfo)?;
+    // Intake 写入 ledger / Media / NFO：目标 Library 的投影必须重建。
+    state.projection.mark_dirty(movie_lease.library_id());
+    if let Some(lease) = tv_lease.as_ref() {
+        state.projection.mark_dirty(lease.library_id());
+    }
     if !outcome.errors.is_empty() {
         let err_msgs: Vec<String> = outcome
             .errors

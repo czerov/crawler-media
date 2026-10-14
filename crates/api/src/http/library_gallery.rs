@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path as FsPath;
 
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
@@ -26,18 +25,20 @@ pub(crate) async fn gallery(
             );
         }
     };
-    // 锁内只取 owned 快照；NFO/stat/过滤/排序/渲染都在锁外的 blocking 预算内。
-    let snapshot = {
+    // 授权从当前配置判定；图片事实优先取目标 Library 的 ready 投影（零文件 IO），
+    // 投影不可用时回退到旧的全量读取（已在 helper 内 warn）。
+    let library = {
         let store = state.store.lock();
-        let library = match require_visible_library(&store, &id, user_id) {
+        match require_visible_library(&store, &id, user_id) {
             Ok(library) => library,
-            Err(response) => return response,
-        };
-        match selection::load_browse_snapshot(&store, &library, user_id) {
-            Ok(snapshot) => snapshot,
             Err(response) => return response,
         }
     };
+    let (snapshot, artwork) =
+        match selection::load_browse_snapshot_or_projection(&state, &library, user_id).await {
+            Ok(loaded) => loaded,
+            Err(response) => return response,
+        };
     let files = state.browse_files.clone();
     let work = state
         .http_work
@@ -47,9 +48,10 @@ pub(crate) async fn gallery(
                 Ok(items) => items,
                 Err(response) => return response,
             };
+            let art = selection::BrowseArtwork::new(artwork.as_ref(), files.as_ref());
             let mut groups = Vec::new();
             for item in selected {
-                let images = gallery_images(&library_id, &item.media, &item.rows);
+                let images = gallery_images(&library_id, &item.media, &item.rows, &art);
                 if images.is_empty() {
                     continue;
                 }
@@ -110,69 +112,47 @@ fn gallery_images(
     library_id: &str,
     media: &domain::Media,
     rows: &[domain::LedgerRow],
+    art: &selection::BrowseArtwork<'_>,
 ) -> Vec<Value> {
     let refs: Vec<&domain::LedgerRow> = rows.iter().collect();
     let Some(pref_row) = preferred_row(&refs) else {
         return Vec::new();
     };
-    let video = FsPath::new(&pref_row.path);
-    let Some(dir) = video.parent() else {
-        return Vec::new();
-    };
-    let parent_dir = dir.parent().unwrap_or(dir);
+    let facts = art.media(media.id, rows);
     let mut images = Vec::new();
 
-    let poster_path = if dir.join("poster.jpg").is_file() {
-        Some(dir.join("poster.jpg"))
-    } else if parent_dir.join("poster.jpg").is_file() {
-        Some(parent_dir.join("poster.jpg"))
-    } else {
-        None
-    };
-    if let Some(p) = poster_path {
+    if facts.has_poster {
         push_image(
             &mut images,
             library_id,
             media,
             pref_row,
             GalleryImageKind::Poster,
-            p,
             None,
             None,
         );
     }
-
-    let fanart_path = if dir.join("fanart.jpg").is_file() {
-        Some(dir.join("fanart.jpg"))
-    } else if parent_dir.join("fanart.jpg").is_file() {
-        Some(parent_dir.join("fanart.jpg"))
-    } else {
-        None
-    };
-    if let Some(p) = fanart_path {
+    if facts.has_backdrop {
         push_image(
             &mut images,
             library_id,
             media,
             pref_row,
             GalleryImageKind::Backdrop,
-            p,
             None,
             None,
         );
     }
 
-    // 遍历所有有剧照的单元
+    // 遍历所有有剧照的单元（剧照存在性来自投影 / 注入 seam，不再现场 stat）。
     for row in rows {
-        let vpath = FsPath::new(&row.path);
-        if crate::episode_still::existing(vpath).is_some() {
+        if art.has_still(row) {
             push_image(
                 &mut images,
                 library_id,
                 media,
                 row,
                 GalleryImageKind::Still,
-                vpath.to_path_buf(),
                 row.season,
                 row.episode,
             );
@@ -187,14 +167,9 @@ fn push_image(
     media: &domain::Media,
     row: &domain::LedgerRow,
     kind: GalleryImageKind,
-    path: std::path::PathBuf,
     season: Option<u32>,
     episode: Option<u32>,
 ) {
-    // Stills live inside the container, so only the filesystem artwork has to exist.
-    if !matches!(kind, GalleryImageKind::Still) && !path.is_file() {
-        return;
-    }
     let label = match kind {
         GalleryImageKind::Poster => "海报".to_string(),
         GalleryImageKind::Backdrop => "背景".to_string(),

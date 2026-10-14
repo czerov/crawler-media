@@ -30,19 +30,24 @@ pub(crate) async fn scan_library(
     Path(id): Path<String>,
 ) -> Response {
     match state.scan_coordinator.enqueue(&state, &id, vec![]) {
-        Ok(op) => (
-            StatusCode::ACCEPTED,
-            axum::Json(serde_json::json!({
-                "ok": true,
-                "data": {
-                    "operation_id": op.id,
-                    "status": op.status.as_str(),
-                    "queued": true,
-                    "transferred": false,
-                }
-            })),
-        )
-            .into_response(),
+        Ok(op) => {
+            // 扫描会写 ledger（library revision 也会递增）；这里再显式标脏，保证
+            // 不依赖 revision 的调用方（如周期刷新）也能看到失效。
+            state.projection.mark_dirty(&id);
+            (
+                StatusCode::ACCEPTED,
+                axum::Json(serde_json::json!({
+                    "ok": true,
+                    "data": {
+                        "operation_id": op.id,
+                        "status": op.status.as_str(),
+                        "queued": true,
+                        "transferred": false,
+                    }
+                })),
+            )
+                .into_response()
+        }
         Err(crate::scan_operations::ScanEnqueueError::NotFound(e)) => {
             err(StatusCode::NOT_FOUND, "library.missing", &e)
         }
@@ -179,6 +184,8 @@ pub(crate) fn scan_library_subdir(
             let _ = crate::http::library::library_cover_path(&store, &library);
         }
     }
+    // ledger 与 NFO/图片都可能已变化：显式标脏，不依赖 revision 触发。
+    state.projection.mark_dirty(&library_id);
     Ok(())
 }
 
@@ -327,6 +334,8 @@ pub(crate) async fn refresh_metadata(
         // 章节场景图自动生成（有内嵌章节且无帧时）。
         crate::http::library_chapters::auto_generate_chapters(&state, &path);
     }
+    // NFO / 海报 / 背景已写入：文件事实变了但 revision 不会动。
+    state.projection.mark_dirty(&id);
     ok(json!({ "queued": true, "refreshed": refreshed })).into_response()
 }
 
@@ -435,18 +444,20 @@ pub(crate) async fn item_index(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    // 锁内只取 owned 快照；NFO/stat/过滤/排序都在锁外的 blocking 预算内。
-    let snapshot = {
+    // 授权从当前配置判定；浏览事实优先取目标 Library 的 ready 投影（零文件 IO），
+    // 投影不可用时回退到旧的全量读取（已在 helper 内 warn）。
+    let library = {
         let store = state.store.lock();
-        let library = match require_visible_library(&store, &id, user_id) {
+        match require_visible_library(&store, &id, user_id) {
             Ok(library) => library,
-            Err(response) => return response,
-        };
-        match selection::load_browse_snapshot(&store, &library, user_id) {
-            Ok(snapshot) => snapshot,
             Err(response) => return response,
         }
     };
+    let (snapshot, _artwork) =
+        match selection::load_browse_snapshot_or_projection(&state, &library, user_id).await {
+            Ok(loaded) => loaded,
+            Err(response) => return response,
+        };
     let files = state.browse_files.clone();
     let work = state
         .http_work
@@ -518,18 +529,20 @@ pub(crate) async fn facets(
             );
         }
     };
-    // 锁内只取 owned 快照；NFO/stat/匹配/计数全部在锁外的 blocking 预算内。
-    let snapshot = {
+    // 授权从当前配置判定；候选事实优先取目标 Library 的 ready 投影（零文件 IO），
+    // 投影不可用时回退到旧的全量读取（已在 helper 内 warn）。
+    let library = {
         let store = state.store.lock();
-        let library = match require_visible_library(&store, &id, user_id) {
+        match require_visible_library(&store, &id, user_id) {
             Ok(library) => library,
-            Err(response) => return response,
-        };
-        match selection::load_browse_snapshot(&store, &library, user_id) {
-            Ok(snapshot) => snapshot,
             Err(response) => return response,
         }
     };
+    let (snapshot, _artwork) =
+        match selection::load_browse_snapshot_or_projection(&state, &library, user_id).await {
+            Ok(loaded) => loaded,
+            Err(response) => return response,
+        };
     let files = state.browse_files.clone();
     let work = state
         .http_work
