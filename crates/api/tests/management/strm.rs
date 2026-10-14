@@ -57,17 +57,7 @@ async fn strm_file_scans_and_stream_redirects_to_remote_url() {
         .as_str()
         .unwrap()
         .to_string();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{movie_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &movie_id).await;
 
     let ledger = json_body(
         app.clone()

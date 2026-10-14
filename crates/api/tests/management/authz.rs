@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 use tower::{Service, ServiceExt};
 
-use super::common::{Fixtures, json_body, request, state as common_state};
+use super::common::{Fixtures, json_body, request, scan_and_wait, state as common_state};
 
 struct NoFetch;
 impl Fetcher for NoFetch {
@@ -267,17 +267,7 @@ async fn create_scanned_video_library(
     )
     .await;
     let lib_id = created["data"]["id"].as_str().unwrap().to_string();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{lib_id}/scan"),
-            Some(admin),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &lib_id).await;
     let items = json_body(
         app.clone()
             .oneshot(request(

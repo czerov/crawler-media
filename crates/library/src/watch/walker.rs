@@ -98,46 +98,47 @@ impl ScanWalker {
                 visited += 1;
 
                 let entry = match entry_res {
-                    Ok(entry) => entry,
+                    Ok(entry) => Some(entry),
                     Err(e) => {
                         issues.push(ScanIssue {
                             path: PathBuf::new(),
                             kind: e.kind(),
                         });
-                        continue;
+                        None
                     }
                 };
 
-                let path = entry.path();
-                let meta = match fs::symlink_metadata(&path) {
-                    Ok(meta) => meta,
-                    Err(e) => {
-                        issues.push(ScanIssue {
-                            path,
-                            kind: e.kind(),
-                        });
-                        continue;
-                    }
-                };
-
-                if meta.file_type().is_symlink() {
-                    skipped += 1;
-                } else if meta.is_dir() {
-                    self.dir_stack.push(path);
-                } else if meta.is_file() {
-                    if is_video_file(&path) {
-                        let name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or_default();
-                        let parsed = release::parse(name);
-                        files.push(TransferredFile {
-                            path,
-                            identified_release: Some(parsed),
-                            nfo_identity: None,
-                        });
-                    } else {
-                        skipped += 1;
+                if let Some(entry) = entry {
+                    let path = entry.path();
+                    match fs::symlink_metadata(&path) {
+                        Ok(meta) => {
+                            if meta.file_type().is_symlink() {
+                                skipped += 1;
+                            } else if meta.is_dir() {
+                                self.dir_stack.push(path);
+                            } else if meta.is_file() {
+                                if is_video_file(&path) {
+                                    let name = path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or_default();
+                                    let parsed = release::parse(name);
+                                    files.push(TransferredFile {
+                                        path,
+                                        identified_release: Some(parsed),
+                                        nfo_identity: None,
+                                    });
+                                } else {
+                                    skipped += 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            issues.push(ScanIssue {
+                                path,
+                                kind: e.kind(),
+                            });
+                        }
                     }
                 }
 

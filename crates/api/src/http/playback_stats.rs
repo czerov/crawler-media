@@ -57,8 +57,17 @@ pub(crate) async fn watch_stats(
     } else {
         "visible"
     };
-    let visible: Option<Vec<domain::MediaId>> =
-        visible_media_ids(&store, user_id, scope).map(|ids| ids.into_iter().collect());
+    let visible: Option<Vec<domain::MediaId>> = match visible_media_ids(&store, user_id, scope) {
+        Ok(v) => v.map(|ids| ids.into_iter().collect()),
+        Err(error) => {
+            tracing::error!(%error, "加载观看统计可见范围失败");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "playback.query_failed",
+                "观看统计查询失败",
+            );
+        }
+    };
     let report = match store.playback_watch_report(
         target_user,
         visible.as_deref(),

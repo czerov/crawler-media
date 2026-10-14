@@ -206,3 +206,39 @@ pub(crate) fn nexusphp() -> &'static str {
 pub(crate) fn rss_xml() -> &'static str {
     include_str!("../../../indexer/tests/fixtures/rss.xml")
 }
+
+pub(crate) async fn scan_and_wait(app: &axum::Router, lib_id: &str) -> Value {
+    let scan = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!("/api/v1/libraries/{lib_id}/scan"),
+            Some("management-secret"),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(scan.status(), StatusCode::ACCEPTED);
+    let body = json_body(scan).await;
+    let op_id = body["data"]["operation_id"].as_str().unwrap();
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let poll = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/api/v1/libraries/{lib_id}/scan-operations/{op_id}"),
+                Some("management-secret"),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        if poll.status() == StatusCode::OK {
+            let p_body = json_body(poll).await;
+            if p_body["data"]["status"] == "completed" {
+                return p_body["data"]["report"].clone();
+            }
+        }
+    }
+    panic!("scan operation timed out");
+}

@@ -22,6 +22,23 @@ fn app(tmp: &tempfile::TempDir) -> axum::Router {
     router(state(tmp.path(), fetcher, downloader))
 }
 
+struct FakePlaybackClock(std::sync::atomic::AtomicI64);
+
+impl api::playback_events::PlaybackClock for FakePlaybackClock {
+    fn now_ms(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn app_with_clock(tmp: &tempfile::TempDir, clock: Arc<FakePlaybackClock>) -> axum::Router {
+    let fetcher = Arc::new(Fixtures {
+        requests: Mutex::new(Vec::new()),
+        bodies: HashMap::new(),
+    });
+    let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("stage")));
+    router(state(tmp.path(), fetcher, downloader).with_playback_clock(clock))
+}
+
 /// Seed one movie file in a movie library root and scan it, returning the
 /// media id via the ledger.
 async fn seed_movie(app: &axum::Router, tmp: &tempfile::TempDir) -> String {
@@ -49,17 +66,7 @@ async fn seed_movie(app: &axum::Router, tmp: &tempfile::TempDir) -> String {
         .as_str()
         .unwrap()
         .to_string();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{movie_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &movie_id).await;
     let ledger = json_body(
         app.clone()
             .oneshot(request(
@@ -140,7 +147,9 @@ async fn post_async(app: &axum::Router, uri: &str, body: Value) -> axum::respons
 #[tokio::test]
 async fn progress_lifecycle_writes_session_log_and_unit() {
     let tmp = tempfile::tempdir().unwrap();
-    let app = app(&tmp);
+    let now = api::job_loop::unix_now();
+    let clock = Arc::new(FakePlaybackClock(std::sync::atomic::AtomicI64::new(now * 1000)));
+    let app = app_with_clock(&tmp, clock.clone());
     let media_id = seed_movie(&app, &tmp).await;
 
     let start = post_async(
@@ -154,15 +163,21 @@ async fn progress_lifecycle_writes_session_log_and_unit() {
     assert_eq!(body["data"]["played"], false);
     assert_eq!(body["data"]["position_ms"], 0);
 
-    let beat = post_async(
-        &app,
-        "/api/v1/playback/progress",
-        json!({ "media_item_id": media_id, "event": "progress", "device_id": "web-1", "position_ms": 120_000, "paused": false }),
-    )
-    .await;
-    assert_eq!(beat.status(), StatusCode::OK);
-    let body = json_body(beat).await;
-    assert_eq!(body["data"]["position_ms"], 120_000);
+    // Send progress in realistic heartbeat increments (<= 30s)
+    for step in 1..=6 {
+        clock.0.fetch_add(20_000, std::sync::atomic::Ordering::SeqCst);
+        let beat = post_async(
+            &app,
+            "/api/v1/playback/progress",
+            json!({ "media_item_id": media_id, "event": "progress", "device_id": "web-1", "position_ms": step * 20_000, "paused": false }),
+        )
+        .await;
+        assert_eq!(beat.status(), StatusCode::OK);
+        if step == 6 {
+            let body = json_body(beat).await;
+            assert_eq!(body["data"]["position_ms"], 120_000);
+        }
+    }
 
     // Active session shows in activity.
     let activity = json_body(
@@ -186,7 +201,20 @@ async fn progress_lifecycle_writes_session_log_and_unit() {
     );
     assert_eq!(sessions[0]["media"]["title"], "The Matrix");
 
+    // Advance to 300_000 ms in realistic intervals
+    for step in 7..=14 {
+        clock.0.fetch_add(20_000, std::sync::atomic::Ordering::SeqCst);
+        let beat = post_async(
+            &app,
+            "/api/v1/playback/progress",
+            json!({ "media_item_id": media_id, "event": "progress", "device_id": "web-1", "position_ms": step * 20_000, "paused": false }),
+        )
+        .await;
+        assert_eq!(beat.status(), StatusCode::OK);
+    }
+
     // Stop closes the session into a play log.
+    clock.0.fetch_add(20_000, std::sync::atomic::Ordering::SeqCst);
     let stop = post_async(
         &app,
         "/api/v1/playback/progress",
@@ -344,13 +372,7 @@ async fn up_next_lists_next_episode_for_tv_subscription() {
         .as_str()
         .unwrap()
         .to_string();
-    let scan = post_async(
-        &app,
-        &format!("/api/v1/libraries/{tv_id}/scan"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &tv_id).await;
     let ledger = json_body(
         app.clone()
             .oneshot(request(
@@ -488,7 +510,9 @@ async fn end_web_session_and_reject_unsupported_revoke() {
 #[tokio::test]
 async fn stats_aggregate_and_policy_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
-    let app = app(&tmp);
+    let now = api::job_loop::unix_now();
+    let clock = Arc::new(FakePlaybackClock(std::sync::atomic::AtomicI64::new(now * 1000)));
+    let app = app_with_clock(&tmp, clock.clone());
     let media_id = seed_movie(&app, &tmp).await;
     let start = post_async(
         &app,
@@ -497,6 +521,17 @@ async fn stats_aggregate_and_policy_round_trip() {
     )
     .await;
     assert_eq!(start.status(), StatusCode::OK);
+    for step in 1..=2 {
+        clock.0.fetch_add(20_000, std::sync::atomic::Ordering::SeqCst);
+        let beat = post_async(
+            &app,
+            "/api/v1/playback/progress",
+            json!({ "media_item_id": media_id, "event": "progress", "device_id": "web-1", "position_ms": step * 20_000, "paused": false }),
+        )
+        .await;
+        assert_eq!(beat.status(), StatusCode::OK);
+    }
+    clock.0.fetch_add(20_000, std::sync::atomic::Ordering::SeqCst);
     let stop = post_async(
         &app,
         "/api/v1/playback/progress",

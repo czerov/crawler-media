@@ -298,7 +298,14 @@ async fn deleting_one_episode_keeps_sibling_ledger_rows() {
 
     let store = api::Store::open(temp.path().join("data")).unwrap();
     store
-        .set_library_root(domain::MediaKind::Tv, library_root.to_str().unwrap())
+        .create_library(
+            domain::MediaKind::Tv,
+            "电视剧",
+            &[library_root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        )
         .unwrap();
     let state = api::management::ApiState::new(
         store,
@@ -340,7 +347,7 @@ async fn deleting_one_episode_keeps_sibling_ledger_rows() {
     api::fs_watcher::handle_fs_events(
         &state,
         &tracker,
-        vec![fs_event(episode_two), fs_event(season_dir.clone())],
+        vec![fs_event(episode_two.clone()), fs_event(season_dir.clone())],
     );
     tracker.set_now(tracker.current_now() + 45);
     api::fs_watcher::handle_fs_events(&state, &tracker, Vec::new());
@@ -349,9 +356,11 @@ async fn deleting_one_episode_keeps_sibling_ledger_rows() {
     }
 
     let rows = state.store().lock().list_ledger().unwrap();
-    assert_eq!(rows.len(), 1, "只应删除已不存在的 E02，实际: {rows:?}");
+    assert_eq!(rows.len(), 2, "文件缺失后台账保留并被标记缺失: {rows:?}");
     assert_eq!(rows[0].id, first_id, "仍在磁盘上的 E01 不能换 ledger_id");
     assert_eq!(rows[0].path, episode_one.display().to_string());
+    assert!(state.store().lock().missing_at_by_path().unwrap().contains_key(&episode_two.display().to_string()));
+    assert!(!state.store().lock().missing_at_by_path().unwrap().contains_key(&episode_one.display().to_string()));
     assert!(state.store().lock().get_media(media.id).unwrap().is_some());
 }
 
@@ -429,29 +438,17 @@ async fn restoring_one_episode_after_grace_requeues_probe() {
     let after_expiry = store.lock();
     assert!(
         after_expiry
-            .ledger_by_path(&fixture.episode.display().to_string())
+            .missing_at_by_path()
             .unwrap()
-            .is_none(),
-        "宽限期过后这一集的台账应删除"
-    );
-    assert!(
-        after_expiry
-            .get_file_meta(&fixture.ledger_id.to_string())
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        after_expiry
-            .get_fingerprint_cache(&fixture.ledger_id.to_string())
-            .unwrap()
-            .is_none()
+            .contains_key(&fixture.episode.display().to_string()),
+        "宽限期过后这一集应被标记缺失"
     );
     assert!(
         after_expiry
             .get_media_marker(fixture.media_id, Some(1), Some(2))
             .unwrap()
-            .is_none(),
-        "这一集的片头片尾应随台账删除"
+            .is_some(),
+        "标记缺失时不应删除片头片尾"
     );
     assert!(
         after_expiry
@@ -471,27 +468,15 @@ async fn restoring_one_episode_after_grace_requeues_probe() {
     );
 
     let restored = wait_for_restored_ledger(&fixture);
-    assert_ne!(restored.id, fixture.ledger_id, "重新入账必须使用新的台账");
-    let probe = wait_for_probe_job(&fixture, &restored.id.to_string());
-    assert!(probe.is_some(), "重新入账后应创建媒体信息探测任务");
-}
-
-fn wait_for_probe_job(
-    fixture: &EpisodeFixture,
-    ledger_id: &str,
-) -> Option<store::ProbeJob> {
-    for _ in 0..50 {
-        if let Ok(Some(job)) = fixture
-            .state
-            .store()
-            .lock()
-            .latest_probe_job_for_scope(&format!("ledger:{ledger_id}"))
-        {
-            return Some(job);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    None
+    assert_eq!(restored.id, fixture.ledger_id, "文件恢复时保留原有台账");
+    let missing_cleared = !fixture
+        .state
+        .store()
+        .lock()
+        .missing_at_by_path()
+        .unwrap()
+        .contains_key(&fixture.episode.display().to_string());
+    assert!(missing_cleared, "恢复后缺失标记应被清除");
 }
 
 fn wait_for_restored_ledger(fixture: &EpisodeFixture) -> domain::LedgerRow {
@@ -528,7 +513,14 @@ fn episode_fixture() -> EpisodeFixture {
     std::fs::write(&sibling, "https://example.com/e01.mkv").unwrap();
     let store = api::Store::open(temp.path().join("data")).unwrap();
     store
-        .set_library_root(domain::MediaKind::Tv, library_root.to_str().unwrap())
+        .create_library(
+            domain::MediaKind::Tv,
+            "电视剧",
+            &[library_root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        )
         .unwrap();
     let state = api::management::ApiState::new(
         store,
@@ -667,7 +659,14 @@ async fn deleting_the_show_directory_removes_every_episode_ledger_row() {
 
     let store = api::Store::open(temp.path().join("data")).unwrap();
     store
-        .set_library_root(domain::MediaKind::Tv, library_root.to_str().unwrap())
+        .create_library(
+            domain::MediaKind::Tv,
+            "电视剧",
+            &[library_root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        )
         .unwrap();
     let state = api::management::ApiState::new(
         store,
@@ -708,9 +707,10 @@ async fn deleting_the_show_directory_removes_every_episode_ledger_row() {
     tracker.set_now(tracker.current_now() + 45);
     api::fs_watcher::handle_fs_events(&state, &tracker, Vec::new());
 
-    assert!(
-        state.store().lock().list_ledger().unwrap().is_empty(),
-        "整目录删除后两集台账都应消失"
+    assert_eq!(
+        state.store().lock().missing_at_by_path().unwrap().len(),
+        2,
+        "整目录删除后两集台账都应被标记缺失"
     );
-    assert!(state.store().lock().get_media(media.id).unwrap().is_none());
+    assert!(state.store().lock().get_media(media.id).unwrap().is_some());
 }

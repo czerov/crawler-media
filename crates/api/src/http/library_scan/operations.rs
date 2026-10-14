@@ -31,21 +31,24 @@ pub(crate) async fn cancel_scan_operation(
     Path((lib_id, op_id)): Path<(String, String)>,
 ) -> Response {
     let now_ms = crate::job_loop::unix_now() * 1000;
-    let store = state.store.lock();
-    let op_opt = match store.scan_operation(&op_id) {
-        Ok(opt) => opt,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &e.to_string()),
+    let cancel_res = {
+        let store = state.store.lock();
+        let op_opt = match store.scan_operation(&op_id) {
+            Ok(opt) => opt,
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &e.to_string()),
+        };
+        let Some(op) = op_opt else {
+            return err(StatusCode::NOT_FOUND, "scan_operation.missing", "未找到可取消的扫描操作");
+        };
+        if op.library_id != lib_id {
+            return err(StatusCode::NOT_FOUND, "scan_operation.missing", "未找到可取消的扫描操作");
+        }
+        store.cancel_scan(&op_id, now_ms)
     };
-    let Some(op) = op_opt else {
-        return err(StatusCode::NOT_FOUND, "scan_operation.missing", "未找到可取消的扫描操作");
-    };
-    if op.library_id != lib_id {
-        return err(StatusCode::NOT_FOUND, "scan_operation.missing", "未找到可取消的扫描操作");
-    }
 
-    match store.cancel_scan(&op_id, now_ms) {
+    match cancel_res {
         Ok(true) => {
-            state.cancel_library_work(&lib_id);
+            state.scan_coordinator.cancel_operation(&op_id);
             ok(json!({ "cancelled": true })).into_response()
         }
         Ok(false) => err(StatusCode::NOT_FOUND, "scan_operation.missing", "未找到可取消的扫描操作"),

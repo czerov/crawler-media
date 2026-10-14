@@ -229,8 +229,11 @@ impl PresenceFixture {
                 .await;
             if poll_status == StatusCode::OK {
                 let status_str = poll_res["data"]["status"].as_str().unwrap_or("");
-                if matches!(status_str, "completed" | "partial" | "failed" | "cancelled") {
-                    return (StatusCode::OK, poll_res["data"]["report"].clone());
+                match status_str {
+                    "completed" | "partial" => return (StatusCode::OK, poll_res["data"]["report"].clone()),
+                    "cancelled" => return (StatusCode::CONFLICT, poll_res["data"]["report"].clone()),
+                    "failed" => return (StatusCode::INTERNAL_SERVER_ERROR, poll_res["data"]["report"].clone()),
+                    _ => {}
                 }
             }
         }

@@ -206,8 +206,13 @@ fn reconcile_presence(
         for obs in &mut observations {
             if obs.presence == FilePresence::Missing && obs.missing_at.is_some() {
                 // Re-verify immediately before pruning
-                if let Ok(true) = state.library_files.presence(Path::new(&obs.row.path)) {
-                    obs.presence = FilePresence::Present;
+                match state.library_files.presence(Path::new(&obs.row.path)) {
+                    Ok(true) => obs.presence = FilePresence::Present,
+                    Ok(false) => obs.presence = FilePresence::Missing,
+                    Err(e) => {
+                        tracing::warn!(path = %obs.row.path, error = %e, "Re-verifying file presence returned error, skipping deletion");
+                        obs.presence = FilePresence::Unknown;
+                    }
                 }
             }
         }

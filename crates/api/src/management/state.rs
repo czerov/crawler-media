@@ -259,6 +259,8 @@ impl ApiState {
                 .map_err(std::io::Error::other)?;
             state.probe.try_start_workers();
             crate::scan_probe_dispatch::start_dispatcher(state.clone());
+            let _ = state.store.lock().recover_orphaned_scans();
+            state.scan_coordinator.trigger_next(&state);
         }
         Ok(state)
     }

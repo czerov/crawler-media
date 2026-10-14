@@ -1,8 +1,7 @@
 //! ScanCoordinator orchestrating single-flight durable scan operations.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use parking_lot::Mutex;
 use store::{ScanOperation, ScanOperationStatus};
@@ -18,12 +17,53 @@ pub enum ScanEnqueueError {
 
 pub struct ScanCoordinator {
     running_ops: Mutex<HashSet<String>>,
+    active_controls: Mutex<HashMap<String, library::WorkControl>>,
 }
 
 impl ScanCoordinator {
     pub fn new() -> Self {
         Self {
             running_ops: Mutex::new(HashSet::new()),
+            active_controls: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn register_control(&self, op_id: &str, control: library::WorkControl) {
+        self.active_controls.lock().insert(op_id.to_string(), control);
+    }
+
+    pub fn unregister_control(&self, op_id: &str) {
+        self.active_controls.lock().remove(op_id);
+    }
+
+    pub fn cancel_operation(&self, op_id: &str) {
+        if let Some(control) = self.active_controls.lock().get(op_id) {
+            control.cancel();
+        }
+    }
+
+    pub fn trigger_next(&self, state: &ApiState) {
+        let next_op = {
+            let running = self.running_ops.lock();
+            if running.len() >= 2 {
+                None
+            } else {
+                let store = state.store.lock();
+                match store.next_queued_scan() {
+                    Ok(Some(op)) if !running.contains(&op.id) => Some(op),
+                    _ => None,
+                }
+            }
+        };
+
+        if let Some(op) = next_op {
+            self.running_ops.lock().insert(op.id.clone());
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                run_operation(&state_clone, &op.id, &op.library_id).await;
+                state_clone.scan_coordinator.running_ops.lock().remove(&op.id);
+                state_clone.scan_coordinator.trigger_next(&state_clone);
+            });
         }
     }
 
@@ -71,23 +111,7 @@ impl ScanCoordinator {
             }
         }
 
-        // Check global concurrency (max 2 active scan operations)
-        {
-            let mut running = self.running_ops.lock();
-            if running.len() >= 2 {
-                // Operation queued, worker will pick it up or be triggered
-                return Ok(op);
-            }
-            running.insert(op.id.clone());
-        }
-
-        let state_clone = state.clone();
-        let op_id = op.id.clone();
-        let lib_id = library_id.to_string();
-        tokio::spawn(async move {
-            run_operation(&state_clone, &op_id, &lib_id).await;
-            state_clone.scan_coordinator.running_ops.lock().remove(&op_id);
-        });
+        self.trigger_next(state);
 
         Ok(op)
     }
@@ -107,6 +131,8 @@ async fn run_operation(state: &ApiState, op_id: &str, library_id: &str) {
         }
     };
 
+    state.scan_coordinator.register_control(op_id, lease.control().clone());
+
     {
         let store = state.store.lock();
         let _ = store.update_scan_operation_status(
@@ -122,6 +148,8 @@ async fn run_operation(state: &ApiState, op_id: &str, library_id: &str) {
         crate::http::library_scan::scan_library_leased_result(&state_clone, &lib_id, &lease)
     })
     .await;
+
+    state.scan_coordinator.unregister_control(op_id);
 
     let store = state.store.lock();
     match scan_res {

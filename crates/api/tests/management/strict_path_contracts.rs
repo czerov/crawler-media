@@ -36,17 +36,7 @@ async fn movie_library(tmp: &tempfile::TempDir) -> MovieLibrary {
     let source = root.join("Matrix.1999.mkv");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(&source, b"matrix-source-bytes").unwrap();
-    let response = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{}/scan", library.id),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    scan_and_wait(&app, &library.id).await;
     let rows = ledger(&app).await;
     assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
     assert_eq!(rows[0]["path"], source.to_str().unwrap());

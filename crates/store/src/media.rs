@@ -338,15 +338,40 @@ impl Store {
         &self,
         media: &Media,
         previous: Option<&Media>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         if let Some(previous) = previous {
-            self.update_media(previous)
-        } else {
-            self.app.execute(
-                "DELETE FROM media WHERE id = ?1",
-                params![media.id.to_string()],
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.app,
+                rusqlite::TransactionBehavior::Immediate,
             )?;
-            Ok(())
+            let current_matches: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM media WHERE id = ?1 AND title = ?2 AND kind = ?3)",
+                params![media.id.to_string(), media.title, media.kind.as_str()],
+                |r| r.get(0),
+            )?;
+            if !current_matches {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE media SET title = ?2, year = ?3, original_title = ?4, tmdb_id = ?5,
+                 douban_id = ?6, tvdb_id = ?7, bangumi_id = ?8, anilist_id = ?9
+                 WHERE id = ?1",
+                params![
+                    previous.id.to_string(),
+                    previous.title,
+                    previous.year,
+                    previous.original_title,
+                    previous.tmdb_id,
+                    previous.douban_id,
+                    previous.tvdb_id,
+                    previous.bangumi_id,
+                    previous.anilist_id,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        } else {
+            self.undo_ensured_media_if_unreferenced(media.id, media)
         }
     }
 

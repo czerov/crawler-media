@@ -52,17 +52,7 @@ async fn item_detail_reads_nfo_metadata_and_fanart() {
         .as_str()
         .unwrap()
         .to_string();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{movie_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &movie_id).await;
     // 扫描会写自己的最小 NFO，测试的富 NFO 在扫描后落盘（模拟外部刮削器产物）。
     std::fs::write(
         movie.join("The.Matrix.1999.2160p.nfo"),
@@ -161,17 +151,7 @@ async fn episode_still_url_and_bytes() {
         .as_str()
         .unwrap()
         .to_string();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{tv_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &tv_id).await;
 
     let ledger = json_body(
         app.clone()
@@ -251,17 +231,7 @@ async fn sibling_episodes_serve_their_own_stills() {
         .unwrap()["id"]
         .as_str()
         .unwrap();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, id).await;
     let ledger = json_body(
         app.clone()
             .oneshot(request(
@@ -330,17 +300,7 @@ async fn episode_without_artwork_does_not_advertise_missing_fanart() {
         .unwrap()["id"]
         .as_str()
         .unwrap();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, id).await;
     let ledger = json_body(
         app.clone()
             .oneshot(request(

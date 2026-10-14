@@ -76,14 +76,12 @@ pub(super) fn visible_media_ids(
     store: &crate::Store,
     user_id: domain::UserId,
     scope: &str,
-) -> Option<std::collections::HashSet<domain::MediaId>> {
+) -> Result<Option<std::collections::HashSet<domain::MediaId>>, store::StoreError> {
     if scope == "all" {
-        return None;
+        return Ok(None);
     }
-    match crate::visible_scope::VisibleScope::load(store, user_id) {
-        Ok(vs) => Some(vs.media_ids.into_iter().collect()),
-        Err(_) => None,
-    }
+    let vs = crate::visible_scope::VisibleScope::load(store, user_id)?;
+    Ok(Some(vs.media_ids.into_iter().collect()))
 }
 
 /// GET /playback/history?limit&before&days&member_id&scope — cursor-paginated.
@@ -133,7 +131,17 @@ pub(crate) async fn history(
     } else {
         "visible"
     };
-    let visible_media = visible_media_ids(&store, user_id, scope);
+    let visible_media = match visible_media_ids(&store, user_id, scope) {
+        Ok(v) => v,
+        Err(error) => {
+            tracing::error!(%error, "加载播放历史可见范围失败");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "playback.query_failed",
+                "播放历史查询失败",
+            );
+        }
+    };
     // SQL 侧做 keyset 分页 + 可见集合过滤 + hidden 计数：不再把整个表读进内存。
     let log_scope = crate::store::PlaybackLogScope {
         before,

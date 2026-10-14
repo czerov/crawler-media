@@ -47,17 +47,7 @@ async fn seed_tv(tmp: &tempfile::TempDir, app: &axum::Router) -> (String, String
         .as_str()
         .unwrap()
         .to_string();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{tv_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &tv_id).await;
     let ledger = json_body(
         app.clone()
             .oneshot(request(
@@ -133,17 +123,7 @@ async fn episodes_are_sorted_by_episode_number_ascending() {
         .as_str()
         .unwrap()
         .to_string();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{tv_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &tv_id).await;
 
     let ledger = json_body(
         app.clone()

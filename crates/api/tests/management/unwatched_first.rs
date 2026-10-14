@@ -59,17 +59,7 @@ async fn seed(tmp: &tempfile::TempDir, app: &axum::Router) -> (String, Vec<Strin
         .as_str()
         .unwrap()
         .to_string();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{library_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(app, &library_id).await;
     let ids: Vec<String> = items(app, &library_id, "sort=title").await
         .iter()
         .map(|item| item["media_item_id"].as_str().unwrap().to_string())

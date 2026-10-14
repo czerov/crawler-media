@@ -50,17 +50,7 @@ async fn seed_movie_lib(app: &axum::Router, tmp: &tempfile::TempDir) -> (String,
         .as_str()
         .unwrap()
         .to_string();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{movie_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &movie_id).await;
     let ledger = json_body(
         app.clone()
             .oneshot(request(

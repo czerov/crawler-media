@@ -111,20 +111,23 @@ async fn playing_progress_is_stored_per_user() {
 #[tokio::test]
 async fn jellyfin_session_events_create_activity_and_a_play_log() {
     let tmp = tempfile::tempdir().unwrap();
-    let (app, media_id, item_id) = app(tmp.path());
-    for (uri, ticks) in [
-        ("/Sessions/Playing", 10_000_000),
-        ("/Sessions/Playing/Progress", 30_000_000),
-    ] {
-        assert_eq!(
-            post_session_event(&app, uri, &item_id, ticks).await,
-            StatusCode::NO_CONTENT
-        );
-    }
+    let now = now_secs();
+    let clock = Arc::new(FakeClock(std::sync::atomic::AtomicI64::new(now * 1000)));
+    let (app, media_id, item_id) = app_with_clock(tmp.path(), clock.clone());
+
+    assert_eq!(
+        post_session_event(&app, "/Sessions/Playing", &item_id, 10_000_000).await,
+        StatusCode::NO_CONTENT
+    );
+
+    clock.0.store((now + 2) * 1000, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        post_session_event(&app, "/Sessions/Playing/Progress", &item_id, 30_000_000).await,
+        StatusCode::NO_CONTENT
+    );
 
     let user_id = domain::UserId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
     let store = Store::open(tmp.path().join("data")).unwrap();
-    let now = now_secs();
     let sessions = store.active_sessions(now, 60).unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].user_id, user_id);
@@ -134,13 +137,14 @@ async fn jellyfin_session_events_create_activity_and_a_play_log() {
     assert_eq!(sessions[0].device_name.as_deref(), Some("Bedroom Apple TV"));
     assert_eq!(sessions[0].position_ms, 3_000);
 
+    clock.0.store((now + 4) * 1000, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         post_session_event(&app, "/Sessions/Playing/Stopped", &item_id, 50_000_000).await,
         StatusCode::NO_CONTENT
     );
-    assert!(store.active_sessions(now_secs(), 60).unwrap().is_empty());
+    assert!(store.active_sessions(now + 4, 60).unwrap().is_empty());
     let logs = store
-        .list_logs(10, None, None, None, now_secs(), Some(user_id))
+        .list_logs(10, None, None, None, now + 4, Some(user_id))
         .unwrap();
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].media_id, media_id);

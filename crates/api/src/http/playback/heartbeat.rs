@@ -282,21 +282,36 @@ fn persist_heartbeat(
         Err(_) => return Ok((store.unit_state(heartbeat.user_id, heartbeat.media_id, heartbeat.season, heartbeat.episode)?.unwrap_or_default(), true)),
     };
 
-    let decision = crate::playback_events::classify_event(
-        previous.as_ref(),
-        binding.as_ref(),
-        &identity,
-        ledger_id,
-        event_kind,
-    );
+    let recently_ended = if previous.is_none() && event != "start" {
+        store
+            .recently_ended_device_session(heartbeat.user_id, device, heartbeat.now, 10)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let decision = if recently_ended {
+        crate::playback_events::EventDecision::Ignore
+    } else {
+        crate::playback_events::classify_event(
+            previous.as_ref(),
+            binding.as_ref(),
+            &identity,
+            ledger_id,
+            event_kind,
+        )
+    };
 
     match decision {
         crate::playback_events::EventDecision::Ignore => {
+            let admin_ended = previous.as_ref().is_some_and(|p| p.admin_ended)
+                || recently_ended
+                || binding.as_ref().is_some_and(|b| b.state == store::PlaySessionIdState::Closed);
             return Ok((
                 store
                     .unit_state(heartbeat.user_id, heartbeat.media_id, heartbeat.season, heartbeat.episode)?
                     .unwrap_or_default(),
-                false,
+                admin_ended,
             ));
         }
         crate::playback_events::EventDecision::Start => {
@@ -313,7 +328,7 @@ fn persist_heartbeat(
     }
 
     let is_new_start = decision == crate::playback_events::EventDecision::Start;
-    let unit = update_unit(store, heartbeat, if is_new_start { "start" } else { event })?;
+    let unit = update_unit(store, heartbeat, if is_new_start && event == "start" { "start" } else { event })?;
     let next = next_session(
         heartbeat,
         &unit,

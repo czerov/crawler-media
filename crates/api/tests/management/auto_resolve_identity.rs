@@ -74,16 +74,7 @@ async fn http_scan_rebinds_incoming_rows_to_canonical_media_identity() {
     std::fs::write(&video, b"fake video bytes").unwrap();
 
     let app = router(state.clone());
-    let res = app
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{lib_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    scan_and_wait(&app, &lib_id).await;
 
     let store_arc = state.store();
     let store = store_arc.lock();

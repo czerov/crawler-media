@@ -62,17 +62,7 @@ async fn create_movie_library_and_assert_empty_cover(
     std::fs::write(film_dir.join("poster.jpg"), b"fake poster bytes").unwrap();
     std::fs::write(film_dir.join("matrix.mp4"), b"fake video").unwrap();
 
-    let scan_res = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{lib_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan_res.status(), StatusCode::OK);
+    scan_and_wait(&app, &lib_id).await;
 
     let cover_res2 = app
         .clone()
@@ -124,17 +114,7 @@ async fn setup_movie_library_with_fanart(
         .join(format!("library-{lib_id}.jpg"));
     std::fs::create_dir_all(cover_file.parent().unwrap()).unwrap();
     std::fs::copy(&fanart, &cover_file).unwrap();
-    let scan_res2 = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{lib_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan_res2.status(), StatusCode::OK);
+    scan_and_wait(&app, &lib_id).await;
 
     let cover_res3 = app
         .clone()

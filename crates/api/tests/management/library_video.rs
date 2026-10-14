@@ -48,17 +48,7 @@ async fn video_library_scan_browses_by_filename() {
     let id = body["data"]["id"].as_str().unwrap().to_string();
     assert_eq!(body["data"]["kind"], "video");
 
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &id).await;
 
     let items = json_body(
         app.clone()

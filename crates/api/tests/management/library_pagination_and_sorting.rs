@@ -136,17 +136,7 @@ async fn library_items_respect_limit_and_offset() {
         .to_string();
 
     // 扫描库
-    let scan_res = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{movie_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan_res.status(), StatusCode::OK);
+    scan_and_wait(&app, &movie_id).await;
 
     // 全量是 3 个
     let all = json_data(

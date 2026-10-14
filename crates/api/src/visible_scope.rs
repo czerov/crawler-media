@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use domain::{MediaId, UserId};
-use store::{LibraryOwnership, Store, StoreError};
+use store::{LibraryPathScope, Store, StoreError, StrictOwner};
 
 pub struct VisibleScope {
     pub media_ids: Vec<MediaId>,
@@ -11,27 +11,32 @@ pub struct VisibleScope {
 
 impl VisibleScope {
     pub fn load(store: &Store, user_id: UserId) -> Result<Self, StoreError> {
-        let ownership = store.library_ownership()?;
-        let visible_libs: HashSet<String> = ownership
+        let snapshot = store.library_ownership()?;
+        let visible_libs: HashSet<String> = snapshot
             .libraries()
             .iter()
             .filter(|lib| crate::http::library::library_visible(store, lib, Some(user_id)))
             .map(|lib| lib.id.clone())
             .collect();
 
+        let scope = LibraryPathScope::resolve(snapshot)?;
+        let rows = store.list_ledger()?;
+        let media_ids: Vec<MediaId> = rows.iter().map(|r| r.media_id).collect();
+        let media_map = store.media_batch(&media_ids)?;
+
         let mut media_set = HashSet::new();
-        for row in store.list_ledger()? {
-            let p = std::path::Path::new(&row.path);
-            if let Some(owner) = ownership.owner(p, domain::MediaKind::Movie) {
-                if visible_libs.contains(&owner.id) {
+        for row in rows {
+            let Some(media) = media_map.get(&row.media_id) else {
+                continue;
+            };
+            let Ok(resolved) = LibraryPathScope::resolve_path(std::path::Path::new(&row.path)) else {
+                continue;
+            };
+            match scope.owner(&resolved, media.kind) {
+                StrictOwner::Owned(owner) if visible_libs.contains(&owner.id) => {
                     media_set.insert(row.media_id);
-                    continue;
                 }
-            }
-            if let Some(owner) = ownership.owner(p, domain::MediaKind::Tv) {
-                if visible_libs.contains(&owner.id) {
-                    media_set.insert(row.media_id);
-                }
+                _ => {}
             }
         }
 

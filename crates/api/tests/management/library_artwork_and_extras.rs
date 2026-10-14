@@ -48,16 +48,7 @@ async fn upload_artwork_larger_than_2mb_succeeds_without_axum_body_limit_rejecti
         .unwrap();
     let movie_id = movie_lib["id"].as_str().unwrap();
 
-    let _ = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{movie_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
+    scan_and_wait(&app, &movie_id).await;
 
     let items = json_data(
         app.clone()
@@ -129,16 +120,7 @@ async fn extras_only_detaches_specified_file_ids_not_whole_media() {
         .unwrap();
     let tv_id = tv_lib["id"].as_str().unwrap();
 
-    let _ = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{tv_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
+    scan_and_wait(&app, tv_id).await;
 
     let store = api::Store::open(tmp.path().join("data")).unwrap();
     let ledger = store.list_ledger().unwrap();

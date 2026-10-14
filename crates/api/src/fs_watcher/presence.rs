@@ -12,37 +12,16 @@ use store::{
 use crate::library_presence::PresenceError;
 use crate::management::ApiState;
 
-/// Observe a file event path and apply presence to matching active realtime libraries.
-///
-/// This function never deletes ledger rows or user facts.
-/// Missing files get `missing_at` set (only on first observation);
-/// restored files have `missing_at` cleared.
-pub(crate) fn observe_event(
+fn collect_event_observations(
     state: &ApiState,
     path: &Path,
-) -> Result<LedgerPresenceResult, PresenceError> {
-    // 1. Snapshot libraries in store lock
-    let (snapshot, candidate_rows, missing_map, media_kinds) = {
-        let store_arc = state.store();
-        let guard = store_arc.lock();
-        let snapshot = guard.library_ownership()?;
-        let rows = guard.list_ledger()?;
-        let missing_map = guard.missing_at_by_path()?;
-        let media_ids: Vec<domain::MediaId> = rows.iter().map(|r| r.media_id).collect();
-        let media_map = guard.media_batch(&media_ids)?;
-        let media_kinds: HashMap<domain::MediaId, domain::MediaKind> = media_map
-            .into_iter()
-            .map(|(mid, m)| (mid, m.kind))
-            .collect();
-        (snapshot, rows, missing_map, media_kinds)
-    };
-
-    // 2. Resolve scope out of lock
-    let scope = LibraryPathScope::resolve(snapshot.clone())?;
-
+    scope: &LibraryPathScope,
+    candidate_rows: Vec<domain::LedgerRow>,
+    missing_map: &HashMap<String, i64>,
+    media_kinds: &HashMap<domain::MediaId, domain::MediaKind>,
+) -> HashMap<String, Vec<LedgerPresenceObservation>> {
     let mut observations_by_lib: HashMap<String, Vec<LedgerPresenceObservation>> = HashMap::new();
 
-    // Check matching candidate rows
     for row in candidate_rows {
         let row_p = Path::new(&row.path);
         let matches_event = row_p == path || row_p.starts_with(path);
@@ -58,22 +37,23 @@ pub(crate) fn observe_event(
             continue;
         };
 
-        // Match owner library for this row using real MediaKind
         let owner_lib = match scope.owner(&resolved, real_kind) {
             StrictOwner::Owned(lib) => lib,
             _ => continue,
         };
 
-        // Must be active and realtime_watch == true
         if !owner_lib.realtime_watch || !scope.accepts_work(&owner_lib.id) {
             continue;
         }
 
-        // Find the specific matching root and check if it is readable
         let matching_root = owner_lib
             .root_paths
             .iter()
-            .find(|r| resolved.starts_with(r));
+            .find(|r| {
+                resolved.starts_with(r)
+                    || LibraryPathScope::resolve_path(r)
+                        .is_ok_and(|res_r| resolved.starts_with(&res_r))
+            });
         let Some(root) = matching_root else {
             continue;
         };
@@ -101,10 +81,14 @@ pub(crate) fn observe_event(
             });
     }
 
-    if observations_by_lib.is_empty() {
-        return Ok(LedgerPresenceResult::default());
-    }
+    observations_by_lib
+}
 
+fn publish_event_observations(
+    state: &ApiState,
+    scope: &LibraryPathScope,
+    observations_by_lib: HashMap<String, Vec<LedgerPresenceObservation>>,
+) -> LedgerPresenceResult {
     let mut total_result = LedgerPresenceResult::default();
     let now = crate::job_loop::unix_now();
 
@@ -129,13 +113,55 @@ pub(crate) fn observe_event(
                 .map_err(|e| e.to_string())
         });
 
-        if let Ok(res) = sub_res {
-            total_result.missing += res.missing;
-            total_result.restored += res.restored;
-            total_result.deleted += res.deleted;
-            total_result.skipped += res.skipped;
+        match sub_res {
+            Ok(res) => {
+                total_result.missing += res.missing;
+                total_result.restored += res.restored;
+                total_result.deleted += res.deleted;
+                total_result.skipped += res.skipped;
+            }
+            Err(err) => {
+                tracing::warn!(library_id = %lib_id, %err, "Failed to publish watcher presence");
+            }
         }
     }
 
-    Ok(total_result)
+    total_result
+}
+
+/// Observe a file event path and apply presence to matching active realtime libraries.
+pub(crate) fn observe_event(
+    state: &ApiState,
+    path: &Path,
+) -> Result<LedgerPresenceResult, PresenceError> {
+    let (snapshot, candidate_rows, missing_map, media_kinds) = {
+        let store_arc = state.store();
+        let guard = store_arc.lock();
+        let snapshot = guard.library_ownership()?;
+        let rows = guard.list_ledger()?;
+        let missing_map = guard.missing_at_by_path()?;
+        let media_ids: Vec<domain::MediaId> = rows.iter().map(|r| r.media_id).collect();
+        let media_map = guard.media_batch(&media_ids)?;
+        let media_kinds: HashMap<domain::MediaId, domain::MediaKind> = media_map
+            .into_iter()
+            .map(|(mid, m)| (mid, m.kind))
+            .collect();
+        (snapshot, rows, missing_map, media_kinds)
+    };
+
+    let scope = LibraryPathScope::resolve(snapshot)?;
+    let observations_by_lib = collect_event_observations(
+        state,
+        path,
+        &scope,
+        candidate_rows,
+        &missing_map,
+        &media_kinds,
+    );
+
+    if observations_by_lib.is_empty() {
+        return Ok(LedgerPresenceResult::default());
+    }
+
+    Ok(publish_event_observations(state, &scope, observations_by_lib))
 }

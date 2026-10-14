@@ -76,3 +76,50 @@ async fn watched_time_accumulates_correctly_and_ignores_seeks() {
     let s = store_arc.lock().get_session(user_id, "dev_clock").unwrap().unwrap();
     assert_eq!(s.watched_ms, 0, "seek must not add to watched_ms");
 }
+
+#[tokio::test]
+async fn legacy_client_without_session_id_seek_does_not_accumulate_watch_time() {
+    let fix = PresenceFixture::new();
+    let (_, row) = fix.insert_media_and_ledger("legacy_seek.mkv");
+    let user_id = {
+        let store_arc = fix.state.store();
+        let guard = store_arc.lock();
+        guard.user_by_token(&fix.admin_token).unwrap().unwrap().id
+    };
+
+    let (status, _) = fix
+        .request_with_body(
+            "POST",
+            "/api/v1/playback/progress",
+            Some(&fix.admin_token),
+            json!({
+                "device_id": "legacy_dev",
+                "media_item_id": row.media_id.to_string(),
+                "file_id": row.id.to_string(),
+                "event": "start",
+                "position_ms": 0,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = fix
+        .request_with_body(
+            "POST",
+            "/api/v1/playback/progress",
+            Some(&fix.admin_token),
+            json!({
+                "device_id": "legacy_dev",
+                "media_item_id": row.media_id.to_string(),
+                "file_id": row.id.to_string(),
+                "event": "progress",
+                "position_ms": 600_000,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let store_arc = fix.state.store();
+    let s = store_arc.lock().get_session(user_id, "legacy_dev").unwrap().unwrap();
+    assert_eq!(s.watched_ms, 0, "legacy seek must not accumulate watch time");
+}

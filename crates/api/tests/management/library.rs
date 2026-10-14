@@ -81,17 +81,7 @@ async fn libraries_scan_walks_all_roots() {
     )
     .await;
 
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &id).await;
 
     let body = get(&app, "/api/v1/libraries").await;
     let library = body["data"]
@@ -138,17 +128,7 @@ async fn library_item_poster_url_uses_hyphenated_uuid() {
     )
     .await;
     let id = created["data"]["id"].as_str().unwrap().to_string();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, &id).await;
     let items = get(&app, &format!("/api/v1/libraries/{id}/items")).await;
     let poster = items["data"][0]["poster_url"].as_str().unwrap();
     assert!(
@@ -294,17 +274,7 @@ async fn libraries_scope_items_to_their_roots() {
     let id_a = create_library(&app, "库 A", "movie", &[root_a.display().to_string()]).await;
     let id_b = create_library(&app, "库 B", "movie", &[root_b.display().to_string()]).await;
     for id in [&id_a, &id_b] {
-        let scan = app
-            .clone()
-            .oneshot(request(
-                "POST",
-                &format!("/api/v1/libraries/{id}/scan"),
-                Some("management-secret"),
-                Value::Null,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(scan.status(), StatusCode::OK);
+        scan_and_wait(&app, id).await;
     }
 
     let items_a = get(&app, &format!("/api/v1/libraries/{id_a}/items")).await;
@@ -464,17 +434,7 @@ async fn setup_missing_rows(
     .await;
     let lib_id = created["data"]["id"].as_str().unwrap().to_string();
 
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{lib_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(app, &lib_id).await;
 
     let items = get(app, &format!("/api/v1/libraries/{lib_id}/items")).await;
     let id_a = items["data"][0]["media_item_id"]

@@ -91,3 +91,48 @@ async fn frozen_or_deleted_library_rejects_presence_operations() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(res["error"]["code"], "library.deleting");
 }
+
+#[tokio::test]
+async fn prune_with_permission_denied_on_recheck_skips_and_preserves_ledger() {
+    let fix = PresenceFixture::new();
+    let (_media_id, row) = fix.insert_media_and_ledger("perm_denied.mkv");
+    let file_path = std::path::PathBuf::from(&row.path);
+
+    // 1. First observation: Ok(false) -> marked missing
+    fix.mock_files
+        .files
+        .lock()
+        .insert(file_path.clone(), Ok(false));
+    let (status, res) = fix
+        .request(
+            "POST",
+            &format!("/api/v1/libraries/{}/verify", fix.library_id),
+            Some(&fix.admin_token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(res["data"]["missing"], 1);
+
+    // 2. Before prune: file has permission denied on disk
+    fix.mock_files
+        .files
+        .lock()
+        .insert(file_path, Err(std::io::ErrorKind::PermissionDenied));
+
+    // 3. Prune missing-rows: must NOT delete unverified/permission-denied files
+    let (status, res) = fix
+        .request(
+            "DELETE",
+            &format!("/api/v1/libraries/{}/missing-rows", fix.library_id),
+            Some(&fix.admin_token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(res["data"]["deleted"], 0);
+    assert_eq!(res["data"]["skipped"], 1);
+
+    // 4. Ledger row is safely preserved!
+    let store_arc = fix.state.store();
+    let guard = store_arc.lock();
+    assert!(guard.get_ledger(&row.id.to_string()).unwrap().is_some());
+}

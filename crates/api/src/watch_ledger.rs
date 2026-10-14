@@ -19,7 +19,9 @@ pub fn record_paths(
             .map_err(|e| e.to_string())?
             .is_some()
         {
-            let _ = store.clear_ledger_missing(&path_str);
+            if let Ok(true) = store.clear_ledger_missing(&path_str) {
+                inserted.push(dest);
+            }
             continue;
         }
         let name = dest
@@ -83,7 +85,9 @@ pub fn record_video_paths(
             .map_err(|e| e.to_string())?
             .is_some()
         {
-            let _ = store.clear_ledger_missing(&path_str);
+            if let Ok(true) = store.clear_ledger_missing(&path_str) {
+                inserted.push(dest);
+            }
             continue;
         }
         let stem = dest

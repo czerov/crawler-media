@@ -526,17 +526,7 @@ async fn library_scan_auto_resolves_tmdb_metadata() {
         .unwrap();
 
     // Trigger scan
-    let scan_res = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{tv_lib_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan_res.status(), StatusCode::OK);
+    scan_and_wait(&app, tv_lib_id).await;
 
     // Verify media was auto-recorded in ledger
     let ledger = store.list_ledger().unwrap();
@@ -586,17 +576,7 @@ async fn scan_keeps_same_title_different_years_and_kinds_separate() {
             .unwrap()["id"]
             .as_str()
             .unwrap();
-        let response = app
-            .clone()
-            .oneshot(request(
-                "POST",
-                &format!("/api/v1/libraries/{id}/scan"),
-                Some("management-secret"),
-                Value::Null,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        scan_and_wait(&app, id).await;
     }
     let rows = store.list_ledger().unwrap();
     assert_eq!(rows.len(), 3);
@@ -673,17 +653,7 @@ async fn metadata_refresh_writes_each_episode_still_in_shared_directory() {
         .unwrap()["id"]
         .as_str()
         .unwrap();
-    let scan = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan.status(), StatusCode::OK);
+    scan_and_wait(&app, id).await;
     let rows = store.list_ledger().unwrap();
     assert_eq!(rows.len(), 2);
     let mut item = store.get_media(rows[0].media_id).unwrap().unwrap();

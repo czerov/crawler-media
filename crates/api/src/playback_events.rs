@@ -46,10 +46,6 @@ pub fn watched_increment(
         return 0;
     }
 
-    if previous.play_session_id.is_none() {
-        return (position_ms - previous.position_ms).max(0);
-    }
-
     let rate = if (0.25..=4.0).contains(&rate) { rate } else { 1.0 };
     let elapsed = clock::clamp_elapsed(now_ms, previous.last_report_at_ms);
     if elapsed == 0 {
@@ -164,7 +160,7 @@ pub fn classify_event(
                         EventDecision::Ignore
                     }
                 } else {
-                    EventDecision::Start
+                    EventDecision::Update
                 }
             }
             PlaybackEventKind::Stop => {

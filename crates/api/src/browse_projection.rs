@@ -27,6 +27,19 @@ impl From<String> for ProjectionError {
     }
 }
 
+struct InflightLeaderGuard<'a> {
+    inflight: &'a Mutex<HashMap<String, broadcast::Sender<Result<ProjectionSnapshot, String>>>>,
+    library_id: String,
+    tx: Option<broadcast::Sender<Result<ProjectionSnapshot, String>>>,
+}
+
+impl<'a> Drop for InflightLeaderGuard<'a> {
+    fn drop(&mut self) {
+        let mut map = self.inflight.lock();
+        map.remove(&self.library_id);
+    }
+}
+
 pub struct ProjectionService {
     dirty_libraries: Mutex<HashMap<String, u64>>,
     inflight: Mutex<HashMap<String, broadcast::Sender<Result<ProjectionSnapshot, String>>>>,
@@ -75,18 +88,23 @@ impl ProjectionService {
         }
 
         // Single-flight coordination
-        let (rx, is_leader) = {
+        let (rx, leader_guard) = {
             let mut map = self.inflight.lock();
             if let Some(tx) = map.get(&library_id) {
-                (tx.subscribe(), false)
+                (tx.subscribe(), None)
             } else {
                 let (tx, rx) = broadcast::channel(1);
-                map.insert(library_id.clone(), tx);
-                (rx, true)
+                map.insert(library_id.clone(), tx.clone());
+                let guard = InflightLeaderGuard {
+                    inflight: &self.inflight,
+                    library_id: library_id.clone(),
+                    tx: Some(tx),
+                };
+                (rx, Some(guard))
             }
         };
 
-        if !is_leader {
+        if leader_guard.is_none() {
             let mut rx = rx;
             match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
                 Ok(Ok(Ok(snap))) => return Ok(snap),
@@ -96,6 +114,7 @@ impl ProjectionService {
             }
         }
 
+        let mut leader_guard = leader_guard.unwrap();
         let dirty_version_before = self.dirty_libraries.lock().get(&library_id).copied();
 
         // Leader executes build with RAII inflight guard
@@ -105,10 +124,7 @@ impl ProjectionService {
             builder::build(&state_clone, &lib_id)
         })
         .await
-        .map_err(|e| {
-            self.inflight.lock().remove(&library_id);
-            ProjectionError::Failed(e.to_string())
-        })?;
+        .map_err(|e| ProjectionError::Failed(e.to_string()))?;
 
         let res = match build_res {
             Ok(build) => {
@@ -132,12 +148,12 @@ impl ProjectionService {
             Err(e) => Err(e),
         };
 
-        // Broadcast to followers and remove inflight leader
+        // Broadcast to followers and drop leader guard
         let broadcast_payload = res.as_ref().map(|s| s.clone()).map_err(|e| format!("{:?}", e));
-        let mut map = self.inflight.lock();
-        if let Some(tx) = map.remove(&library_id) {
+        if let Some(tx) = leader_guard.tx.take() {
             let _ = tx.send(broadcast_payload);
         }
+        drop(leader_guard);
 
         res
     }

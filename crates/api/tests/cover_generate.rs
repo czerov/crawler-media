@@ -21,12 +21,7 @@ fn test_app(tmp: &tempfile::TempDir) -> axum::Router {
     router(state(tmp.path(), fetcher, downloader))
 }
 
-#[tokio::test]
-async fn test_generate_library_cover_endpoint() {
-    let tmp = tempfile::tempdir().unwrap();
-    let app = test_app(&tmp);
-
-    // 1. 创建电影库
+async fn setup_library_with_poster(app: &axum::Router, tmp: &tempfile::TempDir) -> String {
     let movies_dir = tmp.path().join("library").join("movies");
     std::fs::create_dir_all(&movies_dir).unwrap();
 
@@ -47,9 +42,8 @@ async fn test_generate_library_cover_endpoint() {
 
     assert_eq!(create_lib_res.status(), StatusCode::OK);
     let lib_info = json_body(create_lib_res).await;
-    let lib_id = lib_info["data"]["id"].as_str().unwrap();
+    let lib_id = lib_info["data"]["id"].as_str().unwrap().to_string();
 
-    // 2. 空库时，尝试生成应返回 400 cover.empty
     let res_empty = app
         .clone()
         .oneshot(request(
@@ -62,7 +56,6 @@ async fn test_generate_library_cover_endpoint() {
         .unwrap();
     assert_eq!(res_empty.status(), StatusCode::BAD_REQUEST);
 
-    // 3. 在电影目录下放假海报 (JPEG 需保存为 RGB，不支持包含 Alpha 通道的 Rgba8)
     let movie_item_dir = movies_dir.join("Inception (2010)");
     std::fs::create_dir_all(&movie_item_dir).unwrap();
     let mut fake_poster = image::RgbImage::new(300, 450);
@@ -70,13 +63,10 @@ async fn test_generate_library_cover_endpoint() {
         *pixel = image::Rgb([30, 90, 160]);
     }
     fake_poster.save(movie_item_dir.join("poster.jpg")).unwrap();
-    // 写入假视频文件以便触发媒体扫描或 ledger 关联
     std::fs::write(movie_item_dir.join("Inception (2010).mkv"), b"video dummy").unwrap();
 
-    // 等待建库首次自动扫描排空
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
-    // 触发库扫描使文件入账
     let scan_res = app
         .clone()
         .oneshot(request(
@@ -112,6 +102,14 @@ async fn test_generate_library_cover_endpoint() {
         }
     }
     assert!(completed, "scan must complete");
+    lib_id
+}
+
+#[tokio::test]
+async fn test_generate_library_cover_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = test_app(&tmp);
+    let lib_id = setup_library_with_poster(&app, &tmp).await;
 
     // 4. 调用预览模式 (preview_only: true)
     let res_preview = app

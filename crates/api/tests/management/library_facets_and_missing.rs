@@ -53,17 +53,7 @@ async fn item_index_and_facets_return_structured_dtos() {
         .to_string();
 
     // 扫描
-    let scan_res = app
-        .clone()
-        .oneshot(request(
-            "POST",
-            &format!("/api/v1/libraries/{movie_id}/scan"),
-            Some("management-secret"),
-            Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(scan_res.status(), StatusCode::OK);
+    scan_and_wait(&app, &movie_id).await;
 
     // 1. 测试 item-index 桶聚合
     let index_res = json_data(

@@ -153,23 +153,23 @@ pub(super) fn report_event(
         event_kind,
     );
 
-    match decision {
-        crate::playback_events::EventDecision::Ignore => return Ok(()),
-        crate::playback_events::EventDecision::Start => {
-            if let Some(ref sid) = identity.play_session_id {
-                let _ = store.activate_play_session(user_id, &client.device_id, sid);
-            }
-        }
-        crate::playback_events::EventDecision::Stop => {
-            if let Some(ref sid) = identity.play_session_id {
-                let _ = store.close_play_session_id(user_id, &client.device_id, sid);
-            }
-        }
-        crate::playback_events::EventDecision::Update => {}
-    }
-
     store
         .playback_write(|store| {
+            match decision {
+                crate::playback_events::EventDecision::Ignore => return Ok(()),
+                crate::playback_events::EventDecision::Start => {
+                    if let Some(ref sid) = identity.play_session_id {
+                        store.activate_play_session(user_id, &client.device_id, sid)?;
+                    }
+                }
+                crate::playback_events::EventDecision::Stop => {
+                    if let Some(ref sid) = identity.play_session_id {
+                        store.close_play_session_id(user_id, &client.device_id, sid)?;
+                    }
+                }
+                crate::playback_events::EventDecision::Update => {}
+            }
+
             persist_event(
                 store,
                 user_id,
@@ -181,6 +181,7 @@ pub(super) fn report_event(
                 identity.play_session_id.as_deref(),
                 identity.event_sequence,
                 now,
+                now_ms,
             )
         })
         .map_err(|error| error.to_string())
@@ -197,6 +198,7 @@ fn persist_event(
     play_session_id: Option<&str>,
     event_sequence: Option<i64>,
     now: i64,
+    now_ms: i64,
 ) -> Result<(), StoreError> {
     let current = current_session(store, user_id, &client.device_id, target, play_session_id, now)?;
     if current.as_ref().is_some_and(|s| s.admin_ended) {
@@ -221,7 +223,6 @@ fn persist_event(
         event == PlaybackEvent::Playing && current.is_none(),
         now,
     )?;
-    let now_ms = now * 1000;
     let watched_ms = accumulated_watch_time(
         current.as_ref(),
         position_ms,
@@ -239,6 +240,7 @@ fn persist_event(
             watched_ms,
             current.as_ref(),
             now,
+            now_ms,
         );
     }
     store.upsert_session(&session_row(
@@ -252,6 +254,7 @@ fn persist_event(
         play_session_id,
         event_sequence,
         now,
+        now_ms,
     ))
 }
 fn current_session(
@@ -341,6 +344,7 @@ fn stop_session(
     watched_ms: i64,
     existing: Option<&SessionRow>,
     now: i64,
+    now_ms: i64,
 ) -> Result<(), StoreError> {
     if existing.is_none() {
         return Ok(());
@@ -356,6 +360,7 @@ fn stop_session(
         existing.and_then(|s| s.play_session_id.as_deref()),
         existing.and_then(|s| s.last_event_sequence),
         now,
+        now_ms,
     ))?;
     store.close_session(user_id, &client.device_id, now)?;
     Ok(())
@@ -377,6 +382,7 @@ fn session_row(
     play_session_id: Option<&str>,
     event_sequence: Option<i64>,
     now: i64,
+    now_ms: i64,
 ) -> SessionRow {
     SessionRow {
         device_id: client.device_id.clone(),
@@ -414,7 +420,7 @@ fn session_row(
         last_report_at: now,
         ledger_id: Some(target.ledger_id.clone()),
         play_session_id: play_session_id.map(str::to_string).or_else(|| existing.and_then(|s| s.play_session_id.clone())),
-        last_report_at_ms: now * 1000,
+        last_report_at_ms: now_ms,
         last_event_sequence: event_sequence.or_else(|| existing.and_then(|s| s.last_event_sequence)),
     }
 }

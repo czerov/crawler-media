@@ -184,6 +184,26 @@ impl Store {
         Ok(self.close_session(user_id, device_id, now)?.is_some())
     }
 
+    /// Check if a session was recently ended/closed on this device within window_secs.
+    pub fn recently_ended_device_session(
+        &self,
+        user_id: UserId,
+        device_id: &str,
+        now: i64,
+        window_secs: i64,
+    ) -> Result<bool, StoreError> {
+        let cutoff = now - window_secs;
+        let exists: bool = self.subscribe.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM playback_logs
+                 WHERE user_id = ?1 AND device_id = ?2 AND ended_at >= ?3
+             )",
+            params![user_id.to_string(), device_id, cutoff],
+            |r| r.get(0),
+        )?;
+        Ok(exists)
+    }
+
     /// Close every session whose heartbeat is older than the timeout.
     pub fn sweep_stale_sessions(&self, now: i64, timeout_secs: i64) -> Result<usize, StoreError> {
         let cutoff = now - timeout_secs;

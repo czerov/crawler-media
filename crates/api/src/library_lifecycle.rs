@@ -27,10 +27,6 @@ impl ApiState {
     pub async fn wait_library_idle(&self, library_id: &str) {
         self.library_work.wait_idle(library_id).await;
     }
-
-    pub fn cancel_library_work(&self, library_id: &str) {
-        self.library_work.cancel(library_id);
-    }
 }
 
 pub fn start_library_removal(state: &ApiState, library_id: &str)
