@@ -12,6 +12,12 @@ use cover_generator::CoverOptions;
 
 use crate::ApiState;
 
+/// Values of the `library_cover_checked.{library_id}` setting.
+///
+/// `MARKER_CHECKED` records that an automatic cover was published. `MARKER_RETRY`
+/// marks an attempt worth retrying, and is the only value a scan clears (see
+/// `clear_library_cover_checked`); clearing `checked-v2` on every scan would
+/// re-render covers needlessly.
 pub const MARKER_CHECKED: &str = "checked-v2";
 pub const MARKER_MANUAL: &str = "manual-v2";
 pub const MARKER_RETRY: &str = "auto-v2";
@@ -328,5 +334,63 @@ fn mark(state: &ApiState, library_id: &str, marker: &str) {
     let store = state.store.lock();
     if let Err(error) = store.put_setting(&format!("library_cover_checked.{library_id}"), marker) {
         tracing::warn!(%error, library_id, "failed to mark library cover state");
+    }
+}
+
+/// Remove every on-disk cover artifact owned by `library_id`.
+///
+/// Library removal is the one place where the "legacy `library-{id}.jpg` is
+/// read-only and never unlinked" rule is intentionally lifted: the Library row is
+/// gone, so nothing can read that file again. Returns the number of files removed.
+pub fn remove_library_cover_files(covers_dir: &Path, library_id: &str) -> usize {
+    let legacy = format!("library-{library_id}.jpg");
+    let versioned = format!("library-{library_id}-");
+    let entries = match std::fs::read_dir(covers_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => {
+            tracing::warn!(%error, dir = %covers_dir.display(), "读取封面目录失败，跳过封面清理");
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name != legacy && !name.starts_with(&versioned) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %entry.path().display(), "删除媒体库封面文件失败");
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!(library_id, removed, "已清理媒体库封面文件");
+    }
+    removed
+}
+
+/// Reconcile covers of Libraries whose removal already succeeded.
+///
+/// A crash between the DB commit and the file unlink would otherwise leave the
+/// bytes behind forever; every startup retries, so the cleanup is idempotent.
+pub fn purge_removed_library_covers(state: &ApiState) {
+    let (covers_dir, removals) = {
+        let store = state.store.lock();
+        (store.library_covers_dir(), store.succeeded_library_removals())
+    };
+    let removals = match removals {
+        Ok(removals) => removals,
+        Err(error) => {
+            tracing::warn!(%error, "读取已完成的媒体库删除记录失败，跳过封面清理");
+            return;
+        }
+    };
+    for removal in removals {
+        remove_library_cover_files(&covers_dir, &removal.library_id);
     }
 }

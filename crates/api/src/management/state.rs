@@ -266,6 +266,8 @@ impl ApiState {
             }
             state.scan_coordinator.trigger_next(&state);
         }
+        // 幂等对账：崩溃可能停在「DB 已提交、封面文件还没删」之间，每次启动重试。
+        crate::library_cover_service::purge_removed_library_covers(&state);
         Ok(state)
     }
 

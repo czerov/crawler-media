@@ -340,6 +340,10 @@ impl Store {
             None
         };
 
+        // Only an active job may be driven to a new terminal state by a unit
+        // finishing: a unit that completes after the job was cancelled (Library
+        // removed, file deleted) must not resurrect it — a marker_refresh job
+        // would otherwise flip back to `running` with no work items left.
         tx.execute(
             "UPDATE probe_jobs SET
                  completed = ?2,
@@ -349,7 +353,7 @@ impl Store {
                  finished_at_ms = COALESCE(?6, finished_at_ms),
                  error = COALESCE((SELECT error FROM probe_job_units
                                    WHERE job_id = ?1 AND error IS NOT NULL LIMIT 1), error)
-             WHERE id = ?1",
+             WHERE id = ?1 AND status IN ('queued', 'running')",
             params![job_id, completed, succeeded, failed, job_status, finished_at],
         )?;
         tx.commit()?;

@@ -1,7 +1,15 @@
 //! Recoverable Library removal. Media and user Playback have separate lifetimes.
+//!
+//! Two storage decisions matter before changing this module:
+//!
+//! - `library_removal_roots` is the permanent boundary. A removed root keeps
+//!   rejecting work from stale paths after the operation succeeds, and the hot
+//!   `path_in_removal_scope` check reads only that small table.
+//! - `snapshot_json` exists to recover an interrupted removal (ledger identity
+//!   and ownership), so it is pruned to `{"rows":[]}` once the operation succeeds.
 use std::path::{Path, PathBuf};
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{Store, StoreError};
@@ -15,10 +23,17 @@ pub struct LibraryRemoval {
     pub error: Option<String>,
 }
 
+/// Per-file rows of a removal, needed for validation/recovery until it succeeds.
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
-    roots: Vec<PathBuf>,
     rows: Vec<RemovalRow>,
+}
+
+/// Snapshot layout written before roots moved into `library_removal_roots`.
+#[derive(Deserialize)]
+struct LegacySnapshot {
+    #[serde(default)]
+    roots: Vec<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -32,6 +47,12 @@ struct RemovalRow {
 
 const COLS: &str = "operation_id, library_id, state, removed_ledger_count, error";
 
+/// `settings` keys owned by a Library, stored as `<prefix><library_id>`.
+///
+/// Library-scoped settings die with the Library; add the prefix here rather
+/// than growing a second cleanup path.
+const LIBRARY_SETTING_KEY_PREFIXES: &[&str] = &["library_cover_checked."];
+
 fn map_removal(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryRemoval> {
     Ok(LibraryRemoval {
         operation_id: row.get(0)?,
@@ -44,12 +65,16 @@ fn map_removal(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryRemoval> {
 
 impl Store {
     /// Deleted roots remain a boundary until explicitly reconfigured as a new Library.
+    ///
+    /// Reads only the small `library_removal_roots` table, so a path check never
+    /// deserializes a snapshot that lists every removed file.
     pub fn path_in_removal_scope(&self, path: &Path) -> Result<bool, StoreError> {
         let path = crate::library_paths::resolved_path(path)?;
-        let mut statement = self.app.prepare("SELECT snapshot_json FROM library_removals")?;
-        for json in statement.query_map([], |row| row.get::<_, String>(0))? {
-            let snapshot: Snapshot = serde_json::from_str(&json?)?;
-            if snapshot.roots.iter().any(|root| path.starts_with(root)) { return Ok(true); }
+        let mut statement = self.app.prepare("SELECT path FROM library_removal_roots")?;
+        for root in statement.query_map([], |row| row.get::<_, String>(0))? {
+            if path.starts_with(Path::new(&root?)) {
+                return Ok(true);
+            }
         }
         Ok(false)
     }
@@ -75,7 +100,7 @@ impl Store {
             .map(|path| crate::library_paths::resolved_path(Path::new(path.trim())))
             .collect::<Result<Vec<_>, _>>()?;
         for removal in pending {
-            for root in self.removal_snapshot(&removal.operation_id)?.roots {
+            for root in self.removal_roots(&removal.operation_id)? {
                 let root = crate::library_paths::resolved_path(&root)?;
                 if proposed
                     .iter()
@@ -147,18 +172,26 @@ impl Store {
             }
         }
         let operation_id = uuid::Uuid::new_v4().to_string();
-        self.app.execute(
+        let tx = self.app.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO library_removals (operation_id, library_id, state, snapshot_json,
              removed_ledger_count, created_at_ms, updated_at_ms)
              VALUES (?1, ?2, 'frozen', ?3, ?4, ?5, ?5)",
             params![
                 operation_id,
                 id,
-                serde_json::to_string(&Snapshot { roots, rows })?,
+                serde_json::to_string(&Snapshot { rows })?,
                 0,
                 crate::unix_now() * 1000
             ],
         )?;
+        for root in &roots {
+            tx.execute(
+                "INSERT OR IGNORE INTO library_removal_roots (operation_id, path) VALUES (?1, ?2)",
+                params![operation_id, root.to_string_lossy()],
+            )?;
+        }
+        tx.commit()?;
         tracing::info!(library_id = id, %operation_id, "Library 删除已冻结");
         self.library_removal(&operation_id)?
             .ok_or_else(|| StoreError::Missing(operation_id))
@@ -191,6 +224,31 @@ impl Store {
             .app
             .prepare(&format!(
                 "SELECT {COLS} FROM library_removals WHERE state != 'succeeded'"
+            ))?
+            .query_map([], map_removal)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Boundary roots of one removal operation.
+    pub fn removal_roots(&self, id: &str) -> Result<Vec<PathBuf>, StoreError> {
+        let mut statement = self.app.prepare(
+            "SELECT path FROM library_removal_roots WHERE operation_id = ?1 ORDER BY path",
+        )?;
+        Ok(statement
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect())
+    }
+
+    /// Removals that already succeeded, so on-disk artifacts a crash left behind
+    /// (for example Library cover files) can be reconciled on startup.
+    pub fn succeeded_library_removals(&self) -> Result<Vec<LibraryRemoval>, StoreError> {
+        Ok(self
+            .app
+            .prepare(&format!(
+                "SELECT {COLS} FROM library_removals WHERE state = 'succeeded'"
             ))?
             .query_map([], map_removal)?
             .collect::<Result<Vec<_>, _>>()?)
@@ -273,10 +331,24 @@ impl Store {
                 ORDER BY c.sort_order, c.id LIMIT 1))",
             [],
         )?;
+        // Library-scoped settings die with the Library.
+        for prefix in LIBRARY_SETTING_KEY_PREFIXES {
+            tx.execute(
+                "DELETE FROM settings WHERE key = ?1",
+                [format!("{prefix}{}", removal.library_id)],
+            )?;
+        }
+        // The per-file snapshot only exists to recover an interrupted removal;
+        // drop it now that this operation is terminal. The boundary roots stay.
         tx.execute(
             "UPDATE library_removals SET state='succeeded', error=NULL,
-            removed_ledger_count=?2, updated_at_ms=?3 WHERE operation_id=?1",
-            params![id, snapshot.rows.len(), crate::unix_now() * 1000],
+            removed_ledger_count=?2, snapshot_json=?3, updated_at_ms=?4 WHERE operation_id=?1",
+            params![
+                id,
+                snapshot.rows.len(),
+                serde_json::to_string(&Snapshot { rows: Vec::new() })?,
+                crate::unix_now() * 1000
+            ],
         )?;
         tx.commit()?;
         tracing::info!(operation_id=id, library_id=%removal.library_id,
@@ -339,8 +411,13 @@ impl Store {
             crate::ledger_cleanup::delete_ledger_by_id_str_in_tx(&tx, &row.ledger_id)?;
         }
         for row in &snapshot.rows {
+            // Locked markers are user intent and outlive the files, exactly like
+            // `fs_watcher` keeps them when an STRM changes. Only unlocked markers
+            // (derived probe output) are cleared, and only once no ledger row for
+            // that media/season/episode remains anywhere.
             tx.execute(
                 "DELETE FROM media_markers WHERE media_id=?1 AND season IS ?2 AND episode IS ?3
+                 AND locked=0
                  AND NOT EXISTS (SELECT 1 FROM ledger WHERE media_id=?1 AND season IS ?2 AND episode IS ?3)",
                 params![row.media_id, row.season, row.episode],
             )?;
@@ -426,6 +503,34 @@ impl Store {
         }
         Ok(closed)
     }
+}
+
+/// Backfill `library_removal_roots` from snapshots written before the roots table
+/// existed. Idempotent; runs from the app schema migration.
+pub(crate) fn backfill_library_removal_roots(conn: &Connection) -> Result<(), StoreError> {
+    let snapshots: Vec<(String, String)> = conn
+        .prepare("SELECT operation_id, snapshot_json FROM library_removals")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut backfilled = 0usize;
+    for (operation_id, json) in snapshots {
+        let legacy: LegacySnapshot = serde_json::from_str(&json)?;
+        for root in legacy.roots {
+            backfilled += tx.execute(
+                "INSERT OR IGNORE INTO library_removal_roots (operation_id, path) VALUES (?1, ?2)",
+                params![operation_id, root.to_string_lossy()],
+            )?;
+        }
+    }
+    tx.commit()?;
+    if backfilled > 0 {
+        tracing::info!(backfilled, "已回填 Library 删除边界根目录");
+    }
+    Ok(())
 }
 
 // Thread-local, unit-test-only injection: never exposed through production configuration.
@@ -547,5 +652,44 @@ mod tests {
         ));
         assert!(store.ledger_by_path(&row.path).unwrap().is_some());
         assert!(store.get_library(&library.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn opening_a_pre_fix_database_backfills_removal_boundary_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let store = Store::open(&data).unwrap();
+        let (library, _row) = fixture(&store, &temp.path().join("tv"));
+        let removal = store.begin_library_removal(&library.id).unwrap();
+        let roots = store.removal_roots(&removal.operation_id).unwrap();
+        assert_eq!(roots.len(), 1);
+        // Rewrite the row into the pre-migration layout: roots live only inside
+        // snapshot_json and library_removal_roots is empty.
+        let legacy = serde_json::json!({
+            "roots": roots.iter().map(|r| r.to_string_lossy()).collect::<Vec<_>>(),
+            "rows": [],
+        });
+        store
+            .app
+            .execute(
+                "UPDATE library_removals SET snapshot_json=?1 WHERE operation_id=?2",
+                params![legacy.to_string(), &removal.operation_id],
+            )
+            .unwrap();
+        store
+            .app
+            .execute("DELETE FROM library_removal_roots", [])
+            .unwrap();
+        store.app.pragma_update(None, "user_version", 6).unwrap();
+        drop(store);
+
+        let reopened = Store::open(&data).unwrap();
+        assert!(reopened
+            .path_in_removal_scope(&roots[0].join("E01.strm"))
+            .unwrap());
+        assert_eq!(
+            reopened.removal_roots(&removal.operation_id).unwrap(),
+            roots
+        );
     }
 }

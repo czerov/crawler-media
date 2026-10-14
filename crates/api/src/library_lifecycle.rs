@@ -90,9 +90,15 @@ async fn drain_removal(state: &ApiState, operation_id: &str) -> Result<(), Strin
         return Err("Library work did not stop within 30 seconds".to_string());
     }
     tracing::info!(%operation_id, %library_id, "Library 任务已全部排空，进入清理阶段");
-    let store = state.store.lock();
-    store.set_removal_state(operation_id, "cleaning", None).map_err(|e| e.to_string())?;
-    store.clean_library_removal(operation_id).map_err(|e| e.to_string())?;
+    let covers_dir = {
+        let store = state.store.lock();
+        store.set_removal_state(operation_id, "cleaning", None).map_err(|e| e.to_string())?;
+        store.clean_library_removal(operation_id).map_err(|e| e.to_string())?;
+        store.library_covers_dir()
+    };
+    // 封面文件无法进 DB 事务：此时 Library 已冻结且行已删除，没有并发发布能重建它；
+    // 启动时的对账（purge_removed_library_covers）负责补做崩溃窗口内漏掉的那次删除。
+    crate::library_cover_service::remove_library_cover_files(&covers_dir, &library_id);
     tracing::info!(%operation_id, %library_id, "Library 索引清理完成，删除操作成功");
     Ok(())
 }

@@ -12,9 +12,9 @@ mod scan_operations;
 
 /// Schema version constants. Bump when adding new migrations.
 /// The version is stored via `PRAGMA user_version` on each database file.
-pub const APP_SCHEMA_VERSION: i64 = 6;
+pub const APP_SCHEMA_VERSION: i64 = 7;
 pub const CATALOG_SCHEMA_VERSION: i64 = 2;
-pub const LIBRARY_SCHEMA_VERSION: i64 = 9;
+pub const LIBRARY_SCHEMA_VERSION: i64 = 10;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 5;
 
 /// Read the current schema version from a database file.
@@ -57,8 +57,14 @@ fn set_schema_version(conn: &Connection, version: i64) -> Result<(), StoreError>
 
 pub fn migrate_app(conn: &Connection) -> Result<(), StoreError> {
     ensure_supported_versions(&[("app", conn, APP_SCHEMA_VERSION)])?;
+    let previous = read_schema_version(conn)?;
     conn.execute_batch(tables::APP_TABLES)?;
     conn.execute_batch(library_deletion::TABLES)?;
+    // app schema 7：删除边界根目录从 `snapshot_json` 迁到 `library_removal_roots`，
+    // 让路径边界检查不再反序列化整份快照。回填幂等（INSERT OR IGNORE）。
+    if previous < APP_SCHEMA_VERSION {
+        crate::library_deletion::backfill_library_removal_roots(conn)?;
+    }
     ensure_column(conn, "downloaders", "path_maps", "TEXT")?;
     // downloaders.enabled：停用的下载器不参与自动投递（手动提交仍可用）。
     ensure_column(conn, "downloaders", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
@@ -231,6 +237,7 @@ pub fn migrate_catalog(conn: &Connection) -> Result<(), StoreError> {
 
 pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
     ensure_supported_versions(&[("library", conn, LIBRARY_SCHEMA_VERSION)])?;
+    let previous = read_schema_version(conn)?;
     conn.execute_batch(tables::LIBRARY_TABLES)?;
     // ledger.missing_at：文件核验标记（老库补列，幂等）。
     ensure_column(conn, "ledger", "missing_at", "INTEGER")?;
@@ -267,6 +274,11 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
     )?;
     scan_operations::migrate_scan_operations(conn)?;
     browse_projection::migrate_browse_projection(conn)?;
+    // library schema 10：一次性清理指向已删除台账行的探测工作项，并把因此
+    // 空掉的活动任务收尾，避免旧库残留悬空 ledger 引用。
+    if previous < LIBRARY_SCHEMA_VERSION {
+        crate::ledger_cleanup::repair_orphan_probe_units(conn)?;
+    }
     read_revisions::migrate_read_revisions("library", conn)?;
     read_revisions::create_revision_trigger(conn, "ledger", "lib_ledger")?;
     read_revisions::create_revision_trigger(conn, "file_meta", "lib_file_meta")?;

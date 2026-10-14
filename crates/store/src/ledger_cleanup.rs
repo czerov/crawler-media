@@ -1,13 +1,17 @@
 //! Transactional cleanup of file-derived rows in library.db for a ledger item.
 //!
 //! Deletes file_meta, fingerprint caches/attempts/samples/stages, scrape_sidecars
-//! associations, and the ledger entry itself in a single transaction.
+//! associations, probe work items, and the ledger entry itself in a single
+//! transaction.
 //! Does NOT delete Media, Playback, Collections, Markers or disk bytes.
 
 use domain::LedgerId;
 use rusqlite::Transaction;
 
 use crate::StoreError;
+
+mod probe_unit_retirement;
+pub(crate) use probe_unit_retirement::repair_orphan_probe_units;
 
 /// Delete all file-derived facts and the ledger row itself for `id` within `tx`.
 ///
@@ -70,6 +74,10 @@ pub(crate) fn delete_ledger_by_id_str_in_tx(
         "DELETE FROM scrape_sidecars WHERE ledger_id = ?1",
         [id_str],
     )?;
+
+    // Retire probe work items that reference this ledger, and resync the jobs
+    // that derived their counters from those units.
+    probe_unit_retirement::retire_probe_units_for_ledger(tx, id_str)?;
 
     // Delete the ledger row itself
     let changed = tx.execute("DELETE FROM ledger WHERE id = ?1", [id_str])?;
