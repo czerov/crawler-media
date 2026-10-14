@@ -62,6 +62,7 @@ impl ScanCoordinator {
             running.insert(op.id.clone());
             drop(running);
             let state_clone = state.clone();
+            let targets = op.targets.clone();
             tokio::spawn(async move {
                 // 无论 worker 正常结束还是 panic，都会释放 running 槽位并唤醒下一个
                 // 排队 operation，避免两次 panic 就把全局 2 个扫描额度永久占满。
@@ -69,7 +70,7 @@ impl ScanCoordinator {
                     state: state_clone.clone(),
                     op_id: op.id.clone(),
                 };
-                run_operation(&state_clone, &op.id, &op.library_id).await;
+                run_operation(&state_clone, &op.id, &op.library_id, &targets).await;
             });
         }
     }
@@ -170,7 +171,49 @@ fn write_terminal_status(
     }
 }
 
-async fn run_operation(state: &ApiState, op_id: &str, library_id: &str) {
+/// 本轮扫描期间又有新的增量目标并入（watch 事件）→ 不写终态，改回 `queued`，
+/// 让 coordinator 用合并后的目标再跑一轮。
+///
+/// 保留 `scan_seen` 断点：下一轮只处理新目标，已处理过的文件不会重复入账/探测。
+/// 返回 `true` 表示本轮已重排，调用方不得再写终态。
+fn requeue_if_targets_grew(
+    store: &crate::Store,
+    op_id: &str,
+    round_targets: &[PathBuf],
+) -> bool {
+    let current = match store.scan_operation(op_id) {
+        Ok(Some(op)) => op.targets,
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::error!(%error, %op_id, "读取扫描目标失败，无法判断是否需要补扫");
+            return false;
+        }
+    };
+    if current.len() <= round_targets.len() {
+        return false;
+    }
+    match store.update_scan_operation_status(
+        op_id,
+        ScanOperationStatus::Queued,
+        &serde_json::json!({}),
+    ) {
+        Ok(true) => {
+            tracing::info!(
+                %op_id,
+                merged = current.len() - round_targets.len(),
+                "扫描期间并入新的增量目标，回到队列补扫一轮"
+            );
+            true
+        }
+        Ok(false) => false,
+        Err(error) => {
+            tracing::error!(%error, %op_id, "扫描补扫重排失败");
+            false
+        }
+    }
+}
+
+async fn run_operation(state: &ApiState, op_id: &str, library_id: &str, targets: &[PathBuf]) {
     let lease = match state.acquire_library_work(library_id) {
         Ok(lease) => lease,
         Err(e) => {
@@ -200,8 +243,18 @@ async fn run_operation(state: &ApiState, op_id: &str, library_id: &str) {
 
     let state_clone = state.clone();
     let lib_id = library_id.to_string();
+    let round_targets = targets.to_vec();
+    let scan_targets = round_targets.clone();
+    let op_id_owned = op_id.to_string();
     let scan_res = tokio::task::spawn_blocking(move || {
-        crate::http::library_scan::scan_library_leased_result(&state_clone, &lib_id, &lease)
+        // op_id 同时是 scan_seen 断点的归属：中断重排后同一 operation 从断点续扫。
+        crate::http::library_scan::scan_library_leased_resumable(
+            &state_clone,
+            &lib_id,
+            &lease,
+            &scan_targets,
+            Some(&op_id_owned),
+        )
     })
     .await;
 
@@ -210,6 +263,9 @@ async fn run_operation(state: &ApiState, op_id: &str, library_id: &str) {
     let store = state.store.lock();
     match scan_res {
         Ok(Ok((scan_report, report_data))) => {
+            if requeue_if_targets_grew(&store, op_id, &round_targets) {
+                return;
+            }
             let any_partial_or_unreachable = scan_report
                 .roots
                 .iter()

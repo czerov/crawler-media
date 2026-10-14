@@ -282,6 +282,18 @@ pub(crate) fn realtime_library_root_for_path(state: &ApiState, path: &Path) -> O
         .max_by_key(|root| root.components().count())
 }
 
+/// 找到 realtime 库根对应的 Library id：watch 增量扫描要把它作为 coordinator 的归属。
+pub(crate) fn realtime_library_id_for_root(state: &ApiState, root: &Path) -> Option<String> {
+    state
+        .store
+        .lock()
+        .list_libraries()
+        .ok()?
+        .into_iter()
+        .find(|library| library.realtime_watch && library.root_paths.iter().any(|r| r == root))
+        .map(|library| library.id)
+}
+
 /// 计算变动文件在媒体库中的条目/扫描目标目录。
 ///
 /// 若文件位于媒体库根目录直属子目录下（如 `<root>/Show Title/Season 1/ep.strm`
@@ -399,27 +411,45 @@ pub fn handle_fs_events(
         tracker.forget(&path);
     }
 
-    // 新增 STRM 在 Library 目录中需要执行 in-place scan 来写入台账；Scrape
+    // 新增 STRM / 视频文件在 Library 目录中需要执行 in-place scan 来写入台账；Scrape
     // 只负责侧车/元数据，不能替代 Library ledger ingestion。
-    // 按变动的具体剧集/条目子目录进行增量扫描，避免遍历整个媒体库根目录。
+    //
+    // B3 §4.2：watch 路径必须走同一个 ScanCoordinator，把变动的条目子目录并进
+    // operation 的目标集；绝不能再自己 spawn_blocking 直接扫库（那会绕过单飞、
+    // 取消与 scan_seen 断点，和手动扫描互相踩踏）。
     for (root, target_dir) in library_scan_targets {
         tracing::info!(
             root = %root.display(),
             target_dir = %target_dir.display(),
-            "媒体库内 STRM 变动，触发增量子目录扫描入账"
+            "媒体库内变动，提交增量扫描目标给扫描 coordinator"
         );
-        let state = state.clone();
-        tokio::task::spawn_blocking(move || {
-            let result = crate::http::library_scan::scan_library_subdir(&state, &root, &target_dir);
-            if let Err(error) = result {
-                tracing::error!(
-                    root = %root.display(),
-                    target_dir = %target_dir.display(),
-                    %error,
-                    "媒体库 STRM 变动增量扫描入账失败"
-                );
-            }
-        });
+        let Some(library_id) = realtime_library_id_for_root(state, &root) else {
+            tracing::warn!(
+                root = %root.display(),
+                target_dir = %target_dir.display(),
+                "找不到对应的 realtime Library，跳过增量扫描"
+            );
+            continue;
+        };
+        match state
+            .scan_coordinator
+            .enqueue(state, &library_id, vec![target_dir.clone()])
+        {
+            Ok(op) => tracing::info!(
+                library_id = %library_id,
+                op_id = %op.id,
+                status = op.status.as_str(),
+                target_dir = %target_dir.display(),
+                "增量扫描目标已并入扫描 operation"
+            ),
+            Err(error) => tracing::error!(
+                library_id = %library_id,
+                root = %root.display(),
+                target_dir = %target_dir.display(),
+                ?error,
+                "增量扫描入队失败"
+            ),
+        }
     }
 
     // 目录有新入库/下载文件完成，主动提前调度任务，不必等待 30 秒

@@ -1,7 +1,7 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use domain::MediaKind;
+use serde_json::Value;
 use support::library_presence::PresenceFixture;
 
 #[tokio::test]
@@ -33,4 +33,97 @@ async fn scan_seen_checkpoints_and_avoids_reprocessing() {
         guard.clear_scan_seen(&op.id).unwrap();
         assert!(!guard.is_scan_seen(&op.id, &f1.display().to_string()).unwrap());
     }
+}
+
+/// 轮询 store 直到 operation 进入终态，返回落库的 report。
+async fn wait_scan_terminal(fix: &PresenceFixture, op_id: &str) -> Value {
+    for _ in 0..200 {
+        let op = fix.state.store().lock().scan_operation(op_id).unwrap();
+        if let Some(op) = op
+            && !op.status.is_active()
+        {
+            return op.report;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("scan operation {op_id} 未在预期时间内进入终态");
+}
+
+/// 中断/重启后，同一个 scan operation 必须从 `scan_seen` 断点续扫：已处理过的文件
+/// 不再重新入账/探测，只处理新增文件（B3 §4.2）。
+#[tokio::test]
+async fn resumed_scan_skips_checkpointed_files() {
+    let fix = PresenceFixture::new();
+    let f1 = fix.root.join("Movie1 (2024).mkv");
+    std::fs::write(&f1, b"1").unwrap();
+
+    // 第一轮：真实扫完 f1（入账 + 探测入队）。
+    let op_id = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .enqueue_scan(&fix.library_id, "sig", &[], 1000)
+            .unwrap()
+            .id
+    };
+    fix.state.scan_coordinator.trigger_next(&fix.state);
+    wait_scan_terminal(&fix, &op_id).await;
+    let first = fix.state.store().lock().list_ledger().unwrap();
+    assert_eq!(first.len(), 1, "第一轮应入账 f1");
+    let f1_row = first[0].id.to_string();
+    // 让 f1 的探测结束，这样“断点生效”不会被“本来就没再探测”混淆。
+    {
+        let store = fix.state.store();
+        let job_id = store
+            .lock()
+            .active_probe_unit_for_ledger(&f1_row)
+            .unwrap()
+            .expect("f1 应有一个探测单元")
+            .job_id;
+        store
+            .lock()
+            .finish_probe_unit(&job_id, &f1_row, true, None)
+            .unwrap();
+        store.lock().finish_probe_job(&job_id, true, None).unwrap();
+        assert!(!fix.state.probe.is_queued(&f1_row));
+    }
+
+    // 模拟中断重启：新 operation 的第一轮已经处理并记下 f1，随后进程崩溃，
+    // recover_orphaned_scans 把 running 的 operation 排回队列（断点保留）。
+    let f2 = fix.root.join("Movie2 (2024).mkv");
+    std::fs::write(&f2, b"2").unwrap();
+    let op2_id = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        let op = guard
+            .enqueue_scan(&fix.library_id, "sig", &[], 2000)
+            .unwrap();
+        assert_ne!(op.id, op_id, "上一个 operation 已终态，应新建 operation");
+        guard.record_scan_seen(&op.id, &[f1.clone()]).unwrap();
+        guard.claim_next_queued_scan(&[]).unwrap().expect("operation 应可被认领");
+        assert_eq!(guard.recover_orphaned_scans().unwrap(), 1, "running 的 operation 应被排回队列");
+        op.id
+    };
+
+    // 续扫：f1 命中断点不再处理，只有新增的 f2 入账并进入探测队列。
+    fix.state.scan_coordinator.trigger_next(&fix.state);
+    let report = wait_scan_terminal(&fix, &op2_id).await;
+    assert_eq!(
+        report["scanned"], 1,
+        "断点命中的 f1 不得被重复处理: {report}"
+    );
+    assert_eq!(report["inserted"], 1, "只有新增的 f2 入账: {report}");
+    let rows = fix.state.store().lock().list_ledger().unwrap();
+    assert_eq!(rows.len(), 2);
+    let f2_row = rows
+        .iter()
+        .find(|row| row.path.ends_with("Movie2 (2024).mkv"))
+        .expect("f2 应已入账")
+        .id
+        .to_string();
+    assert!(fix.state.probe.is_queued(&f2_row), "新增文件必须进入探测队列");
+    assert!(
+        !fix.state.probe.is_queued(&f1_row),
+        "断点命中的 f1 不得被重新探测"
+    );
 }

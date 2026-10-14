@@ -15,10 +15,10 @@ use crate::scrape_store::ScrapeStoreExt;
 pub(crate) mod scope;
 pub(crate) mod operations;
 pub(crate) mod report;
+pub(crate) mod runner;
 pub(crate) mod video;
-use report::format_scan_report;
+pub(crate) use runner::scan_library_leased_resumable;
 use scope::{ScanScope, walk_video_files};
-use video::scan_video_library;
 use super::library::{
     facets, missing_library, preferred_row, require_visible_library, rows_in_library, selection,
 };
@@ -55,6 +55,10 @@ pub(crate) async fn scan_library(
     }
 }
 
+/// 同步扫描一个库根（子目录扫描的整根特例）。
+///
+/// 生产入口是 `runner::scan_library_leased_resumable`（经 ScanCoordinator）；
+/// 这里保留给 watch 子目录扫描的单元测试与手动维护调用。
 #[allow(dead_code)]
 pub(crate) fn scan_library_root(state: &ApiState, root: &std::path::Path) -> Result<(), String> {
     scan_library_subdir(state, root, root)
@@ -270,224 +274,6 @@ fn resolve_and_scrape_subdir(
     Ok(())
 }
 
-fn scan_library_sync(state: ApiState, id: String) -> Response {
-    let lease = match state.acquire_library_work(&id) {
-        Ok(lease) => lease,
-        Err(error) => return err(StatusCode::CONFLICT, "library.deleting", &error),
-    };
-    scan_library_leased(&state, &id, &lease)
-}
-
-pub(crate) fn scan_library_leased(
-    state: &ApiState,
-    id: &str,
-    lease: &crate::library_lifecycle::LibraryWorkLease,
-) -> Response {
-    match scan_library_leased_result(state, id, lease) {
-        Ok((_, report_data)) => ok(report_data).into_response(),
-        Err(resp) => resp,
-    }
-}
-
-fn walk_library_roots(
-    state: &ApiState,
-    roots: &[PathBuf],
-    scrape: bool,
-    probe: &domain::Media,
-) -> Result<(Vec<library::TransferredFile>, Vec<library::ScanRootReport>), Response> {
-    let mut transferred = Vec::new();
-    let mut root_reports = Vec::new();
-    let mut any_readable = false;
-    for root in roots {
-        let is_readable = state.library_files.readable_root(root).is_ok();
-        if is_readable {
-            any_readable = true;
-        }
-        let job = library::WatchJob {
-            kind: library::WatchKind::InPlace,
-            library_root: root.clone(),
-            tv_library_root: None,
-            path: root.clone(),
-            scrape,
-        };
-        match library::scan_watch_reported(&job, probe) {
-            Ok((outcome, r_report)) => {
-                transferred.extend(outcome.transferred);
-                root_reports.push(r_report);
-            }
-            Err(error) => {
-                return Err(err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "library.scan",
-                    &error.to_string(),
-                ));
-            }
-        }
-    }
-    if !any_readable {
-        return Err(err(StatusCode::CONFLICT, "library.root_unavailable", "所有库根目录均不可达"));
-    }
-    Ok((transferred, root_reports))
-}
-
-pub(crate) fn scan_library_leased_result(
-    state: &ApiState,
-    id: &str,
-    lease: &crate::library_lifecycle::LibraryWorkLease,
-) -> Result<(library::ScanReport, Value), Response> {
-    let (kind, roots, scrape) = {
-        let store = state.store.lock();
-        let Some(library) = library_by_id(&store, &id) else {
-            return Err(missing_library());
-        };
-        let cfg = store.get_scrape_config().ok();
-        let nfo = cfg.as_ref().map(|c| c.effective.mirror_nfo).unwrap_or(true);
-        (library.kind, library.root_paths.clone(), nfo)
-    };
-    let probe = domain::Media {
-        id: domain::MediaId::new(),
-        kind,
-        title: "scan".into(),
-        year: None,
-        original_title: None,
-        tmdb_id: None,
-        douban_id: None,
-        tvdb_id: None,
-        bangumi_id: None,
-        anilist_id: None,
-    };
-    if kind == domain::MediaKind::Video {
-        return scan_video_library(state, &roots, id, lease);
-    }
-    let (transferred, root_reports) = walk_library_roots(state, &roots, scrape, &probe)?;
-    let scan_scope = match ScanScope::capture(state, id) {
-        Ok(s) => s,
-        Err(crate::library_presence::PresenceError::Deleting) => {
-            return Err(err(StatusCode::CONFLICT, "library.deleting", "Library 正在删除"));
-        }
-        Err(crate::library_presence::PresenceError::ScopeChanged) => {
-            return Err(err(StatusCode::CONFLICT, "library.scope_changed", "Library 配置变化"));
-        }
-        Err(crate::library_presence::PresenceError::Ambiguous) => {
-            return Err(err(StatusCode::CONFLICT, "library.ownership_ambiguous", "媒体库归属歧义"));
-        }
-        Err(e) => return Err(err(StatusCode::CONFLICT, "library.scan", &format!("{:?}", e))),
-    };
-    let filtered_transferred = match scan_scope.filter_transferred(transferred) {
-        Ok(t) => t,
-        Err(e) => return Err(err(StatusCode::CONFLICT, "library.ownership_ambiguous", &format!("{:?}", e))),
-    };
-    let inserted = match lease.publish(|| {
-        let store = state.store.lock();
-        scan_scope.validate(&store).map_err(|e| format!("{:?}", e))?;
-        crate::watch_ledger::record_paths(&store, filtered_transferred.clone())
-    }) {
-        Ok(inserted) => inserted,
-        Err(error) => {
-            if error.contains("Deleting") {
-                return Err(err(StatusCode::CONFLICT, "library.deleting", "Library 正在删除"));
-            }
-            if error.contains("ScopeChanged") {
-                return Err(err(StatusCode::CONFLICT, "library.scope_changed", "Library 配置变化"));
-            }
-            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &error));
-        }
-    };
-
-    // Resolve scanned media once per title using filtered_transferred
-    let scan_media = {
-        let store = state.store.lock();
-        let mut map = std::collections::HashMap::new();
-        for file in &filtered_transferred {
-            let Some(row) = ledger_row_by_path(&store, &file.path.display().to_string()) else {
-                continue;
-            };
-            let Some(m) = media_by_id(&store, row.media_id) else {
-                continue;
-            };
-            if m.kind != domain::MediaKind::Video {
-                map.entry(m.id).or_insert((m, row));
-            }
-        }
-        map
-    };
-
-    if let Err(response) = resolve_scan_metadata(state, id, lease, scan_media, &inserted, scrape) {
-        return Err(response);
-    }
-    crate::http::library::enqueue_probes_for_paths(&state, inserted.clone());
-    {
-        let store = state.store.lock();
-        if let Some(lib) = library_by_id(&store, &id) {
-            crate::http::library::clear_library_cover_checked(&store, &lib.id);
-            let _ = crate::http::library::library_cover_path(&store, &lib);
-        }
-    }
-    let total_errors: usize = root_reports.iter().map(|r| r.error_count).sum();
-    let scan_report = library::ScanReport {
-        roots: root_reports,
-        scanned: filtered_transferred.len(),
-        inserted: inserted.len(),
-        restored: 0,
-        probe_pending: inserted.len(),
-        error_count: total_errors,
-        errors_truncated: false,
-    };
-    let report_data = format_scan_report(&scan_report);
-    Ok((scan_report, json!(report_data)))
-}
-
-fn resolve_scan_metadata(
-    state: &ApiState,
-    id: &str,
-    lease: &crate::library_lifecycle::LibraryWorkLease,
-    scan_media: HashMap<domain::MediaId, (domain::Media, domain::LedgerRow)>,
-    inserted: &[PathBuf],
-    scrape: bool,
-) -> Result<(), Response> {
-    for (_, (media, row)) in scan_media {
-        if lease.control().is_cancelled() {
-            return Err(err(
-                StatusCode::CONFLICT,
-                "library.deleting",
-                "Library 正在删除",
-            ));
-        }
-        let path_buf = PathBuf::from(&row.path);
-        let path = path_buf.as_path();
-        if crate::auto_resolve::has_local_scan_metadata(state, &media, path) {
-            continue;
-        }
-        let resolved = crate::auto_resolve::resolve_scanned_media(state, &media, path)
-            .unwrap_or_else(|| media.clone());
-        if let Err(error) =
-            crate::auto_resolve::rebind_scan_rows(state, media.id, resolved.id, &inserted)
-        {
-            return Err(err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "store.error",
-                &error,
-            ));
-        }
-        if scrape {
-            // 见上：真实失败由 poster_fetch 内部记录，None 不是错误。
-            let _ = crate::poster_fetch::attach_poster(state, &resolved, path);
-            let _ = crate::poster_fetch::attach_backdrop(state, &resolved, path);
-            // Reread after alias convergence; stale rows still contain the provisional ID.
-            let (row, rows) = {
-                let store = state.store.lock();
-                let row = ledger_row_by_path(&store, &row.path).unwrap_or(row);
-                let rows = library_by_id(&store, id)
-                    .map(|library| rows_in_library(&store, &library))
-                    .unwrap_or_default();
-                (row, rows)
-            };
-            scrape_library_metadata(state, &resolved, &row, path, &rows);
-        }
-    }
-
-    Ok(())
-}
 
 /// POST /libraries/{id}/metadata/refresh — one cover per Media owned under the
 /// library, using the newest owned episode for TV; also writes rich NFO from

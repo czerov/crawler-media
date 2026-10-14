@@ -230,7 +230,7 @@ fn walk_in_place_reported(
 
 /// 文件名已经能确定剧名时，仍从上层目录补年份和别名。
 /// 文件名本身是 Low 时，才用父目录标题替换；NFO 在单独的有界步骤处理。
-fn enrich_from_ancestors(parsed: &mut Release, start: &std::path::Path, root: &std::path::Path) {
+pub(crate) fn enrich_from_ancestors(parsed: &mut Release, start: &std::path::Path, root: &std::path::Path) {
     let mut current = Some(start);
     let mut depth = 0;
     while let Some(dir) = current {
@@ -259,7 +259,7 @@ fn enrich_from_ancestors(parsed: &mut Release, start: &std::path::Path, root: &s
     }
 }
 
-fn identify_local(
+pub(crate) fn identify_local(
     parsed: &mut Release,
     path: &std::path::Path,
     root: &std::path::Path,

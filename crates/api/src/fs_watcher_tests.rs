@@ -351,3 +351,64 @@ fn is_relevant_media_entry_whitelists_only_videos_strm_and_directories() {
     assert!(!is_relevant_media_entry(&tmp.path().join("deleted.txt")));
     assert!(!is_relevant_media_entry(&tmp.path().join("deleted.srt")));
 }
+
+/// B3 §4.2：watch 事件必须把变动目录提交给 `ScanCoordinator`，由它单飞、合并目标、
+/// 带断点地扫描；不能再自己 `spawn_blocking` 直接扫库绕过协调器。
+#[tokio::test]
+async fn watch_event_enqueues_a_targeted_scan_through_the_coordinator() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tv");
+    let episode_dir = root.join("喜剧之王 (2026)/Season 1");
+    std::fs::create_dir_all(&episode_dir).unwrap();
+    let episode = episode_dir.join("喜剧之王 - S01E01 - 第 1 集.strm");
+    std::fs::write(&episode, "https://example.test/e01.mkv").unwrap();
+
+    let store = crate::Store::open(temp.path().join("data")).unwrap();
+    store
+        .set_library_root(domain::MediaKind::Tv, root.to_str().unwrap())
+        .unwrap();
+    let library_id = store.list_libraries().unwrap()[0].id.clone();
+    let state = crate::management::ApiState::new(
+        store,
+        "test-token".into(),
+        indexer::ProfileSet::load(None).unwrap(),
+        Arc::new(EmptyFetcher),
+        Arc::new(downloader::MemoryDownloader::new(temp.path().join("stage"))),
+        temp.path().join("library"),
+    )
+    .unwrap();
+
+    let target_dir = entry_scan_target_dir(&root, &episode);
+    crate::fs_watcher::handle_fs_events(
+        &state,
+        &Arc::new(crate::fs_watcher::StrmGraceTracker::new()),
+        vec![notify_debouncer_mini::DebouncedEvent::new(
+            episode.clone(),
+            notify_debouncer_mini::DebouncedEventKind::Any,
+        )],
+    );
+
+    let ops = state
+        .store()
+        .lock()
+        .scan_operations_for_library(&library_id)
+        .unwrap();
+    assert_eq!(ops.len(), 1, "watch 事件必须提交一个扫描 operation");
+    assert_eq!(
+        ops[0].targets,
+        vec![target_dir],
+        "扫描目标必须是变动的条目子目录"
+    );
+
+    // 定向扫描真的跑完（走 ScanWalker 的 targets 模式）：剧集入账。
+    for _ in 0..200 {
+        let rows = state.store().lock().list_ledger().unwrap();
+        if let Some(row) = rows.first() {
+            assert_eq!(row.path, episode.display().to_string());
+            assert_eq!((row.season, row.episode), (Some(1), Some(1)));
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("watch 触发的定向扫描未入账 episode");
+}

@@ -4,9 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use domain::{Media, MediaKind};
+use domain::{Confidence, MediaKind, Release};
 
-use crate::watch::report::{ScanIssue, ScanRootStatus};
+use crate::watch::report::ScanIssue;
 use crate::{LibraryError, TransferredFile, is_video_file};
 
 #[derive(Clone, Debug)]
@@ -36,6 +36,7 @@ pub struct ScanChunk {
 }
 
 pub struct ScanWalker {
+    /// Library 根：NFO/父目录身份解析的边界（见 `owning_root`）。
     roots: Vec<PathBuf>,
     dir_stack: Vec<PathBuf>,
     current_entries: Option<fs::ReadDir>,
@@ -44,8 +45,22 @@ pub struct ScanWalker {
 }
 
 impl ScanWalker {
+    /// 从库根开始遍历（`start == roots`）。
     pub fn new(roots: Vec<PathBuf>, kind: MediaKind, control: crate::WorkControl) -> Self {
-        let mut dir_stack = roots.clone();
+        Self::from_targets(roots.clone(), roots, kind, control)
+    }
+
+    /// 只遍历 `targets` 子目录，但仍以 `roots` 作为 NFO 身份解析的库根。
+    ///
+    /// watch 增量扫描只关心变动的条目子目录，但身份解析必须看到整个库根，
+    /// 否则电视剧 NFO 的主身份会退化成文件名解析。
+    pub fn from_targets(
+        roots: Vec<PathBuf>,
+        targets: Vec<PathBuf>,
+        kind: MediaKind,
+        control: crate::WorkControl,
+    ) -> Self {
+        let mut dir_stack = targets;
         dir_stack.reverse();
         Self {
             roots,
@@ -118,16 +133,19 @@ impl ScanWalker {
                                 self.dir_stack.push(path);
                             } else if meta.is_file() {
                                 if is_video_file(&path) {
-                                    let name = path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or_default();
-                                    let parsed = release::parse(name);
-                                    files.push(TransferredFile {
-                                        path,
-                                        identified_release: Some(parsed),
-                                        nfo_identity: None,
-                                    });
+                                    let (parsed, nfo_identity) =
+                                        identify(&path, &self.roots, self.kind);
+                                    // 与递归 in-place 扫描一致：文件名解析置信度低时不入账，
+                                    // 不能靠猜把 Unidentified 文件塞进 Library。
+                                    if parsed.confidence == Confidence::Low {
+                                        skipped += 1;
+                                    } else {
+                                        files.push(TransferredFile {
+                                            path,
+                                            identified_release: Some(parsed),
+                                            nfo_identity,
+                                        });
+                                    }
                                 } else {
                                     skipped += 1;
                                 }
@@ -160,4 +178,34 @@ impl ScanWalker {
             self.current_entries = None;
         }
     }
+}
+
+/// `path` 所属的库根：取最长的前缀匹配，避免嵌套根互相抢占。
+fn owning_root(roots: &[PathBuf], path: &Path) -> PathBuf {
+    roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()
+        .or_else(|| roots.first().cloned())
+        .unwrap_or_default()
+}
+
+/// 文件名 → Release + 父目录补全 + NFO 身份，与递归 in-place 扫描保持同一语义。
+fn identify(
+    path: &Path,
+    roots: &[PathBuf],
+    kind: MediaKind,
+) -> (Release, Option<crate::NfoIdentity>) {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let mut parsed = release::parse(name);
+    let root = owning_root(roots, path);
+    if let Some(parent) = path.parent() {
+        super::enrich_from_ancestors(&mut parsed, parent, &root);
+    }
+    let nfo_identity = super::identify_local(&mut parsed, path, &root, kind);
+    (parsed, nfo_identity)
 }

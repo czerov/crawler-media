@@ -180,10 +180,11 @@ pub(crate) async fn end_session(
     session.admin_ended = true;
     session.last_report_at = now;
     if let Err(error) = store.upsert_session(&session) {
+        tracing::error!(%error, %target_user, device_id, "结束设备会话失败");
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "store.error",
-            &error.to_string(),
+            "结束播放会话失败，请稍后重试",
         );
     }
     ok(json!({ "ended": 1 })).into_response()
@@ -295,17 +296,19 @@ pub(crate) async fn revoke_device(
         }
     }
     if let Err(error) = store.end_device_session(target_user, &device_id, now) {
+        tracing::error!(%error, %target_user, device_id, "注销设备前结束会话失败");
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "store.error",
-            &error.to_string(),
+            "注销设备失败，请稍后重试",
         );
     }
     if let Err(error) = store.revoke_device(target_user, &device_id) {
+        tracing::error!(%error, %target_user, device_id, "撤销设备凭据失败");
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "store.error",
-            &error.to_string(),
+            "注销设备失败，请稍后重试",
         );
     }
     ok(json!({ "revoked": true })).into_response()

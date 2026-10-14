@@ -229,7 +229,8 @@ async fn admin_ended_session_is_not_resurrected_by_a_late_progress_event() {
     );
 }
 
-pub(super) async fn items_for(app: &axum::Router, token: &str) -> Value {    let response = app
+pub(super) async fn items_for(app: &axum::Router, token: &str) -> Value {
+    let response = app
         .clone()
         .oneshot(
             Request::builder()

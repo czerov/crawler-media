@@ -384,7 +384,12 @@ pub(crate) async fn search_library_items(
             if matches!(error, crate::blocking_budget::BlockingError::Busy) {
                 err(StatusCode::SERVICE_UNAVAILABLE, "search.busy", "搜索并发过载")
             } else {
-                err(StatusCode::INTERNAL_SERVER_ERROR, "search.failed", &error.to_string())
+                // 用户可见文案必须是可读中文；具体英文错误只进日志。
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "search.failed",
+                    "搜索执行失败，请稍后重试",
+                )
             }
         }
     }

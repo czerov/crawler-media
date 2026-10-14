@@ -11,7 +11,8 @@ pub fn migrate_scan_operations(conn: &Connection) -> Result<(), StoreError> {
              status TEXT NOT NULL,
              generation INTEGER NOT NULL,
              created_at_ms INTEGER NOT NULL,
-             report_json TEXT NOT NULL DEFAULT '{}'
+             report_json TEXT NOT NULL DEFAULT '{}',
+             targets_json TEXT NOT NULL DEFAULT '[]'
          );
          CREATE INDEX IF NOT EXISTS scan_operations_lib_status_idx
              ON scan_operations (library_id, status);
@@ -20,6 +21,14 @@ pub fn migrate_scan_operations(conn: &Connection) -> Result<(), StoreError> {
              path TEXT NOT NULL,
              PRIMARY KEY (operation_id, path)
          );",
+    )?;
+    // 老库补列（幂等）：watch 增量扫描目标必须跟着 operation 一起持久化，才能在
+    // 单飞合并与崩溃重排之后继续生效。
+    super::ensure_column(
+        conn,
+        "scan_operations",
+        "targets_json",
+        "TEXT NOT NULL DEFAULT '[]'",
     )?;
     Ok(())
 }

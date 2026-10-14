@@ -374,6 +374,76 @@ async fn search_history_snapshot_round_trip_and_delete() {
     assert_history_deletion(&app, &id).await;
 }
 
+/// 快照删不掉时必须如实回 500，并且**保留**历史条目：绝不能返回 200 却留下
+/// 「条目在、快照没了」的死链（P3：历史删除不能静默成功）。
+#[tokio::test]
+async fn history_delete_reports_failure_and_keeps_entry_when_snapshot_delete_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = authed_app(&tmp);
+    let id = save_empty_search(&app).await;
+
+    // 触发器拦截快照删除，模拟 store 写失败。
+    let conn = rusqlite::Connection::open(tmp.path().join("data").join("app.db")).unwrap();
+    conn.execute(
+        "CREATE TRIGGER reject_snapshot_delete BEFORE DELETE ON search_snapshots
+         BEGIN SELECT RAISE(FAIL, 'nope'); END;",
+        [],
+    )
+    .unwrap();
+
+    let deleted = send(
+        &app,
+        "DELETE",
+        &format!("/api/v1/search/history/{id}"),
+        Some("management-secret"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        deleted.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "快照删除失败必须回 500，不能假装成功"
+    );
+
+    // 历史条目必须原样保留（先删快照、失败即中止，不动设置）。
+    let history = json_body(
+        send(
+            &app,
+            "GET",
+            "/api/v1/search/history",
+            Some("management-secret"),
+            Value::Null,
+        )
+        .await,
+    )
+    .await;
+    let ids: Vec<&str> = history["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&id.as_str()),
+        "快照删除失败时历史条目必须保留: {history}"
+    );
+
+    // 清空路径同样必须回 500。
+    let cleared = send(
+        &app,
+        "DELETE",
+        "/api/v1/search/history",
+        Some("management-secret"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        cleared.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "清空历史失败必须回 500"
+    );
+}
+
 #[tokio::test]
 async fn title_search_snapshot_captures_results() {
     let tmp = tempfile::tempdir().unwrap();

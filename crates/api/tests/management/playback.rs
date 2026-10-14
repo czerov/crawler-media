@@ -214,36 +214,18 @@ async fn progress_lifecycle_writes_session_log_and_unit() {
     assert_eq!(body["data"]["played"], false);
     assert_eq!(body["data"]["position_ms"], 0);
 
-    // Send progress in realistic heartbeat increments (<= 30s)
+    // 真实节奏心跳（每步 20 秒，<= 30s，不会被判成 seek）。
     for step in 1..=6 {
-        clock.0.fetch_add(20_000, std::sync::atomic::Ordering::SeqCst);
-        let beat = post_async(
-            &app,
-            "/api/v1/playback/progress",
-            json!({ "media_item_id": media_id, "event": "progress", "device_id": "web-1", "position_ms": step * 20_000, "paused": false }),
-        )
-        .await;
-        assert_eq!(beat.status(), StatusCode::OK);
+        let response = beat(&app, &clock, &media_id, step).await;
+        assert_eq!(response.status(), StatusCode::OK);
         if step == 6 {
-            let body = json_body(beat).await;
-            assert_eq!(body["data"]["position_ms"], 120_000);
+            assert_eq!(json_body(response).await["data"]["position_ms"], 120_000);
         }
     }
 
     // Active session shows in activity.
-    let activity = json_body(
-        app.clone()
-            .oneshot(request(
-                "GET",
-                "/api/v1/playback/activity",
-                Some("management-secret"),
-                Value::Null,
-            ))
-            .await
-            .unwrap(),
-    )
-    .await;
-    let sessions = activity["data"]["sessions"].as_array().unwrap();
+    let activity = get_data(&app, "/api/v1/playback/activity").await;
+    let sessions = activity["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["device_id"], "web-1");
     assert_eq!(
@@ -252,16 +234,11 @@ async fn progress_lifecycle_writes_session_log_and_unit() {
     );
     assert_eq!(sessions[0]["media"]["title"], "The Matrix");
 
-    // Advance to 300_000 ms in realistic intervals
     for step in 7..=14 {
-        clock.0.fetch_add(20_000, std::sync::atomic::Ordering::SeqCst);
-        let beat = post_async(
-            &app,
-            "/api/v1/playback/progress",
-            json!({ "media_item_id": media_id, "event": "progress", "device_id": "web-1", "position_ms": step * 20_000, "paused": false }),
-        )
-        .await;
-        assert_eq!(beat.status(), StatusCode::OK);
+        assert_eq!(
+            beat(&app, &clock, &media_id, step).await.status(),
+            StatusCode::OK
+        );
     }
 
     // Stop closes the session into a play log.
@@ -274,52 +251,179 @@ async fn progress_lifecycle_writes_session_log_and_unit() {
     .await;
     assert_eq!(stop.status(), StatusCode::OK);
 
-    let activity = json_body(
-        app.clone()
-            .oneshot(request(
-                "GET",
-                "/api/v1/playback/activity",
-                Some("management-secret"),
-                Value::Null,
-            ))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert!(activity["data"]["sessions"].as_array().unwrap().is_empty());
+    let activity = get_data(&app, "/api/v1/playback/activity").await;
+    assert!(activity["sessions"].as_array().unwrap().is_empty());
 
-    let history = json_body(
-        app.clone()
-            .oneshot(request(
-                "GET",
-                "/api/v1/playback/history",
-                Some("management-secret"),
-                Value::Null,
-            ))
-            .await
-            .unwrap(),
-    )
-    .await;
-    let entries = history["data"]["entries"].as_array().unwrap();
+    let history = get_data(&app, "/api/v1/playback/history").await;
+    let entries = history["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["media"]["title"], "The Matrix");
     assert_eq!(entries[0]["watched_ms"], 120_000 + 180_000);
     assert_eq!(entries[0]["completed"], false);
 
     // Resume reads the unit.
-    let resume = json_body(
-        app.clone()
-            .oneshot(request(
-                "GET",
-                &format!("/api/v1/playback/resume?media_item_id={media_id}"),
-                Some("management-secret"),
-                Value::Null,
-            ))
-            .await
-            .unwrap(),
+    let resume = get_data(
+        &app,
+        &format!("/api/v1/playback/resume?media_item_id={media_id}"),
     )
     .await;
-    assert_eq!(resume["data"]["position_ms"], 300_000);
+    assert_eq!(resume["position_ms"], 300_000);
+}
+
+/// 假时钟 + 可读 store 的播放测试环境。
+///
+/// 假时钟停在 1 小时前：`activity` / `devices` / `end_session` / `revoke_device`
+/// 任一回退到真实时钟，会话都会立刻被 300 秒超时判成不活跃。
+struct ClockEnv {
+    app: axum::Router,
+    clock: Arc<FakePlaybackClock>,
+    store: Arc<Mutex<api::Store>>,
+    user: domain::UserId,
+    media_id: String,
+    base_ms: i64,
+}
+
+impl ClockEnv {
+    async fn new(tmp: &tempfile::TempDir) -> Self {
+        let base_ms = (api::job_loop::unix_now() - 3_600) * 1000;
+        let clock = Arc::new(FakePlaybackClock(std::sync::atomic::AtomicI64::new(base_ms)));
+        let fetcher = Arc::new(Fixtures {
+            requests: Mutex::new(Vec::new()),
+            bodies: HashMap::new(),
+        });
+        let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("stage")));
+        let st = state(tmp.path(), fetcher, downloader);
+        let app = router(st.clone().with_playback_clock(clock.clone()));
+        let media_id = seed_movie(&app, tmp).await;
+        let store = st.store();
+        let user = {
+            let guard = store.lock();
+            guard.user_by_token("management-secret").unwrap().unwrap().id
+        };
+        Self {
+            app,
+            clock,
+            store,
+            user,
+            media_id,
+            base_ms,
+        }
+    }
+
+    /// 在 `web-1` 上 start + 一次心跳，返回心跳后的假时钟毫秒值。
+    async fn start_web_session(&self) -> i64 {
+        let response = post_async(
+            &self.app,
+            "/api/v1/playback/progress",
+            json!({ "media_item_id": self.media_id, "event": "start", "device_id": "web-1", "position_ms": 0 }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            beat(&self.app, &self.clock, &self.media_id, 1).await.status(),
+            StatusCode::OK
+        );
+        self.base_ms + 20_000
+    }
+}
+
+#[tokio::test]
+async fn injected_clock_drives_activity_devices_and_end_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = ClockEnv::new(&tmp).await;
+    let beat_ms = env.start_web_session().await;
+
+    let activity = get_data(&env.app, "/api/v1/playback/activity").await;
+    let sessions = activity["sessions"].as_array().unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "注入时钟下 1 小时前的会话仍应活跃: {activity}"
+    );
+    assert_eq!(sessions[0]["last_report_at"], beat_ms.to_string());
+
+    let devices = get_data(&env.app, "/api/v1/playback/devices").await;
+    let device = devices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["device_id"] == "web-1")
+        .expect("活跃设备应出现在 devices");
+    assert_eq!(device["active_sessions"], 1);
+    assert_eq!(device["last_seen_at"], beat_ms.to_string());
+
+    // end_session 写回的 last_report_at 必须来自注入时钟。
+    let ended = post_async(
+        &env.app,
+        "/api/v1/playback/activity/sessions/web-1/end",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(ended.status(), StatusCode::OK);
+    let session = env
+        .store
+        .lock()
+        .get_session(env.user, "web-1")
+        .unwrap()
+        .expect("会话行仍在（admin_ended），只是不再活跃");
+    assert!(session.admin_ended);
+    assert_eq!(
+        session.last_report_at,
+        beat_ms / 1000,
+        "end_session 必须用注入时钟"
+    );
+    let activity = get_data(&env.app, "/api/v1/playback/activity").await;
+    assert!(activity["sessions"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn injected_clock_drives_revoke_device() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = ClockEnv::new(&tmp).await;
+    // 注销需要已绑定的会话凭据（web 会话本身不可注销）。
+    {
+        let guard = env.store.lock();
+        guard.set_user_token(env.user, "tv-token").unwrap();
+        guard
+            .bind_playback_credential(env.user, "web-1", "tv-token")
+            .unwrap();
+    }
+    let beat_ms = env.start_web_session().await;
+
+    // 注销用注入时钟关闭会话：落库日志的 ended_at 决定 devices 的 last_seen_at。
+    let revoke = env
+        .app
+        .clone()
+        .oneshot(request(
+            "DELETE",
+            &format!("/api/v1/playback/devices/web-1?user_id={}", env.user),
+            Some("management-secret"),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::OK);
+
+    let devices = get_data(&env.app, "/api/v1/playback/devices").await;
+    let revoked = devices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["device_id"] == "web-1")
+        .expect("已注销设备应出现在 devices");
+    assert_eq!(
+        revoked["last_seen_at"],
+        beat_ms.to_string(),
+        "注销日志的 ended_at 必须用注入时钟"
+    );
+
+    let blocked = post_async(
+        &env.app,
+        "/api/v1/playback/progress",
+        json!({ "media_item_id": env.media_id, "event": "progress", "device_id": "web-1", "position_ms": 10 }),
+    )
+    .await;
+    assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -573,14 +677,10 @@ async fn stats_aggregate_and_policy_round_trip() {
     .await;
     assert_eq!(start.status(), StatusCode::OK);
     for step in 1..=2 {
-        clock.0.fetch_add(20_000, std::sync::atomic::Ordering::SeqCst);
-        let beat = post_async(
-            &app,
-            "/api/v1/playback/progress",
-            json!({ "media_item_id": media_id, "event": "progress", "device_id": "web-1", "position_ms": step * 20_000, "paused": false }),
-        )
-        .await;
-        assert_eq!(beat.status(), StatusCode::OK);
+        assert_eq!(
+            beat(&app, &clock, &media_id, step).await.status(),
+            StatusCode::OK
+        );
     }
     clock.0.fetch_add(20_000, std::sync::atomic::Ordering::SeqCst);
     let stop = post_async(
@@ -591,67 +691,32 @@ async fn stats_aggregate_and_policy_round_trip() {
     .await;
     assert_eq!(stop.status(), StatusCode::OK);
 
-    let conn = rusqlite::Connection::open(tmp.path().join("data/subscribe.db")).unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    conn.execute(
-        "INSERT INTO playback_logs (id, user_id, media_id, started_at, ended_at, watched_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            uuid::Uuid::new_v4().to_string(),
-            "00000000-0000-0000-0000-000000000001",
-            media_id,
-            now - 8 * 86_400,
-            now - 8 * 86_400 + 60,
-            30_000
-        ],
-    )
-    .unwrap();
+    // 8 天前的完结日志只进 previous 窗口，用于覆盖 retention 边界。
+    seed_old_playback_log(&tmp, &media_id);
 
-    let stats = json_body(
-        app.clone()
-            .oneshot(request(
-                "GET",
-                "/api/v1/playback/stats/watch?days=7",
-                Some("management-secret"),
-                Value::Null,
-            ))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(stats["data"]["current"]["plays"], 1);
-    assert!(stats["data"]["current"]["watched_ms"].as_i64().unwrap() >= 60_000);
-    assert_eq!(stats["data"]["by_day"].as_array().unwrap().len(), 7);
-    assert_eq!(stats["data"]["by_hour"].as_array().unwrap().len(), 7);
-    assert_eq!(stats["data"]["by_hour"][0].as_array().unwrap().len(), 24);
+    let stats = get_data(&app, "/api/v1/playback/stats/watch?days=7").await;
+    assert_eq!(stats["current"]["plays"], 1);
+    assert!(stats["current"]["watched_ms"].as_i64().unwrap() >= 60_000);
+    assert_eq!(stats["by_day"].as_array().unwrap().len(), 7);
+    assert_eq!(stats["by_hour"].as_array().unwrap().len(), 7);
+    assert_eq!(stats["by_hour"][0].as_array().unwrap().len(), 24);
     assert!(
-        stats["data"]["by_day"]
+        stats["by_day"]
             .as_array()
             .unwrap()
             .iter()
             .any(|day| day["members"] == 1)
     );
     assert_eq!(
-        stats["data"]["by_member"][0]["member_id"],
+        stats["by_member"][0]["member_id"],
         "00000000-0000-0000-0000-000000000001"
     );
+    assert!(stats["top_titles"][0]["watched_ms"].as_i64().unwrap() >= 60_000);
+    assert_eq!(stats["top_titles"][0]["members"], 1);
+    assert_eq!(stats["previous"]["active_members"], 1);
+    assert_eq!(stats["previous_by_day"].as_array().unwrap().len(), 7);
     assert!(
-        stats["data"]["top_titles"][0]["watched_ms"]
-            .as_i64()
-            .unwrap()
-            >= 60_000
-    );
-    assert_eq!(stats["data"]["top_titles"][0]["members"], 1);
-    assert_eq!(stats["data"]["previous"]["active_members"], 1);
-    assert_eq!(
-        stats["data"]["previous_by_day"].as_array().unwrap().len(),
-        7
-    );
-    assert!(
-        stats["data"]["previous_by_day"]
+        stats["previous_by_day"]
             .as_array()
             .unwrap()
             .iter()
@@ -669,20 +734,9 @@ async fn stats_aggregate_and_policy_round_trip() {
         .await
         .unwrap();
     assert_eq!(policy.status(), StatusCode::OK);
-    let policy_get = json_body(
-        app.clone()
-            .oneshot(request(
-                "GET",
-                "/api/v1/playback/policy",
-                Some("management-secret"),
-                Value::Null,
-            ))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(policy_get["data"]["trickplay_enabled"], true);
-    assert_eq!(policy_get["data"]["hardware_available"], false);
+    let policy_get = get_data(&app, "/api/v1/playback/policy").await;
+    assert_eq!(policy_get["trickplay_enabled"], true);
+    assert_eq!(policy_get["hardware_available"], false);
 }
 
 #[path = "playback_subtitles.rs"]

@@ -64,10 +64,13 @@ fn record_history_entry(
         }),
     );
     history.truncate(20);
-    let _ = store.put_setting(
+    if let Err(error) = store.put_setting(
         &user_setting_key("search.history", user_id),
         &serde_json::json!(history).to_string(),
-    );
+    ) {
+        // 快照已经落盘，条目没写上只会丢一条历史入口，不影响「条目⇒快照可回放」。
+        tracing::warn!(%error, %user_id, "写入关键词历史条目失败");
+    }
 }
 
 /// 落盘 torrents 快照并在成功后补写历史条目；失败时不写历史（宁可不记录也不留死链）。
@@ -149,19 +152,44 @@ pub(super) fn save_titles_history(
 }
 
 /// 按 id 删除一条关键词历史（连同结果快照）。
-fn delete_history_entry(store: &crate::Store, user_id: domain::UserId, id: &str) -> bool {
+///
+/// 顺序是**先删快照、确认成功，再改历史设置**：快照删除失败就立即中止，历史条目
+/// 原样保留，不会在删除动作失败后仍返回成功。任一步失败都返回 `Err`，路由层回 500。
+///
+/// 残余风险：快照删成功后写设置仍可能失败，此时条目还在而快照已没（死链）。要彻底
+/// 消除需要把两步放进同一个 SQLite 事务（store 层新方法），不在本次改动范围内。
+fn delete_history_entry(
+    store: &crate::Store,
+    user_id: domain::UserId,
+    id: &str,
+) -> Result<bool, crate::store::StoreError> {
     let mut history = history_items(store, user_id);
     let before = history.len();
     history.retain(|item| item["id"].as_str() != Some(id));
     if history.len() == before {
-        return false;
+        return Ok(false);
     }
-    let _ = store.put_setting(
-        &user_setting_key("search.history", user_id),
-        &serde_json::json!(history).to_string(),
-    );
-    let _ = store.delete_search_snapshot(id);
-    true
+    match store.delete_search_snapshot(id) {
+        Ok(true) => {}
+        Ok(false) => {
+            // 快照本就不在（历史条目在旧版本里可能没落盘快照）：不算失败，但要说清。
+            tracing::warn!(history_id = %id, "历史条目没有对应快照，仅清理条目");
+        }
+        Err(error) => {
+            tracing::error!(%error, history_id = %id, "删除历史快照失败，保留历史条目");
+            return Err(error);
+        }
+    }
+    store
+        .put_setting(
+            &user_setting_key("search.history", user_id),
+            &serde_json::json!(history).to_string(),
+        )
+        .map_err(|error| {
+            tracing::error!(%error, history_id = %id, "快照已删但写入历史条目失败");
+            error
+        })?;
+    Ok(true)
 }
 
 pub(super) fn chrono_like_now() -> String {
@@ -301,14 +329,24 @@ pub(crate) async fn delete_history_entry_route(
     Path(id): Path<String>,
 ) -> Response {
     let store = state.store.lock();
-    if delete_history_entry(&store, user_id, &id) {
-        ok(json!({ "deleted": true })).into_response()
-    } else {
-        err(StatusCode::NOT_FOUND, "search.history", "历史快照不存在")
+    match delete_history_entry(&store, user_id, &id) {
+        Ok(true) => ok(json!({ "deleted": true })).into_response(),
+        Ok(false) => err(StatusCode::NOT_FOUND, "search.history", "历史快照不存在"),
+        Err(error) => {
+            tracing::error!(%error, history_id = %id, "删除历史条目失败");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store.error",
+                "删除历史记录失败，请稍后重试",
+            )
+        }
     }
 }
 
 /// DELETE /search/history — 清空关键词历史与全部快照。
+///
+/// 与单条删除同序：先把快照删干净，再清历史设置；任一快照删失败就中止并回 500，
+/// 不改设置，避免留下「条目在、快照没了」的死链。
 pub(crate) async fn clear_search_history_route(
     State(state): State<ApiState>,
     axum::Extension(user_id): axum::Extension<domain::UserId>,
@@ -316,8 +354,22 @@ pub(crate) async fn clear_search_history_route(
     let store = state.store.lock();
     let history = history_items(&store, user_id);
     for id in history.iter().filter_map(|item| item["id"].as_str()) {
-        let _ = store.delete_search_snapshot(id);
+        if let Err(error) = store.delete_search_snapshot(id) {
+            tracing::error!(%error, history_id = %id, "清空搜索历史时删除快照失败");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store.error",
+                "清空搜索历史失败，请稍后重试",
+            );
+        }
     }
-    let _ = store.delete_setting(&user_setting_key("search.history", user_id));
+    if let Err(error) = store.delete_setting(&user_setting_key("search.history", user_id)) {
+        tracing::error!(%error, %user_id, "清空搜索历史设置失败");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store.error",
+            "清空搜索历史失败，请稍后重试",
+        );
+    }
     ok(json!({ "cleared": true })).into_response()
 }
