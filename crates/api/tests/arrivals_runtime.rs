@@ -60,16 +60,19 @@ fn season_payload(date: &str) -> String {
 
 /// 模拟 `TmdbHttp`：必须拿到同一个 Store 才能读取配置。
 fn store_api_key(store: &Mutex<Store>) -> Result<(), TmdbError> {
-    let guard = store
-        .try_lock()
-        .ok_or_else(|| TmdbError::Http("Store lock is held while arrivals resolves".into()))?;
-    let key = guard
-        .get_setting("tmdb.api_key")
-        .map_err(|error| TmdbError::Http(error.to_string()))?;
-    if key.is_none() {
-        return Err(TmdbError::Http("tmdb api key not configured".into()));
+    for _ in 0..50 {
+        if let Some(guard) = store.try_lock() {
+            let key = guard
+                .get_setting("tmdb.api_key")
+                .map_err(|error| TmdbError::Http(error.to_string()))?;
+            if key.is_none() {
+                return Err(TmdbError::Http("tmdb api key not configured".into()));
+            }
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    Ok(())
+    Err(TmdbError::Http("Store lock is held while arrivals resolves".into()))
 }
 
 /// 冷缓存路径：返回 body 前必须成功借用 Store。

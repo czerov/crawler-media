@@ -34,15 +34,8 @@ async fn full_movie_scan_skips_nested_independent_library() {
     std::fs::write(&nested_file, b"nested video").unwrap();
 
     // Trigger full scan on parent library
-    let (status, res) = fix
-        .request(
-            "POST",
-            &format!("/api/v1/libraries/{}/scan", fix.library_id),
-            Some(&fix.admin_token),
-        )
-        .await;
+    let (status, _res) = fix.scan_and_wait(&fix.library_id).await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    assert_eq!(res["ok"], true);
 
     // Parent ledger contains parent_file, but does NOT contain nested_file!
     let store_arc = fix.state.store();
@@ -95,15 +88,8 @@ async fn full_video_scan_skips_nested_independent_library() {
     std::fs::write(&p_file, b"clip1").unwrap();
     std::fs::write(&n_file, b"clip2").unwrap();
 
-    let (status, res) = fix
-        .request(
-            "POST",
-            &format!("/api/v1/libraries/{}/scan", video_lib.id),
-            Some(&fix.admin_token),
-        )
-        .await;
+    let (status, _res) = fix.scan_and_wait(&video_lib.id).await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    assert_eq!(res["ok"], true);
 
     let store_arc = fix.state.store();
     let guard = store_arc.lock();
@@ -139,13 +125,7 @@ async fn rescanning_restored_movie_clears_missing_without_overwriting_probe_qual
     std::fs::write(&row.path, b"restored bytes").unwrap();
 
     // Scan library
-    let (status, res) = fix
-        .request(
-            "POST",
-            &format!("/api/v1/libraries/{}/scan", fix.library_id),
-            Some(&fix.admin_token),
-        )
-        .await;
+    let (status, _res) = fix.scan_and_wait(&fix.library_id).await;
     assert_eq!(status, axum::http::StatusCode::OK);
 
     // missing_at must be cleared, ledger row and media id preserved

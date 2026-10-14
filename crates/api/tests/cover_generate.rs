@@ -73,6 +73,9 @@ async fn test_generate_library_cover_endpoint() {
     // 写入假视频文件以便触发媒体扫描或 ledger 关联
     std::fs::write(movie_item_dir.join("Inception (2010).mkv"), b"video dummy").unwrap();
 
+    // 等待建库首次自动扫描排空
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
     // 触发库扫描使文件入账
     let scan_res = app
         .clone()
@@ -84,7 +87,31 @@ async fn test_generate_library_cover_endpoint() {
         ))
         .await
         .unwrap();
-    assert_eq!(scan_res.status(), StatusCode::OK);
+    assert_eq!(scan_res.status(), StatusCode::ACCEPTED);
+    let scan_body = json_body(scan_res).await;
+    let op_id = scan_body["data"]["operation_id"].as_str().unwrap();
+    let mut completed = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let poll_res = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/api/v1/libraries/{lib_id}/scan-operations/{op_id}"),
+                Some("management-secret"),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        if poll_res.status() == StatusCode::OK {
+            let body = json_body(poll_res).await;
+            if body["data"]["status"] == "completed" {
+                completed = true;
+                break;
+            }
+        }
+    }
+    assert!(completed, "scan must complete");
 
     // 4. 调用预览模式 (preview_only: true)
     let res_preview = app

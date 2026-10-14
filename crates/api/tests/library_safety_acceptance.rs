@@ -39,13 +39,7 @@ async fn verify_restore_scan_prune_preserves_two_users_and_sidecar_bytes() {
     std::fs::write(&row.path, b"movie content").unwrap();
 
     // 3. Scan: clears missing flag without replacing LedgerId or MediaId
-    let (status, res) = fix
-        .request(
-            "POST",
-            &format!("/api/v1/libraries/{}/scan", fix.library_id),
-            Some(&fix.admin_token),
-        )
-        .await;
+    let (status, _res) = fix.scan_and_wait(&fix.library_id).await;
     assert_eq!(status, StatusCode::OK);
 
     // Check missing is cleared

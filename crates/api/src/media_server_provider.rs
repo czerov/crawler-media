@@ -40,16 +40,18 @@ pub(crate) fn default_library_cover(kind: MediaKind) -> Result<Vec<u8>, String> 
 }
 
 fn library_cover_tag(cover_path: Option<&std::path::Path>, kind: MediaKind) -> String {
-    let bytes = match cover_path {
-        Some(path) => match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::warn!(%error, cover_path = %path.display(), "failed to read library cover for cache tag");
-                default_library_cover(kind).unwrap_or_default()
-            }
-        },
-        None => default_library_cover(kind).unwrap_or_default(),
-    };
+    if let Some(path) = cover_path {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            return format!("cover-{:x}-{:x}", meta.len(), mtime);
+        }
+    }
+    let bytes = default_library_cover(kind).unwrap_or_default();
     format!("cover-{:x}", Sha256::digest(bytes))
 }
 

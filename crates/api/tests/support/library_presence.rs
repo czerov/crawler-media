@@ -205,4 +205,35 @@ impl PresenceFixture {
         let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, json)
     }
+
+    pub async fn scan_and_wait(&self, library_id: &str) -> (StatusCode, Value) {
+        let (status, res) = self
+            .request(
+                "POST",
+                &format!("/api/v1/libraries/{}/scan", library_id),
+                Some(&self.admin_token),
+            )
+            .await;
+        if status != StatusCode::ACCEPTED {
+            return (status, res);
+        }
+        let op_id = res["data"]["operation_id"].as_str().expect("must return operation_id");
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (poll_status, poll_res) = self
+                .request(
+                    "GET",
+                    &format!("/api/v1/libraries/{}/scan-operations/{}", library_id, op_id),
+                    Some(&self.admin_token),
+                )
+                .await;
+            if poll_status == StatusCode::OK {
+                let status_str = poll_res["data"]["status"].as_str().unwrap_or("");
+                if matches!(status_str, "completed" | "partial" | "failed" | "cancelled") {
+                    return (StatusCode::OK, poll_res["data"]["report"].clone());
+                }
+            }
+        }
+        panic!("scan operation timed out");
+    }
 }

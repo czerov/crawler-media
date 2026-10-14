@@ -14,16 +14,9 @@ async fn full_lifecycle_playback_and_scan_correctness_acceptance() {
     let movie_file = fix.root.join("correctness_movie (2024).mkv");
     std::fs::write(&movie_file, b"content").unwrap();
 
-    let (status, res) = fix
-        .request(
-            "POST",
-            &format!("/api/v1/libraries/{}/scan", fix.library_id),
-            Some(&fix.admin_token),
-        )
-        .await;
+    let (status, res) = fix.scan_and_wait(&fix.library_id).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(res["ok"], true);
-    assert_eq!(res["data"]["inserted"], 1);
+    assert_eq!(res["inserted"], 1);
 
     let store_arc = fix.state.store();
     let row = store_arc

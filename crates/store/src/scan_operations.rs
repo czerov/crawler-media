@@ -203,18 +203,19 @@ impl Store {
         Ok(changed > 0)
     }
 
-    /// Update operation status and report.
+    /// Update operation status and report. Does not overwrite terminal statuses (cancelled/completed/failed).
     pub fn update_scan_operation_status(
         &self,
         id: &str,
         status: ScanOperationStatus,
         report: &serde_json::Value,
-    ) -> Result<(), StoreError> {
-        self.library.execute(
-            "UPDATE scan_operations SET status = ?1, report_json = ?2 WHERE id = ?3",
+    ) -> Result<bool, StoreError> {
+        let changed = self.library.execute(
+            "UPDATE scan_operations SET status = ?1, report_json = ?2
+             WHERE id = ?3 AND status NOT IN ('cancelled', 'completed', 'failed')",
             params![status.as_str(), report.to_string(), id],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 }
 

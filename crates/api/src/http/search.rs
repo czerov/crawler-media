@@ -617,29 +617,42 @@ pub(crate) async fn search_library_items(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let keyword = query.get("keyword").cloned().unwrap_or_default();
-    let store = state.store.lock();
-    let rows = store.list_ledger().unwrap_or_default();
-    let mut items = Vec::new();
-    for row in rows {
-        let Some(media) = store.get_media(row.media_id).ok().flatten() else {
-            continue;
-        };
-        if !crate::http::library::row_visible_to_user(&store, &row, &media, user_id) {
-            continue;
+    let res = state
+        .search_work
+        .run(std::time::Duration::from_secs(10), move || {
+            let store = state.store.lock();
+            let rows = store.list_ledger().unwrap_or_default();
+            let mut items = Vec::new();
+            for row in rows {
+                let Some(media) = store.get_media(row.media_id).ok().flatten() else {
+                    continue;
+                };
+                if !crate::http::library::row_visible_to_user(&store, &row, &media, user_id) {
+                    continue;
+                }
+                if !keyword.is_empty() && !media.title.to_lowercase().contains(&keyword.to_lowercase()) {
+                    continue;
+                }
+                items.push(json!({
+                    "media_item_id": media.id.to_string(),
+                    "title": media.title,
+                    "kind": media.kind.as_str(),
+                    "path": row.path,
+                    "season": row.season,
+                    "episode": row.episode,
+                }));
+            }
+            items
+        })
+        .await;
+
+    match res {
+        Ok(items) => ok_list(items).into_response(),
+        Err(crate::blocking_budget::BlockingError::Busy) => {
+            err(StatusCode::SERVICE_UNAVAILABLE, "search.busy", "搜索并发过载")
         }
-        if !keyword.is_empty() && !media.title.to_lowercase().contains(&keyword.to_lowercase()) {
-            continue;
-        }
-        items.push(json!({
-            "media_item_id": media.id.to_string(),
-            "title": media.title,
-            "kind": media.kind.as_str(),
-            "path": row.path,
-            "season": row.season,
-            "episode": row.episode,
-        }));
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "search.failed", &e.to_string()),
     }
-    ok_list(items).into_response()
 }
 
 mod history;

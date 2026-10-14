@@ -179,7 +179,10 @@ fn session(user: UserId, media: MediaId, device: &str, started: i64) -> SessionR
         admin_ended: false,
         started_at: started,
         last_report_at: started,
+        last_report_at_ms: started * 1000,
         ledger_id: None,
+        play_session_id: None,
+        last_event_sequence: None,
     }
 }
 

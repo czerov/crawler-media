@@ -425,7 +425,10 @@ fn playback_retention_dry_run_keeps_logs_then_prunes_only_logs() {
                 admin_ended: false,
                 started_at: cutoff - 10 * DAY,
                 last_report_at: cutoff - 10 * DAY,
+                last_report_at_ms: (cutoff - 10 * DAY) * 1000,
                 ledger_id: None,
+                play_session_id: None,
+                last_event_sequence: None,
             };
             guard.upsert_session(&session).unwrap();
             guard

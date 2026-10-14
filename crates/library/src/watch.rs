@@ -124,7 +124,7 @@ fn in_place_reported(job: &WatchJob, kind: MediaKind) -> Result<(WatchOutcome, r
         report.status = report::ScanRootStatus::Unreachable;
         return Ok((outcome, report));
     }
-    walk_in_place_reported(&job.path, &job.path, kind, job.scrape, &mut outcome, &mut report)?;
+    walk_in_place_reported(&job.path, &job.library_root, kind, job.scrape, &mut outcome, &mut report)?;
     if report.error_count > 0 && report.status != report::ScanRootStatus::Unreachable {
         report.status = report::ScanRootStatus::Partial;
     }

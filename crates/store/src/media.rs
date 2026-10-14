@@ -48,11 +48,11 @@ impl Store {
         Ok(())
     }
 
-    /// Safely undo a newly inserted media if it is completely unreferenced by subscribes or ledgers.
+    /// Safely undo a newly inserted media if it matches expected and is completely unreferenced by subscribes or ledgers.
     pub fn undo_ensured_media_if_unreferenced(
         &self,
         media_id: MediaId,
-        _expected: &Media,
+        expected: &Media,
     ) -> Result<bool, StoreError> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.app,
@@ -60,6 +60,15 @@ impl Store {
         )?;
 
         let id_str = media_id.to_string();
+        let matches_expected: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM media WHERE id = ?1 AND title = ?2 AND kind = ?3)",
+            params![id_str, expected.title, expected.kind.as_str()],
+            |r| r.get(0),
+        )?;
+        if !matches_expected {
+            return Ok(false);
+        }
+
         let has_sub: bool = self.subscribe.query_row(
             "SELECT EXISTS(SELECT 1 FROM subscribes WHERE media_id = ?1)",
             [&id_str],

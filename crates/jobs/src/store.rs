@@ -151,21 +151,34 @@ pub fn ensure_def(conn: &Connection, def: NewDef) -> Result<JobDef, JobError> {
 }
 
 pub fn claim(conn: &Connection, now: i64, limit: usize) -> Result<Vec<Job>, JobError> {
+    let tx = if conn.is_autocommit() {
+        Some(rusqlite::Transaction::new_unchecked(
+            conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    } else {
+        None
+    };
+    let c = tx.as_deref().unwrap_or(conn);
+
     let mut claimed = Vec::new();
     for _ in 0..limit {
-        let Some(job) = next_claimable(conn, now)? else {
+        let Some(job) = next_claimable(c, now)? else {
             break;
         };
-        let changed = conn.execute(
+        let changed = c.execute(
             "UPDATE jobs SET status = 'running', started_at = ?1
              WHERE id = ?2 AND status = 'queued'",
             params![now, job.id.to_string()],
         )?;
         if changed == 1 {
-            if let Some(taken) = get_job(conn, job.id)? {
+            if let Some(taken) = get_job(c, job.id)? {
                 claimed.push(taken);
             }
         }
+    }
+    if let Some(tx) = tx {
+        tx.commit()?;
     }
     Ok(claimed)
 }
@@ -174,7 +187,7 @@ fn next_claimable(conn: &Connection, now: i64) -> Result<Option<Job>, JobError> 
     let mut stmt = conn.prepare(&format!(
         "SELECT {JOB_COLS} FROM jobs
          WHERE status = 'queued' AND run_after <= ?1
-         ORDER BY run_after, id"
+         ORDER BY run_after, rowid"
     ))?;
     let rows = stmt.query_map(params![now], map_job)?;
     for row in rows {

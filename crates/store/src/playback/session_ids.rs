@@ -142,12 +142,31 @@ impl Store {
         device_id: &str,
         play_session_id: &str,
     ) -> Result<bool, StoreError> {
+        if !self.subscribe.is_autocommit() {
+            return self.activate_play_session_conn(
+                &self.subscribe,
+                user_id,
+                device_id,
+                play_session_id,
+            );
+        }
         let tx = rusqlite::Transaction::new_unchecked(
             &self.subscribe,
             rusqlite::TransactionBehavior::Immediate,
         )?;
+        let res = self.activate_play_session_conn(&tx, user_id, device_id, play_session_id)?;
+        tx.commit()?;
+        Ok(res)
+    }
 
-        let current: Option<(i64, String)> = tx
+    fn activate_play_session_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        user_id: UserId,
+        device_id: &str,
+        play_session_id: &str,
+    ) -> Result<bool, StoreError> {
+        let current: Option<(i64, String)> = conn
             .query_row(
                 "SELECT generation, state
                  FROM playback_session_ids
@@ -168,7 +187,7 @@ impl Store {
             return Ok(false);
         }
 
-        let max_active_gen: Option<i64> = tx
+        let max_active_gen: Option<i64> = conn
             .query_row(
                 "SELECT MAX(generation)
                  FROM playback_session_ids
@@ -181,32 +200,27 @@ impl Store {
 
         if let Some(active_gen) = max_active_gen {
             if active_gen >= generation {
-                // Superseded by newer generation
-                tx.execute(
+                conn.execute(
                     "UPDATE playback_session_ids SET state = 'closed'
                      WHERE user_id = ?1 AND device_id = ?2 AND play_session_id = ?3",
                     params![user_id.to_string(), device_id, play_session_id],
                 )?;
-                tx.commit()?;
                 return Ok(false);
             }
         }
 
-        // Close any older pending or active sessions on this device
-        tx.execute(
+        conn.execute(
             "UPDATE playback_session_ids SET state = 'closed'
              WHERE user_id = ?1 AND device_id = ?2 AND generation < ?3 AND state IN ('pending', 'active')",
             params![user_id.to_string(), device_id, generation],
         )?;
 
-        // Activate this session
-        tx.execute(
+        conn.execute(
             "UPDATE playback_session_ids SET state = 'active'
              WHERE user_id = ?1 AND device_id = ?2 AND play_session_id = ?3",
             params![user_id.to_string(), device_id, play_session_id],
         )?;
 
-        tx.commit()?;
         Ok(true)
     }
 

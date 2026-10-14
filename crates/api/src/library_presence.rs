@@ -37,7 +37,9 @@ impl LibraryFileRead for SystemLibraryFileRead {
         // Try opening directory read
         let mut reader = std::fs::read_dir(path)?;
         // Fetch first entry or end of empty dir
-        let _ = reader.next();
+        if let Some(res) = reader.next() {
+            res?;
+        }
         Ok(())
     }
 
@@ -82,6 +84,65 @@ pub(crate) fn prune(
     reconcile_presence(state, library_id, media_id, LedgerPresenceMode::Prune)
 }
 
+fn collect_presence_observations(
+    state: &ApiState,
+    library_id: &str,
+    target_media_id: Option<MediaId>,
+    candidate_scope: &LibraryPathScope,
+    candidate_rows: Vec<domain::LedgerRow>,
+    missing_map: &std::collections::HashMap<String, i64>,
+    media_kinds: &std::collections::HashMap<MediaId, domain::MediaKind>,
+) -> Result<Vec<LedgerPresenceObservation>, PresenceError> {
+    let mut observations = Vec::new();
+
+    for row in candidate_rows {
+        if let Some(mid) = target_media_id {
+            if row.media_id != mid {
+                continue;
+            }
+        }
+
+        let Some(&real_kind) = media_kinds.get(&row.media_id) else {
+            // Missing media identity: skip conservatively
+            continue;
+        };
+
+        let Ok(resolved) = LibraryPathScope::resolve_path(Path::new(&row.path)) else {
+            observations.push(LedgerPresenceObservation {
+                row: row.clone(),
+                missing_at: missing_map.get(&row.path).copied(),
+                presence: FilePresence::Unknown,
+            });
+            continue;
+        };
+
+        match candidate_scope.owner(&resolved, real_kind) {
+            StrictOwner::Owned(owner) if owner.id == library_id => {
+                // Eligible row
+            }
+            StrictOwner::Ambiguous => return Err(PresenceError::Ambiguous),
+            _ => continue,
+        }
+
+        let presence = match state.library_files.presence(Path::new(&row.path)) {
+            Ok(true) => FilePresence::Present,
+            Ok(false) => FilePresence::Missing,
+            Err(e) => {
+                tracing::warn!(path = %row.path, error = %e, "Observing file presence failed");
+                FilePresence::Unknown
+            }
+        };
+
+        observations.push(LedgerPresenceObservation {
+            row: row.clone(),
+            missing_at: missing_map.get(&row.path).copied(),
+            presence,
+        });
+    }
+
+    Ok(observations)
+}
+
 fn reconcile_presence(
     state: &ApiState,
     library_id: &str,
@@ -117,66 +178,49 @@ fn reconcile_presence(
         }
     }
 
-    // Collect candidates for this library
-    let (candidate_rows, candidate_scope) = {
+    // Collect candidates for this library and batch load their media kinds
+    let (candidate_rows, media_kinds, candidate_scope) = {
         let guard = state.store.lock();
         let rows = guard.list_ledger()?;
-        (rows, scope.clone())
+        let media_ids: Vec<MediaId> = rows.iter().map(|r| r.media_id).collect();
+        let media_map = guard.media_batch(&media_ids)?;
+        let kinds: std::collections::HashMap<MediaId, domain::MediaKind> = media_map
+            .into_iter()
+            .map(|(mid, m)| (mid, m.kind))
+            .collect();
+        (rows, kinds, scope.clone())
     };
 
-    let mut observations = Vec::new();
+    let mut observations = collect_presence_observations(
+        state,
+        library_id,
+        target_media_id,
+        &candidate_scope,
+        candidate_rows,
+        &missing_map,
+        &media_kinds,
+    )?;
 
-    for row in candidate_rows {
-        if let Some(mid) = target_media_id {
-            if row.media_id != mid {
-                continue;
-            }
-        }
-
-        let Ok(resolved) = LibraryPathScope::resolve_path(Path::new(&row.path)) else {
-            observations.push(LedgerPresenceObservation {
-                row: row.clone(),
-                missing_at: missing_map.get(&row.path).copied(),
-                presence: FilePresence::Unknown,
-            });
-            continue;
-        };
-
-        match candidate_scope.owner(&resolved, target_lib.kind) {
-            StrictOwner::Owned(owner) if owner.id == library_id => {
-                // Eligible row
-            }
-            StrictOwner::Ambiguous => return Err(PresenceError::Ambiguous),
-            _ => continue,
-        }
-
-        let presence = match state.library_files.presence(Path::new(&row.path)) {
-            Ok(true) => FilePresence::Present,
-            Ok(false) => FilePresence::Missing,
-            Err(e) => {
-                tracing::warn!(path = %row.path, error = %e, "Observing file presence failed");
-                FilePresence::Unknown
-            }
-        };
-
-        observations.push(LedgerPresenceObservation {
-            row: row.clone(),
-            missing_at: missing_map.get(&row.path).copied(),
-            presence,
-        });
-    }
-
-    // Cancel active probe work if in Prune mode
+    // If in Prune mode: verify presence one last time and cancel probe work
     if mode == LedgerPresenceMode::Prune {
+        for obs in &mut observations {
+            if obs.presence == FilePresence::Missing && obs.missing_at.is_some() {
+                // Re-verify immediately before pruning
+                if let Ok(true) = state.library_files.presence(Path::new(&obs.row.path)) {
+                    obs.presence = FilePresence::Present;
+                }
+            }
+        }
+
         let ids_to_cancel: Vec<String> = observations
             .iter()
             .filter(|obs| obs.presence == FilePresence::Missing && obs.missing_at.is_some())
             .map(|obs| obs.row.id.to_string())
             .collect();
         if !ids_to_cancel.is_empty() {
-            let _ = state
+            state
                 .probe
-                .cancel_ledger_work(&ids_to_cancel, "pruning missing files");
+                .cancel_ledger_work(&ids_to_cancel, "pruning missing files")?;
         }
     }
 
@@ -188,8 +232,7 @@ fn reconcile_presence(
         }
     };
 
-    // 4. In publication barrier, verify presence one last time for拟删除 rows,
-    // check scope matches, and apply presence in a single Immediate transaction.
+    // 4. In publication barrier, check scope matches and apply presence in a single Immediate transaction.
     lease.publish(|| {
         let guard = state.store.lock();
         let current_snapshot = guard.library_ownership().map_err(|e| e.to_string())?;

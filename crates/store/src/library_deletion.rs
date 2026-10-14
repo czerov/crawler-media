@@ -336,8 +336,7 @@ impl Store {
     fn clean_removal_rows(&self, snapshot: &Snapshot) -> Result<(), StoreError> {
         let tx = self.library.unchecked_transaction()?;
         for row in &snapshot.rows {
-            crate::library::delete_file_meta_for_ledger(&tx, &row.ledger_id)?;
-            tx.execute("DELETE FROM ledger WHERE id=?1", [&row.ledger_id])?;
+            crate::ledger_cleanup::delete_ledger_by_id_str_in_tx(&tx, &row.ledger_id)?;
         }
         for row in &snapshot.rows {
             tx.execute(

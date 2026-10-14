@@ -181,7 +181,10 @@ fn log_play(
             admin_ended: false,
             started_at,
             last_report_at: started_at,
+            last_report_at_ms: started_at * 1000,
             ledger_id: None,
+            play_session_id: None,
+            last_event_sequence: None,
         })
         .unwrap();
     store

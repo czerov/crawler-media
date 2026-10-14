@@ -110,7 +110,10 @@ fn seed_nested_hidden_movie(store: &Store, child_root: &std::path::Path, member_
             admin_ended: false,
             started_at: now,
             last_report_at: now,
+            last_report_at_ms: now * 1000,
             ledger_id: None,
+            play_session_id: None,
+            last_event_sequence: None,
         })
         .unwrap();
     store

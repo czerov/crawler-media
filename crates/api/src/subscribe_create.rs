@@ -97,7 +97,11 @@ fn rollback_store(
             tracing::error!(filter_id = %filter.id, error = %error, "回滚规则组失败");
         }
     }
-    if let Err(error) = store.undo_ensured_media(media, previous) {
+    if previous.is_none() {
+        if let Err(error) = store.undo_ensured_media_if_unreferenced(media.id, media) {
+            tracing::error!(media_id = %media.id, error = %error, "回滚新建 Media 失败");
+        }
+    } else if let Err(error) = store.undo_ensured_media(media, previous) {
         tracing::error!(media_id = %media.id, error = %error, "回滚 Media 失败");
     }
 }

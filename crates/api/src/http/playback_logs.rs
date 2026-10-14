@@ -80,18 +80,10 @@ pub(super) fn visible_media_ids(
     if scope == "all" {
         return None;
     }
-    Some(
-        store
-            .list_ledger()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| {
-                let media = store.get_media(row.media_id).ok().flatten()?;
-                crate::http::library::row_visible_to_user(store, &row, &media, Some(user_id))
-                    .then_some(row.media_id)
-            })
-            .collect(),
-    )
+    match crate::visible_scope::VisibleScope::load(store, user_id) {
+        Ok(vs) => Some(vs.media_ids.into_iter().collect()),
+        Err(_) => None,
+    }
 }
 
 /// GET /playback/history?limit&before&days&member_id&scope — cursor-paginated.

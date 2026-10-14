@@ -40,10 +40,23 @@ fn dispatch_once_sync(state: &ApiState) -> Result<usize, String> {
             continue;
         };
 
-        let _ = crate::http::library::ensure_probe_enqueued(state, &row);
-        let store = state.store.lock();
-        if store.ack_scan_probe_obligation(ob.ledger_id).is_ok() {
-            acked += 1;
+        let enqueued_or_active = match state
+            .probe
+            .request_probe(&row, crate::probe_manager::policy::ProbeRequestOrigin::Detail)
+        {
+            Ok(
+                crate::probe_manager::policy::ProbeRequestResult::Queued { .. }
+                | crate::probe_manager::policy::ProbeRequestResult::AlreadyRunning
+                | crate::probe_manager::policy::ProbeRequestResult::Complete,
+            ) => true,
+            _ => false,
+        };
+
+        if enqueued_or_active {
+            let store = state.store.lock();
+            if store.ack_scan_probe_obligation(ob.ledger_id).is_ok() {
+                acked += 1;
+            }
         }
     }
 

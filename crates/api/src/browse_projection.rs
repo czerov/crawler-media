@@ -28,7 +28,7 @@ impl From<String> for ProjectionError {
 }
 
 pub struct ProjectionService {
-    dirty_libraries: Mutex<HashMap<String, bool>>,
+    dirty_libraries: Mutex<HashMap<String, u64>>,
     inflight: Mutex<HashMap<String, broadcast::Sender<Result<ProjectionSnapshot, String>>>>,
 }
 
@@ -42,7 +42,9 @@ impl ProjectionService {
 
     /// Mark a library projection as dirty.
     pub fn mark_dirty(&self, library_id: &str) {
-        self.dirty_libraries.lock().insert(library_id.to_string(), true);
+        let mut map = self.dirty_libraries.lock();
+        let counter = map.entry(library_id.to_string()).or_insert(0);
+        *counter += 1;
     }
 
     /// Ensure a valid projection snapshot is available for `library_id`.
@@ -53,15 +55,22 @@ impl ProjectionService {
         state: ApiState,
         library_id: String,
     ) -> Result<ProjectionSnapshot, ProjectionError> {
+        let cur_revs = {
+            let store = state.store.lock();
+            store.read_revisions().map_err(|e| ProjectionError::Failed(e.to_string()))?
+        };
+
         // Fast path: check if existing projection in store is ready and not dirty
-        let is_dirty = self.dirty_libraries.lock().get(&library_id).copied().unwrap_or(false);
+        let is_dirty = self.dirty_libraries.lock().contains_key(&library_id);
         if !is_dirty {
             let snap_opt = {
                 let store = state.store.lock();
                 store.browse_projection(&library_id).map_err(|e| ProjectionError::Failed(e.to_string()))?
             };
             if let Some(snap) = snap_opt {
-                return Ok(snap);
+                if snap.revisions == cur_revs {
+                    return Ok(snap);
+                }
             }
         }
 
@@ -87,14 +96,19 @@ impl ProjectionService {
             }
         }
 
-        // Leader executes build
+        let dirty_version_before = self.dirty_libraries.lock().get(&library_id).copied();
+
+        // Leader executes build with RAII inflight guard
         let state_clone = state.clone();
         let lib_id = library_id.clone();
         let build_res = tokio::task::spawn_blocking(move || {
             builder::build(&state_clone, &lib_id)
         })
         .await
-        .map_err(|e| ProjectionError::Failed(e.to_string()))?;
+        .map_err(|e| {
+            self.inflight.lock().remove(&library_id);
+            ProjectionError::Failed(e.to_string())
+        })?;
 
         let res = match build_res {
             Ok(build) => {
@@ -102,7 +116,10 @@ impl ProjectionService {
                 let pub_res = store.publish_browse_projection(&build);
                 match pub_res {
                     Ok(true) => {
-                        self.dirty_libraries.lock().remove(&library_id);
+                        let mut dirty_map = self.dirty_libraries.lock();
+                        if dirty_map.get(&library_id).copied() == dirty_version_before {
+                            dirty_map.remove(&library_id);
+                        }
                         store
                             .browse_projection(&library_id)
                             .map_err(|e| ProjectionError::Failed(e.to_string()))?
@@ -133,9 +150,8 @@ impl ProjectionService {
                 let dirty: Vec<String> = self
                     .dirty_libraries
                     .lock()
-                    .iter()
-                    .filter(|(_, d)| **d)
-                    .map(|(k, _)| k.clone())
+                    .keys()
+                    .cloned()
                     .collect();
                 for lib_id in dirty {
                     let _ = self.ensure(state.clone(), lib_id).await;

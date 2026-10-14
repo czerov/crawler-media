@@ -38,7 +38,7 @@ pub struct FsBrowse {
 /// 这里用裸 `spawn_blocking` 而不是共享的 HTTP 预算：目录选择器的扫描可能很久，
 /// 不应该占用其它端点共用的 8 个准入名额，也不引入新的 504 语义（对外行为不变）。
 pub async fn browse_fs(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Query(query): Query<BrowseQuery>,
 ) -> Response {
     let target = query
@@ -58,9 +58,16 @@ pub async fn browse_fs(
             }
         });
 
-    match tokio::task::spawn_blocking(move || read_directory(&target)).await {
+    match state
+        .fs_work
+        .run(std::time::Duration::from_secs(10), move || read_directory(&target))
+        .await
+    {
         Ok(Ok(browse)) => ok(serde_json::to_value(browse).unwrap_or_default()).into_response(),
         Ok(Err(response)) => response,
+        Err(crate::blocking_budget::BlockingError::Busy) => {
+            err(StatusCode::SERVICE_UNAVAILABLE, "fs.busy", "文件系统浏览并发过载")
+        }
         Err(error) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "fs.worker",

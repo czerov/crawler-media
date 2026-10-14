@@ -1504,8 +1504,9 @@ export function VideoPlayer(props: VideoPlayerProps) {
 
   useEffect(() => {
     if (state.phase !== "playing") return;
-    if (reportedStartRef.current !== unitKey) {
-      reportedStartRef.current = unitKey;
+    const startKey = `${unitKey}:${playSessionIdRef.current ?? ""}`;
+    if (reportedStartRef.current !== startKey) {
+      reportedStartRef.current = startKey;
       eventSequenceRef.current += 1;
       void reportPlaybackProgress(
         {

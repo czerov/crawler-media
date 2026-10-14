@@ -115,7 +115,8 @@ pub(super) fn report_event(
     let target = resolve_target(provider, user_id, id)?
         .ok_or_else(|| format!("Jellyfin playback item {id} is missing or not visible"))?;
     let target_ledger_id = target.ledger_id.parse::<domain::LedgerId>().map_err(|e| e.to_string())?;
-    let now = crate::job_loop::unix_now();
+    let now_ms = provider.state.playback_clock.now_ms();
+    let now = now_ms / 1000;
     let position_ms = position_ms.max(0);
     let store = provider.state.store.lock();
     if store
@@ -197,7 +198,7 @@ fn persist_event(
     event_sequence: Option<i64>,
     now: i64,
 ) -> Result<(), StoreError> {
-    let current = current_session(store, user_id, &client.device_id, target, now)?;
+    let current = current_session(store, user_id, &client.device_id, target, play_session_id, now)?;
     if current.as_ref().is_some_and(|s| s.admin_ended) {
         return Ok(());
     }
@@ -258,12 +259,19 @@ fn current_session(
     user_id: UserId,
     device_id: &str,
     target: &PlaybackTarget,
+    play_session_id: Option<&str>,
     now: i64,
 ) -> Result<Option<SessionRow>, StoreError> {
     let prior = store.get_session(user_id, device_id)?;
     if prior
         .as_ref()
-        .is_some_and(|session| same_target(session, target))
+        .is_some_and(|session| {
+            same_target(session, target)
+                && match (session.play_session_id.as_deref(), play_session_id) {
+                    (Some(prior_id), Some(new_id)) => prior_id == new_id,
+                    _ => true,
+                }
+        })
     {
         return Ok(prior);
     }

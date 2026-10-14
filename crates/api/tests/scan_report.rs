@@ -32,21 +32,12 @@ async fn multi_root_partial_scan_report() {
     let p_file = root1.join("valid_movie (2024).mkv");
     std::fs::write(&p_file, b"valid movie").unwrap();
 
-    let (status, res) = fix
-        .request(
-            "POST",
-            &format!("/api/v1/libraries/{}/scan", lib2.id),
-            Some(&fix.admin_token),
-        )
-        .await;
+    let (status, res) = fix.scan_and_wait(&lib2.id).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(res["ok"], true);
-    assert_eq!(res["data"]["status"], "partial");
-    assert_eq!(res["data"]["queued"], true);
-    assert_eq!(res["data"]["transferred"], true);
-    assert_eq!(res["data"]["inserted"], 1);
+    assert_eq!(res["status"], "partial");
+    assert_eq!(res["inserted"], 1);
 
-    let roots = res["data"]["roots"].as_array().unwrap();
+    let roots = res["roots"].as_array().unwrap();
     assert_eq!(roots.len(), 2);
     assert!(roots.iter().any(|r| r["status"] == "completed"));
     assert!(roots.iter().any(|r| r["status"] == "unreachable"));
@@ -83,15 +74,9 @@ async fn video_library_supports_mts_and_vob_and_iso() {
     std::fs::write(&f3, b"iso").unwrap();
     std::fs::write(&f_invalid, b"txt").unwrap();
 
-    let (status, res) = fix
-        .request(
-            "POST",
-            &format!("/api/v1/libraries/{}/scan", v_lib.id),
-            Some(&fix.admin_token),
-        )
-        .await;
+    let (status, res) = fix.scan_and_wait(&v_lib.id).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(res["data"]["inserted"], 3);
+    assert_eq!(res["inserted"], 3);
 
     let store_arc = fix.state.store();
     let guard = store_arc.lock();

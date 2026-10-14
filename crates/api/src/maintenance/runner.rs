@@ -57,10 +57,10 @@ pub fn run(state: &ApiState, job: &Job) -> Result<(), String> {
             report.dry_run = policy.dry_run;
             let dry_run = policy.dry_run;
             run_batches(&mut report, dry_run, &check_stop, || {
-                let queue = state.jobs.lock();
+                let mut queue = state.jobs.lock();
                 queue
-                    .prune_terminal_jobs(cutoff, BATCH_SIZE, dry_run)
-                    .map(BatchCounts::from_jobs)
+                    .prune_terminal_window(cutoff, BATCH_SIZE, dry_run)
+                    .map(BatchCounts::from_jobs_window)
                     .map_err(|error| error.to_string())
             })
         }
@@ -353,6 +353,17 @@ struct BatchCounts {
 }
 
 impl BatchCounts {
+    fn from_jobs_window(win: jobs::RetentionWindow) -> Self {
+        Self {
+            scanned: win.scanned,
+            candidates: win.candidates,
+            deleted: win.deleted,
+            protected: win.protected,
+            protected_truncated: false,
+            has_more: win.window_has_more,
+        }
+    }
+
     fn from_jobs(batch: jobs::RetentionBatch) -> Self {
         Self {
             scanned: batch.scanned,

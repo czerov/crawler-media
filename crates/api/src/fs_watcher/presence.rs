@@ -1,6 +1,7 @@
 //! Watcher presence reconciliation: marks ledger rows missing instead of
 //! automatically deleting ledger/Media/Playback facts.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use store::{
@@ -21,19 +22,25 @@ pub(crate) fn observe_event(
     path: &Path,
 ) -> Result<LedgerPresenceResult, PresenceError> {
     // 1. Snapshot libraries in store lock
-    let (snapshot, candidate_rows, missing_map) = {
+    let (snapshot, candidate_rows, missing_map, media_kinds) = {
         let store_arc = state.store();
         let guard = store_arc.lock();
         let snapshot = guard.library_ownership()?;
         let rows = guard.list_ledger()?;
         let missing_map = guard.missing_at_by_path()?;
-        (snapshot, rows, missing_map)
+        let media_ids: Vec<domain::MediaId> = rows.iter().map(|r| r.media_id).collect();
+        let media_map = guard.media_batch(&media_ids)?;
+        let media_kinds: HashMap<domain::MediaId, domain::MediaKind> = media_map
+            .into_iter()
+            .map(|(mid, m)| (mid, m.kind))
+            .collect();
+        (snapshot, rows, missing_map, media_kinds)
     };
 
     // 2. Resolve scope out of lock
     let scope = LibraryPathScope::resolve(snapshot.clone())?;
 
-    let mut observations = Vec::new();
+    let mut observations_by_lib: HashMap<String, Vec<LedgerPresenceObservation>> = HashMap::new();
 
     // Check matching candidate rows
     for row in candidate_rows {
@@ -43,22 +50,18 @@ pub(crate) fn observe_event(
             continue;
         }
 
-        let Ok(resolved) = LibraryPathScope::resolve_path(row_p) else {
-            observations.push(LedgerPresenceObservation {
-                row: row.clone(),
-                missing_at: missing_map.get(&row.path).copied(),
-                presence: FilePresence::Unknown,
-            });
+        let Some(&real_kind) = media_kinds.get(&row.media_id) else {
             continue;
         };
 
-        // Match owner library for this row
-        let owner_lib = match scope.owner(&resolved, domain::MediaKind::Movie) {
+        let Ok(resolved) = LibraryPathScope::resolve_path(row_p) else {
+            continue;
+        };
+
+        // Match owner library for this row using real MediaKind
+        let owner_lib = match scope.owner(&resolved, real_kind) {
             StrictOwner::Owned(lib) => lib,
-            _ => match scope.owner(&resolved, domain::MediaKind::Tv) {
-                StrictOwner::Owned(lib) => lib,
-                _ => continue,
-            },
+            _ => continue,
         };
 
         // Must be active and realtime_watch == true
@@ -66,13 +69,16 @@ pub(crate) fn observe_event(
             continue;
         }
 
-        // Check if root is readable
-        let root_ok = owner_lib
+        // Find the specific matching root and check if it is readable
+        let matching_root = owner_lib
             .root_paths
             .iter()
-            .any(|r| state.library_files.readable_root(r).is_ok());
-        if !root_ok {
-            tracing::warn!(library_id = %owner_lib.id, "Root unreadable during watcher event");
+            .find(|r| resolved.starts_with(r));
+        let Some(root) = matching_root else {
+            continue;
+        };
+        if state.library_files.readable_root(root).is_err() {
+            tracing::warn!(library_id = %owner_lib.id, root = %root.display(), "Root unreadable during watcher event");
             continue;
         }
 
@@ -85,19 +91,51 @@ pub(crate) fn observe_event(
             }
         };
 
-        observations.push(LedgerPresenceObservation {
-            row: row.clone(),
-            missing_at: missing_map.get(&row.path).copied(),
-            presence,
-        });
+        observations_by_lib
+            .entry(owner_lib.id.clone())
+            .or_default()
+            .push(LedgerPresenceObservation {
+                row: row.clone(),
+                missing_at: missing_map.get(&row.path).copied(),
+                presence,
+            });
     }
 
-    if observations.is_empty() {
+    if observations_by_lib.is_empty() {
         return Ok(LedgerPresenceResult::default());
     }
 
+    let mut total_result = LedgerPresenceResult::default();
     let now = crate::job_loop::unix_now();
-    let store_arc = state.store();
-    let guard = store_arc.lock();
-    Ok(guard.apply_ledger_presence(&observations, LedgerPresenceMode::Verify, now)?)
+
+    for (lib_id, observations) in observations_by_lib {
+        let lease = match state.acquire_library_work(&lib_id) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        let sub_res = lease.publish(|| {
+            let store_arc = state.store();
+            let guard = store_arc.lock();
+            let current_snapshot = guard.library_ownership().map_err(|e| e.to_string())?;
+            if !current_snapshot.accepts_work(&lib_id) {
+                return Err("library is deleting".to_string());
+            }
+            if !scope.matches(&current_snapshot) {
+                return Err("scope changed".to_string());
+            }
+            guard
+                .apply_ledger_presence(&observations, LedgerPresenceMode::Verify, now)
+                .map_err(|e| e.to_string())
+        });
+
+        if let Ok(res) = sub_res {
+            total_result.missing += res.missing;
+            total_result.restored += res.restored;
+            total_result.deleted += res.deleted;
+            total_result.skipped += res.skipped;
+        }
+    }
+
+    Ok(total_result)
 }

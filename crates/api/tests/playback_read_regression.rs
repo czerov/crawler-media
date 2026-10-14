@@ -305,7 +305,10 @@ async fn activity_media_target_fields_unchanged() {
                 admin_ended: false,
                 started_at: now_secs(),
                 last_report_at: now_secs(),
+                last_report_at_ms: now_secs() * 1000,
                 ledger_id: None,
+                play_session_id: None,
+                last_event_sequence: None,
             })
             .unwrap();
         media
@@ -373,7 +376,10 @@ async fn media_in_two_libraries_reports_null_library_id() {
                 admin_ended: false,
                 started_at: now_secs(),
                 last_report_at: now_secs(),
+                last_report_at_ms: now_secs() * 1000,
                 ledger_id: None,
+                play_session_id: None,
+                last_event_sequence: None,
             })
             .unwrap();
         media

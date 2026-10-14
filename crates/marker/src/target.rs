@@ -150,7 +150,15 @@ fn disable_proxy_environment(command: &mut Command) {
 }
 
 pub fn read_strm_url(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut handle = file.take(65_537);
+    let mut buf = Vec::new();
+    handle.read_to_end(&mut buf).ok()?;
+    if buf.len() > 65_536 {
+        return None;
+    }
+    let content = String::from_utf8(buf).ok()?;
     content
         .lines()
         .map(|line| line.trim())

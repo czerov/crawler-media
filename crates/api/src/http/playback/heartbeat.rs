@@ -25,6 +25,7 @@ struct Heartbeat<'a> {
     episode: i32,
     duration_ms: Option<i64>,
     now: i64,
+    now_ms: i64,
 }
 
 pub(crate) async fn progress(
@@ -39,6 +40,17 @@ pub(crate) async fn progress(
             "playback.invalid",
             "缺少 device_id",
         );
+    }
+    if let Some(rate_val) = body.get("rate") {
+        if let Some(r) = rate_val.as_f64() {
+            if !r.is_finite() || r < 0.25 || r > 4.0 {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "playback.invalid_rate",
+                    "播放倍率必须在 0.25 到 4.0 之间",
+                );
+            }
+        }
     }
     let play_session_id = body["play_session_id"].as_str().map(str::to_string);
     let event_sequence = body["event_sequence"].as_i64();
@@ -71,6 +83,7 @@ pub(crate) async fn progress(
     if duration_ms.is_none() {
         let _ = crate::http::library::ensure_probe_enqueued(&state, &row);
     }
+    let now_ms = state.playback_clock.now_ms();
     let heartbeat = Heartbeat {
         body: &body,
         user_id,
@@ -80,7 +93,8 @@ pub(crate) async fn progress(
         season,
         episode,
         duration_ms,
-        now: unix_now(),
+        now: now_ms / 1000,
+        now_ms,
     };
     apply_heartbeat(&state.store.lock(), &heartbeat, device_id)
 }
@@ -169,7 +183,7 @@ fn next_session(
     let paused = body["paused"].as_bool().unwrap_or(false);
     let previous = previous.filter(|_| !start);
     let rate = body["rate"].as_f64().unwrap_or(1.0);
-    let now_ms = heartbeat.now * 1000;
+    let now_ms = heartbeat.now_ms;
     let delta = previous
         .map(|prev| crate::playback_events::watched_increment(prev, position_ms, paused, false, now_ms, rate))
         .unwrap_or(0);
@@ -282,29 +296,30 @@ fn persist_heartbeat(
                 store
                     .unit_state(heartbeat.user_id, heartbeat.media_id, heartbeat.season, heartbeat.episode)?
                     .unwrap_or_default(),
-                true,
+                false,
             ));
         }
         crate::playback_events::EventDecision::Start => {
             if let Some(ref sid) = play_session_id {
-                let _ = store.activate_play_session(heartbeat.user_id, device, sid);
+                store.activate_play_session(heartbeat.user_id, device, sid)?;
             }
         }
         crate::playback_events::EventDecision::Stop => {
             if let Some(ref sid) = play_session_id {
-                let _ = store.close_play_session_id(heartbeat.user_id, device, sid);
+                store.close_play_session_id(heartbeat.user_id, device, sid)?;
             }
         }
         crate::playback_events::EventDecision::Update => {}
     }
 
-    let unit = update_unit(store, heartbeat, event)?;
+    let is_new_start = decision == crate::playback_events::EventDecision::Start;
+    let unit = update_unit(store, heartbeat, if is_new_start { "start" } else { event })?;
     let next = next_session(
         heartbeat,
         &unit,
         device,
         previous.as_ref(),
-        event == "start",
+        is_new_start,
     );
     let admin_ended = next.admin_ended && event != "stop";
     if event == "stop" {
@@ -363,7 +378,7 @@ mod tests {
         let body = serde_json::json!({"event":"start", "position_ms":500, "device_id":"race"});
         let heartbeat = Heartbeat { body: &body, user_id, media_id: provisional.id,
             kind: domain::MediaKind::Movie, ledger_id: ledger.id.to_string(),
-            season: UNIT_WHOLE, episode: UNIT_WHOLE, duration_ms: Some(1000), now: 10 };
+            season: UNIT_WHOLE, episode: UNIT_WHOLE, duration_ms: Some(1000), now: 10, now_ms: 10_000 };
 
         let (_, ended) = persist_heartbeat(&store, &heartbeat, "race").unwrap();
 

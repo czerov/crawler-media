@@ -12,13 +12,7 @@ async fn probe_obligation_is_created_on_scan_and_recovered() {
     let file = fix.root.join("ob_movie (2024).mkv");
     std::fs::write(&file, b"content").unwrap();
 
-    let (status, _) = fix
-        .request(
-            "POST",
-            &format!("/api/v1/libraries/{}/scan", fix.library_id),
-            Some(&fix.admin_token),
-        )
-        .await;
+    let (status, _) = fix.scan_and_wait(&fix.library_id).await;
     assert_eq!(status, axum::http::StatusCode::OK);
 
     let store_arc = fix.state.store();
@@ -41,12 +35,7 @@ async fn deleted_ledger_cleans_obligation_without_probe() {
     let file = fix.root.join("del_movie (2024).mkv");
     std::fs::write(&file, b"content").unwrap();
 
-    fix.request(
-        "POST",
-        &format!("/api/v1/libraries/{}/scan", fix.library_id),
-        Some(&fix.admin_token),
-    )
-    .await;
+    fix.scan_and_wait(&fix.library_id).await;
 
     let store_arc = fix.state.store();
     let row = store_arc

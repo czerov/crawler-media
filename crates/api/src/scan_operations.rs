@@ -1,6 +1,6 @@
 //! ScanCoordinator orchestrating single-flight durable scan operations.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,14 +9,21 @@ use store::{ScanOperation, ScanOperationStatus};
 
 use crate::management::ApiState;
 
+#[derive(Debug)]
+pub enum ScanEnqueueError {
+    NotFound(String),
+    Conflict(String),
+    Internal(String),
+}
+
 pub struct ScanCoordinator {
-    running_count: Mutex<usize>,
+    running_ops: Mutex<HashSet<String>>,
 }
 
 impl ScanCoordinator {
     pub fn new() -> Self {
         Self {
-            running_count: Mutex::new(0),
+            running_ops: Mutex::new(HashSet::new()),
         }
     }
 
@@ -26,35 +33,60 @@ impl ScanCoordinator {
         state: &ApiState,
         library_id: &str,
         targets: Vec<PathBuf>,
-    ) -> Result<ScanOperation, String> {
+    ) -> Result<ScanOperation, ScanEnqueueError> {
         let signature = {
             let store = state.store.lock();
             let lib = store
                 .get_library(library_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "Library missing".to_string())?;
-            format!("{}:{}", lib.kind.as_str(), lib.root_paths.len())
+                .map_err(|e| ScanEnqueueError::Internal(e.to_string()))?
+                .ok_or_else(|| ScanEnqueueError::NotFound("Library 不存在".to_string()))?;
+            if !store
+                .library_accepts_work(library_id)
+                .map_err(|e| ScanEnqueueError::Internal(e.to_string()))?
+            {
+                return Err(ScanEnqueueError::Conflict("Library 正在删除或已冻结".to_string()));
+            }
+            let mut roots: Vec<_> = lib.root_paths.iter().map(|p| p.display().to_string()).collect();
+            roots.sort();
+            format!("{}:{}:{}", lib.kind.as_str(), lib.root_paths.len(), roots.join(","))
         };
+
+        if state.acquire_library_work(library_id).is_err() {
+            return Err(ScanEnqueueError::Conflict("Library 正在删除或已冻结".to_string()));
+        }
 
         let now_ms = crate::job_loop::unix_now() * 1000;
         let op = {
             let store = state.store.lock();
             store
                 .enqueue_scan(library_id, &signature, &targets, now_ms)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| ScanEnqueueError::Internal(e.to_string()))?
         };
 
-        // If operation is already running, return it
-        if op.status == ScanOperationStatus::Running {
-            return Ok(op);
+        // If operation is already running or being executed by a worker, return it
+        {
+            let running = self.running_ops.lock();
+            if running.contains(&op.id) || op.status == ScanOperationStatus::Running {
+                return Ok(op);
+            }
         }
 
-        // Spawn async execution worker if within concurrency limit (max 2 global)
+        // Check global concurrency (max 2 active scan operations)
+        {
+            let mut running = self.running_ops.lock();
+            if running.len() >= 2 {
+                // Operation queued, worker will pick it up or be triggered
+                return Ok(op);
+            }
+            running.insert(op.id.clone());
+        }
+
         let state_clone = state.clone();
         let op_id = op.id.clone();
         let lib_id = library_id.to_string();
         tokio::spawn(async move {
             run_operation(&state_clone, &op_id, &lib_id).await;
+            state_clone.scan_coordinator.running_ops.lock().remove(&op_id);
         });
 
         Ok(op)
@@ -87,18 +119,26 @@ async fn run_operation(state: &ApiState, op_id: &str, library_id: &str) {
     let state_clone = state.clone();
     let lib_id = library_id.to_string();
     let scan_res = tokio::task::spawn_blocking(move || {
-        crate::http::library_scan::scan_library_leased(&state_clone, &lib_id, &lease)
+        crate::http::library_scan::scan_library_leased_result(&state_clone, &lib_id, &lease)
     })
     .await;
 
     let store = state.store.lock();
     match scan_res {
-        Ok(resp) => {
-            let status = if resp.status().is_success() {
-                ScanOperationStatus::Completed
+        Ok(Ok((scan_report, report_data))) => {
+            let any_partial_or_unreachable = scan_report
+                .roots
+                .iter()
+                .any(|r| matches!(r.status, library::ScanRootStatus::Partial | library::ScanRootStatus::Unreachable));
+            let status = if any_partial_or_unreachable || scan_report.error_count > 0 {
+                ScanOperationStatus::Partial
             } else {
-                ScanOperationStatus::Failed
+                ScanOperationStatus::Completed
             };
+            let _ = store.update_scan_operation_status(op_id, status, &report_data);
+        }
+        Ok(Err(resp)) => {
+            let status = ScanOperationStatus::Failed;
             let _ = store.update_scan_operation_status(
                 op_id,
                 status,

@@ -105,15 +105,8 @@ impl Store {
             rusqlite::TransactionBehavior::Immediate,
         )?;
 
-        let cur_lib_rev: i64 = tx
-            .query_row(
-                "SELECT revision FROM _read_revisions WHERE id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-
-        if cur_lib_rev != build.revisions.library {
+        let cur_revs = self.read_revisions()?;
+        if cur_revs != build.revisions {
             return Ok(false);
         }
 

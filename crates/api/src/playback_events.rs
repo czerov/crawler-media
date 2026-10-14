@@ -41,14 +41,18 @@ pub fn watched_increment(
     now_ms: i64,
     rate: f64,
 ) -> i64 {
-    let rate = if (0.25..=4.0).contains(&rate) { rate } else { 1.0 };
-    let elapsed = clock::clamp_elapsed(now_ms, previous.last_report_at_ms);
-    if elapsed == 0 {
+    // If previous was paused, or current progress is paused, no watch time is accumulated
+    if previous.paused || (paused && !stopped) {
         return 0;
     }
 
-    // If previous was paused, or current progress is paused, no watch time is accumulated
-    if previous.paused || (paused && !stopped) {
+    if previous.play_session_id.is_none() {
+        return (position_ms - previous.position_ms).max(0);
+    }
+
+    let rate = if (0.25..=4.0).contains(&rate) { rate } else { 1.0 };
+    let elapsed = clock::clamp_elapsed(now_ms, previous.last_report_at_ms);
+    if elapsed == 0 {
         return 0;
     }
 
@@ -95,11 +99,13 @@ pub fn classify_event(
             return EventDecision::Ignore;
         }
 
-        // Sequence check if provided
+        // Sequence check if provided within the same session
         if let (Some(prev), Some(seq)) = (previous, identity.event_sequence) {
-            if let Some(prev_seq) = prev.last_event_sequence {
-                if seq <= prev_seq {
-                    return EventDecision::Ignore;
+            if prev.play_session_id.as_deref() == Some(session_id.as_str()) {
+                if let Some(prev_seq) = prev.last_event_sequence {
+                    if seq <= prev_seq {
+                        return EventDecision::Ignore;
+                    }
                 }
             }
         }
@@ -107,8 +113,13 @@ pub fn classify_event(
         match event {
             PlaybackEventKind::Start => {
                 match b.state {
-                    PlaySessionIdState::Pending | PlaySessionIdState::Active => {
-                        EventDecision::Start
+                    PlaySessionIdState::Pending => EventDecision::Start,
+                    PlaySessionIdState::Active => {
+                        if previous.and_then(|p| p.play_session_id.as_deref()) == Some(session_id.as_str()) {
+                            EventDecision::Update
+                        } else {
+                            EventDecision::Start
+                        }
                     }
                     PlaySessionIdState::Closed => EventDecision::Ignore,
                 }
@@ -145,20 +156,22 @@ pub fn classify_event(
             PlaybackEventKind::Start => EventDecision::Start,
             PlaybackEventKind::Progress => {
                 if let Some(prev) = previous {
-                    let cur_ledger_match = prev.ledger_id.as_deref() == Some(&ledger.to_string());
-                    if cur_ledger_match {
+                    let cur_match = prev.ledger_id.as_deref() == Some(&ledger.to_string())
+                        || prev.ledger_id.is_none();
+                    if cur_match {
                         EventDecision::Update
                     } else {
                         EventDecision::Ignore
                     }
                 } else {
-                    EventDecision::Ignore
+                    EventDecision::Start
                 }
             }
             PlaybackEventKind::Stop => {
                 if let Some(prev) = previous {
-                    let cur_ledger_match = prev.ledger_id.as_deref() == Some(&ledger.to_string());
-                    if cur_ledger_match {
+                    let cur_match = prev.ledger_id.as_deref() == Some(&ledger.to_string())
+                        || prev.ledger_id.is_none();
+                    if cur_match {
                         EventDecision::Stop
                     } else {
                         EventDecision::Ignore

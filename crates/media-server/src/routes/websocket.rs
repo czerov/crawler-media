@@ -29,6 +29,13 @@ pub(super) async fn connect(
         .into_response()
 }
 
+async fn send_with_timeout(socket: &mut WebSocket, msg: Message) -> bool {
+    matches!(
+        tokio::time::timeout(Duration::from_secs(5), socket.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn run_socket(
     mut socket: WebSocket,
     user: AuthUser,
@@ -51,7 +58,7 @@ async fn run_socket(
                         tracing::info!(%user_id, "Token revoked or password changed, closing WebSocket");
                         break;
                     }
-                    if socket.send(Message::Text(event.to_string().into())).await.is_err() {
+                    if !send_with_timeout(&mut socket, Message::Text(event.to_string().into())).await {
                         break;
                     }
                 }
@@ -63,12 +70,12 @@ async fn run_socket(
             },
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(text))) if is_keepalive(&text) => {
-                    if socket.send(Message::Text(json!({"MessageType": "KeepAlive"}).to_string().into())).await.is_err() {
+                    if !send_with_timeout(&mut socket, Message::Text(json!({"MessageType": "KeepAlive"}).to_string().into())).await {
                         break;
                     }
                 }
                 Some(Ok(Message::Ping(payload))) => {
-                    if socket.send(Message::Pong(payload)).await.is_err() {
+                    if !send_with_timeout(&mut socket, Message::Pong(payload)).await {
                         break;
                     }
                 }
@@ -80,7 +87,7 @@ async fn run_socket(
                     tracing::info!(%user_id, "Token revoked or password changed on keepalive tick, closing WebSocket");
                     break;
                 }
-                if socket.send(Message::Text(json!({"MessageType": "KeepAlive"}).to_string().into())).await.is_err() {
+                if !send_with_timeout(&mut socket, Message::Text(json!({"MessageType": "KeepAlive"}).to_string().into())).await {
                     break;
                 }
             }

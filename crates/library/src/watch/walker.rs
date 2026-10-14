@@ -122,10 +122,7 @@ impl ScanWalker {
 
                 if meta.file_type().is_symlink() {
                     skipped += 1;
-                    continue;
-                }
-
-                if meta.is_dir() {
+                } else if meta.is_dir() {
                     self.dir_stack.push(path);
                 } else if meta.is_file() {
                     if is_video_file(&path) {

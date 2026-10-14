@@ -27,30 +27,21 @@ pub fn migrate_retention_cursors(conn: &Connection) -> Result<(), JobError> {
     Ok(())
 }
 
-pub fn prune_terminal_window(
-    conn: &Connection,
+struct RawRow {
+    rowid: i64,
+    id: String,
+    def_id: Option<String>,
+    finished_at: i64,
+    run_after: i64,
+}
+
+fn fetch_candidate_rows(
+    tx: &rusqlite::Transaction<'_>,
     cutoff: i64,
+    cur_finished_at: i64,
+    cur_rowid: i64,
     limit: usize,
-    dry_run: bool,
-) -> Result<RetentionWindow, JobError> {
-    let limit = limit.clamp(1, 500);
-    let tx = conn.unchecked_transaction()?;
-
-    // Read current cursor
-    let cursor_opt: Option<(i64, i64, i64)> = tx
-        .query_row(
-            "SELECT finished_at, last_rowid, cutoff FROM retention_cursors WHERE def_id = '__global__'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .ok();
-
-    let (cur_finished_at, cur_rowid) = match cursor_opt {
-        Some((f, r, c)) if c == cutoff => (f, r),
-        _ => (0, 0),
-    };
-
-    // Query terminal jobs ordered by (finished_at, rowid) strictly after current cursor
+) -> Result<Vec<RawRow>, JobError> {
     let mut stmt = tx.prepare(
         "SELECT rowid, id, def_id, finished_at, run_after
          FROM jobs
@@ -61,38 +52,28 @@ pub fn prune_terminal_window(
          ORDER BY finished_at ASC, rowid ASC
          LIMIT ?4",
     )?;
+    let rows_iter = stmt.query_map(params![cutoff, cur_finished_at, cur_rowid, limit + 1], |r| {
+        Ok(RawRow {
+            rowid: r.get(0)?,
+            id: r.get(1)?,
+            def_id: r.get(2)?,
+            finished_at: r.get(3)?,
+            run_after: r.get(4)?,
+        })
+    })?;
+    rows_iter.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
 
-    struct RawRow {
-        rowid: i64,
-        id: String,
-        def_id: Option<String>,
-        finished_at: i64,
-        run_after: i64,
-    }
-
-    let rows: Vec<RawRow> = {
-        let rows_iter = stmt.query_map(params![cutoff, cur_finished_at, cur_rowid, limit + 1], |r| {
-            Ok(RawRow {
-                rowid: r.get(0)?,
-                id: r.get(1)?,
-                def_id: r.get(2)?,
-                finished_at: r.get(3)?,
-                run_after: r.get(4)?,
-            })
-        })?;
-        rows_iter.collect::<Result<Vec<_>, _>>()?
-    };
-    drop(stmt);
-    let window_has_more = rows.len() > limit;
-    let window_rows: Vec<&RawRow> = rows.iter().take(limit).collect();
-    let scanned = window_rows.len();
-
+fn process_window_deletion(
+    tx: &rusqlite::Transaction<'_>,
+    window_rows: &[&RawRow],
+    dry_run: bool,
+) -> Result<(usize, usize, usize), JobError> {
     let mut to_delete = Vec::new();
     let mut protected = 0;
 
-    for row in &window_rows {
+    for row in window_rows {
         if let Some(ref did) = row.def_id {
-            // Check if this row is protected by latest terminal child rule
             let is_latest: bool = tx.query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM jobs
@@ -103,9 +84,7 @@ pub fn prune_terminal_window(
                 params![did, row.finished_at, row.run_after],
                 |r| r.get(0),
             )?;
-
             if !is_latest {
-                // It is the latest terminal child, protect it!
                 protected += 1;
                 continue;
             }
@@ -125,6 +104,38 @@ pub fn prune_terminal_window(
         candidates
     };
 
+    Ok((candidates, protected, deleted))
+}
+
+pub fn prune_terminal_window(
+    conn: &Connection,
+    cutoff: i64,
+    limit: usize,
+    dry_run: bool,
+) -> Result<RetentionWindow, JobError> {
+    let limit = limit.clamp(1, 500);
+    let tx = conn.unchecked_transaction()?;
+
+    let cursor_opt: Option<(i64, i64, i64)> = tx
+        .query_row(
+            "SELECT finished_at, last_rowid, cutoff FROM retention_cursors WHERE def_id = '__global__'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+
+    // Fixed cycle cutoff: continue cycle if current cutoff is at least stored cutoff
+    let (cur_finished_at, cur_rowid, active_cutoff) = match cursor_opt {
+        Some((f, r, c)) if cutoff >= c => (f, r, c),
+        _ => (0, 0, cutoff),
+    };
+
+    let rows = fetch_candidate_rows(&tx, active_cutoff, cur_finished_at, cur_rowid, limit)?;
+    let window_has_more = rows.len() > limit;
+    let window_rows: Vec<&RawRow> = rows.iter().take(limit).collect();
+    let scanned = window_rows.len();
+
+    let (candidates, protected, deleted) = process_window_deletion(&tx, &window_rows, dry_run)?;
     let cycle_complete = !window_has_more && window_rows.is_empty();
 
     if !dry_run {
@@ -136,7 +147,7 @@ pub fn prune_terminal_window(
             tx.execute(
                 "INSERT OR REPLACE INTO retention_cursors (def_id, cutoff, finished_at, last_rowid, cycle_started_at)
                  VALUES ('__global__', ?1, ?2, ?3, ?4)",
-                params![cutoff, last.finished_at, last.rowid, now],
+                params![active_cutoff, last.finished_at, last.rowid, now],
             )?;
         } else if cycle_complete {
             tx.execute("DELETE FROM retention_cursors WHERE def_id = '__global__'", [])?;
