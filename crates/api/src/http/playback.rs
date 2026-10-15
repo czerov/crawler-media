@@ -11,7 +11,6 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 
 use crate::http::{err, ok};
-use crate::job_loop::unix_now;
 use crate::management::ApiState;
 use crate::store::{UNIT_WHOLE, UnitState};
 
@@ -388,7 +387,8 @@ pub(crate) async fn metrics(
     axum::Extension(user_id): axum::Extension<domain::UserId>,
     Json(body): Json<Value>,
 ) -> Response {
-    let now = unix_now();
+    // `playback_clock` 是毫秒时钟；`playback_metrics.recorded_at` 存 unix 秒。
+    let now = state.playback_clock.now_ms() / 1000;
     let store = state.store.lock();
     let media_id = metric_media_id(&store, user_id, &body);
     match media_id {

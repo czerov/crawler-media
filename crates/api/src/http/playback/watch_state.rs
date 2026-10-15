@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 
 use super::resolve_media_id;
 use crate::http::{err, ok};
-use crate::job_loop::unix_now;
 use crate::management::ApiState;
 use crate::store::{UNIT_WHOLE, UnitRow};
 
@@ -160,15 +159,11 @@ pub(crate) async fn set_marks(
     let (season, episode) = super::selection::watch_unit(&store, media_id, season, episode);
     let played = body["played"].as_bool();
     let favorite = body["favorite"].as_bool();
-    if let Err(error) = store.set_unit_marks(
-        user_id,
-        media_id,
-        season,
-        episode,
-        played,
-        favorite,
-        unix_now(),
-    ) {
+    // `playback_clock` 是毫秒时钟；`playback_units.updated_at` 存 unix 秒。
+    let now = state.playback_clock.now_ms() / 1000;
+    if let Err(error) =
+        store.set_unit_marks(user_id, media_id, season, episode, played, favorite, now)
+    {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "store.error",

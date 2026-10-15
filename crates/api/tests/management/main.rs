@@ -71,6 +71,7 @@ mod library_video;
 mod media_alias_links;
 mod obscura_lifecycle;
 mod playback;
+mod playback_clock;
 mod playback_admin_ended_and_markers;
 mod playback_history_scope;
 mod playback_movie_units;

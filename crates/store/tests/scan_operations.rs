@@ -403,6 +403,86 @@ fn crash_recovery_keeps_requeued_round_report() {
     assert_eq!(recovered.report, report, "崩溃恢复后累计报告必须保留");
 }
 
+/// P2-3：durable 源版本挂在台账行上，跨 operation 存活（`scan_seen` 被清空后仍在），
+/// 并在该路径被重新处理时前进。
+#[test]
+fn ledger_source_version_survives_operation_checkpoint_clear() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("media");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("Movie (2024).strm");
+    std::fs::write(&file, "https://a/video").unwrap();
+    let path = file.display().to_string();
+    insert_ledger_row(&store, &file);
+
+    // 首次处理：断点与 durable 版本一起写下。
+    let op1 = store.enqueue_scan("lib1", "sig1", &[], 1000).unwrap();
+    store.record_scan_seen(&op1.id, &[file.clone()]).unwrap();
+    let recorded = store
+        .ledger_source_versions(&[path.clone()])
+        .unwrap()
+        .remove(&path)
+        .expect("已处理的路径必须有 durable 源版本");
+    assert!(
+        recorded.2.as_deref().is_some_and(|digest| !digest.is_empty()),
+        "STRM 必须有受限内容指纹"
+    );
+
+    // 终态清空断点：durable 版本必须还在，且能证明未变化的文件是同一版本。
+    assert_eq!(
+        store
+            .finalize_or_requeue_scan(&op1.id, 0, ScanOperationStatus::Completed, &serde_json::json!({}))
+            .unwrap(),
+        None
+    );
+    assert!(!store.is_scan_seen(&op1.id, &path).unwrap());
+    let surviving = store.ledger_source_versions(&[path.clone()]).unwrap();
+    assert_eq!(surviving.get(&path), Some(&recorded), "断点清空不得丢掉 durable 版本");
+    assert!(Store::scan_seen_stamp_matches(
+        &recorded,
+        &Store::scan_seen_stamp(&file)
+    ));
+
+    // 同 size/同 mtime 的 URL 替换：版本不再匹配，重新处理后前进。
+    let original_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+    std::fs::write(&file, "https://b/video").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(original_mtime)
+        .unwrap();
+    assert!(
+        !Store::scan_seen_stamp_matches(&recorded, &Store::scan_seen_stamp(&file)),
+        "同 size/同 mtime 的 URL 变化必须被 durable 版本识别"
+    );
+
+    let op2 = store.enqueue_scan("lib1", "sig1", &[], 2000).unwrap();
+    assert_ne!(op1.id, op2.id, "上一个 operation 已终态");
+    store.record_scan_seen(&op2.id, &[file.clone()]).unwrap();
+    let advanced = store
+        .ledger_source_versions(&[path.clone()])
+        .unwrap()
+        .remove(&path)
+        .expect("重新处理必须刷新 durable 源版本");
+    assert_ne!(advanced, recorded, "重新处理后 durable 版本必须前进");
+    assert!(Store::scan_seen_stamp_matches(
+        &advanced,
+        &Store::scan_seen_stamp(&file)
+    ));
+
+    // 没有台账行的路径不返回版本（本轮新文件，没有派生事实需要失效）。
+    let fresh = root.join("New (2024).mkv");
+    std::fs::write(&fresh, b"x").unwrap();
+    assert!(
+        store
+            .ledger_source_versions(&[fresh.display().to_string()])
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// P2-NEW-1：签名升级是 CAS，旧值不匹配时不写入、也不会覆盖别人的值。
 #[test]
 fn scope_signature_upgrade_is_compare_and_swap() {

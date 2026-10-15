@@ -55,5 +55,12 @@ pub fn migrate_scan_operations(conn: &Connection) -> Result<(), StoreError> {
     super::ensure_column(conn, "scan_seen", "file_size", "INTEGER NOT NULL DEFAULT 0")?;
     // P2-3：STRM 只有 URL 文本，size/mtime 无法建立身份；受限内容指纹单独持久化。
     super::ensure_column(conn, "scan_seen", "content_digest", "TEXT")?;
+    // P2-3：`scan_seen` 只是**当前 operation** 的断点，operation 终态时被清空。跨
+    // operation 的变化检测需要一份 durable 的「该台账行上次处理时的文件版本」，直接
+    // 挂在 ledger 行上（随行删除，不留孤儿）。列用 ensure_column 幂等补，不升
+    // `user_version`：语义上不新增表/约束，旧库与新库读到同样的列。
+    super::ensure_column(conn, "ledger", "source_version_ms", "INTEGER NOT NULL DEFAULT 0")?;
+    super::ensure_column(conn, "ledger", "source_version_size", "INTEGER NOT NULL DEFAULT 0")?;
+    super::ensure_column(conn, "ledger", "source_version_digest", "TEXT")?;
     Ok(())
 }

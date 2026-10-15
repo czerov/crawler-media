@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 
 use crate::management::ApiState;
 
-/// 为刚入账的 Video 文件附着 poster/backdrop。
+/// 为本轮处理过的 Video 文件附着 poster/backdrop。
+///
+/// `candidates` 是**封面候选集**，不是探测候选集：包含本 chunk 过滤后真正处理过的
+/// 全部文件（含已入账、本轮未变化的），这样镜像图片后开启、上次失败重试、用户删掉
+/// 自动海报等场景都能在普通重扫里补上（P2-1）。断点跳过的文件不在候选集里。
 ///
 /// 用真实 Media（而不是临时构造的假 Media），这样用户对 `artwork.{media_id}` 的
 /// 海报锁仍然生效。每处理一个文件前检查一次取消，避免一个 chunk 内的截帧工作
@@ -23,13 +27,13 @@ use crate::management::ApiState;
 /// 的图不是错误。
 pub(crate) fn attach_video_artwork(
     state: &ApiState,
-    inserted: &[PathBuf],
+    candidates: &[PathBuf],
     control: &library::WorkControl,
 ) {
-    for path in inserted {
+    for path in candidates {
         if control.is_cancelled() {
             tracing::info!(
-                remaining = inserted.len(),
+                remaining = candidates.len(),
                 "扫描已取消，停止为剩余 Video 文件附着封面"
             );
             return;

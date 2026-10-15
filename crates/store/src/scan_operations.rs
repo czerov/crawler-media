@@ -262,6 +262,10 @@ impl Store {
     /// 批量写断点版本事实：**纯 DB，不做文件 IO**（P2-NEW-2）。
     ///
     /// 调用方必须先在 Store 锁外用 [`Store::scan_seen_stamp`] 采集版本，再进锁写库。
+    ///
+    /// 同一事务里还会把版本写进台账行的 durable 源版本（P2-3）：`scan_seen` 只是当前
+    /// operation 的断点，终态即清空；跨 operation 的变化检测靠 ledger 上的这份事实。
+    /// 因此「断点」与「durable 版本」永远一起前进，不会出现断点已写而版本没写。
     pub fn record_scan_seen_stamps(
         &self,
         operation_id: &str,
@@ -283,9 +287,54 @@ impl Store {
                                content_digest = excluded.content_digest",
                 params![operation_id, path, mtime_ms, file_size, content_digest],
             )?;
+            // 只有已登记的台账行才有 durable 源版本；没有台账行的路径这里是空操作。
+            tx.execute(
+                "UPDATE ledger
+                    SET source_version_ms = ?2, source_version_size = ?3,
+                        source_version_digest = ?4
+                  WHERE path = ?1",
+                params![path, mtime_ms, file_size, content_digest],
+            )?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// 读 durable 每台账源版本：`path -> (mtime_ms, file_size, content_digest)`（P2-3）。
+    ///
+    /// 返回的是「上次处理该路径时的文件版本」，跨 operation 有效。台账行存在但从未
+    /// 记录过版本时返回 `0/0/NULL`——按既有约定等价「版本未知」，由
+    /// [`Store::scan_seen_stamp_matches`] 判为不可信，必须重新处理。map 里没有的路径
+    /// 表示根本没有台账行（本轮新文件）。
+    pub fn ledger_source_versions(
+        &self,
+        paths: &[String],
+    ) -> Result<HashMap<String, (i64, i64, Option<String>)>, StoreError> {
+        let mut versions = HashMap::new();
+        if paths.is_empty() {
+            return Ok(versions);
+        }
+        // 分块：复用 ledger.path 索引，同时不触碰 SQLite 的变量上限。
+        for chunk in paths.chunks(500) {
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT path, source_version_ms, source_version_size, source_version_digest
+                 FROM ledger WHERE path IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self.library.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get(1)?, row.get(2)?, row.get(3)?),
+                ))
+            })?;
+            for row in rows {
+                let (path, version) = row?;
+                versions.insert(path, version);
+            }
+        }
+        Ok(versions)
     }
 
     /// 批量读断点事实：**纯 DB，不做文件 IO**（P2-NEW-2）。

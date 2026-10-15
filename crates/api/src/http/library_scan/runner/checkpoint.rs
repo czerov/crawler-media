@@ -2,6 +2,10 @@
 //!
 //! 文件版本事实（size/mtime，`.strm` 另有受限内容指纹）必须在 Store 锁外采集；进锁后
 //! 只做一次批量 DB 读与纯内存判定。
+//!
+//! 变化检测有两个来源，缺一不可：当前 operation 的 `scan_seen` 断点（本轮已处理过的
+//! 文件），以及 ledger 行上的 **durable 源版本**（上一个 operation 处理时的版本）。
+//! 后者是跨 operation 检测的唯一依据——operation 终态会清空 `scan_seen`（P2-3）。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -49,9 +53,13 @@ pub(super) fn checkpoint_fresh(
         );
     }
     let paths: Vec<String> = files.iter().map(|f| f.path.display().to_string()).collect();
-    let checkpoints = {
+    let (checkpoints, source_versions) = {
         let store = state.store.lock();
-        store.scan_seen_checkpoints(op_id, &paths)
+        // 两个读都在同一把 Store 锁内：断点与 durable 版本必须是同一时刻的一致视图。
+        (
+            store.scan_seen_checkpoints(op_id, &paths),
+            store.ledger_source_versions(&paths),
+        )
     };
     let checkpoints = match checkpoints {
         Ok(checkpoints) => checkpoints,
@@ -65,6 +73,12 @@ pub(super) fn checkpoint_fresh(
             };
         }
     };
+    let source_versions = source_versions.unwrap_or_else(|error| {
+        // 读不到 durable 版本时按「没有版本事实」继续：与 `None` 分支同一保守方向
+        // （有台账行但版本未知 → 视为变化），不会静默跳过变化文件。
+        tracing::error!(%error, %op_id, "读取台账 durable 源版本失败，按版本未知处理");
+        HashMap::new()
+    });
     let mut fresh = Vec::with_capacity(files.len());
     let mut changed = Vec::new();
     let mut skipped = 0usize;
@@ -84,7 +98,15 @@ pub(super) fn checkpoint_fresh(
                 changed.push(file.path.clone());
                 fresh.push(file);
             }
-            None => fresh.push(file),
+            None => {
+                // P2-3：本 operation 对该路径没有断点（首次扫到，或上一个 operation 已
+                // 清空 `scan_seen`）。此时只能靠台账上的 durable 源版本判断文件自上次
+                // 处理以来是否变化。
+                if source_version_changed(source_versions.get(&key), &current) {
+                    changed.push(file.path.clone());
+                }
+                fresh.push(file);
+            }
         }
     }
     CheckpointDecision {
@@ -92,6 +114,21 @@ pub(super) fn checkpoint_fresh(
         skipped,
         changed,
         stamps,
+    }
+}
+
+/// durable 源版本是否证明该台账行对应的文件已经变化（P2-3）。
+///
+/// - 没有版本记录 = 根本没有台账行：本轮新文件，登记即可，没有派生事实需要失效。
+/// - 有台账行但版本未知（`0/0` 且无内容摘要，例如本特性上线前登记的旧行）：绝不视为
+///   同一版本——宁可多探测一次，也不能静默沿用已经过期的派生事实。
+fn source_version_changed(
+    recorded: Option<&(i64, i64, Option<String>)>,
+    current: &(i64, i64, Option<String>),
+) -> bool {
+    match recorded {
+        None => false,
+        Some(recorded) => !store::Store::scan_seen_stamp_matches(recorded, current),
     }
 }
 

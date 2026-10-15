@@ -43,7 +43,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use crate::http::err;
-use crate::http::library::{clear_library_cover_checked, library_cover_path, missing_library};
+use crate::http::library::{clear_library_cover_checked, missing_library};
 use crate::management::ApiState;
 use crate::scrape_store::ScrapeStoreExt;
 
@@ -168,10 +168,15 @@ pub(crate) fn scan_library_leased_resumable(
         }));
     }
     {
+        // 封面失效只做锁内短 DB 读写：`clear_library_cover_checked` 清掉「可重试」
+        // 标记，让下一次封面读取走 `LibraryCoverService::ensure_cover` 重生成。
+        //
+        // 这里**不再**调用 `library_cover_path`（P2-2）：它只做 `Path::is_file`，
+        // 返回值本来就被丢弃，但在 Store 锁内做文件系统 IO 违反 B3 §1.3（慢挂载
+        // 会拖住所有 Store 使用者）。封面路径解析/生成由封面服务在锁外负责。
         let store = state.store.lock();
         if let Some(lib) = library_by_id(&store, id) {
             clear_library_cover_checked(&store, &lib.id);
-            let _ = library_cover_path(&store, &lib);
         }
     }
     let total_errors: usize = run.root_reports.iter().map(|r| r.error_count).sum();

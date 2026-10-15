@@ -92,6 +92,128 @@ async fn cancel_scan_does_not_break_subsequent_library_work_leases() {
     assert_eq!(next_res["status"], "completed");
 }
 
+/// P2-3 端到端：**两次独立 operation** 之间的文件变化必须被识别。
+///
+/// operation A 扫完即清空 `scan_seen`；随后普通文件内容变化、`.strm` URL 换成同 size
+/// 同 mtime 的另一条；operation B 对该路径没有断点，只能靠 durable 源版本证明它变了。
+/// 变化必须让派生探测事实失效并重挂 durable probe 义务，同时**复用**既有台账行。
+#[tokio::test]
+async fn cross_operation_change_invalidates_derived_facts() {
+    let fix = PresenceFixture::new();
+    let mkv = fix.root.join("Movie1 (2024).mkv");
+    let strm = fix.root.join("Movie2 (2024).strm");
+    std::fs::write(&mkv, b"v1").unwrap();
+    std::fs::write(&strm, "https://a/video").unwrap();
+    let strm_len = std::fs::metadata(&strm).unwrap().len();
+    let strm_mtime = std::fs::metadata(&strm).unwrap().modified().unwrap();
+    let sig = fix.scope_signature();
+
+    // operation A：真实扫描，登记台账并记录 durable 源版本；终态后 scan_seen 被清空。
+    let op_a = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .enqueue_scan(&fix.library_id, &sig, &[], 1000)
+            .unwrap()
+    };
+    fix.state.scan_coordinator.trigger_next(&fix.state);
+    let done_a = fix.wait_scan_terminal_op(&op_a.id).await;
+    assert_eq!(
+        done_a.status,
+        store::ScanOperationStatus::Completed,
+        "{:?}",
+        done_a.report
+    );
+
+    // 变化前的基线：探测义务已了结、派生探测事实存在。
+    let (mkv_id, strm_id) = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        let rows = guard.list_ledger().unwrap();
+        assert_eq!(rows.len(), 2, "operation A 必须登记两个文件");
+        for row in &rows {
+            guard.ack_scan_probe_obligation(row.id).unwrap();
+            let tracks = library::Tracks {
+                video: Some(library::VideoTrack {
+                    codec: Some("h264".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            guard
+                .put_file_meta_versioned(&row.id.to_string(), &tracks, Some("v1"), Some(1000))
+                .unwrap();
+        }
+        assert!(
+            guard.scan_probe_obligations(100).unwrap().is_empty(),
+            "基线不应有未了结的探测义务"
+        );
+        (
+            rows.iter().find(|r| r.path.ends_with(".mkv")).unwrap().id,
+            rows.iter().find(|r| r.path.ends_with(".strm")).unwrap().id,
+        )
+    };
+
+    // 文件变化：mkv 内容变长；strm 换成同长度 URL 并把 mtime 恢复成原值。
+    std::fs::write(&mkv, b"v1-changed-content").unwrap();
+    std::fs::write(&strm, "https://b/video").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&strm)
+        .unwrap()
+        .set_modified(strm_mtime)
+        .unwrap();
+    let after = std::fs::metadata(&strm).unwrap();
+    assert_eq!(after.len(), strm_len, "测试前提：URL 长度未变");
+    assert_eq!(after.modified().unwrap(), strm_mtime, "测试前提：mtime 未变");
+
+    // operation B：全新 operation，没有任何该路径的 scan_seen 断点。
+    let op_b = {
+        let store = fix.state.store();
+        let guard = store.lock();
+        guard
+            .enqueue_scan(&fix.library_id, &sig, &[], 2000)
+            .unwrap()
+    };
+    assert_ne!(op_a.id, op_b.id, "A 已终态，B 必须是新 operation");
+    fix.state.scan_coordinator.trigger_next(&fix.state);
+    let done_b = fix.wait_scan_terminal_op(&op_b.id).await;
+    assert_eq!(
+        done_b.status,
+        store::ScanOperationStatus::Completed,
+        "{:?}",
+        done_b.report
+    );
+    assert_eq!(
+        done_b.report["scanned"], 2,
+        "两个变化文件都必须重新处理: {}",
+        done_b.report
+    );
+
+    let store = fix.state.store();
+    let guard = store.lock();
+    let rows = guard.list_ledger().unwrap();
+    assert_eq!(rows.len(), 2, "变化文件必须复用既有台账行，不得重新入库");
+    for id in [mkv_id, strm_id] {
+        assert!(
+            rows.iter().any(|row| row.id == id),
+            "台账行身份必须保持不变（{id}）"
+        );
+        assert!(
+            guard.get_file_meta(&id.to_string()).unwrap().is_none(),
+            "变化后派生探测事实必须失效（{id}）"
+        );
+    }
+    let obligations = guard.scan_probe_obligations(100).unwrap();
+    for (label, id) in [("普通文件", mkv_id), (".strm", strm_id)] {
+        let obligation = obligations
+            .iter()
+            .find(|obligation| obligation.ledger_id == id)
+            .unwrap_or_else(|| panic!("{label} 变化后必须重挂 durable probe 义务: {obligations:?}"));
+        assert_eq!(obligation.reason, "scan_changed", "{label}");
+    }
+}
+
 /// P2-1 端到端：先排整库、再把 watch 目标 A 合并进来，整库语义不得被缩小，
 /// A 与 B 都必须登记。
 #[tokio::test]

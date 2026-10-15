@@ -221,13 +221,23 @@ impl ScanContext<'_> {
                 totals: committed,
             });
         }
-        // 本 chunk 真正处理过的文件：新增/恢复 + 版本变化。
+        // 探测候选 = 新增/恢复 + 版本变化：只有这些文件的派生事实需要重排。
         let mut processed_paths = inserted.clone();
         processed_paths.extend(affected);
         if self.kind == domain::MediaKind::Video {
-            // Video 没有身份解析/刮削阶段：登记即完成，只补封面。旧路径对每个处理过
-            // 的文件都附着 poster/backdrop，这里沿用（断点跳过的未变化文件不重复）。
-            attach_video_artwork(self.state, &processed_paths, self.lease.control());
+            // Video 没有身份解析/刮削阶段：登记即完成，只补封面。
+            //
+            // 封面候选与探测候选**不同**（P2-1）：封面要覆盖本 chunk 过滤后真正
+            // 处理过的**所有**文件，而不只是新增/变化的那几个。已入账且本轮未变化的
+            // 文件不会被 `record_video_paths` 放进 `inserted`，`affected` 也只含当前
+            // operation 断点标记为变化的路径；若沿用探测候选，普通重扫就再也不会
+            // 尝试封面——镜像图片后开启无法回填、上次截帧失败无法重试、用户删掉的
+            // 自动海报无法重生。断点跳过的文件不在 `filtered` 里，不会被重复处理。
+            let artwork_paths: Vec<PathBuf> = filtered
+                .iter()
+                .map(|file| file.path.clone())
+                .collect();
+            attach_video_artwork(self.state, &artwork_paths, self.lease.control());
         } else {
             let scan_media = scan_media_for(self.state, &filtered);
             resolve_scan_metadata(self.state, self.id, self.lease, scan_media, &inserted, self.scrape)
