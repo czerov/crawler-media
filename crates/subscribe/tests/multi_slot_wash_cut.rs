@@ -8,6 +8,19 @@ fn mock_probed_file(path: &std::path::Path) {
     fs::write(path, b"test-video-bytes").unwrap();
 }
 
+/// Replacement approval needs a successful probe (S1); report 1080p/h264.
+struct Probed1080;
+
+impl library::MediaProbe for Probed1080 {
+    fn probe(&self, _: &std::path::Path) -> Result<library::FileQuality, library::LibraryError> {
+        Ok(library::FileQuality {
+            resolution: Some("1080p".into()),
+            codec: Some("h264".into()),
+            hdr: None,
+        })
+    }
+}
+
 fn create_tv_wash_cut_sub(
     media_id: domain::MediaId,
     filter_id: domain::FilterId,
@@ -211,7 +224,7 @@ fn wash_cut_does_not_delete_merged_file_still_referenced_by_other_slots() {
     mock_probed_file(&e1_src);
     let dl = downloader::MemoryDownloader::new(tmp.path().join("stage"));
     dl.map_enclosure_files(&e1.enclosure, vec![e1_src]);
-    let outcome = subscribe::run(RunInput {
+    let outcome = subscribe::run_with_probe(RunInput {
         subscribe: &sub,
         media: &media,
         filter: &filter,
@@ -226,7 +239,7 @@ fn wash_cut_does_not_delete_merged_file_still_referenced_by_other_slots() {
         hooks: None,
         naming: None,
         preserve_removed: false,
-    })
+    }, &Probed1080)
     .unwrap();
     assert!(
         merged.exists(),

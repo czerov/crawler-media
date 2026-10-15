@@ -37,7 +37,8 @@ fn wash_cut_replaces_only_when_score_strictly_greater() {
     map_file(&dl, &worse, tmp.path().join("missing-worse"));
     map_file(&dl, &better, src);
 
-    let outcome = run(run_input(
+    let outcome = subscribe::run_with_probe(
+        run_input(
         &sub,
         &media,
         &filter,
@@ -45,7 +46,9 @@ fn wash_cut_replaces_only_when_score_strictly_greater() {
         facts,
         &dl,
         &tmp.path().join("lib"),
-    ))
+    ),
+        &FileProbe,
+    )
     .unwrap();
 
     assert_eq!(dl.added().len(), 1);
@@ -230,7 +233,8 @@ fn wash_cut_preserve_removed_keeps_old_file() {
     let dl = MemoryDownloader::new(tmp.path().join("stage"));
     map_file(&dl, &better, src);
 
-    let outcome = run(RunInput {
+    let outcome = subscribe::run_with_probe(
+        RunInput {
         preserve_removed: true,
         ..run_input(
             &sub,
@@ -241,7 +245,9 @@ fn wash_cut_preserve_removed_keeps_old_file() {
             &dl,
             &tmp.path().join("lib"),
         )
-    })
+    },
+        &FileProbe,
+    )
     .unwrap();
 
     assert_eq!(outcome.removed_paths, vec![old_lib.display().to_string()]);
@@ -367,4 +373,45 @@ fn wash_cut_keep_old_versions_keeps_both_files() {
     );
     // 旧台账行由 api 层保留（removed_paths 为空 → 不删 ledger 行）。
     assert_eq!(outcome.ledger.len(), 1, "outcome carries only the new row");
+}
+
+struct FailingProbe;
+
+impl library::MediaProbe for FailingProbe {
+    fn probe(&self, _: &std::path::Path) -> Result<library::FileQuality, library::LibraryError> {
+        Err(library::LibraryError::Probe("Invalid data found when processing input".into()))
+    }
+}
+
+/// S1: a title-only "upgrade" (probe failed) must never delete the owned file.
+#[test]
+fn wash_cut_probe_failure_keeps_owned_file_and_fact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let media = media_movie();
+    let filter = movie_filter();
+    let sub = movie_sub(&media, &filter, true);
+    let old_lib = tmp.path().join("lib/old.mkv");
+    fs::create_dir_all(old_lib.parent().unwrap()).unwrap();
+    write_probed(&old_lib, "1080p", "h264", "");
+    let mut facts = SubscribeFacts::default();
+    facts.upsert(None, None, QualityFact { score: 50, path: Some(old_lib.display().to_string()) });
+    facts.set_quality(old_lib.display().to_string(), release::parse("The.Matrix.1999.1080p.BluRay.x264"));
+    let better = torrent("The.Matrix.1999.2160p.BluRay.x265-NEW", "https://pt.example/dl/better");
+    let src = tmp.path().join("better.mkv");
+    fs::write(&src, b"garbage").unwrap();
+    let dl = MemoryDownloader::new(tmp.path().join("stage"));
+    map_file(&dl, &better, src);
+
+    let outcome = subscribe::run_with_probe(
+        run_input(&sub, &media, &filter, vec![better], facts, &dl, &tmp.path().join("lib")),
+        &FailingProbe,
+    )
+    .unwrap();
+
+    assert_eq!(dl.added().len(), 1, "title looks like an upgrade, so it is downloaded");
+    assert!(old_lib.exists(), "unprobed replacement must not delete the owned file");
+    assert!(outcome.removed_paths.is_empty());
+    let fact = outcome.facts.movie().unwrap();
+    assert_eq!(fact.path.as_deref(), Some(old_lib.display().to_string().as_str()));
+    assert_eq!(fact.score, 50);
 }

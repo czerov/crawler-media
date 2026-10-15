@@ -303,7 +303,8 @@ fn collect_one<D: Downloader + ?Sized>(
     publish_video(added, &src, &dest, control)?;
     let (quality, source, confidence) = quality_for(probe, &dest, &scored.release, control);
     control.check()?;
-    // Final deletion approval uses actual quality, not the download title.
+    // Final deletion approval uses actual (probed) quality, never the download
+    // title alone: an unprobed arrival cannot replace an owned slot (S1).
     let (approved, actual_score) = replacement_survives_probe(
         added,
         scored,
@@ -476,6 +477,24 @@ fn replacement_survives_probe<D: Downloader + ?Sized>(
 ) -> (bool, i32) {
     if !added.input.subscribe.wash_cut {
         return (approved, scored.score);
+    }
+    // S1: deleting an owned file needs evidence about the file that replaces
+    // it. Without a successful probe the quality is only the torrent title, so
+    // never approve replacing an owned slot; keep the arrival as an alternate
+    // (score 0) and let the probe retry decide later.
+    let owns_file = slots.iter().any(|(s, e)| {
+        added
+            .input
+            .facts
+            .get(*s, *e)
+            .is_some_and(|fact| fact.path.is_some())
+    });
+    if owns_file && !was_probed {
+        tracing::warn!(
+            torrent = %scored.torrent.title,
+            "新文件 probe 失败，仅凭标题无法证明是升级，拒绝洗版替换并保留在位文件"
+        );
+        return (false, 0);
     }
     let mut release = scored.release.clone();
     release.resolution = quality.resolution.clone();
