@@ -79,7 +79,22 @@ fn should_take(
     candidate: &ScoredTorrent,
 ) -> bool {
     let slots = covered_slots(subscribe, &candidate.release);
-    should_replace_slots(subscribe, wash_filter, facts, candidate, &slots)
+    // H1: at most one upgrade per owned slot in flight. A candidate is only
+    // worth taking for slots that are neither owned-with-upgrade-pending nor
+    // otherwise blocked; if every slot it touches already has an in-flight
+    // upgrade, skip it (the in-flight download decides once it lands).
+    if subscribe.wash_cut
+        && !slots.is_empty()
+        && slots.iter().all(|(s, e)| facts.is_in_flight(*s, *e))
+    {
+        return false;
+    }
+    let open: Vec<_> = slots
+        .iter()
+        .copied()
+        .filter(|(s, e)| !facts.is_in_flight(*s, *e))
+        .collect();
+    should_replace_slots(subscribe, wash_filter, facts, candidate, &open)
 }
 
 /// 逐槽位判定候选是否应替换已有事实。choose() 用它做选择；collect.rs 用它

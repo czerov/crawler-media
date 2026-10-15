@@ -3,7 +3,6 @@
 //! Probing uses the real `ffprobe` on synthetic bytes, i.e. the probe-failure
 //! branch, unless a scenario says otherwise.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,7 +21,42 @@ pub const TOKEN: &str = "management-secret";
 pub const MATRIX_TITLE: &str = "The.Matrix.1999.2160p.BluRay.x265-GROUP";
 pub const MATRIX_ENCLOSURE: &str = "https://pt.example/download.php?id=1&passkey=abc";
 
+/// Indexer fixture whose search page can change between rounds.
+pub struct SearchFixture {
+    pub html: Mutex<String>,
+    pub requests: Mutex<Vec<String>>,
+}
+
+impl indexer::Fetcher for SearchFixture {
+    fn fetch(&self, request: &indexer::FetchRequest) -> Result<String, indexer::IndexerError> {
+        self.requests.lock().push(request.key.clone());
+        if request.key.starts_with("search:") {
+            Ok(self.html.lock().clone())
+        } else {
+            Err(indexer::IndexerError::Fetch(format!("no fixture for {}", request.key)))
+        }
+    }
+}
+
+/// NexusPHP search page with one row per `(title, id)`; enclosure is
+/// `https://pt.example/download.php?id=<id>&passkey=abc`.
+pub fn nexus_rows(rows: &[(&str, u32)]) -> String {
+    let mut html = String::from("<!DOCTYPE html><html><body><table class=\"torrents\">");
+    for (title, id) in rows {
+        html.push_str(&format!(
+            r#"<tr class="torrent"><td><a class="name" title="{title}" href="details.php?id={id}">x</a></td><td><a class="download" href="download.php?id={id}&amp;passkey=abc"></a></td><td class="size">4.00 GB</td><td class="seeders">42</td><td class="leechers">7</td><td class="snatched">180</td><td class="upload_time">2024-01-15 08:30</td><td class="category">Movies</td></tr>"#
+        ));
+    }
+    html.push_str("</table></body></html>");
+    html
+}
+
+pub fn enclosure(id: u32) -> String {
+    format!("https://pt.example/download.php?id={id}&passkey=abc")
+}
+
 pub struct Harness {
+    pub search: Arc<SearchFixture>,
     pub tmp: tempfile::TempDir,
     pub state: ApiState,
     pub app: axum::Router,
@@ -39,18 +73,62 @@ impl Harness {
         let tmp = tempfile::tempdir().unwrap();
         let qb = MockQbit::start(&tmp.path().join("downloads"));
         let client = downloader::QbitDownloader::connect(qb.config()).unwrap();
-        let fixtures = Arc::new(Fixtures {
+        let search = Arc::new(SearchFixture {
+            html: Mutex::new(html.to_string()),
             requests: Mutex::new(vec![]),
-            bodies: HashMap::from([("search", html)]),
         });
-        let state = state(tmp.path(), fixtures, Arc::new(client));
+        let state = ApiState::new(
+            api::Store::open(tmp.path().join("data")).unwrap(),
+            TOKEN.into(),
+            indexer::ProfileSet::load(None).unwrap(),
+            search.clone(),
+            Arc::new(client),
+            tmp.path().join("library"),
+        )
+        .unwrap();
         let app = router(state.clone());
-        Self {
-            tmp,
-            state,
-            app,
-            qb,
-        }
+        Self { search, tmp, state, app, qb }
+    }
+
+    pub fn set_search_rows(&self, rows: &[(&str, u32)]) {
+        *self.search.html.lock() = nexus_rows(rows);
+    }
+
+    /// Seed an owned movie file (library + ledger + facts) of the given quality.
+    pub fn seed_owned_movie(&self, id: SubscribeId, height: u32, codec: &str, score: i32) -> PathBuf {
+        let media_id = self.state.store().lock().get_subscribe(id).unwrap().unwrap().media_id;
+        let owned = self
+            .movie_library_root()
+            .join("The Matrix (1999)")
+            .join(format!("The Matrix (1999) - {height}p.mkv"));
+        std::fs::create_dir_all(owned.parent().unwrap()).unwrap();
+        std::fs::write(&owned, probed_video(height, codec, false)).unwrap();
+        let row = domain::LedgerRow {
+            id: domain::LedgerId::new(),
+            media_id,
+            path: owned.display().to_string(),
+            season: None,
+            episode: None,
+            resolution: Some(format!("{height}p")),
+            codec: Some(codec.into()),
+            hdr: None,
+            quality_source: domain::QualitySource::Probe,
+            confidence: domain::Confidence::High,
+            filter_score: Some(score),
+        };
+        let mut facts = subscribe::SubscribeFacts::default();
+        facts.replace(None, None, subscribe::QualityFact { score, path: Some(row.path.clone()) });
+        let codec_tag = if codec == "hevc" { "x265" } else { "x264" };
+        facts.set_quality(row.path.clone(), release::parse(&format!("The.Matrix.1999.{height}p.WEB-DL.{codec_tag}")));
+        let store = self.state.store();
+        let store = store.lock();
+        store.insert_ledger(&row).unwrap();
+        store.save_subscribe_facts(id, &facts).unwrap();
+        owned
+    }
+
+    pub fn owned_movie_path(&self, id: SubscribeId) -> Option<String> {
+        self.state.store().lock().load_subscribe_facts(id).unwrap().movie().and_then(|f| f.path.clone())
     }
 
     pub async fn create_site(&self) {
@@ -101,6 +179,19 @@ impl Harness {
         let body = json_body(response).await;
         assert_eq!(status, StatusCode::OK, "run failed: {body}");
         body
+    }
+
+    /// Scheduled SubscribeSearch job (finish_search path) run in-process.
+    pub async fn scheduled_search(&self, id: SubscribeId) -> Result<(), String> {
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            use jobs::Runner;
+            let payload = json!({ "subscribe_id": id.to_string() }).to_string();
+            let job = state.jobs().lock().enqueue(jobs::JobKind::SubscribeSearch, &payload, 0).unwrap();
+            api::worker::StateRunner { state: state.clone() }.run(&job)
+        })
+        .await
+        .unwrap()
     }
 
     /// Scheduled Transfer for one subscription (collect completed → import).

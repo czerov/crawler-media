@@ -11,6 +11,9 @@ pub struct SubscribeFacts {
     slots: HashMap<(Option<u32>, Option<u32>), QualityFact>,
     // Quality is supplied by the Library ledger, never inferred from a renamed path.
     qualities: HashMap<String, domain::Release>,
+    /// Owned slots that already have an upgrade download in flight (H1).
+    /// Transient: built from pending rows per round, never persisted.
+    in_flight: std::collections::HashSet<(Option<u32>, Option<u32>)>,
 }
 
 impl SubscribeFacts {
@@ -44,6 +47,16 @@ impl SubscribeFacts {
     /// Remove temporary in-flight coverage before reporting or persisting owned facts.
     pub fn retain_owned(&mut self) {
         self.slots.retain(|_, fact| fact.path.is_some());
+        self.in_flight.clear();
+    }
+
+    /// Mark an owned slot as having an in-flight upgrade download.
+    pub fn mark_in_flight(&mut self, season: Option<u32>, episode: Option<u32>) {
+        self.in_flight.insert((season, episode));
+    }
+
+    pub fn is_in_flight(&self, season: Option<u32>, episode: Option<u32>) -> bool {
+        self.in_flight.contains(&(season, episode))
     }
 
     pub fn movie(&self) -> Option<&QualityFact> {

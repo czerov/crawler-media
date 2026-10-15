@@ -354,7 +354,13 @@ fn load_run_facts(state: &ApiState, id: SubscribeId, context: &RunContext)
             }
         };
         for (season, episode) in units {
-            if facts.get(season, episode).is_none() {
+            if facts
+                .get(season, episode)
+                .is_some_and(|fact| fact.path.is_some())
+            {
+                // H1: an owned slot with a pending download is an in-flight upgrade.
+                facts.mark_in_flight(season, episode);
+            } else if facts.get(season, episode).is_none() {
                 facts.upsert(
                     season,
                     episode,

@@ -415,3 +415,26 @@ fn wash_cut_probe_failure_keeps_owned_file_and_fact() {
     assert_eq!(fact.path.as_deref(), Some(old_lib.display().to_string().as_str()));
     assert_eq!(fact.score, 50);
 }
+
+/// H1: an owned slot with an in-flight upgrade takes no further upgrades;
+/// without the in-flight mark the same candidate is an upgrade.
+#[test]
+fn in_flight_upgrade_blocks_more_upgrades_for_that_slot() {
+    let media = media_movie();
+    let filter = movie_filter();
+    let sub = movie_sub(&media, &filter, true);
+    let mut facts = SubscribeFacts::default();
+    facts.replace(None, None, QualityFact { score: 1, path: Some("/lib/old.mkv".into()) });
+    facts.set_quality("/lib/old.mkv".into(), release::parse("The.Matrix.1999.1080p.WEB-DL.x264"));
+    let title = "The.Matrix.1999.2160p.BluRay.x265-OTHER";
+    let candidate = filter::ScoredTorrent {
+        release: release::parse(title),
+        torrent: torrent(title, "https://pt.example/dl/other"),
+        score: 100,
+    };
+    assert_eq!(subscribe::choose(&sub, Some(&filter), &[candidate.clone()], &facts).len(), 1);
+    facts.mark_in_flight(None, None);
+    assert!(subscribe::choose(&sub, Some(&filter), &[candidate], &facts).is_empty());
+    facts.retain_owned();
+    assert!(!facts.is_in_flight(None, None), "in-flight marks are transient");
+}
