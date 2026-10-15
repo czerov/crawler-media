@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use domain::MediaId;
@@ -9,7 +9,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit};
 
 use super::{PosterBytes, PosterError};
 
-pub type InflightMap = HashMap<MediaId, Arc<PosterInflight>>;
+pub type InflightMap = HashMap<MediaId, Weak<PosterInflight>>;
 
 pub struct PosterInflight {
     pub outcome: Mutex<Option<Result<PosterBytes, PosterError>>>,
@@ -85,6 +85,7 @@ impl PosterWorkerGuard {
                 Err(PosterError::InvalidImage) => "invalid_image",
                 Err(PosterError::Upstream(_)) => "upstream",
                 Err(PosterError::Io(_)) => "io",
+                Err(PosterError::Busy) => "busy",
             };
             let elapsed_ms = self.started.elapsed().as_millis() as u64;
             tracing::info!(
@@ -114,12 +115,12 @@ impl Drop for PosterWorkerGuard {
         }
 
         // Identity-checked retirement: older worker can never remove newer generation's entry
+        // Clean up from map only if the weak entry points to our entry or is dead
         let mut map = self.in_flight.lock();
-        if map
-            .get(&self.media_id)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.entry))
-        {
-            map.remove(&self.media_id);
+        if let Some(weak) = map.get(&self.media_id) {
+            if weak.upgrade().is_none_or(|current| Arc::ptr_eq(&current, &self.entry)) {
+                map.remove(&self.media_id);
+            }
         }
     }
 }

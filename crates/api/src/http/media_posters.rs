@@ -37,5 +37,6 @@ pub(crate) async fn get_media_poster(
             (StatusCode::BAD_GATEWAY, "failed to fetch upstream poster").into_response()
         }
         Err(PosterError::Io(_)) => (StatusCode::INTERNAL_SERVER_ERROR, "poster io error").into_response(),
+        Err(PosterError::Busy) => (StatusCode::SERVICE_UNAVAILABLE, "poster service busy").into_response(),
     }
 }
