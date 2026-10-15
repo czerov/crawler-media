@@ -254,6 +254,77 @@ fn refresh_cannot_publish_a_snapshot_that_omits_a_deleted_job_member() {
     assert!(store.get_probe_job("job").unwrap().unwrap().is_active());
 }
 
+#[test]
+fn job_scoped_publication_publishes_rows_the_job_covers() {
+    let temp_a = tempfile::tempdir().unwrap();
+    let temp_b = tempfile::tempdir().unwrap();
+    let store = Store::open(temp_a.path()).unwrap();
+    let media_id = MediaId::new();
+
+    let mut row_a = row(temp_a.path());
+    row_a.media_id = media_id;
+    row_a.season = Some(1);
+    row_a.episode = Some(1);
+    store.insert_ledger(&row_a).unwrap();
+
+    let mut row_b = row(temp_b.path());
+    row_b.media_id = media_id;
+    row_b.season = Some(1);
+    row_b.episode = Some(2);
+    store.insert_ledger(&row_b).unwrap();
+
+    let id_a = row_a.id.to_string();
+    let units = [ProbeJobUnitSpec {
+        ledger_id: &id_a,
+        kind: "tv",
+        force_fingerprint: true,
+        reuse_fingerprint_cache: false,
+        overwrite_markers: true,
+        reuse_media_info_cache: true,
+    }];
+    store
+        .create_probe_job(
+            "job",
+            "marker_refresh",
+            &media_id.to_string(),
+            Some(1),
+            "scope",
+            &units,
+        )
+        .unwrap();
+    for unit in &units {
+        store.start_probe_unit("job", unit.ledger_id).unwrap();
+        store
+            .finish_probe_unit("job", unit.ledger_id, true, None)
+            .unwrap();
+    }
+
+    let expected_chapters_a = vec![library::ChapterMarker {
+        start_ms: 0,
+        end_ms: 120_000,
+        title: Some("Chapter 1".into()),
+        marker_type: None,
+        synthetic: false,
+    }];
+    let replacement = MarkerResultReplacement {
+        media_id,
+        season: 1,
+        markers: vec![marker(&row_a, "job_covered")],
+        chapter_updates: vec![(id_a.clone(), expected_chapters_a.clone())],
+    };
+
+    let result = store.complete_marker_refresh_checked("job", &[replacement]);
+    assert!(result.is_ok());
+    assert_eq!(
+        store.get_cached_chapters(&id_a).unwrap(),
+        Some(expected_chapters_a)
+    );
+    assert_eq!(
+        store.get_cached_chapters(&row_b.id.to_string()).unwrap(),
+        None
+    );
+}
+
 fn capture_result(row: &LedgerRow) -> (StoredFingerprintAttempt, StoredFingerprintSample) {
     let mut attempt = StoredFingerprintAttempt {
         attempt_id: format!("capture-{}", row.id),

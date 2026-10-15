@@ -1,5 +1,5 @@
 use super::{MarkerResultReplacement, Store, StoreError};
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
 
 impl Store {
@@ -75,6 +75,33 @@ pub(super) fn validate_job_members(
         return Err(StoreError::Missing(
             "file_deleted: refresh membership changed before publication".into(),
         ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_published_rows(
+    tx: &Transaction<'_>,
+    replacements: &[MarkerResultReplacement],
+) -> Result<(), StoreError> {
+    let mut statement = tx.prepare("SELECT path FROM ledger WHERE id = ?1")?;
+    for replacement in replacements {
+        for (id, _) in &replacement.chapter_updates {
+            let path_opt: Option<String> = statement
+                .query_row(params![id], |row| row.get(0))
+                .optional()?;
+            let path = match path_opt {
+                Some(path) => path,
+                None => return Err(StoreError::Missing(format!("file_deleted: {id}"))),
+            };
+            match std::path::Path::new(&path).try_exists() {
+                Ok(true) => {}
+                Ok(false) => return Err(StoreError::Missing(format!("file_deleted: {id}"))),
+                Err(error) => {
+                    tracing::error!(%error, ledger_id = id, "检查标记发布源文件失败");
+                    return Err(error.into());
+                }
+            }
+        }
     }
     Ok(())
 }

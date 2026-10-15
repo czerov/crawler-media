@@ -193,7 +193,7 @@ fn refresh_leases(
     super::progress::MetadataPriorityGate::for_rows(manager, &units).map(|(_, leases)| leases)
 }
 
-fn work_lease(
+pub(super) fn work_lease(
     manager: &ProbeManager,
     unit: &ProbeUnit,
 ) -> Result<Option<crate::library_lifecycle::LibraryWorkLease>, String> {
@@ -212,7 +212,7 @@ fn work_lease(
     registry.acquire(&manager.store, &library_id).map(Some)
 }
 
-fn source_ready(manager: &ProbeManager, unit: &ProbeUnit) -> bool {
+pub(super) fn source_ready(manager: &ProbeManager, unit: &ProbeUnit) -> bool {
     if let Some(id) = &unit.job_id {
         if manager
             .store

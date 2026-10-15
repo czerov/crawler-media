@@ -169,76 +169,80 @@ impl ProbeManager {
                 continue;
             }
             self.recover_retained_units(&job, units, &removed_units);
-            let refreshed = self.store.lock().get_probe_job(&job.id);
-            let refreshed = match refreshed {
-                Ok(Some(refreshed)) => refreshed,
-                Ok(None) => {
-                    tracing::error!(job_id = %job.id, "恢复探测任务后数据库中找不到任务记录");
-                    continue;
+            self.finalize_recovered_job(&job);
+        }
+    }
+
+    fn finalize_recovered_job(&self, job: &crate::store::ProbeJob) {
+        let refreshed = self.store.lock().get_probe_job(&job.id);
+        let refreshed = match refreshed {
+            Ok(Some(refreshed)) => refreshed,
+            Ok(None) => {
+                tracing::error!(job_id = %job.id, "恢复探测任务后数据库中找不到任务记录");
+                return;
+            }
+            Err(error) => {
+                tracing::error!(%error, job_id = %job.id, "恢复探测任务后读取任务状态失败");
+                match self
+                    .store
+                    .lock()
+                    .fail_completed_probe_job(&job.id, "重启恢复时无法读取已完成任务状态")
+                {
+                    Ok(true) => {
+                        tracing::error!(job_id = %job.id, "已将无法确认状态的完成任务标记失败并释放任务范围")
+                    }
+                    Ok(false) => {
+                        tracing::warn!(job_id = %job.id, "未终止探测任务：任务可能仍有待处理单元或已被其他流程终止")
+                    }
+                    Err(finish_error) => {
+                        tracing::error!(%finish_error, job_id = %job.id, "读取任务状态失败后持久化失败状态也失败")
+                    }
                 }
-                Err(error) => {
-                    tracing::error!(%error, job_id = %job.id, "恢复探测任务后读取任务状态失败");
-                    match self
-                        .store
-                        .lock()
-                        .fail_completed_probe_job(&job.id, "重启恢复时无法读取已完成任务状态")
+                return;
+            }
+        };
+        if refreshed.completed >= refreshed.total && refreshed.is_active() {
+            if refreshed.failed > 0 {
+                if let Err(error) = self.store.lock().finish_probe_job(
+                    &job.id,
+                    false,
+                    refreshed.error.as_deref(),
+                ) {
+                    tracing::error!(%error, job_id = %job.id, "持久化恢复任务的失败状态失败");
+                }
+            } else if refreshed.kind == "marker_refresh" {
+                match self.recovered_marker_refresh_unit(&refreshed) {
+                    Ok(unit) => {
+                        // 不在构造期间同步执行整季计算，避免等待尚未启动的 worker 导致死锁。
+                        // 暂存到 recovered_marker_refreshes，在 try_start_workers 启动 worker 后异步处理。
+                        self.recovered_marker_refreshes
+                            .lock()
+                            .push((refreshed, unit));
+                    }
+                    Err(crate::store::StoreError::Missing(reason))
+                        if crate::fingerprint_job::source::is_file_deleted(&reason) =>
                     {
-                        Ok(true) => {
-                            tracing::error!(job_id = %job.id, "已将无法确认状态的完成任务标记失败并释放任务范围")
-                        }
-                        Ok(false) => {
-                            tracing::warn!(job_id = %job.id, "未终止探测任务：任务可能仍有待处理单元或已被其他流程终止")
-                        }
-                        Err(finish_error) => {
-                            tracing::error!(%finish_error, job_id = %job.id, "读取任务状态失败后持久化失败状态也失败")
-                        }
-                    }
-                    continue;
-                }
-            };
-            if refreshed.completed >= refreshed.total && refreshed.is_active() {
-                if refreshed.failed > 0 {
-                    if let Err(error) = self.store.lock().finish_probe_job(
-                        &job.id,
-                        false,
-                        refreshed.error.as_deref(),
-                    ) {
-                        tracing::error!(%error, job_id = %job.id, "持久化恢复任务的失败状态失败");
-                    }
-                } else if refreshed.kind == "marker_refresh" {
-                    match self.recovered_marker_refresh_unit(&refreshed) {
-                        Ok(unit) => {
-                            // 不在构造期间同步执行整季计算，避免等待尚未启动的 worker 导致死锁。
-                            // 暂存到 recovered_marker_refreshes，在 try_start_workers 启动 worker 后异步处理。
-                            self.recovered_marker_refreshes
-                                .lock()
-                                .push((refreshed, unit));
-                        }
-                        Err(crate::store::StoreError::Missing(reason))
-                            if crate::fingerprint_job::source::is_file_deleted(&reason) =>
+                        if let Err(error) =
+                            self.store.lock().cancel_probe_job(&job.id, "file_deleted")
                         {
-                            if let Err(error) =
-                                self.store.lock().cancel_probe_job(&job.id, "file_deleted")
-                            {
-                                tracing::error!(%error, job_id = %job.id, "恢复时持久化任务取消状态失败");
-                            } else {
-                                tracing::info!(job_id = %job.id, reason = "file_deleted", "源文件已删除，取消待发布的刷新任务");
-                            }
-                        }
-                        Err(error) => {
-                            if let Err(finish_error) = self.store.lock().finish_probe_job(
-                                &job.id,
-                                false,
-                                Some("重启恢复时无法读取任务台账"),
-                            ) {
-                                tracing::error!(%finish_error, job_id = %job.id, "持久化无法恢复的片头片尾任务失败状态失败");
-                            }
-                            tracing::error!(%error, job_id = %job.id, "完成的片头片尾任务无法恢复，已标记失败并释放任务范围");
+                            tracing::error!(%error, job_id = %job.id, "恢复时持久化任务取消状态失败");
+                        } else {
+                            tracing::info!(job_id = %job.id, reason = "file_deleted", "源文件已删除，取消待发布的刷新任务");
                         }
                     }
-                } else if let Err(error) = self.store.lock().finish_probe_job(&job.id, true, None) {
-                    tracing::error!(%error, job_id = %job.id, "持久化恢复任务的成功状态失败");
+                    Err(error) => {
+                        if let Err(finish_error) = self.store.lock().finish_probe_job(
+                            &job.id,
+                            false,
+                            Some("重启恢复时无法读取任务台账"),
+                        ) {
+                            tracing::error!(%finish_error, job_id = %job.id, "持久化无法恢复的片头片尾任务失败状态失败");
+                        }
+                        tracing::error!(%error, job_id = %job.id, "完成的片头片尾任务无法恢复，已标记失败并释放任务范围");
+                    }
                 }
+            } else if let Err(error) = self.store.lock().finish_probe_job(&job.id, true, None) {
+                tracing::error!(%error, job_id = %job.id, "持久化恢复任务的成功状态失败");
             }
         }
     }
@@ -372,8 +376,20 @@ impl ProbeManager {
         job: &crate::store::ProbeJob,
     ) -> Result<ProbeUnit, crate::store::StoreError> {
         let store = self.store.lock();
-        let persisted = store
-            .probe_job_units(&job.id)?
+        let persisted_units = store.probe_job_units(&job.id)?;
+        for unit in &persisted_units {
+            let row = store
+                .get_ledger(&unit.ledger_id.replace('-', ""))?
+                .ok_or_else(|| {
+                    crate::store::StoreError::Missing(format!(
+                        "file_deleted: ledger {}",
+                        unit.ledger_id
+                    ))
+                })?;
+            crate::fingerprint_job::source::ensure_source_available(&store, &row)
+                .map_err(crate::store::StoreError::Missing)?;
+        }
+        let persisted = persisted_units
             .into_iter()
             .next()
             .ok_or_else(|| {

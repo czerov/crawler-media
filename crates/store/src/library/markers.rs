@@ -1,6 +1,7 @@
 mod source_guard;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, params, params_from_iter};
+use std::collections::BTreeSet;
 
 use super::{Store, StoreError};
 
@@ -96,14 +97,38 @@ impl Store {
         let serialized = serialize_chapter_updates(replacements)?;
         let tx = self.library.unchecked_transaction()?;
         if check_sources {
-            source_guard::validate_members(&tx, replacements)?;
-            if let Some(job_id) = completed_job_id {
-                source_guard::validate_job_members(&tx, job_id, replacements)?;
+            match completed_job_id {
+                Some(job_id) => {
+                    // A job-scoped refresh publishes exactly the members the job covered, so the
+                    // season-wide membership equality does not apply. Each published row must still
+                    // exist in the ledger and on disk, and the published set must equal the job's members.
+                    source_guard::validate_published_rows(&tx, replacements)?;
+                    source_guard::validate_job_members(&tx, job_id, replacements)?;
+                }
+                None => source_guard::validate_members(&tx, replacements)?,
             }
         }
 
+        // A job-scoped refresh must not mutate marker facts for episodes outside the rows it leased and published.
+        // Only the source-checked job path is job-scoped: the unchecked legacy entry point keeps its season-wide
+        // replacement semantics and may be driven with ledger ids that are not persisted rows.
+        let covered_episodes = match completed_job_id {
+            Some(_) if check_sources => {
+                let mut episodes = BTreeSet::new();
+                let mut stmt = tx.prepare("SELECT COALESCE(episode, 1) FROM ledger WHERE id = ?1")?;
+                for replacement in replacements {
+                    for (id, _) in &replacement.chapter_updates {
+                        let episode: i64 = stmt.query_row(params![id], |row| row.get(0))?;
+                        episodes.insert(episode);
+                    }
+                }
+                Some(episodes)
+            }
+            _ => None,
+        };
+
         for replacement in replacements {
-            write_replacement_markers(&tx, replacement)?;
+            write_replacement_markers(&tx, replacement, covered_episodes.as_ref())?;
         }
         for (ledger_id, chapters_json) in serialized {
             upsert_chapter_cache(&tx, &ledger_id, chapters_json)?;
@@ -201,16 +226,21 @@ fn serialize_chapter_updates(
         .collect()
 }
 
-/// Replace all unlocked marker rows for one season; locked rows are preserved as-is.
+/// Replace unlocked marker rows for one season; locked rows are preserved as-is.
+/// When `covered_episodes` is `Some`, only episodes in that set are deleted and re-inserted;
+/// other episodes keep their marker rows untouched. When `None`, the whole season is replaced.
 fn write_replacement_markers(
     tx: &rusqlite::Transaction<'_>,
     replacement: &MarkerResultReplacement,
+    covered_episodes: Option<&BTreeSet<i64>>,
 ) -> Result<(), StoreError> {
-    tx.execute(
-        "DELETE FROM media_markers WHERE media_id = ?1 AND season = ?2 AND locked = 0",
-        params![replacement.media_id.to_string(), replacement.season],
-    )?;
+    delete_replacement_markers(tx, replacement, covered_episodes)?;
     for marker in &replacement.markers {
+        if let Some(episodes) = covered_episodes {
+            if !episodes.contains(&(marker.episode as i64)) {
+                continue;
+            }
+        }
         let is_locked: bool = tx
             .query_row(
                 "SELECT locked FROM media_markers WHERE media_id = ?1 AND season = ?2 AND episode = ?3",
@@ -222,6 +252,40 @@ fn write_replacement_markers(
             continue;
         }
         insert_marker_row(tx, marker)?;
+    }
+    Ok(())
+}
+
+fn delete_replacement_markers(
+    tx: &rusqlite::Transaction<'_>,
+    replacement: &MarkerResultReplacement,
+    covered_episodes: Option<&BTreeSet<i64>>,
+) -> Result<(), StoreError> {
+    match covered_episodes {
+        None => {
+            tx.execute(
+                "DELETE FROM media_markers WHERE media_id = ?1 AND season = ?2 AND locked = 0",
+                params![replacement.media_id.to_string(), replacement.season],
+            )?;
+        }
+        Some(episodes) => {
+            if episodes.is_empty() {
+                return Ok(());
+            }
+            let placeholders = vec!["?"; episodes.len()].join(", ");
+            let sql = format!(
+                "DELETE FROM media_markers WHERE media_id = ?1 AND season = ?2 AND locked = 0 AND episode IN ({placeholders})"
+            );
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(2 + episodes.len());
+            let media_id_str = replacement.media_id.to_string();
+            params.push(&media_id_str);
+            params.push(&replacement.season);
+            for ep in episodes {
+                params.push(ep);
+            }
+            let mut stmt = tx.prepare(&sql)?;
+            stmt.execute(params_from_iter(params))?;
+        }
     }
     Ok(())
 }

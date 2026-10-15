@@ -180,7 +180,7 @@ fn prepare_season_replacements(
                 )
             })?;
 
-        let replacement =
+        let mut replacement =
             if sampling_mode == "adaptive" && tokio::runtime::Handle::try_current().is_ok() {
                 let season_units: Vec<ProbeUnit> = all_rows
                     .iter()
@@ -222,6 +222,11 @@ fn prepare_season_replacements(
                     .map_err(|error| (*season, error))?
             };
 
+        // The job's membership is what the caller leased and validated, so the
+        // publication must cover exactly those rows.
+        scope_replacement_to_job(mgr, job, &mut replacement)
+            .map_err(|error| (*season, error))?;
+
         tracing::info!(
             job_id = %job.id,
             %media_id,
@@ -233,6 +238,30 @@ fn prepare_season_replacements(
         replacements.push(replacement);
     }
     Ok(replacements)
+}
+
+fn scope_replacement_to_job(
+    mgr: &ProbeManager,
+    job: &crate::store::ProbeJob,
+    replacement: &mut crate::store::MarkerResultReplacement,
+) -> Result<(), crate::store::StoreError> {
+    let units = mgr.store.lock().probe_job_units(&job.id)?;
+    let members: std::collections::HashSet<String> =
+        units.into_iter().map(|unit| unit.ledger_id).collect();
+    let before = replacement.chapter_updates.len();
+    replacement
+        .chapter_updates
+        .retain(|(id, _)| members.contains(id));
+    let dropped = before.saturating_sub(replacement.chapter_updates.len());
+    if dropped > 0 {
+        tracing::info!(
+            job_id = %job.id,
+            kept = replacement.chapter_updates.len(),
+            dropped,
+            "【片头片尾】整条目刷新只发布任务范围内的剧集，跳过其他库的同季行"
+        );
+    }
+    Ok(())
 }
 
 fn fail_job(mgr: &ProbeManager, job: &crate::store::ProbeJob, message: &str) {

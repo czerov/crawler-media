@@ -755,6 +755,12 @@ mod tests {
         include!("probe_manager/marker_refresh_tests.rs");
     }
 
+    mod marker_refresh_lifecycle {
+        use super::*;
+        include!("probe_manager/marker_refresh_lifecycle_tests.rs");
+        include!("probe_manager/marker_refresh_lifecycle_worker_tests.rs");
+    }
+
     mod marker_persist {
         use super::*;
         include!("probe_manager/marker_persist_tests.rs");
