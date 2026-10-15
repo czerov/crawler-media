@@ -343,7 +343,23 @@ impl Store {
         source: &str,
         prefixes: &[String],
     ) -> Result<Vec<CatalogCacheRow>, StoreError> {
+        self.catalog_details_for_prefixes_with_vm_steps(source, prefixes)
+            .map(|(rows, _)| rows)
+    }
+
+    /// Same read as [`Self::catalog_details_for_prefixes`], additionally
+    /// reporting the SQLite VM steps the query consumed so tests can assert DB work.
+    #[doc(hidden)]
+    pub fn catalog_details_for_prefixes_with_vm_steps(
+        &self,
+        source: &str,
+        prefixes: &[String],
+    ) -> Result<(Vec<CatalogCacheRow>, i64), StoreError> {
+        if prefixes.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
         let mut results = Vec::new();
+        let mut total_vm_steps: i64 = 0;
         for chunk in prefixes.chunks(400) {
             let mut sql = String::from(
                 "SELECT source, cache_key, body, fetched_at, expires_at
@@ -356,10 +372,14 @@ impl Store {
                     sql.push_str(" OR ");
                 }
                 let exact = values.len() + 1;
-                let like = values.len() + 2;
-                sql.push_str(&format!("cache_key = ?{exact} OR cache_key LIKE ?{like}"));
+                let lower = values.len() + 2;
+                let upper = values.len() + 3;
+                sql.push_str(&format!(
+                    "cache_key = ?{exact} OR (cache_key >= ?{lower} AND cache_key < ?{upper})"
+                ));
                 values.push(rusqlite::types::Value::from(prefix.clone()));
-                values.push(rusqlite::types::Value::from(format!("{prefix}?%")));
+                values.push(rusqlite::types::Value::from(format!("{prefix}?")));
+                values.push(rusqlite::types::Value::from(format!("{prefix}@")));
             }
             sql.push_str(") ORDER BY fetched_at DESC, rowid ASC");
             let mut stmt = self.catalog.prepare(&sql)?;
@@ -375,8 +395,9 @@ impl Store {
             for row in rows {
                 results.push(row?);
             }
+            total_vm_steps += i64::from(stmt.get_status(rusqlite::StatementStatus::VmStep));
         }
-        Ok(results)
+        Ok((results, total_vm_steps))
     }
 }
 

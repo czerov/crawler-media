@@ -14,7 +14,7 @@ mod scan_operations;
 /// The version is stored via `PRAGMA user_version` on each database file.
 pub const APP_SCHEMA_VERSION: i64 = 7;
 pub const CATALOG_SCHEMA_VERSION: i64 = 2;
-pub const LIBRARY_SCHEMA_VERSION: i64 = 10;
+pub const LIBRARY_SCHEMA_VERSION: i64 = 11;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 5;
 
 /// Read the current schema version from a database file.
@@ -275,13 +275,15 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
              ledger_id TEXT PRIMARY KEY,
              created_at_ms INTEGER NOT NULL,
              reason TEXT NOT NULL
-         );",
+        );
+        CREATE INDEX IF NOT EXISTS ledger_probe_obligations_created_ledger_idx
+            ON ledger_probe_obligations(created_at_ms, ledger_id);",
     )?;
     scan_operations::migrate_scan_operations(conn)?;
     browse_projection::migrate_browse_projection(conn)?;
     // library schema 10：一次性清理指向已删除台账行的探测工作项，并把因此
     // 空掉的活动任务收尾，避免旧库残留悬空 ledger 引用。
-    if previous < LIBRARY_SCHEMA_VERSION {
+    if previous < 10 {
         crate::ledger_cleanup::repair_orphan_probe_units(conn)?;
     }
     read_revisions::migrate_read_revisions("library", conn)?;

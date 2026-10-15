@@ -61,6 +61,17 @@ impl Store {
 
     /// Retrieve up to `limit` (clamped 1..=100) pending probe obligations in deterministic order.
     pub fn scan_probe_obligations(&self, limit: usize) -> Result<Vec<ScanProbeObligation>, StoreError> {
+        self.scan_probe_obligations_with_vm_steps(limit)
+            .map(|(obligations, _)| obligations)
+    }
+
+    /// Same read as [`Self::scan_probe_obligations`], additionally reporting the
+    /// SQLite VM steps the query consumed so tests can assert DB work.
+    #[doc(hidden)]
+    pub fn scan_probe_obligations_with_vm_steps(
+        &self,
+        limit: usize,
+    ) -> Result<(Vec<ScanProbeObligation>, i64), StoreError> {
         let limit = limit.clamp(1, 100);
         let mut stmt = self.library.prepare(
             "SELECT ledger_id, created_at_ms, reason
@@ -80,7 +91,9 @@ impl Store {
                 reason,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let obligations = rows.collect::<Result<Vec<_>, _>>()?;
+        let vm_steps = i64::from(stmt.get_status(rusqlite::StatementStatus::VmStep));
+        Ok((obligations, vm_steps))
     }
 
     /// Acknowledge / remove a fulfilled probe obligation.

@@ -215,6 +215,8 @@ pub(super) const LIBRARY_TABLES: &str = r#"
             created_at_ms INTEGER NOT NULL,
             reason TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS ledger_probe_obligations_created_ledger_idx
+            ON ledger_probe_obligations(created_at_ms, ledger_id);
         "#;
 
 pub(super) const SUBSCRIBE_TABLES: &str = r#"
