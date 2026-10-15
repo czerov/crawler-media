@@ -1,6 +1,7 @@
 import { publicEnv } from "@/lib/env";
 import { clearBackdropCache } from "@/lib/backdrop-cache";
 import { clearUiPrefsCache } from "@/lib/ui-prefs-cache";
+import { linkRequestSignal } from "@/lib/request-signal.mjs";
 
 export class HttpError extends Error {
   status: number;
@@ -88,62 +89,68 @@ export function redirectToLoginOn401(status: number): void {
   }
 }
 
+function classifyRequestAbort(lease: { isLocalTimeout: () => boolean }, error: unknown): never {
+  if (lease.isLocalTimeout()) {
+    throw new HttpError("请求超时，请检查服务状态后重试", 0, null);
+  }
+  throw error;
+}
+
 export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   // 兜底超时：后端异常/负载过高时不让页面无限「正在连接服务…」。
   // 调用方传了自己的 signal（AbortController）时不覆盖，由调用方决定。
-  const controller = new AbortController();
-  const externalSignal = init.signal;
-  if (externalSignal?.aborted) {
-    controller.abort();
-  }
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  if (!externalSignal) {
-    timeoutId = setTimeout(() => controller.abort(), 15_000);
-  } else {
-    externalSignal.addEventListener("abort", () => controller.abort(), { once: true });
-  }
+  // The lease deliberately covers response-body consumption so external cancellation
+  // works while the body streams. This also means fallback timeout covers the body read,
+  // unlike the previous headers-only boundary.
+  const lease = linkRequestSignal(init.signal, 15_000);
 
-  let response: Response;
   try {
-    response = await fetch(resolveRequestUrl(path), {
-      ...init,
-      signal: controller.signal,
-      headers: buildHeaders(init.headers, init.body),
-    });
-  } catch (error) {
-    if (controller.signal.aborted && !externalSignal?.aborted) {
-      throw new HttpError("请求超时，请检查服务状态后重试", 0, null);
+    let response: Response;
+    try {
+      response = await fetch(resolveRequestUrl(path), {
+        ...init,
+        signal: lease.signal,
+        headers: buildHeaders(init.headers, init.body),
+      });
+    } catch (error) {
+      classifyRequestAbort(lease, error);
     }
-    throw error;
+
+    if (response.status === 204) {
+      return undefined as T;
+    }
+
+    if (!response.ok) {
+      redirectToLoginOn401(response.status);
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    const isJson = contentType.includes("application/json");
+    let payload: unknown;
+    try {
+      payload = isJson ? await response.json() : await response.text();
+    } catch (error) {
+      classifyRequestAbort(lease, error);
+    }
+
+    if (!response.ok) {
+      // Self API error envelope: { ok: false, error: { code, message } }.
+      const message =
+        isJson && payload && typeof payload === "object"
+          ? (("error" in payload && payload.error && typeof payload.error === "object"
+              ? String((payload.error as { message?: unknown }).message ?? "")
+              : "") ||
+            ("message" in payload ? String((payload as { message: unknown }).message) : ""))
+          : `Request failed with status ${response.status}`;
+
+      throw new HttpError(message || `Request failed with status ${response.status}`, response.status, payload);
+    }
+
+    // Success: return the full envelope; callers unwrap `.data` themselves
+    // (both the legacy `{success, code, message, data}` and the self API
+    // `{ok, data}` shapes carry `data`, so existing unwrap() calls keep working).
+    return payload as T;
   } finally {
-    if (timeoutId !== undefined) clearTimeout(timeoutId);
+    lease.release();
   }
-
-  if (response.status === 204) {
-    return undefined as T;
-  }
-
-  const contentType = response.headers.get("content-type") || "";
-  const isJson = contentType.includes("application/json");
-  const payload = isJson ? await response.json() : await response.text();
-
-  if (!response.ok) {
-    // Self API error envelope: { ok: false, error: { code, message } }.
-    const message =
-      isJson && payload && typeof payload === "object"
-        ? (("error" in payload && payload.error && typeof payload.error === "object"
-            ? String((payload.error as { message?: unknown }).message ?? "")
-            : "") ||
-          ("message" in payload ? String((payload as { message: unknown }).message) : ""))
-        : `Request failed with status ${response.status}`;
-
-    redirectToLoginOn401(response.status);
-
-    throw new HttpError(message || `Request failed with status ${response.status}`, response.status, payload);
-  }
-
-  // Success: return the full envelope; callers unwrap `.data` themselves
-  // (both the legacy `{success, code, message, data}` and the self API
-  // `{ok, data}` shapes carry `data`, so existing unwrap() calls keep working).
-  return payload as T;
 }
