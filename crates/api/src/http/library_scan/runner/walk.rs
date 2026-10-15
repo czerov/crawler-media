@@ -206,7 +206,20 @@ impl ScanContext<'_> {
             })
             .cloned()
             .collect();
-        let affected = invalidate_changed_facts(self.state, &changed_in_scope);
+        let (affected, failed_invalidations) = match invalidate_changed_facts(self.state, &changed_in_scope) {
+            Ok(res) => res,
+            Err(e) => {
+                let committed = ChunkTotals {
+                    scanned,
+                    inserted: inserted.len(),
+                };
+                return Err(ChunkError {
+                    response: err(StatusCode::INTERNAL_SERVER_ERROR, "library.scan_invalidation", &e),
+                    error: format!("library.scan_invalidation: {e}"),
+                    totals: committed,
+                });
+            }
+        };
         // 到这里 ledger 已提交：任何后续失败都必须把这段前缀带回调用方（P3-3）。
         let committed = ChunkTotals {
             scanned,
@@ -248,7 +261,16 @@ impl ScanContext<'_> {
                 })?;
         }
         enqueue_probes_for_paths(self.state, processed_paths);
-        self.record_seen(&filtered, stamps);
+        // P2-3: 排除失效/重挂失败的路径，失败路径不得推进 durable 源版本与断点。
+        let successful_files: Vec<library::TransferredFile> = if failed_invalidations.is_empty() {
+            filtered
+        } else {
+            filtered
+                .into_iter()
+                .filter(|file| !failed_invalidations.contains(&file.path.display().to_string()))
+                .collect()
+        };
+        self.record_seen(&successful_files, stamps);
         Ok(committed)
     }
 

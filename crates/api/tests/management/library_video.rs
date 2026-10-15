@@ -273,6 +273,37 @@ async fn rescan_keeps_a_locked_video_poster() {
     );
 }
 
+/// P2-1：未变化 Video 第二次扫描时已有自动海报字节不变且不发生重复覆盖；删除海报后重扫能补齐。
+#[tokio::test]
+async fn rescan_unchanged_video_skips_existing_poster_and_backfills_when_deleted() {
+    let fix = video_artwork_fixture().await;
+    let poster = fix.root.join("poster.jpg");
+
+    // 第一次扫描：补齐缺图
+    scan_and_wait(&fix.app, &fix.library_id).await;
+    assert_eq!(std::fs::read(&poster).unwrap(), b"poster-image-bytes");
+
+    // 人工修改海报内容，证明若未发生重写/重截帧，内容将保持不变
+    std::fs::write(&poster, b"custom-existing-bytes").unwrap();
+
+    // 第二次扫描：未变化且已有海报，必须短路跳过，不得覆盖现有文件
+    scan_and_wait(&fix.app, &fix.library_id).await;
+    assert_eq!(
+        std::fs::read(&poster).unwrap(),
+        b"custom-existing-bytes",
+        "未变化且已有有效海报的文件不应被重写/覆盖"
+    );
+
+    // 删除海报：重扫必须能发现缺图并补齐
+    std::fs::remove_file(&poster).unwrap();
+    scan_and_wait(&fix.app, &fix.library_id).await;
+    assert_eq!(
+        std::fs::read(&poster).unwrap(),
+        b"poster-image-bytes",
+        "海报被删除后重扫必须能够补齐"
+    );
+}
+
 /// P2-2：扫描收尾仍要清掉「可重试」的封面标记，且不得清掉已发布的标记。
 #[tokio::test]
 async fn video_scan_clears_only_the_retryable_cover_marker() {

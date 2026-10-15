@@ -53,7 +53,7 @@ pub(super) fn checkpoint_fresh(
         );
     }
     let paths: Vec<String> = files.iter().map(|f| f.path.display().to_string()).collect();
-    let (checkpoints, source_versions) = {
+    let source_versions_res = {
         let store = state.store.lock();
         // 两个读都在同一把 Store 锁内：断点与 durable 版本必须是同一时刻的一致视图。
         (
@@ -61,9 +61,13 @@ pub(super) fn checkpoint_fresh(
             store.ledger_source_versions(&paths),
         )
     };
-    let checkpoints = match checkpoints {
-        Ok(checkpoints) => checkpoints,
-        Err(error) => {
+    let (checkpoints, source_versions_map, durable_failed) = match source_versions_res {
+        (Ok(cp), Ok(sv)) => (cp, sv, false),
+        (Ok(cp), Err(error)) => {
+            tracing::error!(%error, %op_id, "读取台账 durable 源版本失败，fail-closed: 本 chunk 全部候选文件视为变化");
+            (cp, HashMap::new(), true)
+        }
+        (Err(error), _) => {
             tracing::error!(%error, %op_id, "读取扫描断点失败，按未处理继续");
             return CheckpointDecision {
                 fresh: files,
@@ -73,18 +77,19 @@ pub(super) fn checkpoint_fresh(
             };
         }
     };
-    let source_versions = source_versions.unwrap_or_else(|error| {
-        // 读不到 durable 版本时按「没有版本事实」继续：与 `None` 分支同一保守方向
-        // （有台账行但版本未知 → 视为变化），不会静默跳过变化文件。
-        tracing::error!(%error, %op_id, "读取台账 durable 源版本失败，按版本未知处理");
-        HashMap::new()
-    });
     let mut fresh = Vec::with_capacity(files.len());
     let mut changed = Vec::new();
     let mut skipped = 0usize;
     for file in files {
         let key = file.path.display().to_string();
         let current = stamps.get(&key).cloned().unwrap_or((0, 0, None));
+        if durable_failed {
+            // P2-2 fail-closed: durable 源版本读取失败时，不能当成无台账新文件放过，
+            // 必须把所有候选列入 changed，交由后续台账查询筛选已有行并失效/重挂。
+            changed.push(file.path.clone());
+            fresh.push(file);
+            continue;
+        }
         match checkpoints.get(&key) {
             Some((mtime_ms, file_size, digest, true))
                 if store::Store::scan_seen_stamp_matches(
@@ -102,7 +107,7 @@ pub(super) fn checkpoint_fresh(
                 // P2-3：本 operation 对该路径没有断点（首次扫到，或上一个 operation 已
                 // 清空 `scan_seen`）。此时只能靠台账上的 durable 源版本判断文件自上次
                 // 处理以来是否变化。
-                if source_version_changed(source_versions.get(&key), &current) {
+                if source_version_changed(source_versions_map.get(&key), &current) {
                     changed.push(file.path.clone());
                 }
                 fresh.push(file);
@@ -134,29 +139,37 @@ fn source_version_changed(
 
 /// 变化文件：失效派生探测事实，并重挂 durable probe 义务（P2-3）。
 ///
-/// 返回实际完成失效的路径，供调用方立即请求探测（obligation 是崩溃后的兜底）。
-pub(super) fn invalidate_changed_facts(state: &ApiState, changed: &[PathBuf]) -> Vec<PathBuf> {
+/// 返回 `Result<(Vec<PathBuf>, std::collections::HashSet<String>), (Response, String)>`：
+/// 成功时返回 `(完成失效的路径, 失效失败的路径集合)`。
+/// 当有路径失效/重挂失败时，返回给调用方，以保证失败路径不得推进源版本或写入断点。
+pub(super) fn invalidate_changed_facts(
+    state: &ApiState,
+    changed: &[PathBuf],
+) -> Result<(Vec<PathBuf>, std::collections::HashSet<String>), String> {
     if changed.is_empty() {
-        return Vec::new();
+        return Ok((Vec::new(), std::collections::HashSet::new()));
     }
     let now_ms = crate::job_loop::unix_now() * 1000;
     let store = state.store.lock();
     let mut affected = Vec::new();
+    let mut failed_paths = std::collections::HashSet::new();
     for path in changed {
         let path_str = path.display().to_string();
-        let Some(row) = store.ledger_by_path(&path_str).ok().flatten() else {
+        let Some(row) = store.ledger_by_path(&path_str).map_err(|e| e.to_string())? else {
             continue;
         };
         let ledger_id = row.id.to_string();
         if let Err(error) = store.delete_file_meta_by_ledger_id(&ledger_id) {
             tracing::error!(%error, %ledger_id, %path_str, "变化文件的派生探测事实失效失败");
+            failed_paths.insert(path_str);
             continue;
         }
         if let Err(error) = store.arm_scan_probe_obligation(&ledger_id, now_ms, "scan_changed") {
             tracing::error!(%error, %ledger_id, "变化文件重挂探测义务失败");
+            failed_paths.insert(path_str);
             continue;
         }
         affected.push(path.clone());
     }
-    affected
+    Ok((affected, failed_paths))
 }

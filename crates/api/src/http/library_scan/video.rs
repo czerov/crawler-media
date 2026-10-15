@@ -30,6 +30,7 @@ pub(crate) fn attach_video_artwork(
     candidates: &[PathBuf],
     control: &library::WorkControl,
 ) {
+    let mut seen_dirs = std::collections::HashSet::new();
     for path in candidates {
         if control.is_cancelled() {
             tracing::info!(
@@ -41,7 +42,19 @@ pub(crate) fn attach_video_artwork(
         let Some(media) = media_for_path(state, path) else {
             continue;
         };
-        let _ = crate::poster_fetch::attach_poster(state, &media, path);
+        // 同目录共享海报（同一 poster.jpg / fanart.jpg）：按目标目录去重，
+        // 避免一个 chunk 内多个视频反复覆盖同一文件。
+        if let Some(dir) = path.parent() {
+            if !seen_dirs.insert(dir.to_path_buf()) {
+                tracing::debug!(
+                    dir = %dir.display(),
+                    path = %path.display(),
+                    "同目录已有视频处理过封面，跳过当前文件"
+                );
+                continue;
+            }
+        }
+        let _ = crate::poster_fetch::attach_poster_if_missing(state, &media, path);
         let _ = crate::poster_fetch::attach_backdrop(state, &media, path);
     }
 }

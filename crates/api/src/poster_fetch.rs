@@ -32,7 +32,23 @@ impl PosterFetch for HttpPoster {
 /// 2. else extract a video frame locally (network-independent fallback).
 /// Writes `poster.jpg` beside the video. Any failure keeps sidecars intact.
 pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Vec<u8>> {
-    attach_poster_with(state, media, video, |video| {
+    attach_poster_opts(state, media, video, true)
+}
+
+/// 扫描缺图补齐专用的海报附着：
+/// 当 `target` 已存在时，直接复用现有文件，不重复走网络下载或视频截帧；
+/// 仅当海报文件不存在时才执行下载或截帧补齐。
+pub fn attach_poster_if_missing(state: &ApiState, media: &Media, video: &Path) -> Option<Vec<u8>> {
+    attach_poster_opts(state, media, video, false)
+}
+
+fn attach_poster_opts(
+    state: &ApiState,
+    media: &Media,
+    video: &Path,
+    force: bool,
+) -> Option<Vec<u8>> {
+    attach_poster_with(state, media, video, force, |video| {
         let lease = state.acquire_path_work(video, media.kind)?;
         let control = lease.as_ref().map(|lease| lease.control().clone()).unwrap_or_default();
         frame_poster_controlled(video, &control)
@@ -43,6 +59,7 @@ fn attach_poster_with(
     state: &ApiState,
     media: &Media,
     video: &Path,
+    force: bool,
     frame: impl Fn(&Path) -> Result<Vec<u8>, String>,
 ) -> Option<Vec<u8>> {
     if !crate::scrape_metadata::targets::video_present(video) {
@@ -94,6 +111,16 @@ fn attach_poster_with(
             Ok(bytes) => Some(bytes),
             Err(error) => {
                 tracing::warn!(%error, media = %media.title, path = %target.display(), "读取已锁定海报失败");
+                None
+            }
+        };
+    }
+    if !force && target.is_file() {
+        tracing::debug!(media = %media.title, path = %target.display(), "海报已存在且未锁定强制刷新，跳过重新下载/截帧");
+        return match std::fs::read(&target) {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                tracing::warn!(%error, media = %media.title, path = %target.display(), "读取已有海报失败");
                 None
             }
         };
@@ -569,7 +596,7 @@ mod rename_tests {
             bangumi_id: None,
             anilist_id: None,
         };
-        let written = attach_poster_with(&state, &media, &video, |_| {
+        let written = attach_poster_with(&state, &media, &video, true, |_| {
             called.store(true, Ordering::SeqCst);
             panic!("ffmpeg must not run after the poster source disappears");
         });
