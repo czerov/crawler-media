@@ -131,6 +131,19 @@ impl Harness {
         self.state.store().lock().load_subscribe_facts(id).unwrap().movie().and_then(|f| f.path.clone())
     }
 
+    /// Site whose download links point at the mock (serves `torrent_file`).
+    pub async fn create_site_at_mock(&self) {
+        let mut payload = site_payload();
+        payload["url"] = json!(format!("{}/", self.qb.url));
+        let response = self
+            .app
+            .clone()
+            .oneshot(request("POST", "/api/v1/sites", Some(TOKEN), payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
     pub async fn create_site(&self) {
         create_site(&self.app).await;
     }

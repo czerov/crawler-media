@@ -40,6 +40,9 @@ pub struct MockQbit {
     pub forbid_next: AtomicUsize,
     /// When set, login answers like a wrong password (200 `Fails.`, no cookie).
     pub reject_login: std::sync::atomic::AtomicBool,
+    /// Bytes served at `GET /download.php` (acts as the PT site's .torrent).
+    pub torrent_file: Mutex<Option<String>>,
+    pub add_tags: Mutex<Vec<String>>,
     next: AtomicU64,
 }
 
@@ -58,6 +61,8 @@ impl MockQbit {
             info_calls: AtomicUsize::new(0),
             forbid_next: AtomicUsize::new(0),
             reject_login: std::sync::atomic::AtomicBool::new(false),
+            torrent_file: Mutex::new(None),
+            add_tags: Mutex::new(Vec::new()),
             next: AtomicU64::new(1),
         });
         let server = mock.clone();
@@ -152,6 +157,12 @@ impl MockQbit {
                 "Set-Cookie: SID=e2e-sid; HttpOnly\r\n",
             );
         }
+        if req.starts_with("GET /download.php") {
+            return match self.torrent_file.lock().clone() {
+                Some(bytes) => ("200 OK", bytes, ""),
+                None => ("404 Not Found", "no".into(), ""),
+            };
+        }
         if self
             .forbid_next
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -159,7 +170,7 @@ impl MockQbit {
         {
             return ("403 Forbidden", "Forbidden".into(), "");
         }
-        if req.starts_with("POST /api/v2/torrents/add") {
+        if req.starts_with("POST /api/v2/torrents/add ") || req.starts_with("POST /api/v2/torrents/add?") {
             self.adds.lock().push(req.to_string());
             let tags = multipart_field(req, "tags").unwrap_or_default();
             let source = if req.contains("name=\"torrents\"") {
@@ -183,6 +194,21 @@ impl MockQbit {
                 state: "downloading".into(),
                 source,
             });
+            return ("200 OK", "Ok.".into(), "");
+        }
+        if req.contains("/api/v2/torrents/addTags") {
+            self.add_tags.lock().push(req.to_string());
+            let hashes = form_field(req, "hashes").unwrap_or_default();
+            let tags = form_field(req, "tags").unwrap_or_default().replace("%2C", ",");
+            for task in self.tasks.lock().iter_mut() {
+                if hashes.split('|').any(|h| h.eq_ignore_ascii_case(&task.hash)) {
+                    for tag in tags.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                        if !task.tags.iter().any(|t| t == tag) {
+                            task.tags.push(tag.to_string());
+                        }
+                    }
+                }
+            }
             return ("200 OK", "Ok.".into(), "");
         }
         if req.contains("/api/v2/torrents/info") {

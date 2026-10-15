@@ -187,6 +187,14 @@ impl Downloader for QbitDownloader {
                         std::process::id(),
                         tag
                     ));
+                    // D-H2: a task with the same info hash may already exist
+                    // without our tags (added by hand). Claim it instead of
+                    // failing every round with qBittorrent's `Fails.`.
+                    if let Some(hash) = crate::torrent_info_hash(&bytes) {
+                        if self.claim_existing(&hash, &tag, &torrent.title)? {
+                            return Ok(());
+                        }
+                    }
                     if std::fs::write(&temp, &bytes).is_ok() {
                         temp_path = Some(temp);
                         fallback_url = false;
@@ -393,6 +401,23 @@ impl Downloader for QbitDownloader {
 }
 
 impl QbitDownloader {
+    /// Tag an existing task with `hash` as ours. Only tags are added; nothing
+    /// destructive happens to a task the user created. Returns whether found.
+    fn claim_existing(&self, hash: &str, tags: &str, title: &str) -> Result<bool, DownloaderError> {
+        let url = format!("{}?hashes={hash}", join(&self.config.url, "/api/v2/torrents/info"));
+        let infos: Vec<TorrentInfo> = serde_json::from_str(&self.get(&url)?)
+            .map_err(|e| DownloaderError::Message(e.to_string()))?;
+        if !infos.iter().any(|info| info.hash.eq_ignore_ascii_case(hash)) {
+            return Ok(false);
+        }
+        self.post_form(
+            &join(&self.config.url, "/api/v2/torrents/addTags"),
+            &format!("hashes={hash}&tags={}", form_enc(tags)),
+        )?;
+        tracing::info!(torrent = %title, %hash, "qBittorrent 已有同 info hash 任务，补打标签认领");
+        Ok(true)
+    }
+
     fn exact_existing_hash(&self, torrent: &Torrent) -> Result<Option<String>, DownloaderError> {
         let body = self.get(&join(&self.config.url, "/api/v2/torrents/info"))?;
         let infos: Vec<TorrentInfo> =

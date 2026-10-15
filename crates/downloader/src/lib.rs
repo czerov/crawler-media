@@ -7,6 +7,8 @@ mod path_map;
 mod pool;
 mod qbit;
 mod transmission;
+mod torrent_file;
+pub use torrent_file::torrent_info_hash;
 
 use std::path::PathBuf;
 use std::sync::Arc;

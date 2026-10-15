@@ -71,6 +71,24 @@ pub struct TransmissionDownloader {
 }
 
 impl TransmissionDownloader {
+    fn claim_duplicate(&self, hash: &str, torrent: &Torrent) -> Result<(), DownloaderError> {
+        let got = self.rpc("torrent-get", json!({ "ids": [hash], "fields": ["labels"] }))?;
+        let mut labels: Vec<String> = got["torrents"][0]["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        for wanted in [crate::TASK_TAG.to_string(), crate::ownership_tag(&torrent.enclosure)] {
+            if !labels.contains(&wanted) {
+                labels.push(wanted);
+            }
+        }
+        self.rpc("torrent-set", json!({ "ids": [hash], "labels": labels }))?;
+        tracing::info!(torrent = %torrent.title, %hash, "Transmission 已有同 hash 任务，补打标签认领");
+        Ok(())
+    }
+
     pub fn connect(config: TransmissionConfig) -> Result<Self, DownloaderError> {
         tracing::debug!(url = %config.url, "正在连接 Transmission RPC");
         let mut dl = Self {
@@ -246,6 +264,13 @@ impl Downloader for TransmissionDownloader {
             tracing::error!(torrent = %torrent.title, error = %e, "添加种子到 Transmission 失败");
             e
         })?;
+        // D-H2: a duplicate (e.g. added by hand) keeps its old labels; add ours
+        // so ownership survives restarts. Existing labels are preserved.
+        if self.labels_supported {
+            if let Some(hash) = added["torrent-duplicate"]["hashString"].as_str() {
+                self.claim_duplicate(hash, torrent)?;
+            }
+        }
         for field in ["torrent-added", "torrent-duplicate"] {
             if let Some(hash) = added[field]["hashString"]
                 .as_str()
