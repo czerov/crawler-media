@@ -200,9 +200,16 @@ fn unchanged_video_file_is_artwork_attempted_without_reregistration() {
     );
 }
 
-/// P2-2：故障注入测试：断点失败、durable 失败、两者同时失败、断点命中四种组合。
-#[test]
-fn checkpoint_decision_fault_injection_matrix() {
+struct CheckpointFaultFixture {
+    _dir: tempfile::TempDir,
+    state: ApiState,
+    db_path: std::path::PathBuf,
+    file_path: std::path::PathBuf,
+    file: library::TransferredFile,
+    op_id: &'static str,
+}
+
+fn checkpoint_fault_fixture() -> CheckpointFaultFixture {
     let (dir, state, _library_id, root) = video_fixture();
     let file_path = root.join("movie.mp4");
     std::fs::write(&file_path, b"hello-world-content").unwrap();
@@ -213,10 +220,8 @@ fn checkpoint_decision_fault_injection_matrix() {
     };
     let key = file_path.display().to_string();
     let current_stamp = store::Store::scan_seen_stamp(&file_path);
-
     let op_id = "test-op-1";
 
-    // 预备数据：在 ledger 中写入已知版本（大小与内容相同）
     let media = domain::Media {
         id: domain::MediaId::new(),
         kind: MediaKind::Movie,
@@ -246,97 +251,121 @@ fn checkpoint_decision_fault_injection_matrix() {
             confidence: domain::Confidence::High,
             filter_score: None,
         }).unwrap();
-        guard.record_scan_seen_stamps(op_id, &[(key.clone(), current_stamp.0, current_stamp.1, current_stamp.2.clone())]).unwrap();
+        guard.record_scan_seen_stamps(op_id, &[(key, current_stamp.0, current_stamp.1, current_stamp.2)]).unwrap();
     }
-
-    // 组合 1：断点命中（断点查询成功且版本匹配，durable 查询也成功）
-    {
-        let dec = super::checkpoint_fresh(&state, Some(op_id), vec![file.clone()]);
-        assert_eq!(dec.skipped, 1, "断点命中必须跳过");
-        assert_eq!(dec.changed.len(), 0, "断点命中无变化文件");
-        assert_eq!(dec.fresh.len(), 0, "断点命中跳过后无 fresh 文件");
-    }
-
     let db_path = dir.path().join("data").join("library.db");
+    CheckpointFaultFixture {
+        _dir: dir,
+        state,
+        db_path,
+        file_path,
+        file,
+        op_id,
+    }
+}
 
-    // 组合 2：断点失败（注入 scan_seen 读取触发器失败，但 durable 成功）
-    // 断点查询失败但 durable 成功：仍按 durable 版本判断变化；
-    // 此时 durable 版本与当前一致，因此不计为 changed，但由于没有断点命中，fresh 中包含该文件。
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+fn set_scan_seen_disabled(db_path: &std::path::Path, disabled: bool) {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    if disabled {
+        conn.execute("ALTER TABLE scan_seen RENAME TO scan_seen_disabled", []).unwrap();
+    } else {
+        conn.execute("ALTER TABLE scan_seen_disabled RENAME TO scan_seen", []).unwrap();
+    }
+}
+
+/// 只让 durable 源版本查询失败：重命名 `ledger.source_version_ms`。
+/// `scan_seen_checkpoints` 不读该列，因此断点查询仍然成功——这是真实 SQL 故障，
+/// 不需要在生产代码里留测试钩子（也不会有跨测试的全局状态）。
+fn set_durable_disabled(db_path: &std::path::Path, disabled: bool) {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    if disabled {
         conn.execute(
-            "CREATE TRIGGER fail_scan_seen AFTER INSERT ON scan_seen
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected scan_seen failure');
-             END;",
+            "ALTER TABLE ledger RENAME COLUMN source_version_ms TO source_version_ms_disabled",
             [],
-        ).unwrap();
-        // 重命名 scan_seen 表以让 SELECT s.path FROM scan_seen 失败
-        conn.execute("ALTER TABLE scan_seen RENAME TO scan_seen_disabled", []).unwrap();
+        )
+        .unwrap();
+    } else {
+        conn.execute(
+            "ALTER TABLE ledger RENAME COLUMN source_version_ms_disabled TO source_version_ms",
+            [],
+        )
+        .unwrap();
     }
-    {
-        let dec = super::checkpoint_fresh(&state, Some(op_id), vec![file.clone()]);
-        assert_eq!(dec.skipped, 0, "断点查询失败不得跳过文件");
-        assert_eq!(dec.fresh.len(), 1, "断点查询失败按未处理继续进入 fresh");
-        assert_eq!(dec.changed.len(), 0, "durable 版本匹配，不应判为 changed");
+}
 
-        // 如果文件内容修改，durable 版本检测仍应生效并将文件计入 changed！
-        std::fs::write(&file_path, b"changed-new-content").unwrap();
-        let changed_file = library::TransferredFile {
-            path: file_path.clone(),
-            identified_release: None,
-            nfo_identity: None,
-        };
-        let dec_changed = super::checkpoint_fresh(&state, Some(op_id), vec![changed_file]);
-        assert_eq!(dec_changed.changed.len(), 1, "断点查询失败但 durable 成功：仍应按 durable 版本检测出变化！");
-        assert_eq!(dec_changed.changed[0], file_path);
+/// 组合 1：断点成功且命中 + durable 成功
+#[test]
+fn checkpoint_decision_both_ok_hits() {
+    let fix = checkpoint_fault_fixture();
+    let dec = super::checkpoint_fresh(&fix.state, Some(fix.op_id), vec![fix.file]);
+    assert!(dec.checkpoints_ok, "断点查询必须成功");
+    assert!(dec.durable_ok, "durable 查询必须成功");
+    assert_eq!(dec.skipped, 1, "断点命中必须跳过");
+    assert_eq!(dec.changed.len(), 0, "断点命中无变化文件");
+    assert_eq!(dec.fresh.len(), 0, "断点命中跳过后无 fresh 文件");
+}
 
-        // 恢复文件内容
-        std::fs::write(&file_path, b"hello-world-content").unwrap();
-    }
-    // 恢复 scan_seen 表
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("ALTER TABLE scan_seen_disabled RENAME TO scan_seen", []).unwrap();
-    }
+/// 组合 2：断点失败 + durable 成功（且 durable 检测到变化时必须进入 changed）
+#[test]
+fn checkpoint_decision_checkpoint_err_durable_ok() {
+    let fix = checkpoint_fault_fixture();
+    set_scan_seen_disabled(&fix.db_path, true);
 
-    // 组合 3：durable 失败（断点查询成功，但 durable 查询失败）
-    // fail-closed: 无论文件是否变化，全部候选列入 changed，不得确认未知版本。
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("ALTER TABLE ledger RENAME TO ledger_disabled", []).unwrap();
-    }
-    {
-        let dec = super::checkpoint_fresh(&state, Some(op_id), vec![file.clone()]);
-        assert_eq!(dec.skipped, 0, "durable 失败不得跳过");
-        assert_eq!(dec.fresh.len(), 1);
-        assert_eq!(dec.changed.len(), 1, "durable 失败必须 fail-closed 将所有候选列入 changed");
-        assert_eq!(dec.changed[0], file_path);
-    }
-    // 恢复 ledger 表
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("ALTER TABLE ledger_disabled RENAME TO ledger", []).unwrap();
-    }
+    let dec = super::checkpoint_fresh(&fix.state, Some(fix.op_id), vec![fix.file.clone()]);
+    assert!(!dec.checkpoints_ok, "断点查询必须失败");
+    assert!(dec.durable_ok, "durable 查询必须成功");
+    assert_eq!(dec.skipped, 0, "断点查询失败不得跳过文件");
+    assert_eq!(dec.fresh.len(), 1, "断点查询失败按未处理继续进入 fresh");
+    assert_eq!(dec.changed.len(), 0, "durable 版本匹配，不应判为 changed");
 
-    // 组合 4：两者同时失败（scan_seen 和 ledger 同时查询失败）
-    // 仍必须 fail-closed：全部候选列入 changed！
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("ALTER TABLE scan_seen RENAME TO scan_seen_disabled", []).unwrap();
-        conn.execute("ALTER TABLE ledger RENAME TO ledger_disabled", []).unwrap();
-    }
-    {
-        let dec = super::checkpoint_fresh(&state, Some(op_id), vec![file.clone()]);
-        assert_eq!(dec.skipped, 0, "两者均失败不得跳过");
-        assert_eq!(dec.fresh.len(), 1);
-        assert_eq!(dec.changed.len(), 1, "两者同时失败仍必须保守 fail-closed 列入 changed");
-        assert_eq!(dec.changed[0], file_path);
-    }
-    // 恢复表结构
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("ALTER TABLE scan_seen_disabled RENAME TO scan_seen", []).unwrap();
-        conn.execute("ALTER TABLE ledger_disabled RENAME TO ledger", []).unwrap();
-    }
+    // 文件内容修改，durable 检测仍应生效并将文件计入 changed
+    std::fs::write(&fix.file_path, b"changed-new-content").unwrap();
+    let changed_file = library::TransferredFile {
+        path: fix.file_path.clone(),
+        identified_release: None,
+        nfo_identity: None,
+    };
+    let dec_changed = super::checkpoint_fresh(&fix.state, Some(fix.op_id), vec![changed_file]);
+    assert!(!dec_changed.checkpoints_ok);
+    assert!(dec_changed.durable_ok);
+    assert_eq!(dec_changed.changed.len(), 1, "断点失败但 durable 成功必须检测到变化");
+    assert_eq!(dec_changed.changed[0], fix.file_path);
+
+    set_scan_seen_disabled(&fix.db_path, false);
+}
+
+/// 组合 3：断点成功且命中 + durable 失败 → 不跳过、全部 fresh、全部 changed
+#[test]
+fn checkpoint_decision_checkpoint_hit_durable_err() {
+    let fix = checkpoint_fault_fixture();
+    set_durable_disabled(&fix.db_path, true);
+
+    let dec = super::checkpoint_fresh(&fix.state, Some(fix.op_id), vec![fix.file]);
+    set_durable_disabled(&fix.db_path, false);
+
+    assert!(dec.checkpoints_ok, "断点查询必须成功且命中");
+    assert!(!dec.durable_ok, "durable 查询必须失败");
+    assert_eq!(dec.skipped, 0, "durable 失败时断点命中也不得跳过");
+    assert_eq!(dec.fresh.len(), 1, "durable 失败全部进入 fresh");
+    assert_eq!(dec.changed.len(), 1, "durable 失败必须 fail-closed 全部列入 changed");
+    assert_eq!(dec.changed[0], fix.file_path);
+}
+
+/// 组合 4：两者同时失败 → fail-closed: 全部 fresh、全部 changed
+#[test]
+fn checkpoint_decision_both_err() {
+    let fix = checkpoint_fault_fixture();
+    set_scan_seen_disabled(&fix.db_path, true);
+    set_durable_disabled(&fix.db_path, true);
+
+    let dec = super::checkpoint_fresh(&fix.state, Some(fix.op_id), vec![fix.file]);
+    set_durable_disabled(&fix.db_path, false);
+    set_scan_seen_disabled(&fix.db_path, false);
+
+    assert!(!dec.checkpoints_ok, "断点查询必须失败");
+    assert!(!dec.durable_ok, "durable 查询必须失败");
+    assert_eq!(dec.skipped, 0, "两者均失败不得跳过");
+    assert_eq!(dec.fresh.len(), 1);
+    assert_eq!(dec.changed.len(), 1, "两者同时失败必须 fail-closed 全部列入 changed");
+    assert_eq!(dec.changed[0], fix.file_path);
 }

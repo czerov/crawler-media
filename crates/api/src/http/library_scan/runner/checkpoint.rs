@@ -23,6 +23,10 @@ pub(super) struct CheckpointDecision {
     pub(super) changed: Vec<PathBuf>,
     /// 锁外采集到的版本事实：`path -> (mtime_ms, file_size, content_digest)`。
     pub(super) stamps: HashMap<String, (i64, i64, Option<String>)>,
+    #[cfg(test)]
+    pub(super) checkpoints_ok: bool,
+    #[cfg(test)]
+    pub(super) durable_ok: bool,
 }
 
 /// 断点续扫：丢掉本 operation 已经处理过、且仍然有效的文件（P2-NEW-2 / P2-3）。
@@ -40,6 +44,10 @@ pub(crate) fn checkpoint_fresh(
             skipped: 0,
             changed: Vec::new(),
             stamps: HashMap::new(),
+            #[cfg(test)]
+            checkpoints_ok: true,
+            #[cfg(test)]
+            durable_ok: true,
         };
     };
     let mut stamps = HashMap::with_capacity(files.len());
@@ -117,6 +125,10 @@ pub(crate) fn checkpoint_fresh(
         skipped,
         changed,
         stamps,
+        #[cfg(test)]
+        checkpoints_ok: checkpoints_opt.is_some(),
+        #[cfg(test)]
+        durable_ok: !durable_failed,
     }
 }
 

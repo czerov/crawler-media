@@ -241,8 +241,9 @@ fn attach_poster_with(
     }
 
     // Channel 2: local video frame → 2:3 poster (no network needed).
-    if write_frame_poster(state, media, video, &target, frame) {
-        return ArtworkOutcome::Written;
+    match write_frame_poster(state, media, video, &target, lease.as_ref(), frame) {
+        Some(outcome) => return outcome,
+        None => {}
     }
     tracing::warn!(
         media = %media.title,
@@ -294,38 +295,35 @@ fn write_frame_poster(
     media: &Media,
     video: &Path,
     target: &Path,
+    lease: Option<&crate::library_lifecycle::LibraryWorkLease>,
     frame: impl Fn(&Path) -> Result<Vec<u8>, String>,
-) -> bool {
+) -> Option<ArtworkOutcome> {
     let is_strm = video
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("strm"));
     if is_strm || !thumbnails_allowed(state, video) || !crate::scrape_metadata::targets::video_present(video) {
-        return false;
+        return None;
     }
-    let lease = match state.acquire_path_work(video, media.kind) {
-        Ok(lease) => lease,
-        Err(error) => {
-            tracing::warn!(%error, media = %media.title, video = %video.display(), "获取路径工作租约失败，跳过截帧海报");
-            return false;
-        }
-    };
     match frame_poster_with(video, frame) {
         Ok(bytes) if !bytes.is_empty() => {
             if !crate::scrape_metadata::targets::video_present(video) {
                 tracing::debug!(video = %video.display(), "源视频已不存在，跳过截帧海报写入");
-                return true;
+                return Some(ArtworkOutcome::Skipped);
             }
-            publish_artwork(lease.as_ref(), media, target, "海报", &bytes);
-            true
+            if publish_artwork(lease, media, target, "海报", &bytes).is_some() {
+                Some(ArtworkOutcome::Written)
+            } else {
+                Some(ArtworkOutcome::Failed)
+            }
         }
         Ok(_) => {
             tracing::warn!(media = %media.title, video = %video.display(), "视频截帧海报为空");
-            false
+            None
         }
         Err(error) => {
             tracing::warn!(%error, media = %media.title, video = %video.display(), "视频截帧海报失败");
-            false
+            None
         }
     }
 }
@@ -696,5 +694,92 @@ mod rename_tests {
         assert!(!called.load(Ordering::SeqCst));
         assert!(!video.exists());
         assert!(!tmp.path().join("poster.jpg").exists());
+    }
+
+    struct NoCatalog;
+    impl crate::catalog::Catalog for NoCatalog {
+        fn search_movie(&self, _: &str) -> Result<Vec<media::CatalogHit>, String> { Ok(Vec::new()) }
+        fn search_tv(&self, _: &str) -> Result<Vec<media::CatalogHit>, String> { Ok(Vec::new()) }
+        fn popular_movie(&self) -> Result<Vec<media::CatalogHit>, String> { Ok(Vec::new()) }
+        fn popular_tv(&self) -> Result<Vec<media::CatalogHit>, String> { Ok(Vec::new()) }
+        fn details(&self, _: domain::MediaKind, _: &str) -> Result<Option<domain::Media>, String> { Ok(None) }
+    }
+
+    fn test_state(tmp: &std::path::Path) -> ApiState {
+        ApiState::new(
+            crate::Store::open(tmp.join("data")).unwrap(),
+            "test-token".into(),
+            indexer::ProfileSet::load(None).unwrap(),
+            Arc::new(EmptyFetcher),
+            Arc::new(downloader::MemoryDownloader::new(tmp.join("stage"))),
+            tmp.join("library"),
+        )
+        .unwrap()
+        .with_catalog(Arc::new(NoCatalog))
+    }
+
+    fn test_media() -> domain::Media {
+        domain::Media {
+            id: domain::MediaId::new(),
+            kind: domain::MediaKind::Movie,
+            title: "Test Movie".into(),
+            year: Some(2024),
+            original_title: None,
+            tmdb_id: None,
+            douban_id: None,
+            tvdb_id: None,
+            bangumi_id: None,
+            anilist_id: None,
+        }
+    }
+
+    #[test]
+    fn frame_non_empty_but_write_fails_returns_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let video = tmp.path().join("Movie.mp4");
+        std::fs::write(&video, b"video-data").unwrap();
+        // 把目标 poster.jpg 建成目录使 std::fs::write 必然失败
+        std::fs::create_dir(tmp.path().join("poster.jpg")).unwrap();
+        let outcome = attach_poster_with(&test_state(tmp.path()), &test_media(), &video, true, |_| {
+            Ok(b"fake-frame-bytes".to_vec())
+        });
+        assert_eq!(outcome, ArtworkOutcome::Failed);
+    }
+
+    #[test]
+    fn frame_after_source_vanishes_returns_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let video = tmp.path().join("Movie.mp4");
+        std::fs::write(&video, b"video-data").unwrap();
+        let v_clone = video.clone();
+        let outcome = attach_poster_with(&test_state(tmp.path()), &test_media(), &video, true, move |_| {
+            let _ = std::fs::remove_file(&v_clone);
+            Ok(b"fake-frame-bytes".to_vec())
+        });
+        assert_eq!(outcome, ArtworkOutcome::Skipped);
+        assert!(!tmp.path().join("poster.jpg").exists());
+    }
+
+    #[test]
+    fn frame_after_cancelled_publication_returns_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("homevideos");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = test_state(tmp.path());
+        let _ = state.store().lock().create_library(
+            domain::MediaKind::Movie,
+            "Movies",
+            &[root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        ).unwrap();
+        let video = root.join("Movie.mp4");
+        std::fs::write(&video, b"video-data").unwrap();
+        let media = test_media();
+        let lease = state.acquire_path_work(&video, domain::MediaKind::Movie).unwrap().unwrap();
+        lease.control().cancel();
+        let outcome = lease.publish(|| Ok(write_artwork(&media, &root.join("poster.jpg"), "海报", b"fake-frame-bytes")));
+        assert!(outcome.is_err(), "已取消的 lease.publish 必须返回 Err");
     }
 }
