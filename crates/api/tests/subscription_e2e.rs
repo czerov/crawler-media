@@ -25,6 +25,8 @@ mod h2_probe_rejected;
 mod h3_background_reconcile;
 #[path = "subscription_e2e/h4_season_pack_pending.rs"]
 mod h4_season_pack_pending;
+#[path = "subscription_e2e/d_h1_qbit_relogin.rs"]
+mod d_h1_qbit_relogin;
 
 pub(crate) fn is_video(path: &std::path::Path) -> bool {
     matches!(

@@ -38,6 +38,8 @@ pub struct MockQbit {
     pub info_calls: AtomicUsize,
     /// Reject every authenticated request with 403 while > 0 (decrements per request).
     pub forbid_next: AtomicUsize,
+    /// When set, login answers like a wrong password (200 `Fails.`, no cookie).
+    pub reject_login: std::sync::atomic::AtomicBool,
     next: AtomicU64,
 }
 
@@ -55,6 +57,7 @@ impl MockQbit {
             logins: AtomicUsize::new(0),
             info_calls: AtomicUsize::new(0),
             forbid_next: AtomicUsize::new(0),
+            reject_login: std::sync::atomic::AtomicBool::new(false),
             next: AtomicU64::new(1),
         });
         let server = mock.clone();
@@ -140,6 +143,9 @@ impl MockQbit {
     fn route(&self, req: &str) -> (&'static str, String, &'static str) {
         if req.starts_with("POST /api/v2/auth/login") {
             self.logins.fetch_add(1, Ordering::SeqCst);
+            if self.reject_login.load(Ordering::SeqCst) {
+                return ("200 OK", "Fails.".into(), "");
+            }
             return (
                 "200 OK",
                 "Ok.".into(),

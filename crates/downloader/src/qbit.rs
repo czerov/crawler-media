@@ -57,11 +57,24 @@ mod debug_tests {
 
 pub struct QbitDownloader {
     config: QbitConfig,
-    cookie: String,
+    /// Session cookie; refreshed by [`Self::relogin`] when the SID expires (D-H1).
+    cookie: parking_lot::Mutex<String>,
+    /// Serialises re-logins so concurrent 403s trigger a single login.
+    login_lock: parking_lot::Mutex<()>,
 }
 
 impl QbitDownloader {
     pub fn connect(config: QbitConfig) -> Result<Self, DownloaderError> {
+        let cookie = Self::login(&config)?;
+        tracing::info!(url = %config.url, user = %config.username, "qBittorrent 连接成功");
+        Ok(Self {
+            config,
+            cookie: parking_lot::Mutex::new(cookie),
+            login_lock: parking_lot::Mutex::new(()),
+        })
+    }
+
+    fn login(config: &QbitConfig) -> Result<String, DownloaderError> {
         let body = format!(
             "username={}&password={}",
             form_enc(&config.username),
@@ -92,8 +105,48 @@ impl QbitDownloader {
                 "qBittorrent login produced no cookie".into(),
             ));
         }
-        tracing::info!(url = %config.url, user = %config.username, "qBittorrent 连接成功");
-        Ok(Self { config, cookie })
+        Ok(cookie)
+    }
+
+    fn cookie(&self) -> String {
+        self.cookie.lock().clone()
+    }
+
+    /// Log in again unless another thread already refreshed the cookie
+    /// since `stale` was used.
+    fn relogin(&self, stale: &str) -> Result<(), DownloaderError> {
+        let _serial = self.login_lock.lock();
+        if *self.cookie.lock() != stale {
+            return Ok(());
+        }
+        tracing::warn!(url = %self.config.url, "qBittorrent 会话失效（403），重新登录");
+        let fresh = Self::login(&self.config)?;
+        *self.cookie.lock() = fresh;
+        Ok(())
+    }
+
+    /// Run an authenticated request; on 403 re-login once and retry (D-H1).
+    /// A second 403 is reported as an authentication error, never retried again.
+    fn authed<T>(
+        &self,
+        op: impl Fn(&str) -> Result<T, ureq::Error>,
+    ) -> Result<T, DownloaderError> {
+        let cookie = self.cookie();
+        match op(&cookie) {
+            Err(ureq::Error::StatusCode(403)) => {
+                self.relogin(&cookie)?;
+                match op(&self.cookie()) {
+                    Err(ureq::Error::StatusCode(403)) => {
+                        tracing::error!(url = %self.config.url, "qBittorrent 重新登录后仍返回 403，认证失败");
+                        Err(DownloaderError::Message(
+                            "qBittorrent authentication failed (403 after re-login)".into(),
+                        ))
+                    }
+                    other => other.map_err(http_err),
+                }
+            }
+            other => other.map_err(http_err),
+        }
     }
 }
 
@@ -121,13 +174,6 @@ impl Downloader for QbitDownloader {
             crate::ownership_tag(&torrent.enclosure)
         );
         const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-        let mut form = ureq::unversioned::multipart::Form::new()
-            .text("paused", "false")
-            .text("stopped", "false")
-            .text("tags", tag.as_str());
-        if let Some(save_path) = save_path.filter(|path| !path.trim().is_empty()) {
-            form = form.text("savepath", save_path);
-        }
         let mut temp_path = None;
         let mut fallback_url = true;
         if download_url.starts_with("http://") || download_url.starts_with("https://") {
@@ -148,22 +194,34 @@ impl Downloader for QbitDownloader {
                 }
             }
         }
-        if let Some(ref path) = temp_path {
-            if let Ok(part) = ureq::unversioned::multipart::Part::file(path) {
-                form = form.part("torrents", part.file_name("download.torrent"));
-            }
-        } else if fallback_url {
-            if download_url != torrent.enclosure {
-                return Err(DownloaderError::Message(
-                    "failed to fetch resolved Torrent before the signed URL expired".into(),
-                ));
-            }
-            form = form.text("urls", download_url);
+        if temp_path.is_none() && fallback_url && download_url != torrent.enclosure {
+            return Err(DownloaderError::Message(
+                "failed to fetch resolved Torrent before the signed URL expired".into(),
+            ));
         }
-        if let Some(category) = &self.config.category {
-            form = form.text("category", category);
-        }
-        self.post_add_form(form, &torrent.title, &tag)
+        // The multipart form is consumed per request, so rebuild it for a
+        // retry after re-login.
+        let build_form = || {
+            let mut form = ureq::unversioned::multipart::Form::new()
+                .text("paused", "false")
+                .text("stopped", "false")
+                .text("tags", tag.as_str());
+            if let Some(save_path) = save_path.filter(|path| !path.trim().is_empty()) {
+                form = form.text("savepath", save_path);
+            }
+            if let Some(ref path) = temp_path {
+                if let Ok(part) = ureq::unversioned::multipart::Part::file(path) {
+                    form = form.part("torrents", part.file_name("download.torrent"));
+                }
+            } else if fallback_url {
+                form = form.text("urls", download_url);
+            }
+            if let Some(category) = &self.config.category {
+                form = form.text("category", category);
+            }
+            form
+        };
+        self.post_add_form(&build_form, &torrent.title, &tag)
     }
 
     fn uploaded_by_category(&self, category: &str) -> Result<u64, DownloaderError> {
@@ -288,14 +346,15 @@ impl Downloader for QbitDownloader {
                 download_limit, upload_limit
             ))
         );
-        let response = agent_for_url(&self.config.url, true)
-            .post(&url)
-            .header("Referer", &self.config.url)
-            .header("Origin", self.config.url.trim_end_matches('/'))
-            .header("Cookie", &self.cookie)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send(&payload)
-            .map_err(http_err)?;
+        let response = self.authed(|cookie| {
+            agent_for_url(&self.config.url, true)
+                .post(&url)
+                .header("Referer", &self.config.url)
+                .header("Origin", self.config.url.trim_end_matches('/'))
+                .header("Cookie", cookie)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .send(&payload)
+        })?;
         let _ = read_body(response)?;
         Ok(())
     }
@@ -386,44 +445,48 @@ impl QbitDownloader {
     }
 
     fn get(&self, url: &str) -> Result<String, DownloaderError> {
-        let response = agent_for_url(&self.config.url, true)
-            .get(url)
-            .header("Referer", &self.config.url)
-            .header("Origin", self.config.url.trim_end_matches('/'))
-            .header("Cookie", &self.cookie)
-            .call()
-            .map_err(http_err)?;
+        let response = self.authed(|cookie| {
+            agent_for_url(&self.config.url, true)
+                .get(url)
+                .header("Referer", &self.config.url)
+                .header("Origin", self.config.url.trim_end_matches('/'))
+                .header("Cookie", cookie)
+                .call()
+        })?;
         read_body(response)
     }
 
     fn post_form(&self, url: &str, body: &str) -> Result<String, DownloaderError> {
-        let response = agent_for_url(&self.config.url, true)
-            .post(url)
-            .header("Referer", &self.config.url)
-            .header("Origin", self.config.url.trim_end_matches('/'))
-            .header("Cookie", &self.cookie)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send(body)
-            .map_err(http_err)?;
+        let response = self.authed(|cookie| {
+            agent_for_url(&self.config.url, true)
+                .post(url)
+                .header("Referer", &self.config.url)
+                .header("Origin", self.config.url.trim_end_matches('/'))
+                .header("Cookie", cookie)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .send(body)
+        })?;
         read_body(response)
     }
 
-    fn post_add_form(
+    fn post_add_form<'f>(
         &self,
-        form: ureq::unversioned::multipart::Form<'_>,
+        form: &dyn Fn() -> ureq::unversioned::multipart::Form<'f>,
         title: &str,
         tag: &str,
     ) -> Result<(), DownloaderError> {
         let url = join(&self.config.url, "/api/v2/torrents/add");
-        let response = agent_for_url(&self.config.url, true)
-            .post(&url)
-            .header("Referer", &self.config.url)
-            .header("Origin", self.config.url.trim_end_matches('/'))
-            .header("Cookie", &self.cookie)
-            .send(form)
-            .map_err(|e| {
+        let response = self
+            .authed(|cookie| {
+                agent_for_url(&self.config.url, true)
+                    .post(&url)
+                    .header("Referer", &self.config.url)
+                    .header("Origin", self.config.url.trim_end_matches('/'))
+                    .header("Cookie", cookie)
+                    .send(form())
+            })
+            .inspect_err(|e| {
                 tracing::error!(torrent = %title, error = %e, "提交种子到 qBittorrent 失败");
-                http_err(e)
             })?;
         let body = read_body(response)?;
         if body.trim().eq_ignore_ascii_case("fails.") {

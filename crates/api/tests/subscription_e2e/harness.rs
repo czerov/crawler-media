@@ -181,6 +181,18 @@ impl Harness {
         body
     }
 
+    /// Manual run returning status and body without asserting success.
+    pub async fn run_subscribe_raw(&self, id: SubscribeId) -> (StatusCode, Value) {
+        let response = self
+            .app
+            .clone()
+            .oneshot(request("POST", &format!("/api/v1/subscriptions/{id}/run"), Some(TOKEN), Value::Null))
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, json_body(response).await)
+    }
+
     /// Scheduled SubscribeSearch job (finish_search path) run in-process.
     pub async fn scheduled_search(&self, id: SubscribeId) -> Result<(), String> {
         let state = self.state.clone();
