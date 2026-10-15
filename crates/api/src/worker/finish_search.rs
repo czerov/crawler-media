@@ -257,71 +257,23 @@ fn merge_added_pending<D: downloader::Downloader + ?Sized>(
 }
 
 fn facts_with_pending(
-    mut facts: subscribe::SubscribeFacts,
+    facts: subscribe::SubscribeFacts,
     existing: &[(i32, crate::store::PendingDownload)],
     subscribe: &domain::Subscribe,
     media: &domain::Media,
 ) -> subscribe::SubscribeFacts {
-    for (_, pending) in existing {
-        let release = pending
-            .release_override
-            .clone()
-            .unwrap_or_else(|| release::parse(&pending.torrent.title));
-        if !subscribe::candidate_matches_subscribe(subscribe, media, &release) {
-            continue;
-        }
-        for (season, episode) in covered_units(&release, subscribe) {
-            if facts
-                .get(season, episode)
-                .is_some_and(|fact| fact.path.is_some())
-            {
-                // H1: an owned slot with a pending download is an in-flight upgrade.
-                facts.mark_in_flight(season, episode);
-            } else if facts.get(season, episode).is_none() {
-                facts.upsert(
-                    season,
-                    episode,
-                    subscribe::QualityFact {
-                        score: 0,
-                        path: None,
-                    },
-                );
-            }
-        }
-    }
-    facts
+    let releases = pending_releases(existing);
+    subscribe::facts_with_pending(facts, &releases, subscribe, media)
 }
 
-fn covered_units(
-    release: &domain::Release,
-    subscribe: &domain::Subscribe,
-) -> Vec<(Option<u32>, Option<u32>)> {
-    if release.season.is_none() {
-        return vec![(None, None)];
-    }
-    let units = release.covered_episodes();
-    if units.is_empty() {
-        // D04: 若订阅开启了整季包模式，将无具体集号的季包展开为具体的 (season, episode) 槽位，
-        // 与 chooser 保持一致，防止下一轮重复下载相同季的其他种子。
-        if let domain::Coverage::Tv {
-            season,
-            episode_from,
-            episode_to,
-        } = subscribe.coverage
-        {
-            if release.season == Some(season) && subscribe.full_season_pack {
-                let pack_to = episode_to.unwrap_or(episode_from);
-                let capped = episode_from
-                    .saturating_add(domain::Coverage::MAX_EPISODES.saturating_sub(1));
-                return (episode_from..=pack_to.min(capped))
-                    .map(|ep| (Some(season), Some(ep)))
-                    .collect();
-            }
-        }
-        return vec![(release.season, None)];
-    }
-    units
-        .into_iter()
-        .map(|(season, episode)| (Some(season), Some(episode)))
+pub(crate) fn pending_releases(existing: &[(i32, crate::store::PendingDownload)]) -> Vec<domain::Release> {
+    existing
+        .iter()
+        .map(|(_, pending)| {
+            pending
+                .release_override
+                .clone()
+                .unwrap_or_else(|| release::parse(&pending.torrent.title))
+        })
         .collect()
 }

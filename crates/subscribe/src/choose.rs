@@ -450,6 +450,24 @@ pub(crate) fn candidate_matches_subscribe_with_keywords(
     release_matches_subscribe(subscribe, media, release)
 }
 
+/// Identity check for an in-flight pending release (H4): like
+/// `candidate_matches_subscribe`, but a pure season pack of the subscribed
+/// season counts even when the chooser would not pick packs itself (a pack
+/// admitted by hand still occupies the season).
+pub(crate) fn pending_matches_subscribe(subscribe: &Subscribe, media: &Media, release: &Release) -> bool {
+    if candidate_matches_subscribe(subscribe, media, release) {
+        return true;
+    }
+    let Coverage::Tv { season, .. } = subscribe.coverage else {
+        return false;
+    };
+    let keywords = short_title_keyword(media);
+    subscribe.media_id == media.id
+        && matches_media(media, release, &keywords)
+        && release.season == Some(season)
+        && release.covered_episodes().is_empty()
+}
+
 fn release_matches_subscribe(subscribe: &Subscribe, media: &Media, release: &Release) -> bool {
     if let (Some(want), Some(got)) = (media.year, release.year) {
         if want != got {

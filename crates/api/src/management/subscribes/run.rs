@@ -331,47 +331,13 @@ fn load_run_facts(state: &ApiState, id: SubscribeId, context: &RunContext)
     -> Result<subscribe::SubscribeFacts, ApiError>
 {
     let existing = state.store.lock().load_pending(id)?;
-    let mut facts = state
+    let facts = state
         .store
         .lock()
         .load_library_subscribe_facts(&context.subscribe, context.media.kind)?;
-    for (_, pending) in &existing {
-        let release = pending
-            .release_override
-            .clone()
-            .unwrap_or_else(|| release::parse(&pending.torrent.title));
-        if !subscribe::candidate_matches_subscribe(&context.subscribe, &context.media, &release) {
-            continue;
-        }
-        let units = if release.season.is_none() {
-            vec![(None, None)]
-        } else {
-            let eps = release.covered_episodes();
-            if eps.is_empty() {
-                vec![(release.season, None)]
-            } else {
-                eps.into_iter().map(|(s, e)| (Some(s), Some(e))).collect()
-            }
-        };
-        for (season, episode) in units {
-            if facts
-                .get(season, episode)
-                .is_some_and(|fact| fact.path.is_some())
-            {
-                // H1: an owned slot with a pending download is an in-flight upgrade.
-                facts.mark_in_flight(season, episode);
-            } else if facts.get(season, episode).is_none() {
-                facts.upsert(
-                    season,
-                    episode,
-                    subscribe::QualityFact {
-                        score: 0,
-                        path: None,
-                    },
-                );
-            }
-        }
-    }
+    // H4: same placeholder rule as the scheduled path (shared in subscribe).
+    let releases = crate::worker::finish_search::pending_releases(&existing);
+    let facts = subscribe::facts_with_pending(facts, &releases, &context.subscribe, &context.media);
     Ok(facts)
 }
 

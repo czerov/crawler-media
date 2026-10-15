@@ -3,7 +3,7 @@ use jobs::{Job, JobKind, Runner};
 
 use crate::management::ApiState;
 
-mod finish_search;
+pub(crate) mod finish_search;
 use finish_search::finish_search;
 mod search;
 pub(crate) use search::{report_site_failures, search_torrents_for_media};

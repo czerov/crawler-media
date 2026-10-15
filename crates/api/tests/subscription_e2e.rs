@@ -23,6 +23,8 @@ mod h1_wash_in_flight;
 mod h2_probe_rejected;
 #[path = "subscription_e2e/h3_background_reconcile.rs"]
 mod h3_background_reconcile;
+#[path = "subscription_e2e/h4_season_pack_pending.rs"]
+mod h4_season_pack_pending;
 
 pub(crate) fn is_video(path: &std::path::Path) -> bool {
     matches!(
