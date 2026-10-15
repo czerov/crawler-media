@@ -5,8 +5,8 @@
 ## 当前先读
 
 1. 术语与用户请求：[CONTEXT](<../CONTEXT.md>)；工程约束：[AGENTS](<../AGENTS.md>)。
-2. **当前数据库／接口状态：** [总复核](<audits/2026-10-13-database-api-review.md>)（固定代码快照 723394e）。
-3. **唯一后续修复／验收计划：** [收敛计划](<superpowers/plans/2026-10-13-database-api-followup.md>)（T1–T9 已有 2026-10-13 实现提交，部分缺计划要求的测试／测量；T10 未实施；以该文顶部状态更新为准；不自动授权修改生产数据）。
+2. **本轮数据库／接口／内存审查：** [2026-10-15 三方向报告](<audits/2026-10-15-database-api-memory-review.md>)（17 项发现，含隔离实验和全仓测试失败记录；不是生产测量）。历史数据库／接口固定快照见 [10-13 总复核](<audits/2026-10-13-database-api-review.md>)。
+3. **本轮详细修复计划：** [总执行顺序](<superpowers/plans/2026-10-15-performance-resource-remediation.md>)、[共享设计](<superpowers/specs/2026-10-15-performance-resource-remediation.md>)，下分数据库 D1–D5、接口 A1–A6、资源 R1–R5。**待 review，未实施，不授权生产清理。** [旧收敛计划](<superpowers/plans/2026-10-13-database-api-followup.md>) 保留 T1–T9 缺失验收／测量和 T10，不机械重跑已有实现、不自动关项。
 4. **维护任务合同／已实现与偏差：** [DB8](<superpowers/plans/2026-10-12-db8-maintenance-retention.md>)。
 5. API 约定：[self](<api-contracts/self.md>)；完整现行路由读 [后端](<../crates/api/src/http/mod.rs>) 与前端 API 模块，文档不复制动态路由表。
 6. 部署与默认清理警告：[deploy](<deploy.md>)；UI／设备验收清单：[system regression](<testing/system-regression-cases.md>)，**清单不是执行结果**。
