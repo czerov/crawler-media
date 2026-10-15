@@ -15,6 +15,8 @@ mod golden_path;
 mod d_s1_pending_cleanup;
 #[path = "subscription_e2e/s1_wash_probe_fail.rs"]
 mod s1_wash_probe_fail;
+#[path = "subscription_e2e/d_h3_m8_no_overwrite.rs"]
+mod d_h3_m8_no_overwrite;
 
 pub(crate) fn is_video(path: &std::path::Path) -> bool {
     matches!(

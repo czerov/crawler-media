@@ -269,13 +269,6 @@ fn collect_one<D: Downloader + ?Sized>(
         Some(release) => release,
         None => return Ok(None),
     };
-    let dest = dest_path(
-        added.input.library_root,
-        added.input.media,
-        &release,
-        &src,
-        added.input.naming,
-    )?;
     // Facts paths are canonical: retries must not create collision copies or
     // restore user-deleted files. Unapproved Wash-cut arrivals never replace owned slots.
     let slots = covered_slots(added.input.subscribe, &release);
@@ -293,14 +286,38 @@ fn collect_one<D: Downloader + ?Sized>(
     if added.input.subscribe.wash_cut && has_existing && !approved {
         return Ok(None);
     }
-    if added.input.facts.entries().any(|(_, f)| {
-        f.path
-            .as_deref()
-            .is_some_and(|p| p == dest.to_string_lossy())
-    }) {
-        return Ok(None);
-    }
-    publish_video(added, &src, &dest, control)?;
+    // A name can be taken between choosing it and publishing it (another
+    // worker, the user): publication never overwrites (D-H3), so pick the next
+    // free name and retry a few times (M8).
+    let mut attempts = 0;
+    let dest = loop {
+        let dest = dest_path(
+            added.input.library_root,
+            added.input.media,
+            &release,
+            &src,
+            added.input.naming,
+        )?;
+        if added.input.facts.entries().any(|(_, f)| {
+            f.path
+                .as_deref()
+                .is_some_and(|p| p == dest.to_string_lossy())
+        }) {
+            return Ok(None);
+        }
+        match publish_video(added, &src, &dest, control) {
+            Err(SubscribeError::Library(library::LibraryError::Io(error)))
+                if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 3 =>
+            {
+                attempts += 1;
+                tracing::warn!(dest = %dest.display(), "目标文件在发布前出现，改用下一个可用文件名");
+            }
+            result => {
+                result?;
+                break dest;
+            }
+        }
+    };
     let (quality, source, confidence) = quality_for(probe, &dest, &scored.release, control);
     control.check()?;
     // Final deletion approval uses actual (probed) quality, never the download
@@ -461,10 +478,43 @@ fn dest_path(
     if !dest.exists() {
         return Ok(dest);
     }
+    // M8: never hand back an occupied alternate name; walk `-2`, `-3`, … until
+    // a free slot. An alternate that already is this very file (retry after a
+    // hardlink import) is reused so retries stay idempotent.
     let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("media");
     let src_stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("alt");
     let ext = dest.extension().and_then(|s| s.to_str()).unwrap_or("bin");
-    Ok(dest.with_file_name(format!("{stem}-{src_stem}.{ext}")))
+    for n in 1..=MAX_ALTERNATE_NAMES {
+        let name = if n == 1 {
+            format!("{stem}-{src_stem}.{ext}")
+        } else {
+            format!("{stem}-{src_stem}-{n}.{ext}")
+        };
+        let candidate = dest.with_file_name(name);
+        if std::fs::symlink_metadata(&candidate).is_err() || same_file(src, &candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(SubscribeError::Library(library::LibraryError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free alternate name for {}", dest.display()),
+    ))))
+}
+
+const MAX_ALTERNATE_NAMES: usize = 100;
+
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(_: &Path, _: &Path) -> bool {
+    false
 }
 
 fn replacement_survives_probe<D: Downloader + ?Sized>(

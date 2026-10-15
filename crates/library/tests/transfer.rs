@@ -13,11 +13,78 @@ fn hardlink_replacement_preserves_old_seeding_bytes() {
     fs::write(&new_source, b"new release bytes").unwrap();
     fs::hard_link(&old_source, &destination).unwrap();
 
-    transfer_file(&new_source, &destination, TransferMode::Hardlink).unwrap();
+    // D-H3: publication never overwrites an existing destination; the old
+    // seeding bytes (shared via hardlink) are never written through.
+    let error = transfer_file(&new_source, &destination, TransferMode::Hardlink).unwrap_err();
+    assert!(
+        matches!(&error, library::LibraryError::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+        "{error:?}"
+    );
 
-    assert_eq!(fs::read(&destination).unwrap(), b"new release bytes");
+    assert_eq!(fs::read(&destination).unwrap(), b"old release bytes");
     assert_eq!(fs::read(&old_source).unwrap(), b"old release bytes");
     assert_eq!(fs::read(&new_source).unwrap(), b"new release bytes");
+    assert_eq!(fs::read_dir(destination.parent().unwrap()).unwrap().count(), 1, "no temp left behind");
+}
+
+#[test]
+fn transfer_never_overwrites_existing_destination_in_any_mode() {
+    for mode in [TransferMode::Copy, TransferMode::Move, TransferMode::Hardlink] {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("new.mkv");
+        let dest = tmp.path().join("library/movie.mkv");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&src, b"new").unwrap();
+        fs::write(&dest, b"user file").unwrap();
+        let error = transfer_file(&src, &dest, mode).unwrap_err();
+        assert!(matches!(&error, library::LibraryError::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists), "{mode:?}: {error:?}");
+        assert_eq!(fs::read(&dest).unwrap(), b"user file", "{mode:?}");
+        assert!(src.is_file(), "{mode:?}: source kept on conflict");
+        assert_eq!(fs::read_dir(dest.parent().unwrap()).unwrap().count(), 1, "{mode:?}: no temp left");
+    }
+}
+
+#[test]
+fn concurrent_transfers_to_one_destination_publish_exactly_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("library/movie.mkv");
+    let sources: Vec<_> = (0..8)
+        .map(|i| {
+            let src = tmp.path().join(format!("src-{i}.mkv"));
+            fs::write(&src, vec![b'a' + i as u8; 64 * 1024]).unwrap();
+            src
+        })
+        .collect();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(sources.len()));
+    let handles: Vec<_> = sources
+        .iter()
+        .cloned()
+        .map(|src| {
+            let dest = dest.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                transfer_file(&src, &dest, TransferMode::Copy).is_ok()
+            })
+        })
+        .collect();
+    let wins = handles.into_iter().map(|h| h.join().unwrap()).filter(|ok| *ok).count();
+    assert_eq!(wins, 1, "exactly one writer publishes");
+    let bytes = fs::read(&dest).unwrap();
+    assert!(bytes.iter().all(|b| *b == bytes[0]), "published file is one intact source");
+    assert_eq!(fs::read_dir(dest.parent().unwrap()).unwrap().count(), 1, "no temps left");
+}
+
+#[test]
+fn transfer_to_a_hardlink_of_itself_is_a_no_op() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("seed.mkv");
+    let dest = tmp.path().join("library/movie.mkv");
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    fs::write(&src, b"bytes").unwrap();
+    fs::hard_link(&src, &dest).unwrap();
+    transfer_file(&src, &dest, TransferMode::Hardlink).unwrap();
+    assert_eq!(fs::read(&dest).unwrap(), b"bytes");
 }
 
 #[test]
