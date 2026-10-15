@@ -766,6 +766,38 @@ mod rename_tests {
         let root = tmp.path().join("homevideos");
         std::fs::create_dir_all(&root).unwrap();
         let state = test_state(tmp.path());
+        let library = state.store().lock().create_library(
+            domain::MediaKind::Movie,
+            "Movies",
+            &[root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        ).unwrap();
+        let video = root.join("Movie.mp4");
+        std::fs::write(&video, b"video-data").unwrap();
+        let media = test_media();
+        let target = root.join("poster.jpg");
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let called_ref = &called;
+        let state_ref = &state;
+        let library_id = library.id.clone();
+        let outcome = attach_poster_with(&state, &media, &video, true, move |_| {
+            called_ref.store(true, std::sync::atomic::Ordering::SeqCst);
+            state_ref.library_work().cancel(&library_id);
+            Ok(b"fake-frame-bytes".to_vec())
+        });
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst), "frame 闭包必须被执行");
+        assert_eq!(outcome, ArtworkOutcome::Failed);
+        assert!(!target.exists(), "已取消的工作不得写入海报目标文件");
+    }
+
+    #[test]
+    fn library_lease_publish_after_cancelled_control_returns_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("homevideos");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = test_state(tmp.path());
         let _ = state.store().lock().create_library(
             domain::MediaKind::Movie,
             "Movies",
@@ -780,6 +812,6 @@ mod rename_tests {
         let lease = state.acquire_path_work(&video, domain::MediaKind::Movie).unwrap().unwrap();
         lease.control().cancel();
         let outcome = lease.publish(|| Ok(write_artwork(&media, &root.join("poster.jpg"), "海报", b"fake-frame-bytes")));
-        assert!(outcome.is_err(), "已取消的 lease.publish 必须返回 Err");
+        assert!(outcome.is_err(), "底层租约取消后 lease.publish 必须返回 Err");
     }
 }
