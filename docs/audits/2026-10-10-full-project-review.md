@@ -392,7 +392,7 @@
 | review_integrations_tmp_login.rs | hooks | 2 failed | I04 |
 | review_integrations_tmp_browser.rs | indexer | 1 failed | I05 |
 
-复现源码已随报告保存在同目录附件（[复现说明](<2026-10-10-full-project-review-repro/README.md>)），保持原 crate/tests 路径；它们不是已修复的正式回归测试，默认 `cargo test` 不会执行 docs 下源码。其 README 给出安全恢复、运行及清理命令。各发现正文包含独立触发步骤和实际结果，不依赖临时日志才能理解。
+复现源码曾随报告保存在同目录附件 `2026-10-10-full-project-review-repro/`（保持原 crate/tests 路径），**该附件已于 2026-10-15 从工作树移除**，正文可由 `git show <本轮清理提交>^:docs/audits/2026-10-10-full-project-review-repro/README.md` 一类命令取回。它们不是已修复的正式回归测试，默认 `cargo test` 不会执行 docs 下源码。各发现正文包含独立触发步骤和实际结果，不依赖临时日志才能理解。
 
 原始日志保存在 `/tmp/crawler-media-project-review-pipeline-repro.log`、`/tmp/crawler-media-project-review-root.log`、`/tmp/crawler-media-project-review-models.log`、`/tmp/crawler-media-review-access-test.log`，以及 `/tmp/crawler-media-project-review-integrations-repro/` 下的日志；临时日志可能被系统清理，长期证据以文档和保存的源码为准。
 

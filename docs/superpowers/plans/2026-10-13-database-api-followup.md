@@ -9,7 +9,9 @@
 
 **Tech Stack:** Rust edition 2024、Axum 0.8、Tokio、parking_lot、rusqlite 0.37 bundled SQLite；React/TypeScript、pnpm。
 
-**Spec:** [总复核 F01–F12](<../../audits/2026-10-13-database-api-review.md>)＋[DB8 合同与偏差](<2026-10-12-db8-maintenance-retention.md>)。代码基线 `723394e`。**本轮只 review 和修改文档，下面生产任务尚未执行。**
+**Spec:** [总复核 F01–F12](<../../audits/2026-10-13-database-api-review.md>)＋[DB8 合同与偏差](<2026-10-12-db8-maintenance-retention.md>)。代码基线 `723394e`。
+
+> **状态更新（2026-10-15）：** T1–T9 已有实现提交（`6f34c7a` T1／`9c4a1f1` T2／`d996788` T3／`af4dbbc` T4／`57a4837` T5／`f51b3f6` T6／`59b9c98` T7／`ce40b56` T8／`7aa1c7e` T9）。其中 T4／T5／T8 只改代码，未新增计划要求的 RED 目标；T9 的 release 矩阵、gallery ≥30% 目标、DB8 并发矩阵、VidHub／Infuse 设备证据与 `docs/benchmarks/2026-10-13-optimization-acceptance.md` 仍缺。**T10 未实施。** 下方复选框与“本次未实施”表述保留为当时计划原文，不等于当前状态；未完成项以 [总复核](<../../audits/2026-10-13-database-api-review.md>) §5 与本文 T10 为准。
 
 ## Global Constraints
 
