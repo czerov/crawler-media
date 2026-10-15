@@ -21,6 +21,8 @@ mod d_h3_m8_no_overwrite;
 mod h1_wash_in_flight;
 #[path = "subscription_e2e/h2_probe_rejected.rs"]
 mod h2_probe_rejected;
+#[path = "subscription_e2e/h3_background_reconcile.rs"]
+mod h3_background_reconcile;
 
 pub(crate) fn is_video(path: &std::path::Path) -> bool {
     matches!(

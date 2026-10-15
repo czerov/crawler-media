@@ -35,6 +35,7 @@ mod dynamic_downloader;
 pub mod fingerprint_job;
 pub mod http;
 pub mod playback_events;
+pub(crate) mod pending_reconcile;
 pub mod management;
 pub mod library_lifecycle;
 pub mod library_presence;

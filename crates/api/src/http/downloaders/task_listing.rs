@@ -8,36 +8,7 @@ use serde_json::{Value, json};
 use super::tasks::{ABSENT_CLEANUP_GRACE_SECS, task_state};
 use crate::http::ok;
 use crate::management::ApiState;
-
-fn snapshot_matches_pending(
-    torrent: &domain::Torrent,
-    snapshot: &downloader::TaskSnapshot,
-) -> bool {
-    if let Some(hash) = downloader::magnet_info_hash(&torrent.enclosure) {
-        return !snapshot.info_hash.is_empty() && snapshot.info_hash.eq_ignore_ascii_case(&hash);
-    }
-    // HTTP enclosures are identified only by their per-torrent ownership tag.
-    // Real clients report it in `owned_tags` (`tag` keeps the generic marker);
-    // `tag` is still checked for legacy / in-memory snapshots.
-    let owned = downloader::ownership_tag(&torrent.enclosure);
-    snapshot.owned_tags.iter().any(|tag| tag == &owned)
-        || snapshot.tag == owned
-        || snapshot.tag.split(',').any(|item| item.trim() == owned)
-}
-
-/// Whether absence of `torrent` among `snapshots` is evidence it is gone.
-/// A magnet is matched by info hash, so a reachable client always proves it.
-/// An HTTP enclosure needs ownership tags to be visible on this client: if
-/// the client reports tasks but none carries any ownership tag (tags stripped,
-/// unsupported labels, …) its absence proves nothing and must not delete rows.
-fn absence_is_provable(torrent: &domain::Torrent, snapshots: &[downloader::TaskSnapshot]) -> bool {
-    if snapshots.is_empty() || downloader::magnet_info_hash(&torrent.enclosure).is_some() {
-        return true;
-    }
-    snapshots.iter().any(|s| {
-        !s.owned_tags.is_empty() || s.tag.starts_with(downloader::OWNED_TAG_PREFIX)
-    })
-}
+use crate::pending_reconcile::{absence_is_provable, snapshot_matches_pending};
 
 fn prune_orphan_pending(
     state: &ApiState,
@@ -279,7 +250,7 @@ pub(crate) async fn list_tasks(State(state): State<ApiState>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{absence_is_provable, snapshot_matches_pending};
+    use crate::pending_reconcile::{absence_is_provable, snapshot_matches_pending};
 
     fn torrent(enclosure: &str) -> domain::Torrent {
         domain::Torrent {
