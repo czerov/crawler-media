@@ -187,3 +187,29 @@ fn batch_pending_submissions_refreshes_all_timestamps() {
         "批量提交必须为每个重投种子刷新时间戳"
     );
 }
+
+/// H2: automatic submissions never revive a rejected row; manual ones do.
+#[test]
+fn rejected_pending_is_only_revived_by_manual_submission() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (id, torrent) = create_sub(&store);
+    let pending = || PendingDownload {
+        torrent: torrent.clone(),
+        release_override: None,
+        downloader_id: None,
+        submitted_at: None,
+    };
+    store.record_pending_submissions(id, &[(10, pending())]).unwrap();
+    store.mark_pending_rejected(id, &[torrent.enclosure.clone()]).unwrap();
+    assert!(store.load_pending(id).unwrap().is_empty());
+    assert!(store.load_rejected_enclosures(id).unwrap().contains(&torrent.enclosure));
+
+    store.record_pending_submissions(id, &[(10, pending())]).unwrap();
+    store.merge_pending(id, &[(10, pending())]).unwrap();
+    assert!(store.load_pending(id).unwrap().is_empty(), "automatic paths keep it rejected");
+
+    store.record_manual_pending_submissions(id, &[(10, pending())]).unwrap();
+    assert_eq!(store.load_pending(id).unwrap().len(), 1, "manual submission revives");
+    assert!(store.load_rejected_enclosures(id).unwrap().is_empty());
+}

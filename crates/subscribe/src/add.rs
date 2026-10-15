@@ -90,6 +90,7 @@ pub fn admit_and_add<D: Downloader + ?Sized>(
             ledger_sources: Vec::new(),
             removed_paths: Vec::new(),
             transferred_enclosures: Vec::new(),
+            rejected_enclosures: Vec::new(),
             collection_errors: Vec::new(),
             submission_errors: add_errors.clone(),
             torrents_added,

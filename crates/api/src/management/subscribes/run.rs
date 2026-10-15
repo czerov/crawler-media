@@ -439,9 +439,11 @@ fn exclude_pending(
     torrents: &mut Vec<domain::Torrent>,
 ) -> Result<(), ApiError> {
     let existing = state.store.lock().load_pending(id)?;
+    let rejected = state.store.lock().load_rejected_enclosures(id)?;
     let enclosures: std::collections::HashSet<&str> = existing
         .iter()
         .map(|(_, pending)| pending.torrent.enclosure.as_str())
+        .chain(rejected.iter().map(String::as_str))
         .collect();
     let before = torrents.len();
     torrents.retain(|torrent| !enclosures.contains(torrent.enclosure.as_str()));
@@ -484,6 +486,7 @@ fn persist(
     }
     let now = crate::job_loop::unix_now();
     let transferred = outcome.transferred_enclosures;
+    let rejected = outcome.rejected_enclosures;
     let pending_items: Vec<_> = outcome
         .torrents_added
         .into_iter()
@@ -502,6 +505,7 @@ fn persist(
         .collect();
     store.record_pending_submissions(id, &pending_items)?;
     store.mark_pending_imported(id, &transferred)?;
+    store.mark_pending_rejected(id, &rejected)?;
     store.save_subscribe_facts(id, &outcome.facts)?;
     for path in &outcome.removed_paths {
         crate::http::file_delete::remove_file_and_ledger(&store, path)

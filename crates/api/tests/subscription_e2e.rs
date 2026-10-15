@@ -19,6 +19,8 @@ mod s1_wash_probe_fail;
 mod d_h3_m8_no_overwrite;
 #[path = "subscription_e2e/h1_wash_in_flight.rs"]
 mod h1_wash_in_flight;
+#[path = "subscription_e2e/h2_probe_rejected.rs"]
+mod h2_probe_rejected;
 
 pub(crate) fn is_video(path: &std::path::Path) -> bool {
     matches!(

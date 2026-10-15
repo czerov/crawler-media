@@ -61,6 +61,9 @@ fn commit_transfer_outcome(
     store
         .mark_pending_imported(subscribe.id, &outcome.transferred_enclosures)
         .map_err(|e| e.to_string())?;
+    store
+        .mark_pending_rejected(subscribe.id, &outcome.rejected_enclosures)
+        .map_err(|e| e.to_string())?;
     for row in &outcome.ledger {
         store.clear_ledger_missing(&row.path).map_err(|error| {
             tracing::error!(path = %row.path, %error, "清理 Library 缺失标记失败");
@@ -158,6 +161,7 @@ fn build_added_input<'a>(
             removed_paths: Vec::new(),
             completed: false,
             transferred_enclosures: Vec::new(),
+            rejected_enclosures: Vec::new(),
             collection_errors: Vec::new(),
             submission_errors: Vec::new(),
             torrents_added: Vec::new(),

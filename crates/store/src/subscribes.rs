@@ -101,27 +101,33 @@ impl Store {
         score: i32,
         pending: &PendingDownload,
         refresh_submitted_at: bool,
+        revive_rejected: bool,
     ) -> Result<(), StoreError> {
         let value_str = pending_torrent_json(pending);
         let submitted_at = pending.submitted_at.unwrap_or_else(super::unix_now);
-        let sql = if refresh_submitted_at {
-            "INSERT INTO pending_downloads (subscribe_id, enclosure, title, score, torrent_json, submitted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(subscribe_id, enclosure) DO UPDATE SET
-               title = excluded.title,
-               score = excluded.score,
-               torrent_json = excluded.torrent_json,
-               submitted_at = excluded.submitted_at,
-               state = 'active'"
+        // H2: automatic rounds never revive a `rejected` row; only an explicit
+        // user submission does.
+        let next_state = if revive_rejected {
+            "'active'"
         } else {
+            "CASE WHEN pending_downloads.state = 'rejected' THEN 'rejected' ELSE 'active' END"
+        };
+        let submitted = if refresh_submitted_at {
+            "submitted_at = excluded.submitted_at,"
+        } else {
+            ""
+        };
+        let sql = format!(
             "INSERT INTO pending_downloads (subscribe_id, enclosure, title, score, torrent_json, submitted_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(subscribe_id, enclosure) DO UPDATE SET
                title = excluded.title,
                score = excluded.score,
                torrent_json = excluded.torrent_json,
-               state = 'active'"
-        };
+               {submitted}
+               state = {next_state}"
+        );
+        let sql = sql.as_str();
         self.subscribe.execute(
             sql,
             params![
@@ -145,7 +151,7 @@ impl Store {
         torrents: &[(i32, PendingDownload)],
     ) -> Result<(), StoreError> {
         for (score, pending) in torrents {
-            self.upsert_pending_row(subscribe_id, *score, pending, false)?;
+            self.upsert_pending_row(subscribe_id, *score, pending, false, false)?;
         }
         Ok(())
     }
@@ -157,7 +163,8 @@ impl Store {
         score: i32,
         pending: &PendingDownload,
     ) -> Result<(), StoreError> {
-        self.upsert_pending_row(subscribe_id, score, pending, true)
+        // Single explicit submission (manual delivery): may revive `rejected`.
+        self.upsert_pending_row(subscribe_id, score, pending, true, true)
     }
 
     /// 批量记录由下载器提交成功的 pending 任务（更新 submitted_at 为当前时间，重置其宽限期）。
@@ -167,9 +174,53 @@ impl Store {
         torrents: &[(i32, PendingDownload)],
     ) -> Result<(), StoreError> {
         for (score, pending) in torrents {
-            self.upsert_pending_row(subscribe_id, *score, pending, true)?;
+            self.upsert_pending_row(subscribe_id, *score, pending, true, false)?;
         }
         Ok(())
+    }
+
+    /// Explicit user submissions (manual admit): revive `rejected` rows (H2).
+    pub fn record_manual_pending_submissions(
+        &self,
+        subscribe_id: SubscribeId,
+        torrents: &[(i32, PendingDownload)],
+    ) -> Result<(), StoreError> {
+        for (score, pending) in torrents {
+            self.upsert_pending_row(subscribe_id, *score, pending, true, true)?;
+        }
+        Ok(())
+    }
+
+    /// Mark wash-cut arrivals vetoed by their probed quality (H2).
+    pub fn mark_pending_rejected(
+        &self,
+        subscribe_id: SubscribeId,
+        enclosures: &[String],
+    ) -> Result<(), StoreError> {
+        for enclosure in enclosures {
+            self.subscribe.execute(
+                "UPDATE pending_downloads SET state = 'rejected'
+                 WHERE subscribe_id = ?1 AND enclosure = ?2",
+                params![subscribe_id.to_string(), enclosure],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Enclosures automatic rounds must never pick again (H2).
+    pub fn load_rejected_enclosures(
+        &self,
+        subscribe_id: SubscribeId,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let mut stmt = self.subscribe.prepare(
+            "SELECT enclosure FROM pending_downloads WHERE subscribe_id = ?1 AND state = 'rejected'",
+        )?;
+        let rows = stmt.query_map(params![subscribe_id.to_string()], |row| row.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
     }
 
     pub fn delete_pending(

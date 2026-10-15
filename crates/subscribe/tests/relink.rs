@@ -119,6 +119,7 @@ fn transfer_once(
             removed_paths: vec![],
             completed: false,
             transferred_enclosures: vec![],
+            rejected_enclosures: Vec::new(),
             collection_errors: vec![],
             submission_errors: vec![],
             torrents_added: vec![],

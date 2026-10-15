@@ -38,6 +38,7 @@ pub fn collect_completed_controlled<D: Downloader + ?Sized>(
     let mut ledger_sources = Vec::new();
     let mut removed_paths = Vec::new();
     let mut transferred_enclosures = Vec::new();
+    let mut rejected_enclosures = Vec::new();
     let mut collection_errors = Vec::new();
 
     // 先依据现有已确认的目标映射刷新/协调 facts，确保即便 Downloader 在 Move 模式下不再列出视频，
@@ -60,6 +61,7 @@ pub fn collect_completed_controlled<D: Downloader + ?Sized>(
             &mut ledger_sources,
             &mut removed_paths,
             &mut transferred_enclosures,
+            &mut rejected_enclosures,
             &mut collection_errors,
             control,
         );
@@ -72,6 +74,7 @@ pub fn collect_completed_controlled<D: Downloader + ?Sized>(
         ledger_sources,
         removed_paths,
         transferred_enclosures,
+        rejected_enclosures,
         collection_errors,
         submission_errors: added.add_errors,
         torrents_added: added.outcome.torrents_added,
@@ -87,9 +90,11 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
     ledger_sources: &mut Vec<LedgerSource>,
     removed_paths: &mut Vec<String>,
     transferred_enclosures: &mut Vec<String>,
+    rejected_enclosures: &mut Vec<String>,
     collection_errors: &mut Vec<String>,
     control: &library::WorkControl,
 ) {
+    let mut vetoed = false;
     let errors_before_torrent = collection_errors.len();
     let completed_files = match added.input.downloader.completed_files(&scored.torrent) {
         Ok(files) => files,
@@ -140,6 +145,7 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
             ledger,
             ledger_sources,
             removed_paths,
+            &mut vetoed,
             control,
         ) {
             Ok(Some(dest)) => torrent_destinations.push(
@@ -186,6 +192,9 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
     let has_work = !torrent_destinations.is_empty() || subs_count > 0;
     if reported_any && has_work && collection_errors.len() == errors_before_torrent {
         transferred_enclosures.push(scored.torrent.enclosure.clone());
+    }
+    if vetoed && !rejected_enclosures.contains(&scored.torrent.enclosure) {
+        rejected_enclosures.push(scored.torrent.enclosure.clone());
     }
 }
 
@@ -251,6 +260,7 @@ fn collect_one<D: Downloader + ?Sized>(
     ledger: &mut Vec<LedgerRow>,
     ledger_sources: &mut Vec<LedgerSource>,
     removed_paths: &mut Vec<String>,
+    vetoed: &mut bool,
     control: &library::WorkControl,
 ) -> Result<Option<PathBuf>, SubscribeError> {
     let file_release = release::parse(
@@ -331,6 +341,7 @@ fn collect_one<D: Downloader + ?Sized>(
         source == QualitySource::Probe,
     );
     if added.input.subscribe.wash_cut && has_existing && !approved {
+        *vetoed = true;
         tracing::warn!(
             dest = %dest.display(),
             resolution = ?quality.resolution,

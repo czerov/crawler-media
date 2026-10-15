@@ -50,6 +50,15 @@ pub(super) fn finish_search(
         "评估候选种子"
     );
     remove_pending_candidates(&mut torrents, &context.existing, subscribe.id);
+    // H2: never auto-pick an enclosure whose probed quality already vetoed it.
+    let rejected = state
+        .store
+        .lock()
+        .load_rejected_enclosures(subscribe.id)
+        .map_err(|e| e.to_string())?;
+    if !rejected.is_empty() {
+        torrents.retain(|torrent| !rejected.contains(&torrent.enclosure));
+    }
 
     let add_errors = admit_candidates(
         state,

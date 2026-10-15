@@ -53,6 +53,9 @@ pub struct RunOutcome {
     pub completed: bool,
     /// Enclosures whose completed files were transferred into the Library.
     pub transferred_enclosures: Vec<String>,
+    /// Wash-cut arrivals whose actual (probed) quality vetoed the replacement
+    /// (H2). Persisted as `rejected` so automatic rounds never pick them again.
+    pub rejected_enclosures: Vec<String>,
     /// Failures that occurred while collecting a multi-file download. Successful
     /// files remain in the outcome so callers can persist them before retrying.
     pub collection_errors: Vec<String>,
