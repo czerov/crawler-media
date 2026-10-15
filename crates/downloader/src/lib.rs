@@ -171,7 +171,23 @@ pub struct TaskSnapshot {
     pub download_speed: u64,
     pub upload_speed: u64,
     pub info_hash: String,
+    /// Every per-torrent ownership tag (`crawler-media-owned-<sha256>`) the
+    /// client reports for this task. `tag` only carries the generic marker, so
+    /// HTTP-enclosure identity must be proven through this list.
+    pub owned_tags: Vec<String>,
 }
+
+/// Collect `crawler-media-owned-*` ownership tags from client tag/label values.
+pub fn owned_tags_from<'a>(tags: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    tags.into_iter()
+        .map(str::trim)
+        .filter(|tag| tag.starts_with(OWNED_TAG_PREFIX))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Prefix of [`ownership_tag`] values.
+pub const OWNED_TAG_PREFIX: &str = "crawler-media-owned-";
 
 /// The one tag every crawler-media delivery carries inside a download client.
 ///
@@ -268,6 +284,17 @@ fn is_ignored_token(t: &str) -> bool {
 /// 体积精确匹配（可选）。
 pub(crate) fn size_matches(got: u64, want: Option<u64>) -> bool {
     want.is_some_and(|want| want > 0 && got == want)
+}
+
+#[cfg(test)]
+mod owned_tag_tests {
+    #[test]
+    fn owned_tags_are_collected_and_generic_tags_ignored() {
+        let owned = super::ownership_tag("https://pt.example/a");
+        let raw = format!("other, crawler-media ,{owned}, crawler-media-legacy");
+        assert_eq!(super::owned_tags_from(raw.split(',')), vec![owned]);
+        assert!(super::owned_tags_from(["crawler-media", ""]).is_empty());
+    }
 }
 
 #[cfg(test)]

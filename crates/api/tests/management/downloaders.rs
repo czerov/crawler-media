@@ -468,6 +468,7 @@ async fn list_tasks_does_not_bind_pending_to_same_size_different_title() {
         download_speed: 1,
         upload_speed: 0,
         info_hash: "bbbb".into(),
+        owned_tags: vec![],
     });
     let app = router(state(
         tmp.path(),
@@ -720,6 +721,7 @@ async fn untagged_reachable_snapshot_does_not_prune_stale_pending() {
         download_speed: 1,
         upload_speed: 0,
         info_hash: "cccccccccccccccccccccccccccccccccccccccc".into(),
+        owned_tags: vec![],
     });
     let app = router(state(
         tmp.path(),

@@ -11,6 +11,8 @@ mod mock_qbit;
 
 #[path = "subscription_e2e/golden_path.rs"]
 mod golden_path;
+#[path = "subscription_e2e/d_s1_pending_cleanup.rs"]
+mod d_s1_pending_cleanup;
 
 pub(crate) fn is_video(path: &std::path::Path) -> bool {
     matches!(

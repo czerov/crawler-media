@@ -16,8 +16,27 @@ fn snapshot_matches_pending(
     if let Some(hash) = downloader::magnet_info_hash(&torrent.enclosure) {
         return !snapshot.info_hash.is_empty() && snapshot.info_hash.eq_ignore_ascii_case(&hash);
     }
+    // HTTP enclosures are identified only by their per-torrent ownership tag.
+    // Real clients report it in `owned_tags` (`tag` keeps the generic marker);
+    // `tag` is still checked for legacy / in-memory snapshots.
     let owned = downloader::ownership_tag(&torrent.enclosure);
-    snapshot.tag == owned || snapshot.tag.split(',').any(|item| item.trim() == owned)
+    snapshot.owned_tags.iter().any(|tag| tag == &owned)
+        || snapshot.tag == owned
+        || snapshot.tag.split(',').any(|item| item.trim() == owned)
+}
+
+/// Whether absence of `torrent` among `snapshots` is evidence it is gone.
+/// A magnet is matched by info hash, so a reachable client always proves it.
+/// An HTTP enclosure needs ownership tags to be visible on this client: if
+/// the client reports tasks but none carries any ownership tag (tags stripped,
+/// unsupported labels, …) its absence proves nothing and must not delete rows.
+fn absence_is_provable(torrent: &domain::Torrent, snapshots: &[downloader::TaskSnapshot]) -> bool {
+    if snapshots.is_empty() || downloader::magnet_info_hash(&torrent.enclosure).is_some() {
+        return true;
+    }
+    snapshots.iter().any(|s| {
+        !s.owned_tags.is_empty() || s.tag.starts_with(downloader::OWNED_TAG_PREFIX)
+    })
 }
 
 fn prune_orphan_pending(
@@ -86,7 +105,6 @@ fn prune_absent_pending(
     snapshots_by_downloader: &HashMap<Option<DownloaderId>, Vec<downloader::TaskSnapshot>>,
     reachable: &HashSet<Option<DownloaderId>>,
 ) -> Vec<(domain::SubscribeId, i32, store::PendingDownload)> {
-    let store = state.store.lock();
     let now = crate::job_loop::unix_now();
     let mut kept = Vec::with_capacity(pending.len());
     for (subscribe_id, score, item) in pending {
@@ -96,25 +114,57 @@ fn prune_absent_pending(
             .unwrap_or(&[]);
         let matched = snapshots
             .iter()
-            .find(|s| snapshot_matches_pending(&item.torrent, s));
-        let identity_visible = snapshots.is_empty() || snapshots.iter().any(|s| !s.tag.is_empty());
-        let absent =
-            reachable.contains(&item.downloader_id) && identity_visible && matched.is_none();
+            .any(|s| snapshot_matches_pending(&item.torrent, s));
+        let absent = reachable.contains(&item.downloader_id)
+            && !matched
+            && absence_is_provable(&item.torrent, snapshots);
+        if !matched && reachable.contains(&item.downloader_id) && !absent {
+            tracing::error!(%subscribe_id, torrent = %item.torrent.title,
+                "下载器未暴露归属标签，无法证明任务已消失，拒绝自动清理 pending");
+        }
         let stale = item
             .submitted_at
             .is_some_and(|ts| now - ts >= ABSENT_CLEANUP_GRACE_SECS);
-        if absent && stale {
-            let enclosure = item.torrent.enclosure.clone();
-            if let Err(error) = store.delete_pending(subscribe_id, &enclosure) {
-                tracing::error!(%subscribe_id, %error, "自动清理缺失任务失败");
-            } else {
-                tracing::info!(%subscribe_id, torrent = %item.torrent.title, "自动清理：种子已不在下载器且超过宽限期");
-            }
+        if absent && stale && delete_absent_pending(state, subscribe_id, &item) {
             continue;
         }
         kept.push((subscribe_id, score, item));
     }
     kept
+}
+
+/// Delete one absent pending row under its Subscribe guard (lock order:
+/// guard → store, same as search/Transfer). A busy guard means a search or
+/// Transfer is working on this Subscribe right now: skip this round.
+fn delete_absent_pending(
+    state: &ApiState,
+    subscribe_id: domain::SubscribeId,
+    item: &store::PendingDownload,
+) -> bool {
+    let guard = state.subscribe_guard(subscribe_id);
+    let Some(_held) = guard.try_lock() else {
+        tracing::debug!(%subscribe_id, "订阅正在搜索/转存，本轮跳过缺失任务清理");
+        return false;
+    };
+    let store = state.store.lock();
+    // Re-check under the guard: Transfer may have imported it meanwhile.
+    let still_active = store
+        .load_pending(subscribe_id)
+        .map(|rows| rows.iter().any(|(_, p)| p.torrent.enclosure == item.torrent.enclosure))
+        .unwrap_or(false);
+    if !still_active {
+        return true;
+    }
+    match store.delete_pending(subscribe_id, &item.torrent.enclosure) {
+        Ok(()) => {
+            tracing::info!(%subscribe_id, torrent = %item.torrent.title, "自动清理：种子已不在下载器且超过宽限期");
+            true
+        }
+        Err(error) => {
+            tracing::error!(%subscribe_id, %error, "自动清理缺失任务失败");
+            false
+        }
+    }
 }
 
 fn subscribe_media_index(
@@ -225,4 +275,60 @@ pub(crate) async fn list_tasks(State(state): State<ApiState>) -> Response {
     let kept = prune_absent_pending(&state, pending, &snapshots_by_downloader, &reachable);
     let items = map_task_rows(&state, &kept, &snapshots_by_downloader, &reachable);
     ok(json!({ "items": items, "sources": [] })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{absence_is_provable, snapshot_matches_pending};
+
+    fn torrent(enclosure: &str) -> domain::Torrent {
+        domain::Torrent {
+            site_id: domain::SiteId::new(),
+            title: "The.Matrix.1999.2160p".into(),
+            enclosure: enclosure.into(),
+            size_bytes: None,
+            seeders: None,
+            free: false,
+            hr: false,
+            imdb_id: None,
+            id: None,
+            leechers: None,
+            snatched: None,
+            upload_time: None,
+            detail_url: None,
+            category: None,
+            poster_url: None,
+        }
+    }
+
+    fn snapshot(owned: &[String]) -> downloader::TaskSnapshot {
+        downloader::TaskSnapshot {
+            tag: downloader::TASK_TAG.into(),
+            owned_tags: owned.to_vec(),
+            info_hash: "aaaa".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn http_pending_matches_real_client_snapshot_by_owned_tag() {
+        let t = torrent("https://pt.example/download.php?id=1");
+        let owned = downloader::ownership_tag(&t.enclosure);
+        assert!(snapshot_matches_pending(&t, &snapshot(&[owned])));
+        let other = downloader::ownership_tag("https://pt.example/download.php?id=2");
+        assert!(!snapshot_matches_pending(&t, &snapshot(&[other])));
+        assert!(!snapshot_matches_pending(&t, &snapshot(&[])));
+    }
+
+    #[test]
+    fn absence_needs_visible_ownership_for_http_but_not_magnets() {
+        let http = torrent("https://pt.example/download.php?id=1");
+        let magnet = torrent("magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let generic_only = vec![snapshot(&[])];
+        assert!(!absence_is_provable(&http, &generic_only));
+        assert!(absence_is_provable(&magnet, &generic_only));
+        assert!(absence_is_provable(&http, &[]));
+        let visible = vec![snapshot(&[downloader::ownership_tag("https://x/other")])];
+        assert!(absence_is_provable(&http, &visible));
+    }
 }

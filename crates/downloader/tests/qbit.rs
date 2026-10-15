@@ -392,6 +392,11 @@ fn task_snapshots_extract_our_tag_and_live_state() {
         snapshot.tag, "crawler-media",
         "应从 tags 里挑出 crawler-media 标记，忽略 ownership 派生标签"
     );
+    assert_eq!(
+        snapshot.owned_tags,
+        vec![downloader::ownership_tag("https://pt.example/download.php?id=1")],
+        "D-S1: per-torrent ownership tag must be exposed for HTTP identity"
+    );
     assert_eq!(snapshot.state, "stalledDL");
     assert_eq!(snapshot.progress, 1.0);
     assert_eq!(snapshot.size_bytes, 1000);

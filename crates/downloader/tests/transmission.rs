@@ -170,6 +170,34 @@ fn transmission_snapshots_preserve_metrics_and_only_mark_owned_tasks() {
 }
 
 #[test]
+fn transmission_snapshots_expose_per_torrent_ownership_labels() {
+    let owned = downloader::ownership_tag("https://pt.example/download.php?id=7");
+    let capture = Capture::new();
+    *capture.injected_torrents.lock() = Some(
+        serde_json::json!({
+            "result": "success", "arguments": {"torrents": [
+                {"name": "owned", "hashString": "abc", "status": 4,
+                 "labels": [downloader::TASK_TAG, owned]},
+                {"name": "generic-only", "hashString": "def", "status": 4,
+                 "labels": [downloader::TASK_TAG]}
+            ]}
+        })
+        .to_string(),
+    );
+    let dl = TransmissionDownloader::connect(TransmissionConfig {
+        url: serve(capture, "/downloads".into()),
+        username: None,
+        password: None,
+        path_maps: vec![],
+    })
+    .unwrap();
+    let rows = dl.task_snapshots().unwrap();
+    assert_eq!(rows[0].tag, downloader::TASK_TAG);
+    assert_eq!(rows[0].owned_tags, vec![owned]);
+    assert!(rows[1].owned_tags.is_empty());
+}
+
+#[test]
 fn transmission_adds_enclosure_over_rpc() {
     let capture = Capture::new();
     let url = serve(capture.clone(), "/downloads".into());

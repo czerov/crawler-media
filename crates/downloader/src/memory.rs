@@ -178,6 +178,7 @@ impl Downloader for MemoryDownloader {
                 download_speed: 0,
                 upload_speed: 0,
                 info_hash: String::new(),
+                owned_tags: vec![crate::ownership_tag(&torrent.enclosure)],
             })
             .collect())
     }

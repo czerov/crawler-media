@@ -411,6 +411,13 @@ impl Downloader for TransmissionDownloader {
                 .find(|label| *label == crate::TASK_TAG || label.starts_with("crawler-media-"))
                 .unwrap_or("")
                 .to_string();
+            let owned_tags = crate::owned_tags_from(
+                item["labels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            );
             let progress = item
                 .get("percentDone")
                 .and_then(Value::as_f64)
@@ -449,6 +456,7 @@ impl Downloader for TransmissionDownloader {
                 uploaded_bytes,
                 state,
                 tag,
+                owned_tags,
             });
         }
         Ok(snapshots)

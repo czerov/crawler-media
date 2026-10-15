@@ -314,7 +314,9 @@ impl Downloader for QbitDownloader {
             .into_iter()
             .map(|info| {
                 let tag = our_tag(&info.tags);
+                let owned_tags = crate::owned_tags_from(info.tags.split(','));
                 crate::TaskSnapshot {
+                    owned_tags,
                     tag,
                     name: info.name,
                     progress: info.progress,
