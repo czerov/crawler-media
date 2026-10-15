@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::catalog::ArtworkCandidate;
@@ -27,6 +27,13 @@ impl PosterFetch for HttpPoster {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtworkOutcome {
+    Written,
+    AlreadyPresent,
+    Skipped,
+    Failed,
+}
 /// Best-effort poster for a transferred file (Emby-style):
 /// 1. catalog poster URL (TMDB etc.) if reachable;
 /// 2. else extract a video frame locally (network-independent fallback).
@@ -39,7 +46,29 @@ pub fn attach_poster(state: &ApiState, media: &Media, video: &Path) -> Option<Ve
 /// 当 `target` 已存在时，直接复用现有文件，不重复走网络下载或视频截帧；
 /// 仅当海报文件不存在时才执行下载或截帧补齐。
 pub fn attach_poster_if_missing(state: &ApiState, media: &Media, video: &Path) -> Option<Vec<u8>> {
-    attach_poster_opts(state, media, video, false)
+    match attach_poster_outcome_opts(state, media, video, false) {
+        ArtworkOutcome::Written | ArtworkOutcome::AlreadyPresent => {
+            let target = video.parent().map(|p| p.join("poster.jpg"))?;
+            std::fs::read(&target).ok()
+        }
+        ArtworkOutcome::Skipped | ArtworkOutcome::Failed => None,
+    }
+}
+
+pub fn attach_poster_outcome_if_missing(
+    state: &ApiState,
+    media: &Media,
+    video: &Path,
+) -> ArtworkOutcome {
+    attach_poster_outcome_opts(state, media, video, false)
+}
+
+pub fn attach_backdrop_outcome(
+    state: &ApiState,
+    media: &Media,
+    video: &Path,
+) -> ArtworkOutcome {
+    attach_backdrop_outcome_opts(state, media, video, false)
 }
 
 fn attach_poster_opts(
@@ -48,6 +77,22 @@ fn attach_poster_opts(
     video: &Path,
     force: bool,
 ) -> Option<Vec<u8>> {
+    let outcome = attach_poster_outcome_opts(state, media, video, force);
+    match outcome {
+        ArtworkOutcome::Written | ArtworkOutcome::AlreadyPresent => {
+            let target = video.parent()?.join("poster.jpg");
+            std::fs::read(&target).ok()
+        }
+        ArtworkOutcome::Skipped | ArtworkOutcome::Failed => None,
+    }
+}
+
+fn attach_poster_outcome_opts(
+    state: &ApiState,
+    media: &Media,
+    video: &Path,
+    force: bool,
+) -> ArtworkOutcome {
     attach_poster_with(state, media, video, force, |video| {
         let lease = state.acquire_path_work(video, media.kind)?;
         let control = lease.as_ref().map(|lease| lease.control().clone()).unwrap_or_default();
@@ -55,47 +100,18 @@ fn attach_poster_opts(
     })
 }
 
-fn attach_poster_with(
+enum ExistingPoster {
+    Locked,
+    Present,
+    Missing,
+}
+
+fn check_existing_poster(
     state: &ApiState,
     media: &Media,
-    video: &Path,
+    target: &Path,
     force: bool,
-    frame: impl Fn(&Path) -> Result<Vec<u8>, String>,
-) -> Option<Vec<u8>> {
-    if !crate::scrape_metadata::targets::video_present(video) {
-        return None;
-    }
-    let lease = match state.acquire_path_work(video, media.kind) {
-        Ok(lease) => lease,
-        Err(error) => {
-            tracing::warn!(%error, media = %media.title, video = %video.display(), "获取路径工作租约失败，跳过海报");
-            return None;
-        }
-    };
-    // 刮削与整理设置：写入图片总开关（mirror_images）。
-    let mirror_images = state
-        .store
-        .lock()
-        .get_scrape_config()
-        .ok()
-        .map(|config| config.effective.mirror_images)
-        .unwrap_or(true);
-    if !mirror_images {
-        tracing::info!(media = %media.title, "镜像图片已关闭，跳过海报");
-        return None;
-    }
-    if !crate::scrape_metadata::targets::video_present(video) {
-        return None;
-    }
-    let Some(dir) = video.parent() else {
-        tracing::warn!(media = %media.title, video = %video.display(), "海报落盘失败：视频没有父目录");
-        return None;
-    };
-    let target = dir.join("poster.jpg");
-    tracing::debug!(media = %media.title, video = %video.display(), target = %target.display(), "为媒体文件补充海报");
-
-    // A user-selected or uploaded cover is authoritative. Metadata refreshes
-    // and future imports must not overwrite it (Emby-style artwork lock).
+) -> ExistingPoster {
     let locked = state
         .store
         .lock()
@@ -107,68 +123,126 @@ fn attach_poster_with(
         .unwrap_or(false);
     if locked && target.is_file() {
         tracing::debug!(media = %media.title, path = %target.display(), "海报已锁定，保留现有文件");
-        return match std::fs::read(&target) {
-            Ok(bytes) => Some(bytes),
+        return match std::fs::metadata(target) {
+            Ok(_) => ExistingPoster::Locked,
             Err(error) => {
-                tracing::warn!(%error, media = %media.title, path = %target.display(), "读取已锁定海报失败");
-                None
+                tracing::warn!(%error, media = %media.title, path = %target.display(), "读取已锁定海报元数据失败");
+                ExistingPoster::Missing
             }
         };
     }
     if !force && target.is_file() {
         tracing::debug!(media = %media.title, path = %target.display(), "海报已存在且未锁定强制刷新，跳过重新下载/截帧");
-        return match std::fs::read(&target) {
-            Ok(bytes) => Some(bytes),
+        return match std::fs::metadata(target) {
+            Ok(_) => ExistingPoster::Present,
             Err(error) => {
-                tracing::warn!(%error, media = %media.title, path = %target.display(), "读取已有海报失败");
-                None
+                tracing::warn!(%error, media = %media.title, path = %target.display(), "读取已有海报元数据失败");
+                ExistingPoster::Missing
             }
         };
     }
+    ExistingPoster::Missing
+}
 
-    // Channel 1: catalog artwork. poster_mode=language picks per the language
-    // priority + min-width gate; default keeps the TMDB detail poster. Both
-    // paths honor poster_size so sidecars are suitable for full-screen views.
-    if let Some(tmdb_id) = media.tmdb_id.as_deref() {
-        let config = state.store.lock().get_scrape_config().ok();
-        let size = config
-            .as_ref()
-            .map(|c| c.effective.poster_size.as_str())
-            .unwrap_or("w780");
-        let mode = config
-            .as_ref()
-            .map(|c| c.effective.poster_mode.as_str())
-            .unwrap_or("default");
-        let picked: Option<Vec<u8>> = if mode == "language" {
-            language_poster(state, media, tmdb_id, config.as_ref())
-        } else {
-            match state.catalog.poster_url(media.kind, tmdb_id) {
-                Ok(Some(url)) => {
-                    fetch_artwork(state, media, "海报", &poster_url_at_size(&url, size))
-                }
-                Ok(None) => {
-                    tracing::warn!(media = %media.title, tmdb_id, "目录没有海报地址");
-                    None
-                }
-                Err(error) => {
-                    tracing::warn!(%error, media = %media.title, tmdb_id, "查询海报地址失败");
-                    None
-                }
+fn attach_poster_catalog(
+    state: &ApiState,
+    media: &Media,
+    video: &Path,
+    target: &Path,
+    lease: Option<&crate::library_lifecycle::LibraryWorkLease>,
+) -> Option<Vec<u8>> {
+    let tmdb_id = media.tmdb_id.as_deref()?;
+    let config = state.store.lock().get_scrape_config().ok();
+    let size = config
+        .as_ref()
+        .map(|c| c.effective.poster_size.as_str())
+        .unwrap_or("w780");
+    let mode = config
+        .as_ref()
+        .map(|c| c.effective.poster_mode.as_str())
+        .unwrap_or("default");
+    let picked: Option<Vec<u8>> = if mode == "language" {
+        language_poster(state, media, tmdb_id, config.as_ref())
+    } else {
+        match state.catalog.poster_url(media.kind, tmdb_id) {
+            Ok(Some(url)) => {
+                fetch_artwork(state, media, "海报", &poster_url_at_size(&url, size))
             }
-        };
-        if let Some(bytes) = picked {
-            if !crate::scrape_metadata::targets::video_present(video) {
-                return None;
+            Ok(None) => {
+                tracing::warn!(media = %media.title, tmdb_id, "目录没有海报地址");
+                None
             }
-            return publish_artwork(lease.as_ref(), media, &target, "海报", &bytes);
+            Err(error) => {
+                tracing::warn!(%error, media = %media.title, tmdb_id, "查询海报地址失败");
+                None
+            }
         }
+    };
+    if let Some(bytes) = picked {
+        if !crate::scrape_metadata::targets::video_present(video) {
+            return None;
+        }
+        return publish_artwork(lease, media, target, "海报", &bytes);
+    }
+    None
+}
+
+fn attach_poster_with(
+    state: &ApiState,
+    media: &Media,
+    video: &Path,
+    force: bool,
+    frame: impl Fn(&Path) -> Result<Vec<u8>, String>,
+) -> ArtworkOutcome {
+    if !crate::scrape_metadata::targets::video_present(video) {
+        return ArtworkOutcome::Skipped;
+    }
+    let lease = match state.acquire_path_work(video, media.kind) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(%error, media = %media.title, video = %video.display(), "获取路径工作租约失败，跳过海报");
+            return ArtworkOutcome::Skipped;
+        }
+    };
+    let mirror_images = state
+        .store
+        .lock()
+        .get_scrape_config()
+        .ok()
+        .map(|config| config.effective.mirror_images)
+        .unwrap_or(true);
+    if !mirror_images {
+        tracing::info!(media = %media.title, "镜像图片已关闭，跳过海报");
+        return ArtworkOutcome::Skipped;
+    }
+    if !crate::scrape_metadata::targets::video_present(video) {
+        return ArtworkOutcome::Skipped;
+    }
+    let Some(dir) = video.parent() else {
+        tracing::warn!(media = %media.title, video = %video.display(), "海报落盘失败：视频没有父目录");
+        return ArtworkOutcome::Failed;
+    };
+    let target = dir.join("poster.jpg");
+    tracing::debug!(media = %media.title, video = %video.display(), target = %target.display(), "为媒体文件补充海报");
+
+    match check_existing_poster(state, media, &target, force) {
+        ExistingPoster::Locked | ExistingPoster::Present => {
+            return ArtworkOutcome::AlreadyPresent;
+        }
+        ExistingPoster::Missing => {}
+    }
+
+    // Channel 1: catalog artwork.
+    if attach_poster_catalog(state, media, video, &target, lease.as_ref()).is_some() {
+        return ArtworkOutcome::Written;
+    }
+    if !crate::scrape_metadata::targets::video_present(video) {
+        return ArtworkOutcome::Skipped;
     }
 
     // Channel 2: local video frame → 2:3 poster (no network needed).
-    // 对于 STRM 虚拟流媒体文件，跳过本地强制抓帧（避免 ffmpeg 读纯文本报错），
-    // 且避免对远程挂载发起大流量视频流拉取
     if write_frame_poster(state, media, video, &target, frame) {
-        return None;
+        return ArtworkOutcome::Written;
     }
     tracing::warn!(
         media = %media.title,
@@ -176,7 +250,7 @@ fn attach_poster_with(
         target = %target.display(),
         "海报未写入"
     );
-    None
+    ArtworkOutcome::Failed
 }
 
 fn language_poster(
@@ -408,6 +482,20 @@ pub fn pick_candidate<'a>(
 
 /// Best-effort backdrop (fanart.jpg) beside a file, using the backdrop
 /// language priority + min-width gate. Any failure keeps sidecars intact.
+pub fn backdrop_target(video: &Path) -> Option<PathBuf> {
+    let dir = video.parent()?;
+    let show_dir = if dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().starts_with("season"))
+    {
+        dir.parent().unwrap_or(dir)
+    } else {
+        dir
+    };
+    Some(show_dir.join("fanart.jpg"))
+}
+
 pub fn attach_backdrop(state: &ApiState, media: &Media, video: &Path) -> Option<Vec<u8>> {
     attach_backdrop_opts(state, media, video, false)
 }
@@ -422,62 +510,62 @@ fn attach_backdrop_opts(
     video: &Path,
     force: bool,
 ) -> Option<Vec<u8>> {
+    let outcome = attach_backdrop_outcome_opts(state, media, video, force);
+    match outcome {
+        ArtworkOutcome::Written | ArtworkOutcome::AlreadyPresent => {
+            let target = backdrop_target(video)?;
+            std::fs::read(&target).ok()
+        }
+        ArtworkOutcome::Skipped | ArtworkOutcome::Failed => None,
+    }
+}
+
+fn attach_backdrop_outcome_opts(
+    state: &ApiState,
+    media: &Media,
+    video: &Path,
+    force: bool,
+) -> ArtworkOutcome {
     let lease = match state.acquire_path_work(video, media.kind) {
         Ok(lease) => lease,
         Err(error) => {
             tracing::warn!(%error, media = %media.title, video = %video.display(), "获取路径工作租约失败，跳过背景图");
-            return None;
+            return ArtworkOutcome::Skipped;
         }
     };
     let Some(config) = state.store.lock().get_scrape_config().ok() else {
         tracing::warn!(media = %media.title, "读取刮削配置失败，跳过背景图");
-        return None;
+        return ArtworkOutcome::Failed;
     };
     if !config.effective.mirror_images {
         tracing::info!(media = %media.title, "镜像图片已关闭，跳过背景图");
-        return None;
+        return ArtworkOutcome::Skipped;
     }
     if !crate::scrape_metadata::targets::video_present(video) {
-        return None;
+        return ArtworkOutcome::Skipped;
     }
-    let Some(dir) = video.parent() else {
+    let Some(target) = backdrop_target(video) else {
         tracing::warn!(media = %media.title, video = %video.display(), "背景图落盘失败：视频没有父目录");
-        return None;
+        return ArtworkOutcome::Failed;
     };
-    let show_dir = if dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|name| name.to_ascii_lowercase().starts_with("season"))
-    {
-        dir.parent().unwrap_or(dir)
-    } else {
-        dir
-    };
-    let target = show_dir.join("fanart.jpg");
     if !force && target.is_file() {
         tracing::debug!(media = %media.title, path = %target.display(), "背景图已存在，跳过下载");
-        return match std::fs::read(&target) {
-            Ok(bytes) => Some(bytes),
-            Err(error) => {
-                tracing::warn!(%error, media = %media.title, path = %target.display(), "读取已有背景图失败");
-                None
-            }
-        };
+        return ArtworkOutcome::AlreadyPresent;
     }
     let Some(tmdb_id) = media.tmdb_id.as_deref() else {
         tracing::warn!(media = %media.title, "没有 TMDB ID，跳过背景图");
-        return None;
+        return ArtworkOutcome::Failed;
     };
     let candidates = match state.catalog.image_candidates(media.kind, tmdb_id) {
         Ok(candidates) => candidates,
         Err(error) => {
             tracing::warn!(%error, media = %media.title, tmdb_id, "拉取背景图候选失败");
-            return None;
+            return ArtworkOutcome::Failed;
         }
     };
     if candidates.backdrops.is_empty() {
         tracing::warn!(media = %media.title, tmdb_id, "目录没有背景图候选");
-        return None;
+        return ArtworkOutcome::Failed;
     }
     let Some(picked) = pick_candidate(
         &candidates.backdrops,
@@ -492,16 +580,20 @@ fn attach_backdrop_opts(
             min_width = config.effective.backdrop_min_width,
             "没有符合语言和宽度的背景图候选"
         );
-        return None;
+        return ArtworkOutcome::Failed;
     };
     let url = picked.url(&config.effective.backdrop_size);
     let Some(bytes) = fetch_artwork(state, media, "背景图", &url) else {
-        return None;
+        return ArtworkOutcome::Failed;
     };
     if !crate::scrape_metadata::targets::video_present(video) {
-        return None;
+        return ArtworkOutcome::Skipped;
     }
-    publish_artwork(lease.as_ref(), media, &target, "背景图", &bytes)
+    if publish_artwork(lease.as_ref(), media, &target, "背景图", &bytes).is_some() {
+        ArtworkOutcome::Written
+    } else {
+        ArtworkOutcome::Failed
+    }
 }
 
 fn lang_subtag(language: &str) -> String {
@@ -600,7 +692,7 @@ mod rename_tests {
             called.store(true, Ordering::SeqCst);
             panic!("ffmpeg must not run after the poster source disappears");
         });
-        assert!(written.is_none());
+        assert_eq!(written, ArtworkOutcome::Skipped);
         assert!(!called.load(Ordering::SeqCst));
         assert!(!video.exists());
         assert!(!tmp.path().join("poster.jpg").exists());

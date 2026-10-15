@@ -335,3 +335,61 @@ async fn video_scan_clears_only_the_retryable_cover_marker() {
         "已发布的封面标记不得被扫描清掉"
     );
 }
+
+/// P2-1：同目录第一个视频海报/背景图补图失败时，不得饿死同目录其它视频（分别独立重试并成功）。
+#[tokio::test]
+async fn video_artwork_first_candidate_failure_does_not_starve_sibling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("homevideos");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let fetcher = Arc::new(Fixtures {
+        requests: Mutex::new(Vec::new()),
+        bodies: HashMap::new(),
+    });
+    let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("stage")));
+    let state = state(tmp.path(), fetcher, downloader)
+        .with_catalog(Arc::new(ArtworkCatalog))
+        .with_poster_fetch(Arc::new(OfflinePosterFetch));
+    let app = router(state.clone());
+
+    // 启用图片镜像
+    put_scrape_setting(&app, true).await;
+
+    // clip1.strm: 虚拟流媒体文件，write_frame_poster 对 strm 会跳过截帧；且无 TMDB 封面 → 首个候选海报与背景图均失败
+    let clip1 = root.join("clip1.strm");
+    std::fs::write(&clip1, b"http://example.com/stream").unwrap();
+
+    // clip2.mp4: 本地视频文件，但我们通过设置 tmdb_id 走 catalog 通道使其成功
+    let clip2 = root.join("clip2.mp4");
+    std::fs::write(&clip2, b"valid-mp4-data").unwrap();
+
+    let id = create_video_library(&app, &root).await;
+
+    // 第一次扫描：入账 clip1 与 clip2
+    scan_and_wait(&app, &id).await;
+
+    // 让 clip2 拥有 TMDB 详情，从而让 Catalog 能为它成功拉取海报和背景图
+    let m2_id = media_id_for(&state, &clip2);
+    {
+        let store = state.store();
+        let guard = store.lock();
+        let mut m2 = guard.get_media(m2_id).unwrap().unwrap();
+        m2.tmdb_id = Some("12345".into());
+        guard.update_media(&m2).unwrap();
+    }
+
+    // 此时同目录中，clip1 没有 tmdb_id 且为 .strm（海报失败，背景图失败）；
+    // clip2 有 tmdb_id（海报成功，背景图成功）。
+    // 重扫：clip1 先处理失败，必须不阻碍同 chunk 同目录的 clip2 成功写出海报与背景图！
+    scan_and_wait(&app, &id).await;
+
+    assert!(
+        root.join("poster.jpg").exists(),
+        "首个候选海报失败后，同目录第二个候选必须成功补齐海报"
+    );
+    assert!(
+        root.join("fanart.jpg").exists(),
+        "首个候选背景图失败后，同目录第二个候选必须成功补齐背景图"
+    );
+}

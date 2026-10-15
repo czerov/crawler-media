@@ -28,7 +28,7 @@ pub(super) struct CheckpointDecision {
 /// 断点续扫：丢掉本 operation 已经处理过、且仍然有效的文件（P2-NEW-2 / P2-3）。
 ///
 /// 读检查点失败时按「未处理」继续——宁可重复一遍，也不能漏文件。
-pub(super) fn checkpoint_fresh(
+pub(crate) fn checkpoint_fresh(
     state: &ApiState,
     op_id: Option<&str>,
     files: Vec<library::TransferredFile>,
@@ -53,7 +53,7 @@ pub(super) fn checkpoint_fresh(
         );
     }
     let paths: Vec<String> = files.iter().map(|f| f.path.display().to_string()).collect();
-    let source_versions_res = {
+    let (checkpoints_res, source_versions_res) = {
         let store = state.store.lock();
         // 两个读都在同一把 Store 锁内：断点与 durable 版本必须是同一时刻的一致视图。
         (
@@ -61,20 +61,18 @@ pub(super) fn checkpoint_fresh(
             store.ledger_source_versions(&paths),
         )
     };
-    let (checkpoints, source_versions_map, durable_failed) = match source_versions_res {
-        (Ok(cp), Ok(sv)) => (cp, sv, false),
-        (Ok(cp), Err(error)) => {
-            tracing::error!(%error, %op_id, "读取台账 durable 源版本失败，fail-closed: 本 chunk 全部候选文件视为变化");
-            (cp, HashMap::new(), true)
+    let checkpoints_opt = match checkpoints_res {
+        Ok(cp) => Some(cp),
+        Err(error) => {
+            tracing::error!(%error, %op_id, "读取扫描断点失败，按未命中断点继续");
+            None
         }
-        (Err(error), _) => {
-            tracing::error!(%error, %op_id, "读取扫描断点失败，按未处理继续");
-            return CheckpointDecision {
-                fresh: files,
-                skipped: 0,
-                changed: Vec::new(),
-                stamps,
-            };
+    };
+    let (source_versions_map, durable_failed) = match source_versions_res {
+        Ok(sv) => (sv, false),
+        Err(error) => {
+            tracing::error!(%error, %op_id, "读取台账 durable 源版本失败，fail-closed: 本 chunk 全部候选文件视为变化");
+            (HashMap::new(), true)
         }
     };
     let mut fresh = Vec::with_capacity(files.len());
@@ -90,7 +88,7 @@ pub(super) fn checkpoint_fresh(
             fresh.push(file);
             continue;
         }
-        match checkpoints.get(&key) {
+        match checkpoints_opt.as_ref().and_then(|cp| cp.get(&key)) {
             Some((mtime_ms, file_size, digest, true))
                 if store::Store::scan_seen_stamp_matches(
                     &(*mtime_ms, *file_size, digest.clone()),
@@ -104,9 +102,9 @@ pub(super) fn checkpoint_fresh(
                 fresh.push(file);
             }
             None => {
-                // P2-3：本 operation 对该路径没有断点（首次扫到，或上一个 operation 已
-                // 清空 `scan_seen`）。此时只能靠台账上的 durable 源版本判断文件自上次
-                // 处理以来是否变化。
+                // P2-3：本 operation 对该路径没有断点（首次扫到、断点查询失败、或上一个
+                // operation 已清空 `scan_seen`）。此时只能靠台账上的 durable 源版本判断
+                // 文件自上次处理以来是否变化。
                 if source_version_changed(source_versions_map.get(&key), &current) {
                     changed.push(file.path.clone());
                 }

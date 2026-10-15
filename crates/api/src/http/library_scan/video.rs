@@ -30,7 +30,8 @@ pub(crate) fn attach_video_artwork(
     candidates: &[PathBuf],
     control: &library::WorkControl,
 ) {
-    let mut seen_dirs = std::collections::HashSet::new();
+    let mut poster_completed_dirs = std::collections::HashSet::new();
+    let mut backdrop_completed_targets = std::collections::HashSet::new();
     for path in candidates {
         if control.is_cancelled() {
             tracing::info!(
@@ -42,20 +43,50 @@ pub(crate) fn attach_video_artwork(
         let Some(media) = media_for_path(state, path) else {
             continue;
         };
-        // 同目录共享海报（同一 poster.jpg / fanart.jpg）：按目标目录去重，
-        // 避免一个 chunk 内多个视频反复覆盖同一文件。
+        // 海报去重：按视频父目录（poster.jpg 目标目录）分别跟踪完成状态；
+        // 首个候选失败且目标仍缺失时，允许同目录后续视频重试。
         if let Some(dir) = path.parent() {
-            if !seen_dirs.insert(dir.to_path_buf()) {
+            if !poster_completed_dirs.contains(dir) {
+                let outcome = crate::poster_fetch::attach_poster_outcome_if_missing(state, &media, path);
+                match outcome {
+                    crate::poster_fetch::ArtworkOutcome::Written
+                    | crate::poster_fetch::ArtworkOutcome::AlreadyPresent => {
+                        poster_completed_dirs.insert(dir.to_path_buf());
+                    }
+                    crate::poster_fetch::ArtworkOutcome::Skipped
+                    | crate::poster_fetch::ArtworkOutcome::Failed => {}
+                }
+            } else {
                 tracing::debug!(
                     dir = %dir.display(),
                     path = %path.display(),
-                    "同目录已有视频处理过封面，跳过当前文件"
+                    "同目录已有视频成功完成海报，跳过当前文件"
                 );
-                continue;
             }
         }
-        let _ = crate::poster_fetch::attach_poster_if_missing(state, &media, path);
-        let _ = crate::poster_fetch::attach_backdrop(state, &media, path);
+
+        // 背景图去重：按实际目标路径（fanart.jpg）分别跟踪完成状态
+        // （Season* 目录的背景图写到上级目录，不等于视频父目录）；
+        // 首个候选失败且目标仍缺失时，允许后续候选重试。
+        if let Some(target) = crate::poster_fetch::backdrop_target(path) {
+            if !backdrop_completed_targets.contains(&target) {
+                let outcome = crate::poster_fetch::attach_backdrop_outcome(state, &media, path);
+                match outcome {
+                    crate::poster_fetch::ArtworkOutcome::Written
+                    | crate::poster_fetch::ArtworkOutcome::AlreadyPresent => {
+                        backdrop_completed_targets.insert(target);
+                    }
+                    crate::poster_fetch::ArtworkOutcome::Skipped
+                    | crate::poster_fetch::ArtworkOutcome::Failed => {}
+                }
+            } else {
+                tracing::debug!(
+                    target = %target.display(),
+                    path = %path.display(),
+                    "目标背景图已由其它视频完成，跳过当前文件"
+                );
+            }
+        }
     }
 }
 

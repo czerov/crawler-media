@@ -31,6 +31,8 @@ mod outcome;
 mod scope;
 mod walk;
 
+pub(crate) use checkpoint::checkpoint_fresh;
+
 #[cfg(test)]
 mod hooks;
 

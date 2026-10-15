@@ -18,6 +18,8 @@ pub(crate) mod report;
 pub(crate) mod runner;
 pub(crate) mod video;
 pub(crate) use runner::scan_library_leased_resumable;
+#[cfg(test)]
+pub(crate) use runner::checkpoint_fresh;
 use scope::{ScanScope, walk_video_files};
 use super::library::{
     facets, missing_library, preferred_row, require_visible_library, rows_in_library, selection,
