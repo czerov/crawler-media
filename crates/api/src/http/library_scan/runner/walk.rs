@@ -5,7 +5,7 @@
 //!
 //! 锁纪律（B3 §2）：文件版本事实在 Store 锁外采集，锁内只做短 DB 读写与内存判断。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use axum::http::StatusCode;
@@ -16,7 +16,7 @@ use crate::http::library::enqueue_probes_for_paths;
 use crate::management::ApiState;
 
 use super::super::video::attach_video_artwork;
-use super::checkpoint::{checkpoint_fresh, invalidate_changed_facts};
+use super::checkpoint::{checkpoint_fresh, invalidate_changed_facts, revalidate_observed};
 #[cfg(test)]
 use super::hooks::test_metadata_hook;
 use super::metadata::{resolve_scan_metadata, scan_media_for};
@@ -167,7 +167,7 @@ impl ScanContext<'_> {
         }
     }
 
-    /// 处理一个 chunk：过滤归属 → 入账 → 失效变化文件事实 → 身份解析 → 探测入队 → 记断点。
+    /// 处理一个 chunk：过滤归属 → 入账 → 失效变化文件事实 → 身份解析 → 收尾。
     ///
     /// 断点写在**处理成功之后**：中途崩溃的文件下一轮会重新处理，不会因为检查点丢账。
     fn process_chunk(
@@ -234,9 +234,6 @@ impl ScanContext<'_> {
                 totals: committed,
             });
         }
-        // 探测候选 = 新增/恢复 + 版本变化：只有这些文件的派生事实需要重排。
-        let mut processed_paths = inserted.clone();
-        processed_paths.extend(affected);
         if self.kind == domain::MediaKind::Video {
             // Video 没有身份解析/刮削阶段：登记即完成，只补封面。
             //
@@ -260,18 +257,53 @@ impl ScanContext<'_> {
                     totals: committed,
                 })?;
         }
-        enqueue_probes_for_paths(self.state, processed_paths);
-        // P2-3: 排除失效/重挂失败的路径，失败路径不得推进 durable 源版本与断点。
-        let successful_files: Vec<library::TransferredFile> = if failed_invalidations.is_empty() {
-            filtered
-        } else {
-            filtered
-                .into_iter()
-                .filter(|file| !failed_invalidations.contains(&file.path.display().to_string()))
-                .collect()
-        };
-        self.record_seen(&successful_files, stamps);
+        self.finish_chunk(filtered, stamps, &inserted, affected, failed_invalidations);
         Ok(committed)
+    }
+
+    /// 收尾一个已处理 chunk：复核版本 → 重挂窗口内变化的处理义务 → 探测入队 → 记断点。
+    ///
+    /// 版本观察发生在处理之前，文件可能在这段窗口里被改写（TOCTOU）。推进 `scan_seen`
+    /// 断点与 durable 源版本之前必须复核：不能证明仍是观察时版本的路径不推进，改为
+    /// 失效派生事实并重挂处理义务（P2-3），下一轮重新处理。未变化的路径行为不变。
+    fn finish_chunk(
+        &self,
+        filtered: Vec<library::TransferredFile>,
+        stamps: &HashMap<String, (i64, i64, Option<String>)>,
+        inserted: &[PathBuf],
+        affected: Vec<PathBuf>,
+        failed_invalidations: HashSet<String>,
+    ) {
+        let (stable_files, changed_late) = match self.op_id {
+            // 无 operation 归属 = 不写断点，也没有 durable 源版本要推进，无需复核。
+            None => (filtered, Vec::new()),
+            Some(_) => revalidate_observed(filtered, stamps),
+        };
+        // 探测候选 = 新增/恢复 + 断点判定变化 + 窗口内变化。
+        let mut processed_paths = inserted.to_vec();
+        processed_paths.extend(affected);
+        processed_paths.extend(changed_late.iter().cloned());
+        let mut uncheckpointed = failed_invalidations;
+        if !changed_late.is_empty() {
+            // 窗口内变化：派生事实可能来自已被替换的内容，必须失效并重挂处理义务。
+            match invalidate_changed_facts(self.state, &changed_late) {
+                Ok((_, failed)) => uncheckpointed.extend(failed),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "窗口内变化路径的处理义务重挂失败，fail-closed: 这些路径不得推进断点与源版本"
+                    );
+                    uncheckpointed.extend(changed_late.iter().map(|path| path.display().to_string()));
+                }
+            }
+        }
+        enqueue_probes_for_paths(self.state, processed_paths);
+        // P2-3: 排除失效/重挂失败与窗口内变化的路径，它们不得推进 durable 源版本与断点。
+        let successful_files: Vec<library::TransferredFile> = stable_files
+            .into_iter()
+            .filter(|file| !uncheckpointed.contains(&file.path.display().to_string()))
+            .collect();
+        self.record_seen(&successful_files, stamps);
     }
 
     /// 按库类型登记 chunk：Video 走「每个视频文件一个 Media」，Movie/TV 走 Release

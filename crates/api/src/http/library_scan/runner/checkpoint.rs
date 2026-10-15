@@ -132,6 +132,34 @@ pub(crate) fn checkpoint_fresh(
     }
 }
 
+/// 推进断点/durable 源版本之前的版本复核（观察与处理之间的 TOCTOU 窗口）。
+///
+/// `checkpoint_fresh` 采集的 `stamps` 只是 chunk 处理**开始前**的版本事实；文件可能在
+/// 处理期间被改写。用同一套语义（[`store::Store::scan_seen_stamp`]：size + mtime ms，
+/// `.strm` 另加受限内容指纹）在锁外重新采集，只有仍能证明是同一版本的路径才允许推进
+/// 断点与 durable 源版本。
+///
+/// 返回 `(可推进的路径, 窗口内变化的路径)`；后者由调用方重挂处理义务，绝不写断点。
+/// 采集全程不持 Store 锁（P2-NEW-2）。
+pub(super) fn revalidate_observed(
+    files: Vec<library::TransferredFile>,
+    stamps: &HashMap<String, (i64, i64, Option<String>)>,
+) -> (Vec<library::TransferredFile>, Vec<PathBuf>) {
+    let mut stable = Vec::with_capacity(files.len());
+    let mut changed = Vec::new();
+    for file in files {
+        let key = file.path.display().to_string();
+        let observed = stamps.get(&key).cloned().unwrap_or((0, 0, None));
+        let current = store::Store::scan_seen_stamp(&file.path);
+        if store::Store::scan_seen_stamp_matches(&observed, &current) {
+            stable.push(file);
+        } else {
+            changed.push(file.path.clone());
+        }
+    }
+    (stable, changed)
+}
+
 /// durable 源版本是否证明该台账行对应的文件已经变化（P2-3）。
 ///
 /// - 没有版本记录 = 根本没有台账行：本轮新文件，登记即可，没有派生事实需要失效。

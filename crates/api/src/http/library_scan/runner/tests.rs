@@ -369,3 +369,198 @@ fn checkpoint_decision_both_err() {
     assert_eq!(dec.changed.len(), 1, "两者同时失败必须 fail-closed 全部列入 changed");
     assert_eq!(dec.changed[0], fix.file_path);
 }
+
+/// 一轮带 operation 归属的 Video 扫描：有 `op_id` 才会写 `scan_seen` 断点。
+fn walk_with_op(
+    state: &ApiState,
+    library_id: &str,
+    root: &std::path::Path,
+    op_id: &str,
+) -> (library::ScanRootReport, super::walk::ChunkTotals) {
+    let lease = state.acquire_library_work(library_id).unwrap();
+    let scan_scope = crate::http::library_scan::scope::ScanScope::capture(state, library_id).unwrap();
+    let ctx = super::walk::ScanContext {
+        state,
+        id: library_id,
+        lease: &lease,
+        scan_scope: &scan_scope,
+        kind: MediaKind::Video,
+        scrape: false,
+        op_id: Some(op_id),
+    };
+    ctx.walk_and_process(root, root)
+        .unwrap_or_else(|failure| panic!("Video 遍历必须成功: {}", failure.error))
+}
+
+fn set_mtime_ms(path: &std::path::Path, mtime_ms: i64) {
+    let time = std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms as u64);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(time)
+        .unwrap();
+}
+
+/// 断言窗口内变化的路径没有被确认为「已处理」：无断点、durable 源版本未推进，
+/// 且处理义务已重挂（`scan_changed`，而不是登记时的 `scan`）。
+fn assert_not_confirmed(state: &ApiState, op_id: &str, path: &std::path::Path) {
+    let key = path.display().to_string();
+    let store = state.store();
+    let guard = store.lock();
+    assert!(
+        guard
+            .scan_seen_checkpoints(op_id, std::slice::from_ref(&key))
+            .unwrap()
+            .is_empty(),
+        "窗口内变化的路径不得写入 scan_seen 断点"
+    );
+    assert_eq!(
+        guard
+            .ledger_source_versions(std::slice::from_ref(&key))
+            .unwrap()
+            .get(&key)
+            .cloned(),
+        Some((0, 0, None)),
+        "窗口内变化的路径不得推进 durable 源版本"
+    );
+    let row = guard.ledger_by_path(&key).unwrap().expect("路径必须已入账");
+    let obligation = guard
+        .scan_probe_obligations(100)
+        .unwrap()
+        .into_iter()
+        .find(|obligation| obligation.ledger_id == row.id)
+        .expect("窗口内变化的路径必须重挂处理义务");
+    assert_eq!(obligation.reason, "scan_changed");
+}
+
+/// 同一 chunk 里未变化的兄弟文件必须照旧推进断点：复核只影响窗口内真正变化的路径，
+/// 不能让整块每轮重做（未变化 = 下一轮命中 `scan_seen` 断点被跳过）。
+#[test]
+fn unchanged_sibling_keeps_checkpoint_while_changed_file_is_reprocessed() {
+    let (_dir, state, library_id, root) = video_fixture();
+    let keep = root.join("keep.mp4");
+    let edit = root.join("edit.mp4");
+    std::fs::write(&keep, b"stable").unwrap();
+    std::fs::write(&edit, b"v1").unwrap();
+    let edit_observed = store::Store::scan_seen_stamp(&edit);
+
+    let rewrite_target = edit.clone();
+    super::hooks::test_metadata_hook::set(
+        "toctou-mixed",
+        Box::new(move || {
+            std::fs::write(&rewrite_target, b"v2-changed-content").unwrap();
+            None
+        }),
+    );
+    let (_report, first) = walk_with_op(&state, &library_id, &root, "toctou-mixed");
+    assert_eq!(first.inserted, 2, "两个文件都必须登记");
+
+    // 未变化的兄弟文件：断点与 durable 源版本照旧推进。
+    let keep_key = keep.display().to_string();
+    let keep_stamp = store::Store::scan_seen_stamp(&keep);
+    {
+        let store = state.store();
+        let guard = store.lock();
+        assert!(
+            guard
+                .scan_seen_checkpoints("toctou-mixed", std::slice::from_ref(&keep_key))
+                .unwrap()
+                .contains_key(&keep_key),
+            "未变化的文件必须照旧写入断点"
+        );
+        assert_eq!(
+            guard
+                .ledger_source_versions(std::slice::from_ref(&keep_key))
+                .unwrap()
+                .get(&keep_key)
+                .cloned(),
+            Some(keep_stamp),
+            "未变化的文件必须照旧推进 durable 源版本"
+        );
+    }
+    assert_not_confirmed(&state, "toctou-mixed", &edit);
+
+    // 窗口内变化的文件回到观察时的版本：第二轮只重做它，未变化的兄弟仍命中断点。
+    std::fs::write(&edit, b"v1").unwrap();
+    set_mtime_ms(&edit, edit_observed.0);
+    let (second_report, second) = walk_with_op(&state, &library_id, &root, "toctou-mixed");
+    assert_eq!(second_report.skipped, 1, "未变化的兄弟文件必须命中断点被跳过");
+    assert_eq!(second.scanned, 1, "只有窗口内变化的文件需要重做");
+}
+
+/// TOCTOU 窗口（普通文件）：文件在版本观察之后、chunk 处理完成之前被改写时，本轮
+/// 绝不能把这个已经过期的版本写成断点/durable 源版本——否则文件回到旧版本后，后续
+/// 轮次会把它当成「已完成」直接跳过，而派生事实其实来自被替换的内容（P2-3）。
+#[test]
+fn file_changed_during_processing_is_not_checkpointed_and_is_reprocessed() {
+    let (_dir, state, library_id, root) = video_fixture();
+    let clip = root.join("clip.mp4");
+    std::fs::write(&clip, b"v1").unwrap();
+    let observed = store::Store::scan_seen_stamp(&clip);
+
+    // 屏障位于 ledger 已提交、元数据解析之前：改写落在观察与处理完成之间。
+    let rewrite_target = clip.clone();
+    super::hooks::test_metadata_hook::set(
+        "toctou-file",
+        Box::new(move || {
+            std::fs::write(&rewrite_target, b"v2-changed-content").unwrap();
+            None
+        }),
+    );
+    let (_report, first) = walk_with_op(&state, &library_id, &root, "toctou-file");
+    assert_eq!(first.inserted, 1, "第一轮必须登记该文件");
+    assert_ne!(
+        store::Store::scan_seen_stamp(&clip),
+        observed,
+        "测试前提：处理期间的改写改变了版本事实"
+    );
+    assert_not_confirmed(&state, "toctou-file", &clip);
+
+    // 文件回到观察时的版本：被错误推进的断点会让第二轮把它当成已完成而跳过。
+    std::fs::write(&clip, b"v1").unwrap();
+    set_mtime_ms(&clip, observed.0);
+    assert_eq!(store::Store::scan_seen_stamp(&clip), observed, "测试前提：版本已复原");
+
+    let (second_report, second) = walk_with_op(&state, &library_id, &root, "toctou-file");
+    assert_eq!(second_report.skipped, 0, "窗口内变化的文件不得被当成已完成跳过");
+    assert_eq!(second.scanned, 1, "第二轮必须重新处理该文件");
+}
+
+/// TOCTOU 窗口（`.strm`）：URL 换成同长度、同 mtime 的另一条时，size/mtime 无法区分，
+/// 只有受限内容指纹能证明变化；窗口内变化的 `.strm` 同样不得被确认（P2-3）。
+#[test]
+fn strm_url_changed_during_processing_is_not_checkpointed_and_is_reprocessed() {
+    let (_dir, state, library_id, root) = video_fixture();
+    let strm = root.join("clip.strm");
+    std::fs::write(&strm, "https://a/video").unwrap();
+    let observed = store::Store::scan_seen_stamp(&strm);
+
+    let rewrite_target = strm.clone();
+    super::hooks::test_metadata_hook::set(
+        "toctou-strm",
+        Box::new(move || {
+            std::fs::write(&rewrite_target, "https://b/video").unwrap();
+            // 同 size 同 mtime：只有内容指纹能证明版本变化。
+            set_mtime_ms(&rewrite_target, observed.0);
+            None
+        }),
+    );
+    let (_report, first) = walk_with_op(&state, &library_id, &root, "toctou-strm");
+    assert_eq!(first.inserted, 1, "第一轮必须登记该 .strm");
+
+    let changed = store::Store::scan_seen_stamp(&strm);
+    assert_eq!(
+        (changed.0, changed.1),
+        (observed.0, observed.1),
+        "测试前提：URL 替换保持 size/mtime 不变"
+    );
+    assert_ne!(changed.2, observed.2, "测试前提：只有内容指纹能证明变化");
+    assert_not_confirmed(&state, "toctou-strm", &strm);
+
+    std::fs::write(&strm, "https://a/video").unwrap();
+    set_mtime_ms(&strm, observed.0);
+    let (second_report, second) = walk_with_op(&state, &library_id, &root, "toctou-strm");
+    assert_eq!(second_report.skipped, 0, "窗口内变化的 .strm 不得被当成已完成跳过");
+    assert_eq!(second.scanned, 1, "第二轮必须重新处理该 .strm");
+}
