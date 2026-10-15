@@ -3,6 +3,7 @@ use domain::MediaId;
 
 pub mod cache;
 pub mod http;
+pub mod inflight;
 pub mod service;
 
 #[derive(Clone, Debug)]

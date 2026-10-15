@@ -10,6 +10,7 @@ use crate::catalog::Catalog;
 use crate::Store;
 use super::cache::{DiskPosterCache, NEGATIVE_TTL};
 use super::http::{ImageFetcher, RestricedImageFetcher};
+use super::inflight::{wait_poster, InflightMap, PosterInflight, PosterWorkerGuard};
 use super::{MediaPosterSource, PosterBytes, PosterError};
 
 pub struct MediaPosterService {
@@ -17,9 +18,10 @@ pub struct MediaPosterService {
     catalog: Arc<dyn Catalog>,
     cache: DiskPosterCache,
     fetcher: Arc<dyn ImageFetcher>,
-    in_flight: Arc<Mutex<HashMap<MediaId, Arc<tokio::sync::Mutex<()>>>>>,
+    in_flight: Arc<Mutex<InflightMap>>,
     negative_cache: Arc<Mutex<HashMap<MediaId, (Instant, PosterError)>>>,
     global_concurrency: Arc<Semaphore>,
+    wait_deadline: Duration,
 }
 
 impl MediaPosterService {
@@ -32,6 +34,7 @@ impl MediaPosterService {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             negative_cache: Arc::new(Mutex::new(HashMap::new())),
             global_concurrency: Arc::new(Semaphore::new(4)),
+            wait_deadline: Duration::from_secs(10),
         }
     }
 
@@ -49,7 +52,30 @@ impl MediaPosterService {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             negative_cache: Arc::new(Mutex::new(HashMap::new())),
             global_concurrency: Arc::new(Semaphore::new(4)),
+            wait_deadline: Duration::from_secs(10),
         }
+    }
+
+    pub fn with_wait_deadline(mut self, deadline: Duration) -> Self {
+        self.wait_deadline = deadline;
+        self
+    }
+
+    /// Diagnostic probe returning the number of in-flight entries.
+    /// Not called by production code.
+    #[doc(hidden)]
+    pub fn inflight_entries(&self) -> usize {
+        self.in_flight.lock().len()
+    }
+
+    /// Diagnostic probe returning the number of active waiters for a media item.
+    /// Returns 0 when no entry exists. Not called by production code.
+    #[doc(hidden)]
+    pub fn inflight_waiters(&self, media_id: MediaId) -> usize {
+        self.in_flight
+            .lock()
+            .get(&media_id)
+            .map_or(0, |entry| entry.waiter_count())
     }
 
     fn check_negative_cache(&self, media_id: MediaId) -> Option<PosterError> {
@@ -63,11 +89,76 @@ impl MediaPosterService {
         None
     }
 
-    fn record_negative_cache(&self, media_id: MediaId, err: PosterError) {
-        let should_cache = matches!(err, PosterError::NotFound | PosterError::Upstream(_) | PosterError::Timeout);
+    fn record_negative_cache(
+        negative_cache: &Mutex<HashMap<MediaId, (Instant, PosterError)>>,
+        media_id: MediaId,
+        err: &PosterError,
+    ) {
+        let should_cache = matches!(
+            err,
+            PosterError::NotFound | PosterError::Upstream(_) | PosterError::Timeout
+        );
         if should_cache {
-            self.negative_cache.lock().insert(media_id, (Instant::now(), err));
+            negative_cache.lock().insert(media_id, (Instant::now(), err.clone()));
         }
+    }
+
+    fn spawn_worker(&self, media_id: MediaId, entry: Arc<PosterInflight>) {
+        let store = self.store.clone();
+        let catalog = self.catalog.clone();
+        let fetcher = self.fetcher.clone();
+        let cache = self.cache.clone();
+        let sem = self.global_concurrency.clone();
+        let in_flight = self.in_flight.clone();
+        let negative_cache = self.negative_cache.clone();
+        let mut guard = PosterWorkerGuard::new(media_id, entry.clone(), in_flight);
+        tokio::spawn(async move {
+            let permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    guard.complete(Err(PosterError::Io("concurrency semaphore closed".into())));
+                    return;
+                }
+            };
+            guard.set_permit(permit);
+
+            let _ = tokio::task::spawn_blocking(move || {
+                let outcome = (|| -> Result<PosterBytes, PosterError> {
+                    if let Some(hit) = cache.get(media_id) {
+                        return Ok(hit);
+                    }
+
+                    let (kind, tmdb_id) = {
+                        let s = store.lock();
+                        let media = s.get_media(media_id)
+                            .map_err(|e| PosterError::Io(e.to_string()))?
+                            .ok_or(PosterError::NotFound)?;
+                        let tmdb_id = media.tmdb_id.clone().ok_or(PosterError::NotFound)?;
+                        (media.kind, tmdb_id)
+                    };
+
+                    let url = catalog
+                        .poster_url(kind, &tmdb_id)
+                        .map_err(PosterError::Upstream)?
+                        .ok_or(PosterError::NotFound)?;
+
+                    let (content_type, bytes) = fetcher.fetch(&url)?;
+                    cache.put(media_id, &content_type, &bytes)?;
+
+                    Ok(PosterBytes {
+                        content_type,
+                        bytes: Arc::from(bytes.into_boxed_slice()),
+                    })
+                })();
+
+                if let Err(err) = &outcome {
+                    Self::record_negative_cache(&negative_cache, media_id, err);
+                }
+
+                guard.complete(outcome);
+            })
+            .await;
+        });
     }
 }
 
@@ -78,86 +169,41 @@ impl MediaPosterSource for MediaPosterService {
             return Err(err);
         }
 
-        // Fast path: memory/disk cache without lock contention
-        let cache_clone = self.cache.clone();
-        if let Some(hit) = tokio::task::spawn_blocking(move || cache_clone.get(media_id))
-            .await
-            .ok()
-            .flatten()
-        {
-            return Ok(hit);
-        }
-
-        // Per-media single-flight coordination
-        let gate = {
+        let (entry, is_leader) = {
             let mut map = self.in_flight.lock();
-            map.entry(media_id)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
+            if let Some(existing) = map.get(&media_id) {
+                (existing.clone(), false)
+            } else {
+                let new_entry = Arc::new(PosterInflight::new());
+                map.insert(media_id, new_entry.clone());
+                (new_entry, true)
+            }
         };
 
-        let _guard = gate.lock().await;
-
-        // Double check cache
-        let cache_clone = self.cache.clone();
-        if let Some(hit) = tokio::task::spawn_blocking(move || cache_clone.get(media_id))
-            .await
-            .ok()
-            .flatten()
-        {
-            return Ok(hit);
+        if is_leader {
+            self.spawn_worker(media_id, entry.clone());
         }
 
-        // Global concurrency bound (max 4 upstream requests)
-        let _permit = self
-            .global_concurrency
-            .acquire()
-            .await
-            .map_err(|e| PosterError::Io(e.to_string()))?;
+        let res = wait_poster(entry, self.wait_deadline).await;
 
-        let store = self.store.clone();
-        let catalog = self.catalog.clone();
-        let fetcher = self.fetcher.clone();
-        let cache = self.cache.clone();
-
-        let fetch_future = tokio::task::spawn_blocking(move || -> Result<PosterBytes, PosterError> {
-            let media = {
-                let s = store.lock();
-                s.get_media(media_id)
-                    .map_err(|e| PosterError::Io(e.to_string()))?
-            };
-            let media = media.ok_or(PosterError::NotFound)?;
-            let tmdb_id = media.tmdb_id.as_deref().ok_or(PosterError::NotFound)?;
-
-            let url = catalog
-                .poster_url(media.kind, tmdb_id)
-                .map_err(PosterError::Upstream)?
-                .ok_or(PosterError::NotFound)?;
-
-            let (content_type, bytes) = fetcher.fetch(&url)?;
-            cache.put(media_id, &content_type, &bytes)?;
-
-            Ok(PosterBytes {
-                content_type,
-                bytes: Arc::from(bytes.into_boxed_slice()),
-            })
-        });
-
-        let result = match tokio::time::timeout(Duration::from_secs(10), fetch_future).await {
-            Ok(Ok(inner_res)) => inner_res,
-            Ok(Err(join_err)) => Err(PosterError::Io(join_err.to_string())),
-            Err(_) => Err(PosterError::Timeout),
-        };
-
-        {
-            let mut map = self.in_flight.lock();
-            map.remove(&media_id);
-        }
-
-        match result {
-            Ok(bytes) => Ok(bytes),
+        match res {
+            Ok(bytes) => {
+                tracing::info!(media_id = %media_id, "海报获取成功");
+                Ok(bytes)
+            }
             Err(err) => {
-                self.record_negative_cache(media_id, err.clone());
+                let outcome = match &err {
+                    PosterError::NotFound => "not_found",
+                    PosterError::Timeout => "timeout",
+                    PosterError::InvalidImage => "invalid_image",
+                    PosterError::Upstream(_) => "upstream",
+                    PosterError::Io(_) => "io",
+                };
+                if matches!(err, PosterError::Timeout) {
+                    tracing::warn!(media_id = %media_id, outcome, "海报等待超时（后台任务继续运行）");
+                } else {
+                    tracing::error!(media_id = %media_id, outcome, "海报获取失败");
+                }
                 Err(err)
             }
         }
