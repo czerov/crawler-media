@@ -35,8 +35,9 @@ pub(crate) fn all_wanted_unaired(state: &ApiState, subscribe: &Subscribe, media:
             return false;
         }
     };
-    let today = crate::store::now_rfc3339();
-    let today = today.get(..10).unwrap_or_default();
+    // Air dates are local calendar dates, so compare against the server's local date.
+    let today = crate::compact_time::local_date(crate::job_loop::unix_now());
+    let today = today.as_str();
     // Episodes beyond the last one the catalog lists (open-window frontier)
     // are not announced yet, so they count as unaired too.
     let Some(last_listed) = air_dates.keys().max().copied() else {

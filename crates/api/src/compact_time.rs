@@ -38,6 +38,12 @@ pub(crate) fn format_rfc3339_utc(value: SystemTime) -> Option<String> {
     ))
 }
 
+/// `YYYY-MM-DD` of `secs` in the server's local timezone (honours `TZ`; UTC fallback).
+pub(crate) fn local_date(secs: i64) -> String {
+    let (year, month, day, ..) = format_local_parts(secs);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 #[cfg(unix)]
 #[repr(C)]
 struct Tm {
@@ -115,6 +121,32 @@ mod tests {
             format_rfc3339_utc(UNIX_EPOCH + Duration::from_millis(1_700_000_000_123)),
             Some("2023-11-14T22:13:20.123Z".into())
         );
+    }
+
+    #[test]
+    fn local_date_matches_system_date_command() {
+        let now = crate::job_loop::unix_now();
+        let Ok(out) = std::process::Command::new("date").arg("+%F").output() else {
+            return;
+        };
+        let system = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // Skip the (rare) midnight race between the two clock reads.
+        if system == local_date(crate::job_loop::unix_now()) {
+            assert_eq!(local_date(now), system);
+        }
+    }
+
+    #[test]
+    fn local_date_differs_from_utc_when_offset_crosses_midnight() {
+        // 2023-11-14T22:13:20Z: in UTC+8 this is already 2023-11-15.
+        let Ok(out) = std::process::Command::new("date")
+            .args(["-d", "@1700000000", "+%F"])
+            .output()
+        else {
+            return;
+        };
+        let system = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(local_date(1_700_000_000), system);
     }
 
     #[test]
