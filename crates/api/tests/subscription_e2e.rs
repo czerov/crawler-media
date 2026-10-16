@@ -78,6 +78,8 @@ mod g_l1_library_scoped_completion;
 mod h2_selective_inferred_season;
 #[path = "subscription_e2e/h3_claimed_task.rs"]
 mod h3_claimed_task;
+#[path = "subscription_e2e/m1_m2_absent_evidence.rs"]
+mod m1_m2_absent_evidence;
 #[path = "subscription_e2e/m1_overlap_policy.rs"]
 mod m1_overlap_policy;
 #[path = "subscription_e2e/m2_owned_slot_skip.rs"]

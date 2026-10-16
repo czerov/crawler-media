@@ -76,6 +76,22 @@ pub(crate) fn is_absent_and_stale(
             .is_some_and(|ts| now - ts >= ABSENT_CLEANUP_GRACE_SECS)
 }
 
+/// Review M-1: `is_absent_and_stale` that also honours the persisted info
+/// hash (D-M3). Shared by the task center and the background reconcile.
+pub(crate) fn is_absent_and_stale_with_hash(
+    item: &store::PendingDownload,
+    hash: Option<&str>,
+    snapshots: Option<&[downloader::TaskSnapshot]>,
+    now: i64,
+) -> bool {
+    let hash_seen = hash.is_some()
+        && snapshots.is_some_and(|l| {
+            l.iter()
+                .any(|s| snapshot_matches_pending_with_hash(&item.torrent, hash, s))
+        });
+    !hash_seen && is_absent_and_stale(item, snapshots, now)
+}
+
 /// Background reconciliation for one Subscribe. The caller must hold the
 /// Subscribe guard. Returns the pending rows that remain active.
 pub(crate) fn reconcile_subscribe(
@@ -109,12 +125,7 @@ pub(crate) fn reconcile_subscribe(
             .get(&item.downloader_id)
             .and_then(|s| s.as_deref());
         let hash = hashes.get(&item.torrent.enclosure).map(String::as_str);
-        let hash_seen = hash.is_some()
-            && list.is_some_and(|l| {
-                l.iter()
-                    .any(|s| snapshot_matches_pending_with_hash(&item.torrent, hash, s))
-            });
-        if !hash_seen && is_absent_and_stale(&item, list, now) {
+        if is_absent_and_stale_with_hash(&item, hash, list, now) {
             match state
                 .store
                 .lock()

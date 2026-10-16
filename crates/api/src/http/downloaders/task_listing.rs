@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Response};
 use domain::DownloaderId;
 use serde_json::{Value, json};
 
-use super::tasks::{ABSENT_CLEANUP_GRACE_SECS, task_state};
+use super::tasks::task_state;
 use crate::http::ok;
 use crate::management::ApiState;
 use crate::pending_reconcile::{absence_is_provable, snapshot_matches_pending};
@@ -77,26 +77,38 @@ fn prune_absent_pending(
     reachable: &HashSet<Option<DownloaderId>>,
 ) -> Vec<(domain::SubscribeId, i32, store::PendingDownload)> {
     let now = crate::job_loop::unix_now();
+    let mut hashes: HashMap<domain::SubscribeId, HashMap<String, String>> = HashMap::new();
     let mut kept = Vec::with_capacity(pending.len());
     for (subscribe_id, score, item) in pending {
         let snapshots = snapshots_by_downloader
             .get(&item.downloader_id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let matched = snapshots
-            .iter()
-            .any(|s| snapshot_matches_pending(&item.torrent, s));
-        let absent = reachable.contains(&item.downloader_id)
-            && !matched
-            && absence_is_provable(&item.torrent, snapshots);
-        if !matched && reachable.contains(&item.downloader_id) && !absent {
+        // Review M-1: same rule as the background reconcile, including the
+        // persisted info hash (D-M3).
+        let sub_hashes = hashes.entry(subscribe_id).or_insert_with(|| {
+            state
+                .store
+                .lock()
+                .load_pending_info_hashes(subscribe_id)
+                .unwrap_or_default()
+        });
+        let hash = sub_hashes.get(&item.torrent.enclosure).map(String::as_str);
+        let reachable_list = reachable.contains(&item.downloader_id).then_some(snapshots);
+        let matched = snapshots.iter().any(|s| {
+            crate::pending_reconcile::snapshot_matches_pending_with_hash(&item.torrent, hash, s)
+        });
+        if !matched && reachable_list.is_some() && !absence_is_provable(&item.torrent, snapshots) {
             tracing::error!(%subscribe_id, torrent = %item.torrent.title,
                 "下载器未暴露归属标签，无法证明任务已消失，拒绝自动清理 pending");
         }
-        let stale = item
-            .submitted_at
-            .is_some_and(|ts| now - ts >= ABSENT_CLEANUP_GRACE_SECS);
-        if absent && stale && delete_absent_pending(state, subscribe_id, &item) {
+        let absent = crate::pending_reconcile::is_absent_and_stale_with_hash(
+            &item,
+            hash,
+            reachable_list,
+            now,
+        );
+        if absent && delete_absent_pending(state, subscribe_id, &item) {
             continue;
         }
         kept.push((subscribe_id, score, item));
@@ -121,7 +133,10 @@ fn delete_absent_pending(
     // Re-check under the guard: Transfer may have imported it meanwhile.
     let still_active = store
         .load_pending(subscribe_id)
-        .map(|rows| rows.iter().any(|(_, p)| p.torrent.enclosure == item.torrent.enclosure))
+        .map(|rows| {
+            rows.iter()
+                .any(|(_, p)| p.torrent.enclosure == item.torrent.enclosure)
+        })
         .unwrap_or(false);
     if !still_active {
         return true;
