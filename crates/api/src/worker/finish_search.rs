@@ -106,12 +106,16 @@ fn load_search_context(
             .or_else(|| store.get_filter(subscribe.filter_id).ok().flatten());
         (facts, wash_filter)
     };
-    let (library_root, transfer_mode, scrape) =
-        crate::directory::transfer_plan_for_library(
-            &state.store.lock(), media.kind,
-            subscribe.library_id.as_ref().map(|id| id.to_string()).as_deref(),
-        )
-            .map_err(|error| error.to_string())?;
+    let (library_root, transfer_mode, scrape) = crate::directory::transfer_plan_for_library(
+        &state.store.lock(),
+        media.kind,
+        subscribe
+            .library_id
+            .as_ref()
+            .map(|id| id.to_string())
+            .as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
     let naming = state
         .store
         .lock()
@@ -252,9 +256,34 @@ fn merge_added_pending<D: downloader::Downloader + ?Sized>(
         })
         .collect();
     let store = state.store.lock();
+    // D-M3: the same torrent reached through another enclosure (other site /
+    // link) is one download: keep a single pending row per info hash.
+    let known = store
+        .load_pending_info_hashes(subscribe.id)
+        .map_err(|error| error.to_string())?;
+    let pending: Vec<_> = pending
+        .into_iter()
+        .filter(|(_, item)| {
+            let Some(hash) = routed.submitted_hash(&item.torrent) else { return true };
+            let duplicate = known
+                .iter()
+                .any(|(enclosure, known)| *enclosure != item.torrent.enclosure && known.eq_ignore_ascii_case(&hash));
+            if duplicate {
+                tracing::info!(torrent = %item.torrent.title, %hash, "同 info hash 的任务已在途，不重复登记 pending");
+            }
+            !duplicate
+        })
+        .collect();
     store
         .record_pending_submissions(subscribe.id, &pending)
         .map_err(|error| error.to_string())?;
+    for (_, item) in &pending {
+        if let Some(hash) = routed.submitted_hash(&item.torrent) {
+            store
+                .set_pending_info_hash(subscribe.id, &item.torrent.enclosure, &hash)
+                .map_err(|error| error.to_string())?;
+        }
+    }
     // G-M2: a broken existing task is recorded as a rejected source so the
     // next round never picks it again and switches to another release.
     if !added.broken.is_empty() {
@@ -273,8 +302,11 @@ fn merge_added_pending<D: downloader::Downloader + ?Sized>(
                 )
             })
             .collect();
-        let enclosures: Vec<String> =
-            added.broken.iter().map(|s| s.torrent.enclosure.clone()).collect();
+        let enclosures: Vec<String> = added
+            .broken
+            .iter()
+            .map(|s| s.torrent.enclosure.clone())
+            .collect();
         store
             .record_pending_submissions(subscribe.id, &broken)
             .map_err(|error| error.to_string())?;
@@ -295,7 +327,9 @@ fn facts_with_pending(
     subscribe::facts_with_pending(facts, &releases, subscribe, media)
 }
 
-pub(crate) fn pending_releases(existing: &[(i32, crate::store::PendingDownload)]) -> Vec<domain::Release> {
+pub(crate) fn pending_releases(
+    existing: &[(i32, crate::store::PendingDownload)],
+) -> Vec<domain::Release> {
     existing
         .iter()
         .map(|(_, pending)| {

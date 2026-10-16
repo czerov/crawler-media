@@ -6,8 +6,8 @@ mod memory;
 mod path_map;
 mod pool;
 mod qbit;
-mod transmission;
 mod torrent_file;
+mod transmission;
 pub use torrent_file::torrent_info_hash;
 
 use std::path::PathBuf;
@@ -39,6 +39,11 @@ pub enum DownloaderError {
 
 pub trait Downloader: Send + Sync {
     fn add(&self, torrent: &Torrent) -> Result<(), DownloaderError>;
+    /// D-M3: re-teach a client the info hash persisted for `torrent` (e.g.
+    /// after a restart). Clients that identify tasks by tags ignore it.
+    fn remember_identity(&self, _torrent: &Torrent, _hash: &str) -> Result<(), DownloaderError> {
+        Ok(())
+    }
     /// Add a torrent to an explicit downloader-side directory. Existing
     /// implementations remain source-compatible; unsupported clients reject
     /// an explicit directory instead of silently ignoring the user's choice.

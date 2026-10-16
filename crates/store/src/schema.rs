@@ -2,13 +2,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::StoreError;
 
+mod browse_projection;
 mod fingerprint;
 mod library_deletion;
 mod probe_state;
-mod tables;
-mod browse_projection;
 mod read_revisions;
 mod scan_operations;
+mod tables;
 
 /// Schema version constants. Bump when adding new migrations.
 /// The version is stored via `PRAGMA user_version` on each database file.
@@ -343,6 +343,8 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     // H3 stalled: last observed progress and when it last increased.
     ensure_column(conn, "pending_downloads", "last_progress", "REAL")?;
     ensure_column(conn, "pending_downloads", "last_progress_at", "INTEGER")?;
+    // D-M3: torrent info hash recorded at submit time (when known).
+    ensure_column(conn, "pending_downloads", "info_hash", "TEXT")?;
     // Index on (subscribe_id, state) — must come after the state column exists.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS pending_downloads_sub_state_idx \
@@ -359,7 +361,12 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(conn, "playback_sessions", "last_event_sequence", "INTEGER")?;
-    ensure_column(conn, "playback_logs", "admin_ended", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(
+        conn,
+        "playback_logs",
+        "admin_ended",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     conn.execute_batch(
         "UPDATE playback_sessions SET last_report_at_ms = last_report_at * 1000 WHERE last_report_at_ms = 0;
          CREATE TABLE IF NOT EXISTS playback_session_ids (

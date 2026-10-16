@@ -76,6 +76,10 @@ macro_rules! delegate {
 }
 
 impl Downloader for DynamicDownloader {
+    fn remember_identity(&self, torrent: &Torrent, hash: &str) -> Result<(), DownloaderError> {
+        delegate!(self, remember_identity(torrent, hash))
+    }
+
     fn add(&self, torrent: &Torrent) -> Result<(), DownloaderError> {
         delegate!(self, add(torrent))
     }

@@ -125,6 +125,31 @@ struct TransferPlan {
     nfo: bool,
 }
 
+/// D-M3: hand persisted info hashes back to the (possibly fresh) clients so
+/// label-less Transmission tasks stay collectable across restarts.
+fn restore_identities(
+    state: &ApiState,
+    subscribe: &Subscribe,
+    routed: &crate::delivery::RoutedDownloader<'_>,
+    pending: &[(i32, crate::store::PendingDownload)],
+) {
+    let hashes = match state.store.lock().load_pending_info_hashes(subscribe.id) {
+        Ok(hashes) => hashes,
+        Err(error) => {
+            tracing::warn!(subscribe_id = %subscribe.id, %error, "读取 pending info hash 失败");
+            return;
+        }
+    };
+    for (_, item) in pending {
+        if let Some(hash) = hashes.get(&item.torrent.enclosure) {
+            use downloader::Downloader as _;
+            if let Err(error) = routed.remember_identity(&item.torrent, hash) {
+                tracing::warn!(torrent = %item.torrent.title, %error, "恢复下载器任务身份失败");
+            }
+        }
+    }
+}
+
 fn filter_matched_pending(
     subscribe: &Subscribe,
     media: &Media,
@@ -252,6 +277,7 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
 
     let (media, filter, facts, wash_filter) = load_transfer_context(state, &subscribe)?;
     let routed = crate::delivery::RoutedDownloader::with_pending(state, &subscribe, &pending);
+    restore_identities(state, &subscribe, &routed, &pending);
     let chosen = filter_matched_pending(&subscribe, &media, pending);
 
     let plan = resolve_transfer_plan(state, &media, &subscribe)?;

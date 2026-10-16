@@ -11,6 +11,18 @@ use crate::management::ApiState;
 /// Grace period after submission before an absent task counts as gone.
 pub(crate) const ABSENT_CLEANUP_GRACE_SECS: i64 = 15 * 60;
 
+/// D-M3: matching that also accepts the persisted info hash, so a task whose
+/// ownership tags were stripped (or never existed) is still recognised.
+pub(crate) fn snapshot_matches_pending_with_hash(
+    torrent: &domain::Torrent,
+    stored_hash: Option<&str>,
+    snapshot: &downloader::TaskSnapshot,
+) -> bool {
+    stored_hash.is_some_and(|hash| {
+        !snapshot.info_hash.is_empty() && snapshot.info_hash.eq_ignore_ascii_case(hash)
+    }) || snapshot_matches_pending(torrent, snapshot)
+}
+
 pub(crate) fn snapshot_matches_pending(
     torrent: &domain::Torrent,
     snapshot: &downloader::TaskSnapshot,
@@ -32,15 +44,17 @@ pub(crate) fn snapshot_matches_pending(
 /// An HTTP enclosure needs ownership tags to be visible on this client: if
 /// the client reports tasks but none carries any ownership tag (tags stripped,
 /// unsupported labels, …) its absence proves nothing and must not delete rows.
-pub(crate) fn absence_is_provable(torrent: &domain::Torrent, snapshots: &[downloader::TaskSnapshot]) -> bool {
+pub(crate) fn absence_is_provable(
+    torrent: &domain::Torrent,
+    snapshots: &[downloader::TaskSnapshot],
+) -> bool {
     if snapshots.is_empty() || downloader::magnet_info_hash(&torrent.enclosure).is_some() {
         return true;
     }
-    snapshots.iter().any(|s| {
-        !s.owned_tags.is_empty() || s.tag.starts_with(downloader::OWNED_TAG_PREFIX)
-    })
+    snapshots
+        .iter()
+        .any(|s| !s.owned_tags.is_empty() || s.tag.starts_with(downloader::OWNED_TAG_PREFIX))
 }
-
 
 /// Whether `item` is provably gone from `snapshots` (client reachable) and
 /// past the grace period at `now`.
@@ -52,7 +66,9 @@ pub(crate) fn is_absent_and_stale(
     let Some(snapshots) = snapshots else {
         return false; // client unreachable: absence proves nothing
     };
-    let matched = snapshots.iter().any(|s| snapshot_matches_pending(&item.torrent, s));
+    let matched = snapshots
+        .iter()
+        .any(|s| snapshot_matches_pending(&item.torrent, s));
     !matched
         && absence_is_provable(&item.torrent, snapshots)
         && item
@@ -82,11 +98,28 @@ pub(crate) fn reconcile_subscribe(
         });
     }
     let now = crate::job_loop::unix_now();
+    let hashes = state
+        .store
+        .lock()
+        .load_pending_info_hashes(subscribe_id)
+        .unwrap_or_default();
     let mut kept = Vec::with_capacity(pending.len());
     for (score, item) in pending {
-        let list = snapshots.get(&item.downloader_id).and_then(|s| s.as_deref());
-        if is_absent_and_stale(&item, list, now) {
-            match state.store.lock().delete_pending(subscribe_id, &item.torrent.enclosure) {
+        let list = snapshots
+            .get(&item.downloader_id)
+            .and_then(|s| s.as_deref());
+        let hash = hashes.get(&item.torrent.enclosure).map(String::as_str);
+        let hash_seen = hash.is_some()
+            && list.is_some_and(|l| {
+                l.iter()
+                    .any(|s| snapshot_matches_pending_with_hash(&item.torrent, hash, s))
+            });
+        if !hash_seen && is_absent_and_stale(&item, list, now) {
+            match state
+                .store
+                .lock()
+                .delete_pending(subscribe_id, &item.torrent.enclosure)
+            {
                 Ok(()) => {
                     tracing::info!(%subscribe_id, torrent = %item.torrent.title,
                         "后台对账：种子已不在下载器且超过宽限期，释放 pending");
@@ -96,7 +129,7 @@ pub(crate) fn reconcile_subscribe(
             }
         }
         if let Some(list) = list {
-            if is_stalled(state, subscribe_id, &item, list, now) {
+            if is_stalled(state, subscribe_id, &item, hash, list, now) {
                 continue;
             }
         }
@@ -127,17 +160,26 @@ fn is_stalled(
     state: &ApiState,
     subscribe_id: SubscribeId,
     item: &store::PendingDownload,
+    hash: Option<&str>,
     snapshots: &[downloader::TaskSnapshot],
     now: i64,
 ) -> bool {
-    let Some(snapshot) = snapshots.iter().find(|s| snapshot_matches_pending(&item.torrent, s)) else {
+    let Some(snapshot) = snapshots
+        .iter()
+        .find(|s| snapshot_matches_pending_with_hash(&item.torrent, hash, s))
+    else {
         return false;
     };
     if snapshot.progress >= 1.0 {
         return false;
     }
     let enclosure = &item.torrent.enclosure;
-    let last = match state.store.lock().touch_pending_progress(subscribe_id, enclosure, snapshot.progress, now) {
+    let last = match state.store.lock().touch_pending_progress(
+        subscribe_id,
+        enclosure,
+        snapshot.progress,
+        now,
+    ) {
         Ok(Some(last)) => last,
         Ok(None) => return false,
         Err(error) => {
@@ -148,7 +190,11 @@ fn is_stalled(
     if now - last < stalled_timeout_secs(state) {
         return false;
     }
-    match state.store.lock().mark_pending_stalled(subscribe_id, enclosure) {
+    match state
+        .store
+        .lock()
+        .mark_pending_stalled(subscribe_id, enclosure)
+    {
         Ok(()) => {
             tracing::warn!(%subscribe_id, torrent = %item.torrent.title, idle_secs = now - last,
                 "下载长时间无进度：标记 stalled 并释放占位（不删除下载器任务）");
@@ -206,10 +252,25 @@ mod tests {
         let mine = "https://pt.example/download.php?id=1";
         let other = [owned_snapshot("https://pt.example/download.php?id=2")];
         assert!(is_absent_and_stale(&pending(mine, old), Some(&other), now));
-        assert!(!is_absent_and_stale(&pending(mine, fresh), Some(&other), now), "grace");
-        assert!(!is_absent_and_stale(&pending(mine, old), None, now), "unreachable");
-        assert!(!is_absent_and_stale(&pending(mine, old), Some(&[owned_snapshot(mine)]), now), "present");
-        let generic = [downloader::TaskSnapshot { tag: downloader::TASK_TAG.into(), ..Default::default() }];
-        assert!(!is_absent_and_stale(&pending(mine, old), Some(&generic), now), "unprovable");
+        assert!(
+            !is_absent_and_stale(&pending(mine, fresh), Some(&other), now),
+            "grace"
+        );
+        assert!(
+            !is_absent_and_stale(&pending(mine, old), None, now),
+            "unreachable"
+        );
+        assert!(
+            !is_absent_and_stale(&pending(mine, old), Some(&[owned_snapshot(mine)]), now),
+            "present"
+        );
+        let generic = [downloader::TaskSnapshot {
+            tag: downloader::TASK_TAG.into(),
+            ..Default::default()
+        }];
+        assert!(
+            !is_absent_and_stale(&pending(mine, old), Some(&generic), now),
+            "unprovable"
+        );
     }
 }

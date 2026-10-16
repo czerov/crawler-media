@@ -59,7 +59,10 @@ mod debug_tests {
             password: None,
             path_maps: Vec::new(),
         };
-        assert!(format!("{anonymous:?}").contains("None"), "未配置口令应可诊断");
+        assert!(
+            format!("{anonymous:?}").contains("None"),
+            "未配置口令应可诊断"
+        );
     }
 }
 
@@ -72,14 +75,20 @@ pub struct TransmissionDownloader {
 
 impl TransmissionDownloader {
     fn claim_duplicate(&self, hash: &str, torrent: &Torrent) -> Result<(), DownloaderError> {
-        let got = self.rpc("torrent-get", json!({ "ids": [hash], "fields": ["labels"] }))?;
+        let got = self.rpc(
+            "torrent-get",
+            json!({ "ids": [hash], "fields": ["labels"] }),
+        )?;
         let mut labels: Vec<String> = got["torrents"][0]["labels"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
-        for wanted in [crate::TASK_TAG.to_string(), crate::ownership_tag(&torrent.enclosure)] {
+        for wanted in [
+            crate::TASK_TAG.to_string(),
+            crate::ownership_tag(&torrent.enclosure),
+        ] {
             if !labels.contains(&wanted) {
                 labels.push(wanted);
             }
@@ -237,6 +246,16 @@ impl TransmissionDownloader {
 }
 
 impl Downloader for TransmissionDownloader {
+    fn remember_identity(&self, torrent: &Torrent, hash: &str) -> Result<(), DownloaderError> {
+        if let Some(hash) = crate::owned::normalize_hash(hash) {
+            self.identities
+                .lock()
+                .entry(torrent.enclosure.clone())
+                .or_insert(hash);
+        }
+        Ok(())
+    }
+
     fn add(&self, torrent: &Torrent) -> Result<(), DownloaderError> {
         self.add_resolved(torrent, &torrent.enclosure)
     }

@@ -29,7 +29,10 @@ pub struct SearchFixture {
 
 impl SearchFixture {
     pub fn empty() -> Self {
-        Self { html: Mutex::new(String::new()), requests: Mutex::new(vec![]) }
+        Self {
+            html: Mutex::new(String::new()),
+            requests: Mutex::new(vec![]),
+        }
     }
 }
 
@@ -86,11 +89,44 @@ impl Harness {
         Self::build(nexusphp(), Some(catalog))
     }
 
+    /// Harness whose default downloader is `client` (e.g. a Transmission
+    /// pointed at `MockTransmission`); the qB mock still runs but is unused.
+    pub fn with_downloader(client: Arc<dyn downloader::Downloader>) -> Self {
+        Self::build_with(nexusphp(), None, Some(client))
+    }
+
     fn build(html: &str, catalog: Option<Arc<dyn api::catalog::Catalog>>) -> Self {
+        Self::build_with(html, catalog, None)
+    }
+
+    /// Simulate a process restart: a fresh ApiState (and downloader client) on
+    /// the same data directory.
+    pub fn restart(&mut self, client: Arc<dyn downloader::Downloader>) {
+        let state = ApiState::new(
+            api::Store::open(self.tmp.path().join("data")).unwrap(),
+            TOKEN.into(),
+            indexer::ProfileSet::load(None).unwrap(),
+            self.search.clone(),
+            client,
+            self.tmp.path().join("library"),
+        )
+        .unwrap();
+        self.app = router(state.clone());
+        self.state = state;
+    }
+
+    fn build_with(
+        html: &str,
+        catalog: Option<Arc<dyn api::catalog::Catalog>>,
+        client: Option<Arc<dyn downloader::Downloader>>,
+    ) -> Self {
         install_fake_ffprobe();
         let tmp = tempfile::tempdir().unwrap();
         let qb = MockQbit::start(&tmp.path().join("downloads"));
-        let client = downloader::QbitDownloader::connect(qb.config()).unwrap();
+        let client: Arc<dyn downloader::Downloader> = match client {
+            Some(client) => client,
+            None => Arc::new(downloader::QbitDownloader::connect(qb.config()).unwrap()),
+        };
         let search = Arc::new(SearchFixture {
             html: Mutex::new(html.to_string()),
             requests: Mutex::new(vec![]),
@@ -100,7 +136,7 @@ impl Harness {
             TOKEN.into(),
             indexer::ProfileSet::load(None).unwrap(),
             search.clone(),
-            Arc::new(client),
+            client,
             tmp.path().join("library"),
         )
         .unwrap();

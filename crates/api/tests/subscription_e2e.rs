@@ -8,6 +8,8 @@ mod common;
 mod harness;
 #[path = "subscription_e2e/mock_qbit.rs"]
 mod mock_qbit;
+#[path = "subscription_e2e/mock_transmission.rs"]
+mod mock_transmission;
 
 #[path = "subscription_e2e/fake_catalog.rs"]
 mod fake_catalog;
@@ -18,6 +20,8 @@ mod d_h1_qbit_relogin;
 mod d_h2_existing_infohash;
 #[path = "subscription_e2e/d_h3_m8_no_overwrite.rs"]
 mod d_h3_m8_no_overwrite;
+#[path = "subscription_e2e/d_m3_persisted_infohash.rs"]
+mod d_m3_persisted_infohash;
 #[path = "subscription_e2e/d_s1_pending_cleanup.rs"]
 mod d_s1_pending_cleanup;
 #[path = "subscription_e2e/g_h1_air_date_gate.rs"]

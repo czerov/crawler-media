@@ -49,4 +49,33 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// D-M3: remember the info hash the downloader assigned to a pending row.
+    pub fn set_pending_info_hash(
+        &self,
+        subscribe_id: SubscribeId,
+        enclosure: &str,
+        hash: &str,
+    ) -> Result<(), StoreError> {
+        self.subscribe.execute(
+            "UPDATE pending_downloads SET info_hash = ?3 WHERE subscribe_id = ?1 AND enclosure = ?2",
+            params![subscribe_id.to_string(), enclosure, hash.to_ascii_lowercase()],
+        )?;
+        Ok(())
+    }
+
+    /// D-M3: enclosure → info hash for the Subscribe's active pending rows.
+    pub fn load_pending_info_hashes(
+        &self,
+        subscribe_id: SubscribeId,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        let mut stmt = self.subscribe.prepare(
+            "SELECT enclosure, info_hash FROM pending_downloads
+             WHERE subscribe_id = ?1 AND state = 'active' AND info_hash IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([subscribe_id.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
