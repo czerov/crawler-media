@@ -12,6 +12,17 @@ pub enum PluginError {
     Veto(String),
     #[error("{0}")]
     Fetch(String),
+    /// Browser failed before the target page was navigated (busy, endpoint,
+    /// target creation, cookie injection). Nothing reached the site, so the
+    /// caller may safely fall back to HTTP.
+    #[error("browser pre-navigation: {0}")]
+    BrowserPreNavigation(String),
+}
+
+impl PluginError {
+    pub fn is_browser_pre_navigation(&self) -> bool {
+        matches!(self, Self::BrowserPreNavigation(_))
+    }
 }
 
 pub trait SiteCredentials {
@@ -135,7 +146,12 @@ fn browser_render(
     };
     browser
         .render(&request)
-        .map_err(|err| PluginError::Fetch(err.to_string()))
+        .map_err(|err| match err {
+            indexer::IndexerError::BrowserSetup(_) | indexer::IndexerError::BrowserBusy => {
+                PluginError::BrowserPreNavigation(err.to_string())
+            }
+            other => PluginError::Fetch(other.to_string()),
+        })
 }
 
 fn require_cookie(site: &Site) -> Result<(), PluginError> {
