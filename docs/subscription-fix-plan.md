@@ -725,3 +725,21 @@ crates/api/tests/subscription_e2e/
 - **通过标准**：不发送完成通知；切换回正确库并补齐后发送一次。
 - **风险与回滚**：风险低。回滚：revert。
 
+
+### F-1. 季包只缺部分集时可选只下载所需文件（选择性下载）
+
+- **严重度**：功能（新增，默认关闭）
+- **涉及文件/函数**：`crates/downloader/src/lib.rs` `Downloader::select_files`（新增，默认不支持）；`qbit.rs`（`torrents/files` + `torrents/filePrio` priority=0）；`transmission.rs`（`torrent-set` `files-unwanted`）；`crates/api/src/delivery.rs` `RoutedDownloader`；`crates/api/src/worker/finish_search.rs`（提交后按缺集筛文件）；设置 `subscribe.selective_files`
+- **根因**：选中季包仅为补齐少数缺集时，整包下载浪费带宽/磁盘，且已有集的文件在 M2 下会被跳过入库。
+- **具体改法**：
+  1. 新增设置 `subscribe.selective_files`（`true`/`false`，默认 `false`）。
+  2. 订阅搜索提交季包后，若开启：按包的 slot 与本轮前的 facts（库内 + 在途）计算“缺失 slot”；缺失 slot 非空且少于包内全部 slot 时，逐文件用 `release::parse` 解析集号，属于已有 slot 的文件设为不下载；无法解析集号的文件（nfo、sample 以外的附属文件等）保留。
+  3. qB：`POST torrents/filePrio`（`hash`、`id=i|j|…`、`priority=0`）；Transmission：`torrent-set {"ids":[id],"files-unwanted":[…]}`。
+  4. 完成判定：qB 忽略 priority=0 的文件，所有想要的文件 progress=1 即视为完成；Transmission 沿用 `percentDone`（按 sizeWhenDone 计算）与 `fileStats.wanted`。pending/coverage/import 由此把种子视为已完成。
+  5. 元数据未就绪（磁力无文件列表）时不筛选，记 info 日志，整包下载（不阻塞）。
+- **验收标准**：
+  - 关闭时行为不变（不发 filePrio / files-unwanted）。
+  - 开启时只有缺失集被下载；所需文件完成即入库、pending 变 imported。
+- **流程测试场景**：库中已有 S01E01–E08，订阅 S01 共 10 集；搜索只返回 S01 全季包（10 个文件）。分别在 mock qB 与 mock Transmission（rpc≥16）上：开启 `subscribe.selective_files` → 提交 → 断言 mock 收到 E01–E08 的 priority=0 / files-unwanted → mock 仅完成 E09、E10 → Transfer。另跑一组关闭设置的对照。
+- **通过标准**：开启组 E09/E10 入库、E01–E08 不被重复导入、pending 为 imported；关闭组 mock 无文件优先级调用。
+- **风险与回滚**：风险：文件名集号解析错误导致误跳过所需文件——仅在设置开启时生效，且无法解析的文件一律保留。回滚：关闭设置或 revert。
