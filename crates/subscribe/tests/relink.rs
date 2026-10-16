@@ -125,6 +125,7 @@ fn transfer_once(
             submission_errors: vec![],
             torrents_added: vec![],
         },
+        broken: Vec::new(),
     };
     collect_completed(added, &Ffprobe::default()).unwrap()
 }

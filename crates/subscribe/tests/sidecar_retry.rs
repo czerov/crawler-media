@@ -104,5 +104,6 @@ fn make_added<'a>(
             submission_errors: vec![],
             torrents_added: vec![],
         },
+        broken: Vec::new(),
     }
 }

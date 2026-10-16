@@ -141,6 +141,7 @@ fn season_pack_retry_only_reconciles_mapped_slots_without_forging_facts() {
             submission_errors: vec![],
             torrents_added: vec![],
         },
+        broken: Vec::new(),
     };
 
     let outcome = collect_completed_with_destinations(added, &library::Ffprobe::default(), &existing_mappings).unwrap();
@@ -228,6 +229,7 @@ fn stale_facts_pointing_at_missing_file_are_reconciled_to_new_destination() {
             submission_errors: vec![],
             torrents_added: vec![],
         },
+        broken: Vec::new(),
     };
 
     let outcome = collect_completed_with_destinations(added, &library::Ffprobe::default(), &existing_mappings).unwrap();

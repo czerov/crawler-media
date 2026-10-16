@@ -165,8 +165,12 @@ impl Downloader for QbitDownloader {
         download_url: &str,
         save_path: Option<&str>,
     ) -> Result<(), DownloaderError> {
-        if self.exact_existing_hash(torrent)?.is_some() {
-            return Ok(());
+        if let Some(info) = self.owned_info(torrent)? {
+            return match existing_task_health(&info.state, info.progress) {
+                ExistingHealth::Broken => Err(DownloaderError::ExistingTaskBroken(info.hash)),
+                ExistingHealth::Paused => self.resume_task(&info.hash),
+                ExistingHealth::Usable => Ok(()),
+            };
         }
         let tag = format!(
             "{},{}",
@@ -584,6 +588,37 @@ struct TorrentInfo {
     dlspeed: u64,
     #[serde(default)]
     upspeed: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExistingHealth {
+    Usable,
+    Paused,
+    Broken,
+}
+
+/// G-M2: classify an existing task's qBittorrent state (v4 `paused*`, v5 `stopped*`).
+fn existing_task_health(state: &str, progress: f64) -> ExistingHealth {
+    match state {
+        "error" | "missingFiles" => ExistingHealth::Broken,
+        "pausedDL" | "stoppedDL" if progress < 1.0 => ExistingHealth::Paused,
+        _ => ExistingHealth::Usable,
+    }
+}
+
+#[cfg(test)]
+mod existing_health_tests {
+    use super::{ExistingHealth, existing_task_health};
+
+    #[test]
+    fn maps_qbit_states() {
+        assert_eq!(existing_task_health("error", 0.2), ExistingHealth::Broken);
+        assert_eq!(existing_task_health("missingFiles", 1.0), ExistingHealth::Broken);
+        assert_eq!(existing_task_health("pausedDL", 0.5), ExistingHealth::Paused);
+        assert_eq!(existing_task_health("stoppedDL", 0.5), ExistingHealth::Paused);
+        assert_eq!(existing_task_health("pausedUP", 1.0), ExistingHealth::Usable);
+        assert_eq!(existing_task_health("downloading", 0.1), ExistingHealth::Usable);
+    }
 }
 
 #[derive(Deserialize)]

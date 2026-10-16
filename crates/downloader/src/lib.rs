@@ -31,6 +31,10 @@ pub enum DownloaderError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Message(String),
+    /// G-M2: an owned task for this enclosure exists but is unusable
+    /// (`error` / `missingFiles`); callers must switch source.
+    #[error("existing downloader task {0} is broken")]
+    ExistingTaskBroken(String),
 }
 
 pub trait Downloader: Send + Sync {

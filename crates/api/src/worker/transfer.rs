@@ -171,6 +171,7 @@ fn build_added_input<'a>(
             submission_errors: Vec::new(),
             torrents_added: Vec::new(),
         },
+        broken: Vec::new(),
     }
 }
 

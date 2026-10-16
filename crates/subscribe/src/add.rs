@@ -12,6 +12,8 @@ pub struct Added<'a, D: Downloader + ?Sized> {
     /// Failures submitting selected torrents. Successfully submitted torrents
     /// are still returned so the caller can persist them before retrying.
     pub add_errors: Vec<String>,
+    /// G-M2: chosen candidates whose existing downloader task is broken.
+    pub broken: Vec<ScoredTorrent>,
     /// 被规则组拒绝的候选（score 0；供 wanted 记录拒绝原因）。
     pub rejected: Vec<ScoredTorrent>,
     pub outcome: RunOutcome,
@@ -60,6 +62,7 @@ pub fn admit_and_add<D: Downloader + ?Sized>(
     emit(input.hooks, Step::ChooseTorrent)?;
     let mut submitted = Vec::new();
     let mut add_errors = Vec::new();
+    let mut broken = Vec::new();
     for scored in chosen {
         tracing::info!(
             media = %input.media.title,
@@ -71,6 +74,10 @@ pub fn admit_and_add<D: Downloader + ?Sized>(
             .and_then(|()| input.downloader.add(&scored.torrent).map_err(Into::into));
         match result {
             Ok(()) => submitted.push(scored),
+            Err(SubscribeError::Downloader(downloader::DownloaderError::ExistingTaskBroken(hash))) => {
+                tracing::warn!(torrent = %scored.torrent.title, %hash, "下载器中已有任务处于错误/缺文件状态，拒绝该来源以便换源");
+                broken.push(scored);
+            }
             Err(error) => {
                 tracing::error!(torrent = %scored.torrent.title, error = %error, "提交种子到下载器失败");
                 add_errors.push(format!("{}: {error}", scored.torrent.title));
@@ -90,13 +97,14 @@ pub fn admit_and_add<D: Downloader + ?Sized>(
             ledger_sources: Vec::new(),
             removed_paths: Vec::new(),
             transferred_enclosures: Vec::new(),
-            rejected_enclosures: Vec::new(),
+            rejected_enclosures: broken.iter().map(|s| s.torrent.enclosure.clone()).collect(),
             collection_errors: Vec::new(),
             submission_errors: add_errors.clone(),
             torrents_added,
         },
         input,
         chosen: submitted,
+        broken,
         add_errors,
         rejected: admission.rejected,
     })

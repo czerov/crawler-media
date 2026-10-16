@@ -34,6 +34,7 @@ pub struct MockQbit {
     pub tasks: Mutex<Vec<Task>>,
     pub adds: Mutex<Vec<String>>,
     pub deletes: Mutex<Vec<String>>,
+    pub resumes: Mutex<Vec<String>>,
     pub logins: AtomicUsize,
     pub info_calls: AtomicUsize,
     /// Reject every authenticated request with 403 while > 0 (decrements per request).
@@ -62,6 +63,7 @@ impl MockQbit {
             forbid_next: AtomicUsize::new(0),
             reject_login: std::sync::atomic::AtomicBool::new(false),
             torrent_file: Mutex::new(None),
+            resumes: Mutex::new(Vec::new()),
             add_tags: Mutex::new(Vec::new()),
             next: AtomicU64::new(1),
         });
@@ -240,6 +242,17 @@ impl MockQbit {
                 })
                 .collect();
             return ("200 OK", serde_json::to_string(&body).unwrap(), "");
+        }
+        if req.contains("/api/v2/torrents/resume") || req.contains("/api/v2/torrents/start") {
+            self.resumes.lock().push(req.to_string());
+            if let Some(hashes) = form_field(req, "hashes") {
+                for task in self.tasks.lock().iter_mut() {
+                    if hashes.split('|').any(|h| h.eq_ignore_ascii_case(&task.hash)) {
+                        task.state = "downloading".into();
+                    }
+                }
+            }
+            return ("200 OK", "Ok.".into(), "");
         }
         if req.contains("/api/v2/torrents/delete") {
             self.deletes.lock().push(req.to_string());

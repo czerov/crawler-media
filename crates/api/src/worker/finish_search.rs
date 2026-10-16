@@ -251,11 +251,38 @@ fn merge_added_pending<D: downloader::Downloader + ?Sized>(
             )
         })
         .collect();
-    state
-        .store
-        .lock()
+    let store = state.store.lock();
+    store
         .record_pending_submissions(subscribe.id, &pending)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    // G-M2: a broken existing task is recorded as a rejected source so the
+    // next round never picks it again and switches to another release.
+    if !added.broken.is_empty() {
+        let broken: Vec<(i32, crate::store::PendingDownload)> = added
+            .broken
+            .iter()
+            .map(|scored| {
+                (
+                    scored.score,
+                    crate::store::PendingDownload {
+                        submitted_at: None,
+                        torrent: scored.torrent.clone(),
+                        release_override: None,
+                        downloader_id: routed.used_id(&scored.torrent),
+                    },
+                )
+            })
+            .collect();
+        let enclosures: Vec<String> =
+            added.broken.iter().map(|s| s.torrent.enclosure.clone()).collect();
+        store
+            .record_pending_submissions(subscribe.id, &broken)
+            .map_err(|error| error.to_string())?;
+        store
+            .mark_pending_rejected(subscribe.id, &enclosures)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn facts_with_pending(

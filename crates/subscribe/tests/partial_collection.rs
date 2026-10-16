@@ -151,6 +151,7 @@ fn one_failed_file_does_not_discard_successful_files_from_same_torrent() {
             submission_errors: vec![],
             torrents_added: vec![],
         },
+        broken: Vec::new(),
     };
 
     let outcome = collect_completed(added, &Probe)
