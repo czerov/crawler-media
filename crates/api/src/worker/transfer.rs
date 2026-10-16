@@ -68,14 +68,18 @@ fn commit_transfer_outcome(
     {
         let store = state.store.lock();
         validate_transfer_plan(&store, subscribe, lease, observation_revisions, plan)?;
-        // Ledger writes bump the library revision, including our own reservations.
-        // Re-check exact identities instead of rejecting those valid writes.
-        for row in &outcome.ledger {
-            if store.ledger_by_path(&row.path).map_err(|e| e.to_string())?
-                .is_some_and(|existing| existing.media_id != subscribe.media_id)
+        for (row, mode) in outcome.ledger.iter().zip(observed_modes.iter()) {
+            let source_path = outcome.ledger_sources.iter()
+                .find(|source| source.ledger_path == row.path)
+                .map(|source| source.source_path.as_str());
+            let existing = store.ledger_by_path(&row.path).map_err(|e| e.to_string())?;
+            if existing.as_ref().map(|existing| (&existing.id, existing.media_id, &existing.path))
+                != Some((&row.id, row.media_id, &row.path))
+                || !store.ledger_source_path_matches(&row.path, source_path).map_err(|e| e.to_string())?
             {
-                return Err("目标路径已被其他媒体占用，放弃本轮提交".into());
+                return Err(format!("Transfer reservation missing or replaced: {}", row.path));
             }
+            store.finalize_transfer(row, mode, source_path).map_err(|e| e.to_string())?;
         }
         for path in &outcome.removed_paths {
             if store.ledger_by_path(path).map_err(|e| e.to_string())?
@@ -85,16 +89,6 @@ fn commit_transfer_outcome(
             }
         }
 
-        for (row, mode) in outcome.ledger.iter().zip(observed_modes.iter()) {
-            let source_path = outcome
-                .ledger_sources
-                .iter()
-                .find(|source| source.ledger_path == row.path)
-                .map(|source| source.source_path.as_str());
-            store
-                .insert_ledger_with_mode_and_source(row, Some(mode), source_path)
-                .map_err(|e| e.to_string())?;
-        }
         store
             .save_subscribe_facts(subscribe.id, &outcome.facts)
             .map_err(|e| e.to_string())?;
@@ -193,15 +187,15 @@ fn load_transfer_context(
     Ok((media, filter, obs.facts, wash_filter, obs.revisions))
 }
 
-struct TransferPlan {
-    library_id: String,
+pub(crate) struct TransferPlan {
+    pub(crate) library_id: String,
     library: store::Library,
-    revisions: store::ReadRevisions,
-    root: std::path::PathBuf,
-    mode: Option<library::TransferMode>,
-    naming: String,
-    scrape: bool,
-    nfo: bool,
+    pub(crate) revisions: store::ReadRevisions,
+    pub(crate) root: std::path::PathBuf,
+    pub(crate) mode: Option<library::TransferMode>,
+    pub(crate) naming: String,
+    pub(crate) scrape: bool,
+    pub(crate) nfo: bool,
 }
 
 fn filter_matched_pending(
@@ -252,7 +246,7 @@ fn build_added_input<'a>(
     }
 }
 
-fn resolve_transfer_plan(
+pub(crate) fn resolve_transfer_plan(
     state: &ApiState,
     media: &Media,
     subscribe: &Subscribe,
@@ -282,7 +276,7 @@ fn resolve_transfer_plan(
     })
 }
 
-fn validate_transfer_plan(
+pub(crate) fn validate_transfer_plan(
     store: &crate::Store,
     subscribe: &Subscribe,
     lease: &crate::library_lifecycle::LibraryWorkLease,
@@ -372,9 +366,9 @@ impl subscribe::TransferRecorder for PublicationRecorder<'_> {
     }
 }
 
-struct PlannedPublicationRecorder<'a> {
-    recorder: PublicationRecorder<'a>,
-    plan: &'a TransferPlan,
+pub(crate) struct PlannedPublicationRecorder<'a> {
+    pub(crate) recorder: PublicationRecorder<'a>,
+    pub(crate) plan: &'a TransferPlan,
 }
 
 impl subscribe::TransferRecorder for PlannedPublicationRecorder<'_> {

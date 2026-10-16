@@ -194,7 +194,7 @@ fn admit_after_search(
     let _guard = guard.lock();
     let context = reload_locked(state, id, user_id)?;
     let routed = RoutedDownloader::new(state, Some(&context.subscribe));
-    let (outcome, scrape, library_lease) =
+    let (outcome, scrape, library_lease, plan) =
         execute(state, id, &context, &routed, torrents, search_keywords)?;
     let completed = outcome.completed;
     let ledger_rows = outcome.ledger.len();
@@ -205,7 +205,7 @@ fn admit_after_search(
         .chain(outcome.collection_errors.iter())
         .cloned()
         .collect::<Vec<_>>();
-    persist(state, id, outcome, &routed, &library_lease)?;
+    persist(state, id, outcome, &routed, &library_lease, &plan)?;
     Ok(AdmittedRun {
         media: context.media,
         scrape,
@@ -258,48 +258,28 @@ fn execute(
         subscribe::RunOutcome,
         bool,
         crate::library_lifecycle::LibraryWorkLease,
+        crate::worker::transfer::TransferPlan,
     ),
     ApiError,
 > {
     exclude_pending(state, id, &mut torrents)?;
     let facts = load_run_facts(state, id, context)?;
-    let (library_id, library_root, transfer_mode, scrape) = {
-        let store = state.store.lock();
-        let library_id = match context.subscribe.library_id {
-            Some(id) => id.to_string(),
-            None => {
-                store
-                    .default_library(context.media.kind)?
-                    .ok_or_else(|| ApiError::internal("目标 Library 不存在".into()))?
-                    .id
-            }
-        };
-        let (root, mode, scrape) = crate::directory::transfer_plan_for_library(
-            &store,
-            context.media.kind,
-            Some(&library_id),
-        )?;
-        (library_id, root, mode, scrape)
-    };
-    let library_lease = state
-        .acquire_library_work(&library_id)
+    let plan = crate::worker::transfer::resolve_transfer_plan(state, &context.media, &context.subscribe)
         .map_err(ApiError::internal)?;
-    library_lease
-        .control()
-        .check()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    let naming = state.store.lock().naming_pattern(context.media.kind)?;
-    let nfo = {
-        let store = state.store.lock();
-        let cfg = store.get_scrape_config()?;
-        scrape && cfg.effective.mirror_nfo
-    };
-    let destinations = routed
-        .imported_destinations()
+    let library_lease = state.acquire_library_work(&plan.library_id).map_err(ApiError::internal)?;
+    let destinations = routed.imported_destinations()
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    let revisions = state.store.lock().read_revisions()?;
-    let recorder = crate::worker::transfer::PublicationRecorder {
-        state, subscribe: &context.subscribe, lease: &library_lease, revisions,
+    {
+        let store = state.store.lock();
+        crate::worker::transfer::validate_transfer_plan(
+            &store, &context.subscribe, &library_lease, &plan.revisions, &plan,
+        ).map_err(ApiError::internal)?;
+    }
+    let recorder = crate::worker::transfer::PlannedPublicationRecorder {
+        recorder: crate::worker::transfer::PublicationRecorder {
+            state, subscribe: &context.subscribe, lease: &library_lease, revisions: plan.revisions.clone(),
+        },
+        plan: &plan,
     };
     let added = subscribe::admit_and_add(
         RunInput {
@@ -311,11 +291,11 @@ fn execute(
             search_keywords,
             facts,
             downloader: routed,
-            library_root: &library_root,
-            transfer_mode,
-            scrape: nfo,
+            library_root: &plan.root,
+            transfer_mode: plan.mode,
+            scrape: plan.nfo,
             hooks: None,
-            naming: Some(&naming),
+            naming: Some(&plan.naming),
             preserve_removed: true,
         },
     )?;
@@ -328,13 +308,16 @@ fn execute(
             downloader::DownloaderError::Message(outcome.submission_errors.join("; ")),
         ).into());
     }
-    library_lease
-        .control()
-        .check()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    library_lease.control().check().map_err(|e| ApiError::internal(e.to_string()))?;
+    {
+        let store = state.store.lock();
+        crate::worker::transfer::validate_transfer_plan(
+            &store, &context.subscribe, &library_lease, &plan.revisions, &plan,
+        ).map_err(ApiError::internal)?;
+    }
     outcome.facts.retain_owned();
     outcome.completed = subscribe::is_complete(&context.subscribe, &outcome.facts);
-    Ok((outcome, scrape, library_lease))
+    Ok((outcome, plan.scrape, library_lease, plan))
 }
 
 fn load_run_facts(state: &ApiState, id: SubscribeId, context: &RunContext)
@@ -463,6 +446,7 @@ fn persist(
     outcome: subscribe::RunOutcome,
     routed: &RoutedDownloader<'_>,
     lease: &crate::library_lifecycle::LibraryWorkLease,
+    plan: &crate::worker::transfer::TransferPlan,
 ) -> Result<(), ApiError> {
     // Transfer-mode observation is filesystem work: observe it before taking the lock.
     let default_transfer_mode = {
@@ -483,13 +467,22 @@ fn persist(
             "目标 Library 正在删除或已不存在",
         ));
     }
+    crate::worker::transfer::validate_transfer_plan(
+        &store, &store.get_subscribe(id)?.ok_or_else(|| ApiError::internal("Subscribe not found".into()))?,
+        lease, &plan.revisions, plan,
+    ).map_err(ApiError::internal)?;
     for (row, mode) in outcome.ledger.iter().zip(modes.iter()) {
-        let source_path = outcome
-            .ledger_sources
-            .iter()
+        let source_path = outcome.ledger_sources.iter()
             .find(|source| source.ledger_path == row.path)
             .map(|source| source.source_path.as_str());
-        store.insert_ledger_with_mode_and_source(row, Some(mode), source_path)?;
+        let existing = store.ledger_by_path(&row.path)?;
+        if existing.as_ref().map(|existing| (&existing.id, existing.media_id, &existing.path))
+            != Some((&row.id, row.media_id, &row.path))
+            || !store.ledger_source_path_matches(&row.path, source_path)?
+        {
+            return Err(ApiError::internal(format!("Transfer reservation missing or replaced: {}", row.path)));
+        }
+        store.finalize_transfer(row, mode, source_path)?;
     }
     let now = crate::job_loop::unix_now();
     let transferred = outcome.transferred_enclosures;
@@ -518,18 +511,27 @@ fn persist(
     // commit is durable), then remove their ledger rows in one short critical section.
     let removed_paths = outcome.removed_paths.clone();
     if !removed_paths.is_empty() {
+        let mut removed = Vec::with_capacity(removed_paths.len());
+        let mut errors = Vec::new();
         for path in &removed_paths {
             match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => tracing::error!(path, %error, "物理删除旧文件失败"),
+                Ok(()) => removed.push(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => removed.push(path),
+                Err(error) => {
+                    tracing::error!(path, %error, "物理删除旧文件失败，保留台账行");
+                    errors.push(format!("{path}: {error}"));
+                }
             }
         }
         let store = state.store.lock();
-        for path in &removed_paths {
+        for path in removed {
             if let Err(error) = store.delete_ledger_path(path) {
                 tracing::error!(path, %error, "删除已替换文件的台账行失败");
+                errors.push(format!("{path}: {error}"));
             }
+        }
+        if !errors.is_empty() {
+            return Err(ApiError::internal(format!("Transfer replacement cleanup failed: {}", errors.join("; "))));
         }
     }
 

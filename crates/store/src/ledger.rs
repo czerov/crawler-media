@@ -81,6 +81,44 @@ impl Store {
         Ok(())
     }
 
+    /// Finalize a previously reserved Transfer row without recreating it if detached.
+    pub fn finalize_transfer(
+        &self,
+        row: &LedgerRow,
+        transfer_mode: &str,
+        source_path: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let changed = self.library.execute(
+            "UPDATE ledger SET season = ?4, episode = ?5, resolution = ?6, codec = ?7,
+                hdr = ?8, quality_source = ?9, confidence = ?10, filter_score = ?11,
+                transfer_mode = COALESCE(?12, transfer_mode)
+             WHERE id = ?1 AND media_id = ?2 AND path = ?3 AND source_path IS ?13",
+            params![
+                row.id.to_string(), row.media_id.to_string(), row.path,
+                row.season.map(i64::from), row.episode.map(i64::from), row.resolution,
+                row.codec, row.hdr, row.quality_source.as_str(), row.confidence.as_str(),
+                row.filter_score, transfer_mode, source_path,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Protected("Transfer reservation changed or was detached".into()));
+        }
+        Ok(())
+    }
+
+    pub fn ledger_source_path_matches(
+        &self,
+        path: &str,
+        expected: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let actual: Option<Option<String>> = self.library.query_row(
+            "SELECT source_path FROM ledger WHERE path = ?1",
+            [path],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(actual.flatten().as_deref() == expected)
+    }
+
     /// Reserve a final path before filesystem publication. Existing identity is
     /// never overwritten; only the same in-flight source can resume publication.
     pub fn prepare_transfer(&self, row: &LedgerRow, mode: &str, source: &str)
