@@ -130,3 +130,72 @@ fn startup_recovery_reconciles_active_job_counts_once() {
     assert_eq!((recovered[0].0.completed, recovered[0].0.partial), (1, 1));
     assert_eq!(recovered[0].1.iter().find(|unit| unit.ledger_id == "done").unwrap().status, "partial");
 }
+
+/// 台账行被删除后，退役的 `partial` 单元不得再计入任务计数。
+#[test]
+fn retiring_a_partial_unit_keeps_the_job_counters_honest() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path()).unwrap();
+    let media = domain::Media {
+        id: domain::MediaId::new(),
+        kind: domain::MediaKind::Movie,
+        title: "Target".into(),
+        year: None,
+        original_title: None,
+        tmdb_id: None,
+        douban_id: None,
+        tvdb_id: None,
+        bangumi_id: None,
+        anilist_id: None,
+    };
+    store.insert_media(&media).unwrap();
+    let rows = ["a", "b"].map(|suffix| domain::LedgerRow {
+        id: domain::LedgerId::new(),
+        media_id: media.id,
+        path: format!("/library/{suffix}.mkv"),
+        season: None,
+        episode: None,
+        resolution: None,
+        codec: None,
+        hdr: None,
+        quality_source: domain::QualitySource::Probe,
+        confidence: domain::Confidence::High,
+        filter_score: None,
+    });
+    for row in &rows {
+        store.insert_ledger(row).unwrap();
+    }
+    let ids: Vec<String> = rows.iter().map(|row| row.id.to_string()).collect();
+    let specs: Vec<_> = ids
+        .iter()
+        .map(|ledger_id| ProbeJobUnitSpec {
+            ledger_id,
+            kind: "movie",
+            force_fingerprint: false,
+            reuse_fingerprint_cache: false,
+            overwrite_markers: false,
+            reuse_media_info_cache: false,
+        })
+        .collect();
+    store.create_probe_job("job", "scan", "media", None, "scope", &specs).unwrap();
+    let (job, changed, _, _) = store
+        .finish_probe_unit_with_status_and_vm_steps("job", &ids[0], "partial", None, None)
+        .unwrap();
+    assert!(changed);
+    assert_eq!(job.partial, 1);
+
+    // 台账行消失 -> 该单元退役，任务仍在跑。
+    store.delete_ledger_path(&rows[0].path).unwrap();
+
+    let (job, changed, _, _) = store
+        .finish_probe_unit_with_status_and_vm_steps("job", &ids[1], "succeeded", None, None)
+        .unwrap();
+    assert!(changed);
+    assert_eq!(job.partial, 0, "retired partial unit must stop being counted");
+    assert_eq!(
+        (job.total, job.completed, job.succeeded, job.failed),
+        (1, 1, 1, 0)
+    );
+    assert_eq!(job.status, "succeeded");
+    assert_eq!(job.succeeded + job.failed + job.partial, job.completed);
+}

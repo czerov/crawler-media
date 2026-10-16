@@ -33,6 +33,40 @@ impl Drop for SeasonFlightLease {
         TITLE_FLIGHTS.lock().remove(&self.0);
     }
 }
+
+/// 后台季名补全的尝试时间：键为 `(tmdb_id, season)`。
+///
+/// 单飞集合只能去重**并发**请求；没有冷却时，一个 TMDB 解析不出的季会在每个
+/// up-next 请求上重新排一次补全，而每次补全都会占用一个共享 `search_work`
+/// permit 直到整个 TMDB 抓取结束，把交互式搜索挤成 503 `search.busy`。
+static TITLE_ENRICH_ATTEMPTS: LazyLock<Mutex<HashMap<(String, u32), std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 同一季的补全尝试间隔；期间不再重新排程（有界，不随请求数增长）。
+const TITLE_ENRICH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(600);
+/// 冷却表的硬上限；超过时先清过期项，仍超上限则整体清空。
+const TITLE_ENRICH_ATTEMPTS_CAP: usize = 1024;
+
+/// 记录一次补全尝试；冷却期内返回 `false`（调用方不再排程）。
+fn reserve_enrichment_attempt(tmdb_id: &str, season: u32) -> bool {
+    let mut attempts = TITLE_ENRICH_ATTEMPTS.lock();
+    let now = std::time::Instant::now();
+    let key = (tmdb_id.to_owned(), season);
+    if attempts
+        .get(&key)
+        .is_some_and(|attempted| now.duration_since(*attempted) < TITLE_ENRICH_COOLDOWN)
+    {
+        return false;
+    }
+    if attempts.len() >= TITLE_ENRICH_ATTEMPTS_CAP {
+        attempts.retain(|_, attempted| now.duration_since(*attempted) < TITLE_ENRICH_COOLDOWN);
+        if attempts.len() >= TITLE_ENRICH_ATTEMPTS_CAP {
+            attempts.clear();
+        }
+    }
+    attempts.insert(key, now);
+    true
+}
 /// GET /playback/up-next?limit= — next unwatched unit per in-progress TV / Movie
 /// subscription or watched local library items, with poster + resume position.
 ///
@@ -439,10 +473,20 @@ pub(crate) async fn up_next(
                     "episode_still_url": still,
                     "season_number": cand.plan_season,
                     "episode_number": cand.plan_next_episode,
-                    "episode_title": cand.next_row.as_ref()
-                        .and_then(|row| files.read_nfo(std::path::Path::new(&row.path)))
-                        .and_then(|nfo| nfo.title)
-                        .or(cand.episode_title),
+                    "episode_title": if cand.media.kind == domain::MediaKind::Tv {
+                        // 台账行路径是视频文件；集名要从**该集自己的** `.nfo` 同名字节读，
+                        // 与库内其它 NFO 读取约定一致（`path.with_extension("nfo")`）。
+                        cand.next_row.as_ref()
+                            .and_then(|row| {
+                                let nfo = std::path::Path::new(&row.path).with_extension("nfo");
+                                files.read_nfo(&nfo)
+                            })
+                            .and_then(|nfo| nfo.title)
+                            .or(cand.episode_title)
+                    } else {
+                        // 电影/视频的 `next_row` 就是媒体自身，不是集行：不做 NFO 标题回落。
+                        cand.episode_title
+                    },
                     "unwatched_ahead_count": 0,
                     "position_ms": cand.position,
                     "duration_ms": cand.duration,
@@ -487,6 +531,9 @@ fn millis(unix_secs: i64) -> String {
 }
 fn schedule_season_enrichment(state: &ApiState, tmdb_id: &str, season: u32) {
     let key = ("tv".to_owned(), tmdb_id.to_owned(), season);
+    if !reserve_enrichment_attempt(tmdb_id, season) {
+        return;
+    }
     {
         let mut flights = TITLE_FLIGHTS.lock();
         if !flights.insert(key.clone()) { return; }

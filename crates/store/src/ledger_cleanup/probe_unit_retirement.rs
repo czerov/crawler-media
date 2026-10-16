@@ -51,7 +51,9 @@ pub(crate) fn resync_probe_job(conn: &Connection, job_id: &str) -> Result<(), St
              succeeded = (SELECT COUNT(*) FROM probe_job_units
                           WHERE job_id = ?1 AND status = 'succeeded'),
              failed = (SELECT COUNT(*) FROM probe_job_units
-                       WHERE job_id = ?1 AND status = 'failed')
+                       WHERE job_id = ?1 AND status = 'failed'),
+             partial = (SELECT COUNT(*) FROM probe_job_units
+                        WHERE job_id = ?1 AND status = 'partial')
          WHERE id = ?1",
         [job_id],
     )?;

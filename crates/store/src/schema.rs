@@ -272,7 +272,6 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(conn, "probe_jobs", "partial", "INTEGER NOT NULL DEFAULT 0")?;
-    ensure_column(conn, "probe_jobs", "error", "TEXT")?;
     fingerprint::migrate_library_fingerprint(conn)?;
     probe_state::migrate_probe_state(conn)?;
     // library schema 8: ledger_probe_obligations 表用于扫描原子登记后的 probe 义务跟踪与恢复

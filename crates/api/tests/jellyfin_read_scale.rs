@@ -18,7 +18,20 @@ impl Fetcher for NoFetch {
 
 fn seed(path: &Path, unrelated: usize) -> (ApiState, domain::UserId, String) {
     let store = Store::open(path.join("data")).unwrap();
-    let library = store.list_libraries().unwrap().into_iter().find(|library| library.kind == MediaKind::Movie).unwrap();
+    // 目标行放在**非默认**库里：默认库的 `NOT (...)` 回退按语义必须扫全表，
+    // 只有非默认库的作用域读才能证明「读不随无关行增长」。
+    let target_root = path.join("target-root");
+    std::fs::create_dir_all(&target_root).unwrap();
+    let library = store
+        .create_library(
+            MediaKind::Movie,
+            "Target",
+            &[target_root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
     let parent_root = library.root_paths.first().cloned().unwrap_or_else(|| path.join("media"));
     std::fs::create_dir_all(&parent_root).unwrap();
     let target = parent_root.join("target.mkv");
@@ -78,14 +91,37 @@ fn fixed_parent_sql_candidate_work_ignores_unrelated_rows() {
     let small_store = small_state.store();
     let small_guard = small_store.lock();
     let ownership = small_guard.library_ownership().unwrap();
-    let parent_id = ownership.default_for(MediaKind::Movie).unwrap().id.clone();
-    let (_, small_steps) = small_guard.jellyfin_ledger_candidates_with_vm_steps(&ownership, &parent_id).unwrap();
+    let parent_id = ownership
+        .libraries()
+        .iter()
+        .find(|library| library.name == "Target")
+        .expect("target library")
+        .id
+        .clone();
+    let (small_rows, small_steps) = small_guard.jellyfin_ledger_candidates_with_vm_steps(&ownership, &parent_id).unwrap();
+    assert_eq!(small_rows.len(), 1);
 
     let large = tempfile::tempdir().unwrap();
     let (large_state, _, large_parent) = seed(large.path(), 300);
     let large_store = large_state.store();
     let large_guard = large_store.lock();
     let large_ownership = large_guard.library_ownership().unwrap();
-    let (_, large_steps) = large_guard.jellyfin_ledger_candidates_with_vm_steps(&large_ownership, &parent_id).unwrap();
-    assert!(large_steps <= small_steps * 2, "scoped DB work grew: small={small_steps}, large={large_steps}");
+    // 大库必须用**它自己**的库 id：否则 scoped 读会走 "该库不在本 ownership" 的
+    // 提前返回，测出 0 步，断言恒真（测不到退化）。
+    let large_parent_id = large_ownership
+        .libraries()
+        .iter()
+        .find(|library| library.name == "Target")
+        .expect("target library")
+        .id
+        .clone();
+    let (large_rows, large_steps) = large_guard
+        .jellyfin_ledger_candidates_with_vm_steps(&large_ownership, &large_parent_id)
+        .unwrap();
+    assert_eq!(large_rows.len(), 1);
+    assert!(small_steps > 0, "fixture read did no DB work: small={small_steps}");
+    assert!(
+        large_steps <= small_steps * 2,
+        "scoped DB work grew with unrelated rows: small={small_steps}, large={large_steps}"
+    );
 }

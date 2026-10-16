@@ -150,4 +150,68 @@ async fn blocked_metadata_does_not_delay_local_up_next() {
     let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["data"]["items"][0]["media_item_id"], tv_id.to_string());
 }
+/// 集名回落必须读该集自己的 `.nfo`（视频同名的兄弟文件），而不是视频文件本身。
+#[tokio::test]
+async fn tv_episode_nfo_title_is_served_locally() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    let state = make_state(&root, Arc::new(GatedCatalog {
+        gate: None, season_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    let tv_id = {
+        let store = state.store();
+        let tv_id = seed_media(&store.lock(), &root, MediaKind::Tv, "Series", "5150", Some(1), Some(1));
+        std::fs::write(
+            root.join("Series.nfo"),
+            "<episodedetails><title>Pilot From Nfo</title></episodedetails>",
+        )
+        .unwrap();
+        let user = store.lock().admin_user_id().unwrap();
+        store.lock().upsert_unit(user, tv_id, 1, 1, 50, Some(false), None, Some(100), None, None, false, 1).unwrap();
+        tv_id
+    };
+    let response = request_up_next(router(state)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["data"]["items"][0]["media_item_id"], tv_id.to_string());
+    assert_eq!(body["data"]["items"][0]["episode_title"], "Pilot From Nfo");
+}
+
+/// 解析不出的季不得在每个请求上重新排补全（每次补全占满一个共享 search permit）。
+#[tokio::test]
+async fn unresolvable_season_is_enriched_at_most_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state = make_state(&root, Arc::new(GatedCatalog {
+        gate: None, season_requests: calls.clone(),
+    }));
+    {
+        let store = state.store();
+        let tv_id = seed_media(&store.lock(), &root, MediaKind::Tv, "Cooldown", "9911", Some(1), Some(1));
+        let user = store.lock().admin_user_id().unwrap();
+        store.lock().upsert_unit(user, tv_id, 1, 1, 50, Some(false), None, Some(100), None, None, false, 1).unwrap();
+    }
+    let app = router(state);
+    assert_eq!(request_up_next(app.clone()).await.status(), StatusCode::OK);
+    for _ in 0..200 {
+        if calls.load(std::sync::atomic::Ordering::SeqCst) > 0 { break; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "first request must schedule exactly one enrichment"
+    );
+    assert_eq!(request_up_next(app).await.status(), StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "cooldown must suppress the re-scheduled enrichment"
+    );
+}
+
 // The public HTTP endpoint assertions above deliberately exercise route auth and DTO shape.

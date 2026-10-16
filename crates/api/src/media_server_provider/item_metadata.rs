@@ -14,26 +14,6 @@ use nfo::row_nfo_metadata;
 pub(super) use people::{catalog_person_image_url, person_image_url, person_tmdb_id};
 use people::{merge_people, people_from_nfo};
 
-fn item_is_favorite(store: &Store, user_id: UserId, row: &domain::LedgerRow) -> bool {
-    let season = row
-        .season
-        .map(|value| value as i32)
-        .unwrap_or(crate::store::UNIT_WHOLE);
-    let episode = row
-        .episode
-        .map(|value| value as i32)
-        .unwrap_or(crate::store::UNIT_WHOLE);
-
-    match store.unit_state(user_id, row.media_id, season, episode) {
-        Ok(Some(state)) => state.favorite,
-        Ok(None) => false,
-        Err(error) => {
-            tracing::warn!(%error, %user_id, media_id = %row.media_id, season = season, episode = episode, "failed to read Jellyfin favorite mark");
-            false
-        }
-    }
-}
-
 /// Owned per-item playback and probe facts collected with the Jellyfin batch.
 pub(super) struct ItemDbFacts {
     resume_state: Option<crate::store::UnitState>,
@@ -41,21 +21,63 @@ pub(super) struct ItemDbFacts {
     is_favorite: bool,
 }
 
-/// Load one item's DB facts while the shared snapshot's Store guard is held.
-pub(super) fn item_db_facts(
+/// Resolve one row's own playback unit and (for series rows) its whole-show unit.
+///
+/// 单条目路径用它补齐事实；批量路径已经在快照里持有这些单元，直接传引用，
+/// 不再为每个条目重查一次 `unit_state`。
+pub(super) fn row_units(
     store: &Store,
     user_id: UserId,
     row: &domain::LedgerRow,
     is_series: bool,
+) -> (Option<crate::store::PlaybackUnitSnapshot>, Option<crate::store::PlaybackUnitSnapshot>) {
+    let unit = {
+        let (season, episode) = row_unit_key(row);
+        store
+            .unit_state(user_id, row.media_id, season, episode)
+            .ok()
+            .flatten()
+            .map(|state| crate::store::PlaybackUnitSnapshot { media_id: row.media_id, season, episode, state })
+    };
+    let whole_unit = is_series
+        .then(|| {
+            store
+                .unit_state(user_id, row.media_id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)
+                .ok()
+                .flatten()
+                .map(|state| crate::store::PlaybackUnitSnapshot {
+                    media_id: row.media_id,
+                    season: crate::store::UNIT_WHOLE,
+                    episode: crate::store::UNIT_WHOLE,
+                    state,
+                })
+        })
+        .flatten();
+    (unit, whole_unit)
+}
+
+/// 台账行对应的单元键：有季/集用该集，否则用整片 `(-1,-1)`。
+fn row_unit_key(row: &domain::LedgerRow) -> (i32, i32) {
+    let season = row.season.map(|value| value as i32).unwrap_or(crate::store::UNIT_WHOLE);
+    let episode = row.episode.map(|value| value as i32).unwrap_or(crate::store::UNIT_WHOLE);
+    (season, episode)
+}
+
+/// Load one item's DB facts while the shared snapshot's Store guard is held.
+pub(super) fn item_db_facts(
+    store: &Store,
+    row: &domain::LedgerRow,
+    is_series: bool,
+    unit: Option<&crate::store::PlaybackUnitSnapshot>,
+    whole_unit: Option<&crate::store::PlaybackUnitSnapshot>,
 ) -> ItemDbFacts {
-    let resume_state = row.season.zip(row.episode).and_then(|(season, episode)| {
-        store.unit_state(user_id, row.media_id, season as i32, episode as i32).ok().flatten()
-    });
+    let resume_state = row
+        .season
+        .zip(row.episode)
+        .and_then(|_| unit.map(|unit| unit.state.clone()));
     let tracks = store.get_file_meta(&row.id.to_string()).ok().flatten().unwrap_or_default();
-    let favorite_row = if is_series {
-        domain::LedgerRow { season: None, episode: None, ..row.clone() }
-    } else { row.clone() };
-    ItemDbFacts { resume_state, tracks, is_favorite: item_is_favorite(store, user_id, &favorite_row) }
+    let favorite = if is_series { whole_unit } else { unit };
+    ItemDbFacts { resume_state, tracks, is_favorite: favorite.is_some_and(|unit| unit.state.favorite) }
 }
 
 /// 锁外渲染：NFO/stat/外部字幕 IO 都在这里，调用方必须先释放 Store 锁。

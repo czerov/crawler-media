@@ -208,8 +208,6 @@ impl Drop for InflightFinish {
 
 pub struct ProjectionService {
     dirty_libraries: Arc<Mutex<HashMap<String, u64>>>,
-    /// Per-source completeness from the most recent poll.
-    sources_complete: std::sync::Arc<Mutex<bool>>,
     /// 至少被浏览过一次的 Library；周期刷新只覆盖这些库。
     visited: Mutex<HashSet<String>>,
     inflight: Arc<Mutex<InflightMap>>,
@@ -238,7 +236,6 @@ impl ProjectionService {
         let consumer = Arc::new(ChangeConsumer::new(deps.clone()));
         Self {
             dirty_libraries: Arc::new(Mutex::new(HashMap::new())),
-            sources_complete: std::sync::Arc::new(Mutex::new(true)),
             visited: Mutex::new(HashSet::new()),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             build_budget: Arc::new(BlockingBudget::new(PROJECTION_BUILD_CAPACITY)),
@@ -545,7 +542,7 @@ impl ProjectionService {
 
     /// Poll all three sources for changes sharing ONE per-round event budget (D3-03).
     pub fn poll_changes(&self, state: &ApiState) -> Result<bool, ProjectionError> {
-        poll_changes_inner(&self.consumer, state, &self.sources_complete)
+        poll_changes_inner(&self.consumer, state)
     }
 
     /// 新鲜度检查的 DB 读也在 blocking 预算里执行，不在 async worker 上持 Store 锁。
@@ -559,17 +556,12 @@ impl ProjectionService {
         let budget = state.http_work.clone();
         let consumer = self.consumer.clone();
         let state_for_poll = state.clone();
-        let sources_complete_for_poll = self.sources_complete.clone();
         let sources_complete = budget
             .run(
                 crate::http::library::selection::BROWSE_DEADLINE,
                 move || {
                     for _ in 0..FRESHNESS_JOURNAL_ROUNDS {
-                        if poll_changes_inner(
-                            &consumer,
-                            &state_for_poll,
-                            &sources_complete_for_poll,
-                        )? {
+                        if poll_changes_inner(&consumer, &state_for_poll)? {
                             return Ok::<bool, ProjectionError>(true);
                         }
                     }
@@ -638,7 +630,6 @@ fn fresh_snapshot_inner(
 fn poll_changes_inner(
     consumer: &ChangeConsumer,
     state: &ApiState,
-    sources_complete: &Mutex<bool>,
 ) -> Result<bool, ProjectionError> {
     let store = state.store.lock();
     consumer
@@ -659,7 +650,6 @@ fn poll_changes_inner(
             .map_err(|error| ProjectionError::Failed(error.to_string()))?;
         all_complete &= complete;
     }
-    *sources_complete.lock() = all_complete;
     Ok(all_complete)
 }
 
