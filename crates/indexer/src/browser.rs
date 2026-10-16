@@ -117,6 +117,7 @@ impl BrowserConfig {
 #[derive(Clone)]
 pub struct Browser {
     config: BrowserConfig,
+    managed_endpoint: Arc<parking_lot::RwLock<Option<String>>>,
     provider: Option<ConfigProvider>,
     opener: Option<Opener>,
     slots: Arc<BrowserSlots>,
@@ -132,6 +133,7 @@ impl Browser {
         let max_sessions = 3;
         Self {
             config,
+            managed_endpoint: Arc::new(parking_lot::RwLock::new(None)),
             provider: None,
             opener: None,
             slots: BrowserSlots::new(max_sessions),
@@ -200,12 +202,23 @@ impl Browser {
         Ok(())
     }
 
-    pub fn cdp_enabled(&self) -> Result<bool, IndexerError> {
-        let config = match &self.provider {
+    pub fn set_managed_endpoint(&self, endpoint: Option<String>) {
+        *self.managed_endpoint.write() = endpoint;
+    }
+
+    pub fn effective_config(&self) -> Result<BrowserConfig, IndexerError> {
+        let mut config = match &self.provider {
             Some(provider) => provider()?,
             None => self.config.clone(),
         };
-        Ok(config.enabled)
+        if config.managed_endpoint.is_none() {
+            config.managed_endpoint = self.managed_endpoint.read().clone();
+        }
+        Ok(config)
+    }
+
+    pub fn cdp_enabled(&self) -> Result<bool, IndexerError> {
+        self.effective_config().map(|c| c.enabled)
     }
 
     pub fn config(&self) -> &BrowserConfig {
@@ -217,10 +230,7 @@ impl Browser {
         cdp_url: Option<&str>,
         deadline: Instant,
     ) -> Result<Arc<dyn PageSession>, IndexerError> {
-        let config = match &self.provider {
-            Some(provider) => provider()?,
-            None => self.config.clone(),
-        };
+        let config = self.effective_config()?;
         let (endpoint, route) = match config.resolve(cdp_url)? {
             Some((ep, r)) => (ep, r),
             None => return Err(IndexerError::BrowserSetup("CDP disabled".into())),

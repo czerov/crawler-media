@@ -105,18 +105,23 @@ pub fn reconcile_obscura(state: &ApiState) {
                 Ok(()) => {
                     tracing::info!("Managed Obscura started successfully in reconcile");
                     state.obscura.set_not_started_reason(None);
+                    state.browser.set_managed_endpoint(state.obscura.cdp_url());
                 }
                 Err(err) => {
                     tracing::warn!(%err, "Managed Obscura failed to start in reconcile");
                     state.obscura.set_last_error(Some(err));
+                    state.browser.set_managed_endpoint(None);
                 }
             }
+        } else {
+            state.browser.set_managed_endpoint(state.obscura.cdp_url());
         }
     } else {
         if state.obscura.owns_live_daemon() {
             tracing::info!("Reconciling Obscura: stopping managed daemon");
             state.obscura.stop();
         }
+        state.browser.set_managed_endpoint(None);
         if !cdp_enabled {
             state.obscura.set_not_started_reason(Some("cdp_disabled"));
         } else {

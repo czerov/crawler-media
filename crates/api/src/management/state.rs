@@ -67,6 +67,7 @@ pub struct ApiState {
     pub(crate) media_posters: Arc<dyn crate::media_posters::MediaPosterSource>,
     pub log_buffer: LogBuffer,
     pub obscura: Arc<crate::obscura_manager::ObscuraManager>,
+    pub browser: Arc<indexer::Browser>,
     /// 异步媒体探测队列（streamdetails + 声纹指纹后台采集）。
     pub probe: Arc<crate::probe_manager::ProbeManager>,
     /// 测试 seam：gallery 实际展开图片 JSON 的组数（生产只读计数，无副作用）。
@@ -255,10 +256,16 @@ impl ApiState {
             )),
             log_buffer: LogBuffer::new(DEFAULT_CAPACITY),
             obscura: Arc::new(crate::obscura_manager::ObscuraManager::new(&data_dir)),
+            browser: crate::runtime_browser::production_browser(store.clone(), false)
+                .map(Arc::new)
+                .unwrap_or_else(|_| {
+                    Arc::new(indexer::Browser::new(indexer::BrowserConfig::disabled()))
+                }),
             probe,
             gallery_expansions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if tokio::runtime::Handle::try_current().is_ok() {
+            crate::http::browser_settings::reconcile_obscura(&state);
             crate::library_lifecycle::resume_library_removals(&state)
                 .map_err(std::io::Error::other)?;
             state.probe.try_start_workers();
@@ -308,6 +315,11 @@ impl ApiState {
     /// 替换 blocking 预算（测试注入小并发以观察准入/超时行为）。
     pub fn with_http_work(mut self, budget: Arc<crate::blocking_budget::BlockingBudget>) -> Self {
         self.http_work = budget;
+        self
+    }
+
+    pub fn with_browser(mut self, browser: Arc<indexer::Browser>) -> Self {
+        self.browser = browser;
         self
     }
 

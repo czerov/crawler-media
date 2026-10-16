@@ -72,11 +72,6 @@ impl BrowserSettings {
     }
 
     fn apply(&mut self, body: &Value) -> Result<(), BrowserSettingsError> {
-        if body["managed"]["enabled"] == true || body["managed_enabled"] == true {
-            return Err(BrowserSettingsError::Invalid(
-                "managed Chromium is unsupported; use external CDP".into(),
-            ));
-        }
         apply_route(body.get("cdp"), &mut self.cdp_enabled, &mut self.cdp_url)?;
         if let Some(obs) = body.get("obscura") {
             if let Some(install) = obs.get("install").and_then(Value::as_str) {

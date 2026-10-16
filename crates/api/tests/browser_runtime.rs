@@ -148,16 +148,25 @@ async fn browser_settings_reject_invalid_cdp_endpoint() {
 }
 
 #[tokio::test]
-async fn browser_settings_reject_websocket_discovery_and_managed_capability() {
+async fn browser_settings_reject_websocket_discovery_and_accepts_managed_key() {
     let tmp = tempfile::tempdir().unwrap();
     let app = router(state(tmp.path()));
-    for payload in [
-        json!({"cdp":{"enabled":true,"url":"ws://fixture.invalid:9222"}}),
-        json!({"managed":{"enabled":true}}),
-    ] {
-        let response = app.clone().oneshot(request("PUT", payload)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            json!({"cdp":{"enabled":true,"url":"ws://fixture.invalid:9222"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Old clients sending {"managed":{"enabled":true}} are accepted rather than rejected
+    let response = app
+        .oneshot(request("PUT", json!({"managed":{"enabled":true}})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
