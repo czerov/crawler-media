@@ -96,26 +96,35 @@ impl<'a> LoginPlugin<'a> {
         require_cookie(&site)?;
         // No credentials can be submitted: verify the supplied session, not an empty login form.
         let url = format!("{}index.php", site_base(&site));
-        let response = match self.via {
+        let (body, cookie_update) = match self.via {
             LoginVia::Http(http) => {
-                http.get(&url, site.cookie.as_deref(), site.proxy.as_deref())?
+                let response = http.get(&url, site.cookie.as_deref(), site.proxy.as_deref())?;
+                let body = response_body(&response).to_string();
+                let cookie = cookies_from_response(&response);
+                (body, cookie)
             }
-            LoginVia::Browser(browser) => browser_page(browser, &site, &url)?,
+            LoginVia::Browser(browser) => {
+                let page = browser_render(browser, &site, &url)?;
+                (page.html, page.cookie_header)
+            }
         };
-        let body = response_body(&response);
-        reject_challenge(body)?;
-        self.policy.authenticated(&site, body)?;
-        if let Some(cookie) = cookies_from_response(&response) {
-            site.cookie = Some(merge_cookie_string(site.cookie.as_deref(), &cookie));
+        reject_challenge(&body)?;
+        self.policy.authenticated(&site, &body)?;
+        if let Some(cookie) = cookie_update.as_deref() {
+            site.cookie = Some(merge_cookie_string(site.cookie.as_deref(), cookie));
             self.store.save(&site)?;
         }
         Ok(())
     }
 }
 
-fn browser_page(browser: &Browser, site: &Site, url: &str) -> Result<String, PluginError> {
+fn browser_render(
+    browser: &Browser,
+    site: &Site,
+    url: &str,
+) -> Result<indexer::RenderedPage, PluginError> {
     let request = indexer::FetchRequest {
-        key: format!("login:{}", site.id),
+        key: format!("maintenance:{}", site.id),
         url: url.to_string(),
         method: indexer::FetchMethod::Get,
         body: None,
@@ -124,9 +133,8 @@ fn browser_page(browser: &Browser, site: &Site, url: &str) -> Result<String, Plu
         proxy: site.proxy.clone(),
         cdp_url: site.cdp_url.clone(),
     };
-    // Fetching HTML does not expose Browser cookies; never synthesize a session credential.
     browser
-        .fetch_html(&request)
+        .render(&request)
         .map_err(|err| PluginError::Fetch(err.to_string()))
 }
 
@@ -195,10 +203,15 @@ fn merge_cookie_string(old_cookie: Option<&str>, new_cookie: &str) -> String {
         .join("; ")
 }
 
+enum CheckInVia<'a> {
+    Http(&'a dyn HttpPost),
+    Browser(&'a Browser),
+}
+
 pub struct CheckInPlugin<'a> {
     bus: &'a Bus,
     store: &'a dyn SiteCredentials,
-    http: Option<&'a dyn HttpPost>,
+    via: Option<CheckInVia<'a>>,
     policy: &'a dyn SiteResponsePolicy,
 }
 
@@ -207,7 +220,7 @@ impl<'a> CheckInPlugin<'a> {
         Self {
             bus,
             store,
-            http: None,
+            via: None,
             policy: &DEFAULT_POLICY,
         }
     }
@@ -216,7 +229,16 @@ impl<'a> CheckInPlugin<'a> {
         Self {
             bus,
             store,
-            http: Some(http),
+            via: Some(CheckInVia::Http(http)),
+            policy: &DEFAULT_POLICY,
+        }
+    }
+
+    pub fn browser(bus: &'a Bus, store: &'a dyn SiteCredentials, browser: &'a Browser) -> Self {
+        Self {
+            bus,
+            store,
+            via: Some(CheckInVia::Browser(browser)),
             policy: &DEFAULT_POLICY,
         }
     }
@@ -241,18 +263,28 @@ impl<'a> CheckInPlugin<'a> {
         self.bus.emit(&HookEvent {
             step: Step::CheckIn,
         })?;
-        let http = self.http.ok_or_else(|| {
-            PluginError::Fetch("Check-in 不支持仅分发 Hook；请配置 HTTP transport".into())
+        let via = self.via.as_ref().ok_or_else(|| {
+            PluginError::Fetch("Check-in 不支持仅分发 Hook；请配置 transport".into())
         })?;
         require_cookie(&site)?;
         let url = format!("{}attendance.php", site_base(&site));
-        let response = http.post(&url, "", site.cookie.as_deref(), site.proxy.as_deref())?;
-        let body = response_body(&response);
-        reject_challenge(body)?;
-        let outcome = self.policy.check_in(&site, body)?;
+        let (body, cookie_update) = match via {
+            CheckInVia::Http(http) => {
+                let response = http.post(&url, "", site.cookie.as_deref(), site.proxy.as_deref())?;
+                let body = response_body(&response).to_string();
+                let cookie = cookies_from_response(&response);
+                (body, cookie)
+            }
+            CheckInVia::Browser(browser) => {
+                let page = browser_render(browser, &site, &url)?;
+                (page.html, page.cookie_header)
+            }
+        };
+        reject_challenge(&body)?;
+        let outcome = self.policy.check_in(&site, &body)?;
         tracing::debug!(site_id = %id, ?outcome, "Site attendance business outcome verified");
-        if let Some(cookie) = cookies_from_response(&response) {
-            site.cookie = Some(merge_cookie_string(site.cookie.as_deref(), &cookie));
+        if let Some(cookie) = cookie_update.as_deref() {
+            site.cookie = Some(merge_cookie_string(site.cookie.as_deref(), cookie));
             self.store.save(&site)?;
         }
         Ok(())
