@@ -84,7 +84,7 @@ impl Downloader for DynamicDownloader {
         &self,
         torrent: &Torrent,
         keep: &dyn Fn(&str) -> bool,
-    ) -> Result<usize, DownloaderError> {
+    ) -> Result<Option<usize>, DownloaderError> {
         delegate!(self, select_files(torrent, keep))
     }
 

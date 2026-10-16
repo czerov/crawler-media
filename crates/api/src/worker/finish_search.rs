@@ -197,11 +197,19 @@ fn admit_candidates(
         tracing::error!(subscribe_id = %subscribe.id, media = %media.title, error = %e, "收录并添加种子失败");
         e.to_string()
     })?;
-    if let Some(before) = &selective {
-        crate::selective_files::apply(&routed, subscribe, &added.chosen, before);
-    }
+    let deferred = selective
+        .as_ref()
+        .map(|before| crate::selective_files::apply(&routed, subscribe, &added.chosen, before))
+        .unwrap_or_default();
     notify_search_additions(state, subscribe, media, &added);
     merge_added_pending(state, subscribe, &added, &routed)?;
+    for (enclosure, missing) in &deferred {
+        state
+            .store
+            .lock()
+            .set_pending_selective(subscribe.id, enclosure, Some(missing))
+            .map_err(|error| error.to_string())?;
+    }
     record_wanted_round(state, subscribe, &added)?;
     notify_subscription_complete(state, subscribe, media)?;
     Ok(added.add_errors)

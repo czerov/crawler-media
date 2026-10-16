@@ -321,9 +321,9 @@ impl Downloader for TransmissionDownloader {
         &self,
         torrent: &Torrent,
         keep: &dyn Fn(&str) -> bool,
-    ) -> Result<usize, DownloaderError> {
+    ) -> Result<Option<usize>, DownloaderError> {
         let Some(hash) = self.owned_identity(torrent)? else {
-            return Ok(0);
+            return Ok(None);
         };
         let arguments = self.rpc(
             "torrent-get",
@@ -340,11 +340,16 @@ impl Downloader for TransmissionDownloader {
                 })
             })
         else {
-            return Ok(0);
+            return Ok(None);
         };
-        let skipped: Vec<usize> = item
+        let Some(listed) = item
             .get("files")
             .and_then(Value::as_array)
+            .filter(|files| !files.is_empty())
+        else {
+            return Ok(None); // metadata not received yet
+        };
+        let skipped: Vec<usize> = Some(listed)
             .map(|files| {
                 files
                     .iter()
@@ -357,7 +362,7 @@ impl Downloader for TransmissionDownloader {
             })
             .unwrap_or_default();
         if skipped.is_empty() {
-            return Ok(0);
+            return Ok(Some(0));
         }
         let id = item.get("id").cloned().unwrap_or(Value::Null);
         tracing::info!(hash = %hash, count = skipped.len(), "Transmission 跳过不需要的文件");
@@ -365,7 +370,7 @@ impl Downloader for TransmissionDownloader {
             "torrent-set",
             json!({ "ids": [id], "files-unwanted": skipped }),
         )?;
-        Ok(skipped.len())
+        Ok(Some(skipped.len()))
     }
 
     fn endpoint(&self) -> Option<String> {

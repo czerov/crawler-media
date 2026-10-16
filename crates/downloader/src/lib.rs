@@ -96,14 +96,15 @@ pub trait Downloader: Send + Sync {
     }
 
     /// F-1: mark files for which `keep(name)` is false as not-to-download.
-    /// Returns how many files were skipped (0 when the file list is not known
-    /// yet or the client cannot select files).
+    /// Returns how many files were skipped, or `None` when the task or its
+    /// file list (magnet metadata) is not known yet, or the client cannot
+    /// select files.
     fn select_files(
         &self,
         _torrent: &Torrent,
         _keep: &dyn Fn(&str) -> bool,
-    ) -> Result<usize, DownloaderError> {
-        Ok(0)
+    ) -> Result<Option<usize>, DownloaderError> {
+        Ok(None)
     }
 
     /// Canonical actual task identity, not a title-derived snapshot match.

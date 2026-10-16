@@ -303,19 +303,22 @@ impl Downloader for QbitDownloader {
         &self,
         torrent: &Torrent,
         keep: &dyn Fn(&str) -> bool,
-    ) -> Result<usize, DownloaderError> {
+    ) -> Result<Option<usize>, DownloaderError> {
         let Some(hash) = self.exact_existing_hash(torrent)? else {
-            return Ok(0);
+            return Ok(None);
         };
-        let skipped: Vec<String> = self
-            .torrent_files(&hash)?
+        let files = self.torrent_files(&hash)?;
+        if files.is_empty() {
+            return Ok(None); // metadata not received yet
+        }
+        let skipped: Vec<String> = files
             .into_iter()
             .enumerate()
             .filter(|(_, file)| !keep(&file.name))
             .map(|(i, file)| file.index.unwrap_or(i).to_string())
             .collect();
         if skipped.is_empty() {
-            return Ok(0);
+            return Ok(Some(0));
         }
         tracing::info!(hash = %hash, count = skipped.len(), "qBittorrent 跳过不需要的文件");
         let url = join(&self.config.url, "/api/v2/torrents/filePrio");
@@ -325,7 +328,7 @@ impl Downloader for QbitDownloader {
             form_enc(&skipped.join("|"))
         );
         let _ = self.post_form(&url, &body)?;
-        Ok(skipped.len())
+        Ok(Some(skipped.len()))
     }
 
     fn delete_task(&self, info_hash: &str, delete_files: bool) -> Result<(), DownloaderError> {

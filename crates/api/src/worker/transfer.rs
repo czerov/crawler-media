@@ -270,6 +270,7 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
     // H3: release rows whose task provably vanished from the client, so a
     // slot never stays blocked just because nobody opened the task center.
     let pending = crate::pending_reconcile::reconcile_subscribe(state, subscribe.id, pending);
+    crate::selective_files::retry_deferred(state, subscribe.id, &pending);
 
     if pending.is_empty() {
         return Ok(());

@@ -165,3 +165,28 @@ async fn transmission_pack_downloads_only_missing_episodes() {
 async fn transmission_selective_off_keeps_whole_pack() {
     assert!(transmission_run(false).await.is_empty());
 }
+
+/// F-1 follow-up: a magnet/HTTP task whose file list is not known at submit
+/// time is filtered later by the Transfer-time reconcile, exactly once.
+#[tokio::test]
+async fn qbit_filters_files_once_metadata_arrives() {
+    let h = Harness::new();
+    enable(&h, true);
+    h.create_site().await;
+    let id = tv_subscribe(&h, window(), json!({})).await;
+    let video = probed_video(1080, "h264", false);
+    h.set_search_rows(&[(E01, 1)]);
+    h.scheduled_search(id).await.unwrap();
+    h.qb.complete(0, E01, &[(&format!("{E01}.mkv"), &video)]);
+    h.transfer(id).await.unwrap();
+
+    h.set_search_rows(&[(PACK, 2)]);
+    h.scheduled_search(id).await.unwrap(); // no metadata yet
+    assert!(h.qb.file_prios.lock().is_empty());
+    h.qb.tasks.lock()[1].files = pack_files().into_iter().map(|f| (f, 0.0)).collect();
+    h.transfer(id).await.unwrap();
+    h.transfer(id).await.unwrap();
+    let prios = h.qb.file_prios.lock().clone();
+    assert_eq!(prios.len(), 1, "filtered once after metadata: {prios:?}");
+    assert!(prios[0].contains("id=0&"), "{}", prios[0]);
+}

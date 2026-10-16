@@ -279,7 +279,7 @@ impl Downloader for RoutedDownloader<'_> {
         &self,
         torrent: &Torrent,
         keep: &dyn Fn(&str) -> bool,
-    ) -> Result<usize, DownloaderError> {
+    ) -> Result<Option<usize>, DownloaderError> {
         self.client_for(torrent)?.select_files(torrent, keep)
     }
 

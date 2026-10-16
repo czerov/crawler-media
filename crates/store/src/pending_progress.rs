@@ -78,4 +78,34 @@ impl Store {
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    /// F-1: episodes (`"s:e,s:e"`) still to keep once the file list is known;
+    /// `None` clears the deferred selection.
+    pub fn set_pending_selective(
+        &self,
+        subscribe_id: SubscribeId,
+        enclosure: &str,
+        missing: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.subscribe.execute(
+            "UPDATE pending_downloads SET selective_missing = ?3 WHERE subscribe_id = ?1 AND enclosure = ?2",
+            params![subscribe_id.to_string(), enclosure, missing],
+        )?;
+        Ok(())
+    }
+
+    /// F-1: enclosure → deferred missing episodes for active pending rows.
+    pub fn load_pending_selective(
+        &self,
+        subscribe_id: SubscribeId,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        let mut stmt = self.subscribe.prepare(
+            "SELECT enclosure, selective_missing FROM pending_downloads
+             WHERE subscribe_id = ?1 AND state = 'active' AND selective_missing IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([subscribe_id.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
