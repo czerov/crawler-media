@@ -2,6 +2,8 @@
 //! resume/marks, and item/episode info. Live activity, history/stats and
 //! up-next/favorites live in sibling modules; the Jellyfin-compatible routes
 //! stay in `crates/api/src/jellyfin.rs`.
+//! Item artwork is observed from an owned visibility snapshot outside Store,
+//! under the shared HTTP blocking budget so slow filesystems cannot hold it.
 
 use axum::Json;
 use axum::extract::State;
@@ -152,22 +154,42 @@ pub(crate) async fn item(
     axum::Extension(user_id): axum::Extension<Option<domain::UserId>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let store = state.store.lock();
-    let Some(media_id) = resolve_media_id(&id) else {
-        return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
+    let (media, library_id, preferred_row) = {
+        let store = state.store.lock();
+        let Some(media_id) = resolve_media_id(&id) else {
+            return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
+        };
+        let Some(media) = store.get_media(media_id).ok().flatten() else {
+            return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
+        };
+        let all_rows = store.list_ledger().unwrap_or_default();
+        let rows = visible_rows_for_media(&store, &media, &all_rows, user_id);
+        if rows.is_empty() {
+            return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
+        }
+        let library_id = library_id_for(&store, &media, &rows).unwrap_or_default();
+        let preferred_row = crate::http::library::preferred_row(&rows).cloned();
+        (media, library_id, preferred_row)
     };
-    let Some(media) = store.get_media(media_id).ok().flatten() else {
-        return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
+    let files = state.browse_files.clone();
+    let poster_url = match state
+        .http_work
+        .run(std::time::Duration::from_secs(30), move || {
+            preferred_row
+                .as_ref()
+                .filter(|row| {
+                    crate::http::library::poster_path_with(row, files.as_ref()).is_some()
+                })
+                .map(|row| crate::http::library::artwork_url("posters", row.id))
+        })
+        .await
+    {
+        Ok(url) => url,
+        Err(error) => {
+            tracing::error!(%error, media_id = %media.id, "读取播放条目海报失败");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "playback.timeout", "加载条目超时");
+        }
     };
-    let all_rows = store.list_ledger().unwrap_or_default();
-    let rows = visible_rows_for_media(&store, &media, &all_rows, user_id);
-    if rows.is_empty() {
-        return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
-    }
-    let library_id = library_id_for(&store, &media, &rows).unwrap_or_default();
-    let poster_url = crate::http::library::preferred_row(&rows)
-        .and_then(|row| crate::http::library::poster_path(row).map(|_| row))
-        .map(|row| crate::http::library::artwork_url("posters", row.id));
     ok(json!({
         "media_item_id": media.id.to_string(),
         "library_id": library_id,

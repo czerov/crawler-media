@@ -192,3 +192,131 @@ async fn reconciliation_bounds_budget_and_depth() {
     assert_eq!(idx_full.incomplete, false);
     assert!(!idx_full.candidates.contains_key(std::ffi::OsStr::new("deep_file.mp4")));
 }
+
+#[tokio::test]
+async fn housekeeping_uses_bounded_blocking_admission() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = make_state(tmp.path());
+    let (library_id, root) = seed_reconciliation_tree(&state, tmp.path());
+    let budget = Arc::new(api::blocking_budget::BlockingBudget::new(1));
+    state = state.with_http_work(budget.clone());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let occupied = tokio::spawn(async move {
+        budget.run_to_completion(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }).await.unwrap();
+    });
+    entered_rx.await.unwrap();
+    let app = router(state.clone());
+    let mut statuses = Vec::new();
+    for (method, endpoint, body) in [
+        ("POST", "path-reconciliations", serde_json::json!({"reconciliations": [{
+            "from": root.join("OldDir/test_movie1.mkv"),
+            "to": root.join("NewDir/test_movie1.mkv"),
+        }]})),
+        ("GET", "root-consolidation-preview", Value::Null),
+    ] {
+        let response = app.clone().oneshot(Request::builder()
+            .method(method)
+            .uri(format!("/api/v1/libraries/{library_id}/{endpoint}"))
+            .header("Authorization", "Bearer management-secret")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        statuses.push((endpoint, response.status()));
+    }
+    release_tx.send(()).unwrap();
+    occupied.await.unwrap();
+    for (endpoint, status) in statuses {
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT,
+            "{endpoint} must enter the same bounded work budget as reconciliation preview");
+    }
+    assert!(state.store().lock().ledger_by_path(
+        root.join("OldDir/test_movie1.mkv").to_str().unwrap()).unwrap().is_some(),
+        "rejected work must not mutate the ledger");
+}
+
+struct ReconciliationFileRead {
+    store: Arc<parking_lot::Mutex<Store>>,
+    library_id: String,
+    change: &'static str,
+    entered: std::sync::atomic::AtomicBool,
+    unlocked: std::sync::atomic::AtomicBool,
+}
+
+impl api::browse_file_read::BrowseFileRead for ReconciliationFileRead {
+    fn read_nfo(&self, path: &std::path::Path) -> Option<library::NfoMeta> {
+        library::read_nfo(path)
+    }
+
+    fn metadata(&self, path: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
+        std::fs::metadata(path)
+    }
+
+    fn is_file(&self, path: &std::path::Path) -> bool {
+        use std::sync::atomic::Ordering;
+        self.entered.store(true, Ordering::SeqCst);
+        if let Some(store) = self.store.try_lock() {
+            self.unlocked.store(true, Ordering::SeqCst);
+            let library = store.get_library(&self.library_id).unwrap().unwrap();
+            match self.change {
+                "roots" => {
+                    let root = library.root_paths[0].to_str().unwrap();
+                    let added = library.root_paths[0].join("added-root");
+                    store.update_library(&self.library_id, None,
+                        Some(&[root, added.to_str().unwrap()]), None).unwrap();
+                    assert_eq!(store.get_library(&self.library_id).unwrap().unwrap().root_paths.len(), 2);
+                }
+                "freeze" => { store.begin_library_removal(&self.library_id).unwrap(); }
+                "source" => {
+                    let from = library.root_paths[0].join("OldDir/test_movie1.mkv");
+                    let mut row = store.ledger_by_path(from.to_str().unwrap()).unwrap().unwrap();
+                    store.delete_ledger_path(&row.path).unwrap();
+                    row.id = LedgerId::new();
+                    store.insert_ledger(&row).unwrap();
+                }
+                "unchanged" => {}
+                _ => panic!("unexpected fixture change"),
+            }
+        }
+        path.is_file()
+    }
+}
+
+#[tokio::test]
+async fn reconciliation_revalidates_off_lock_scope_freeze_and_source() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for change in ["unchanged", "roots", "freeze", "source"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_state(tmp.path());
+        let (library_id, root) = seed_reconciliation_tree(&state, tmp.path());
+        let files = Arc::new(ReconciliationFileRead {
+            store: state.store(), library_id: library_id.clone(), change,
+            entered: AtomicBool::new(false), unlocked: AtomicBool::new(false),
+        });
+        let state = state.with_browse_file_read(files.clone());
+        let from = root.join("OldDir/test_movie1.mkv");
+        let to = root.join("NewDir/test_movie1.mkv");
+        let response = router(state.clone()).oneshot(Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/libraries/{library_id}/path-reconciliations"))
+            .header("Authorization", "Bearer management-secret")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::json!({"reconciliations": [{
+                "from": from, "to": to,
+            }]}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{change}");
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(files.entered.load(Ordering::SeqCst), "real FS seam: {change}");
+        assert!(files.unlocked.load(Ordering::SeqCst), "FS must not hold Store: {change}");
+        let applied = change == "unchanged";
+        assert_eq!(body["data"]["reconciled"], usize::from(applied), "{change}: {body}");
+        assert_eq!(body["data"]["errors"].as_array().unwrap().len(), usize::from(!applied));
+        let store = state.store();
+        let store = store.lock();
+        assert_eq!(store.ledger_by_path(from.to_str().unwrap()).unwrap().is_some(), !applied);
+        assert_eq!(store.ledger_by_path(to.to_str().unwrap()).unwrap().is_some(), applied);
+    }
+}

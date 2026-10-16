@@ -1,12 +1,14 @@
 //! 路径核对 + 根目录归并：文件被外部移动后重新关联台账；多根指向同一物理
 //! 目录时归并。两者都是「预览 → 应用」两步。
+//! FS observations use the HTTP blocking budget after an owned DB snapshot;
+//! reconciliation revalidates strict scope, freeze state and source before writes.
 
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
-use std::path::{Path as FsPath, PathBuf};
+use std::path::Path as FsPath;
 
 use crate::http::{err, ok};
 use crate::management::ApiState;
@@ -14,16 +16,17 @@ use crate::management::ApiState;
 use super::library::missing_library;
 use crate::library_reconciliation::index_basenames;
 
+const HOUSEKEEPING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn canonical(path: &FsPath) -> Option<PathBuf> {
-    fs_canonicalize(path).ok()
+struct Reconciliation {
+    from: String,
+    to: String,
+    source: Option<(domain::LedgerRow, Option<domain::MediaKind>)>,
 }
 
-// 独立函数便于测试与 future 注入。
-fn fs_canonicalize(path: &FsPath) -> std::io::Result<PathBuf> {
-    std::fs::canonicalize(path)
+fn reconciliation_error() -> Response {
+    err(StatusCode::REQUEST_TIMEOUT, "reconciliation.timeout", "目录索引超时")
 }
-
 
 /// POST /libraries/{id}/path-reconciliation-preview — 台账失联行 + 库内新候选。
 pub(crate) async fn path_reconciliation_preview(
@@ -96,71 +99,158 @@ pub(crate) async fn path_reconciliations(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let store = state.store.lock();
-    let Some(library) = store.get_library(&id).ok().flatten() else {
-        return crate::http::library::missing_library();
+    let (library, ownership, rows) = {
+        let store = state.store.lock();
+        let Some(library) = store.get_library(&id).ok().flatten() else {
+            return missing_library();
+        };
+        let ownership = match store.library_ownership() {
+            Ok(ownership) => ownership,
+            Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &error.to_string()),
+        };
+        let rows = match reconciliation_rows(&store, &body) {
+            Ok(rows) => rows,
+            Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &error.to_string()),
+        };
+        (library, ownership, rows)
+    };
+    let files = state.browse_files.clone();
+    let work = state.http_work.run(HOUSEKEEPING_DEADLINE, move || {
+        observe_reconciliations(&library, ownership, rows, files.as_ref())
+    }).await;
+    let (scope, rows) = match work {
+        Ok(observed) => observed,
+        Err(error) => {
+            tracing::warn!(%error, "Reconciliation observation failed");
+            return reconciliation_error();
+        }
     };
     let mut reconciled = 0usize;
     let mut errors = Vec::new();
-    if let Some(rows) = body["reconciliations"].as_array() {
-        for row in rows {
+    let store = state.store.lock();
+    let Some(current_library) = store.get_library(&id).ok().flatten() else {
+        return missing_library();
+    };
+    let current = match store.library_ownership() {
+        Ok(current) => current,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &error.to_string()),
+    };
+    let valid = scope.as_ref().is_some_and(|scope| {
+        scope.matches(&current) && scope.accepts_work(&id) && current.accepts_work(&id)
+    });
+    for row in rows {
+        let row = match row {
+            Ok(row) => row,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        if !valid {
+            tracing::warn!(library_id = %id, "Reconciliation scope changed or frozen");
+            errors.push(format!("{} 不属于当前媒体库范围", row.to));
+            continue;
+        }
+        match apply_reconciliation(&store, &current_library, &row) {
+            Ok(()) => reconciled += 1,
+            Err(error) => errors.push(error),
+        }
+    }
+    tracing::debug!(library_id = %id, reconciled, errors = errors.len(), "Reconciliation applied");
+    ok(json!({ "reconciled": reconciled, "errors": errors })).into_response()
+}
+
+fn reconciliation_rows(store: &store::Store, body: &Value) -> Result<Vec<Reconciliation>, store::StoreError> {
+    let mut rows = Vec::new();
+    if let Some(input) = body["reconciliations"].as_array() {
+        for row in input {
             let (Some(from), Some(to)) = (row["from"].as_str(), row["to"].as_str()) else {
                 continue;
             };
-            let to_path = FsPath::new(to);
-            let from_path = FsPath::new(from);
-            if from_path.exists() {
-                errors.push(format!("{from}: 原文件仍然存在，不能重关联"));
-                continue;
-            }
-            if !to_path.is_file() {
-                errors.push(format!("{to} 不是文件"));
-                continue;
-            }
-            // 目标路径与源路径必须都在当前媒体库严格边界范围内
-            let to_owner = store
-                .library_for_path_strict(to_path, library.kind)
-                .ok()
-                .flatten();
-            if to_owner.as_ref().map(|l| &l.id) != Some(&library.id) {
-                errors.push(format!("{to} 不属于当前媒体库范围"));
-                continue;
-            }
-            let Some(from_row) = store.ledger_by_path(from).ok().flatten() else {
-                errors.push(format!("{from} 不在台账中"));
-                continue;
-            };
-            let from_owner = store
-                .get_media(from_row.media_id)
-                .ok()
-                .flatten()
-                .and_then(|media| {
-                    store
-                        .library_for_path_strict(FsPath::new(&from_row.path), media.kind)
-                        .ok()
-                        .flatten()
-                });
-            if from_owner.as_ref().map(|l| &l.id) != Some(&library.id) {
-                errors.push(format!("{from} 不属于当前媒体库"));
-                continue;
-            }
-            if store.rename_ledger_path(from, to).unwrap_or(false) {
-                // facts 路径同步（洗版替换仍能找到旧位置）。
-                if let Some(ledger_row) = store
-                    .list_ledger()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|r| r.path == to)
-                {
-                    let _ = store.rewrite_fact_paths(ledger_row.media_id, from, to);
+            let source = match store.ledger_by_path(from)? {
+                Some(row) => {
+                    let kind = store.get_media(row.media_id)?.map(|media| media.kind);
+                    Some((row, kind))
                 }
-                reconciled += 1;
-            } else {
-                errors.push(format!("{from} -> {to} 台账重命名失败"));
-            }
+                None => None,
+            };
+            rows.push(Reconciliation { from: from.to_owned(), to: to.to_owned(), source });
         }
     }
-    ok(json!({ "reconciled": reconciled, "errors": errors })).into_response()
+    Ok(rows)
+}
+
+fn observe_reconciliations(
+    library: &store::Library,
+    ownership: store::LibraryOwnership,
+    rows: Vec<Reconciliation>,
+    files: &dyn crate::browse_file_read::BrowseFileRead,
+) -> (Option<store::LibraryPathScope>, Vec<Result<Reconciliation, String>>) {
+    let scope = match store::LibraryPathScope::resolve(ownership) {
+        Ok(scope) => Some(scope),
+        Err(error) => {
+            tracing::warn!(%error, "Reconciliation strict scope resolution failed");
+            None
+        }
+    };
+    let observed = rows.into_iter().map(|row| {
+        if FsPath::new(&row.from).exists() {
+            return Err(format!("{}: 原文件仍然存在，不能重关联", row.from));
+        }
+        if !files.is_file(FsPath::new(&row.to)) {
+            return Err(format!("{} 不是文件", row.to));
+        }
+        if !strictly_owned(scope.as_ref(), FsPath::new(&row.to), library.kind, &library.id) {
+            return Err(format!("{} 不属于当前媒体库范围", row.to));
+        }
+        let Some((source, kind)) = row.source.as_ref() else {
+            return Err(format!("{} 不在台账中", row.from));
+        };
+        if !kind.is_some_and(|kind| strictly_owned(scope.as_ref(), FsPath::new(&source.path), kind, &library.id)) {
+            return Err(format!("{} 不属于当前媒体库", row.from));
+        }
+        Ok(row)
+    }).collect();
+    (scope, observed)
+}
+
+fn strictly_owned(scope: Option<&store::LibraryPathScope>, path: &FsPath, kind: domain::MediaKind, id: &str) -> bool {
+    let Some(scope) = scope else { return false };
+    match store::LibraryPathScope::resolve_path(path) {
+        Ok(path) => matches!(scope.owner(&path, kind), store::StrictOwner::Owned(owner) if owner.id == id),
+        Err(error) => {
+            tracing::warn!(%error, "Reconciliation path resolution failed");
+            false
+        }
+    }
+}
+
+fn apply_reconciliation(store: &store::Store, library: &store::Library, row: &Reconciliation) -> Result<(), String> {
+    let failure = || format!("{} -> {} 台账重命名失败", row.from, row.to);
+    let Some((source, kind)) = row.source.as_ref() else { return Err(failure()) };
+    let current = store.ledger_by_path(&row.from).map_err(|error| {
+        tracing::warn!(%error, "Reconciliation source revalidation failed");
+        failure()
+    })?;
+    let media = store.get_media(source.media_id).map_err(|error| {
+        tracing::warn!(%error, "Reconciliation media revalidation failed");
+        failure()
+    })?;
+    if current.as_ref() != Some(source) || media.as_ref().map(|media| media.kind) != *kind {
+        return Err(failure());
+    }
+    match store.rename_ledger_path(&row.from, &row.to) {
+        Ok(true) => {
+            if let Err(error) = store.rewrite_fact_paths(source.media_id, &row.from, &row.to) {
+                tracing::error!(library_id = %library.id, %error, "Reconciliation fact path rewrite failed");
+            }
+            Ok(())
+        }
+        result => {
+            tracing::warn!(library_id = %library.id, ?result, "Reconciliation ledger rename failed");
+            Err(failure())
+        }
+    }
 }
 
 /// POST /libraries/{id}/root-consolidation-preview — 物理目录去重。
@@ -168,24 +258,36 @@ pub(crate) async fn root_consolidation_preview(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Response {
-    let store = state.store.lock();
-    let Some(library) = store.get_library(&id).ok().flatten() else {
-        return missing_library();
-    };
-    let mut seen: Vec<(String, String)> = Vec::new(); // (canonical, path)
-    let mut duplicates = Vec::new();
-    for root in &library.root_paths {
-        let Some(real) = canonical(&root) else {
-            continue;
+    let library = {
+        let store = state.store.lock();
+        let Some(library) = store.get_library(&id).ok().flatten() else {
+            return missing_library();
         };
-        let real = real.display().to_string();
-        if let Some((keep, _)) = seen.iter().find(|(c, _)| *c == real) {
-            duplicates.push(json!({ "keep": keep, "merge": root }));
-        } else {
-            seen.push((real, root.display().to_string()));
+        library
+    };
+    let result = state.http_work.run(HOUSEKEEPING_DEADLINE, move || {
+        let mut seen: Vec<(String, String)> = Vec::new(); // (canonical, path)
+        let mut duplicates = Vec::new();
+        for root in &library.root_paths {
+            let Ok(real) = std::fs::canonicalize(root) else {
+                continue;
+            };
+            let real = real.display().to_string();
+            if let Some((keep, _)) = seen.iter().find(|(c, _)| *c == real) {
+                duplicates.push(json!({ "keep": keep, "merge": root }));
+            } else {
+                seen.push((real, root.display().to_string()));
+            }
+        }
+        duplicates
+    }).await;
+    match result {
+        Ok(duplicates) => ok(json!({ "duplicates": duplicates })).into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "Root consolidation observation failed");
+            reconciliation_error()
         }
     }
-    ok(json!({ "duplicates": duplicates })).into_response()
 }
 
 /// POST /libraries/{id}/root-consolidations — 归并（删重复根，保留第一个）。

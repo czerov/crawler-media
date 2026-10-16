@@ -247,3 +247,58 @@ async fn slow_gallery_and_episodes_do_not_hold_store() {
         "gallery must include discovered poster"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn playback_item_observes_poster_without_holding_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Gate::new());
+    let gated_read = Arc::new(GatedFileRead { gate: gate.clone() });
+    let state = make_state(tmp.path(), gated_read);
+    let (_admin_user, library_id, media_id) = seed_movie(&state, tmp.path());
+    let ledger_id = state.store().lock().list_ledger().unwrap()[0].id;
+    let app = router(state.clone());
+    let item_app = app.clone();
+    let _release = ReleaseOnDrop(gate.clone());
+    let item_handle = tokio::spawn(async move {
+        let request = Request::builder()
+            .uri(format!("/api/v1/playback/items/{media_id}"))
+            .header("Authorization", "Bearer management-secret")
+            .body(Body::empty())
+            .unwrap();
+        item_app.oneshot(request).await.unwrap()
+    });
+
+    wait_entered(&gate).await;
+    let store_available = state.store().try_lock().is_some();
+    if !store_available {
+        gate.release();
+    }
+    assert!(store_available, "playback poster discovery must not hold Store");
+    let auth_request = Request::builder()
+        .uri("/api/v1/auth/me")
+        .header("Authorization", "Bearer management-secret")
+        .body(Body::empty())
+        .unwrap();
+    let auth_response = tokio::time::timeout(
+        Duration::from_secs(2),
+        app.oneshot(auth_request),
+    )
+    .await
+    .expect("authentication must complete while poster discovery is gated")
+    .unwrap();
+    assert_eq!(auth_response.status(), StatusCode::OK);
+
+    gate.release();
+    let response = item_handle.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let item: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(item["data"], serde_json::json!({
+        "media_item_id": media_id.to_string(),
+        "library_id": library_id,
+        "kind": "movie",
+        "title": "Test Movie",
+        "year": 2024,
+        "poster_url": format!("/posters/{ledger_id}"),
+    }));
+}
