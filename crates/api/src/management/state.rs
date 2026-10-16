@@ -215,6 +215,7 @@ impl ApiState {
         let library_work = Arc::new(crate::library_lifecycle::LibraryWorkRegistry::default());
         let probe = Arc::new(crate::probe_manager::ProbeManager::new(store.clone()));
         probe.set_library_registry(library_work.clone());
+        let startup_browser = crate::runtime_browser::startup_browser(store.clone());
         let state = Self {
             store: store.clone(),
             password_login: Arc::new(crate::password_login::PasswordLogin::new(
@@ -256,14 +257,13 @@ impl ApiState {
             )),
             log_buffer: LogBuffer::new(DEFAULT_CAPACITY),
             obscura: Arc::new(crate::obscura_manager::ObscuraManager::new(&data_dir)),
-            browser: crate::runtime_browser::production_browser(store.clone(), false)
-                .map(Arc::new)
-                .unwrap_or_else(|_| {
-                    Arc::new(indexer::Browser::new(indexer::BrowserConfig::disabled()))
-                }),
+            browser: Arc::new(startup_browser.0),
             probe,
             gallery_expansions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
+        if let Some(error) = startup_browser.1 {
+            state.obscura.set_last_error(Some(error));
+        }
         if tokio::runtime::Handle::try_current().is_ok() {
             crate::http::browser_settings::spawn_reconcile(&state);
             crate::library_lifecycle::resume_library_removals(&state)

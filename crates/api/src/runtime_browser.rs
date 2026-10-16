@@ -251,8 +251,31 @@ pub fn configure(
     if managed {
         // legacy flag
     }
+    browser.validate_timing()?;
     load_config(&store.lock())?;
     Ok(browser.with_config_provider(move || load_config(&store.lock())))
+}
+
+/// Startup path: never silently swap in a permanently disabled Browser. A bad
+/// initial config is logged and returned as an error string for status; the
+/// returned Browser still reads settings on every use, so fixing them in the
+/// UI takes effect without a restart.
+pub fn startup_browser(store: Arc<Mutex<Store>>) -> (Browser, Option<String>) {
+    if store.lock().get_setting("cdp.sync.enabled").ok().flatten().is_some() {
+        tracing::warn!(
+            "Legacy setting cdp.sync.enabled is ignored; enable the Browser switch in settings \
+             and choose maintenance_via=browser per Site if needed"
+        );
+    }
+    match production_browser(store.clone(), false) {
+        Ok(browser) => (browser, None),
+        Err(error) => {
+            tracing::error!(%error, "Browser construction failed at startup; settings will be re-read on use");
+            let browser = Browser::new(BrowserConfig::disabled())
+                .with_config_provider(move || load_config(&store.lock()));
+            (browser, Some(format!("Browser 初始化失败: {error}")))
+        }
+    }
 }
 
 pub fn production_browser(

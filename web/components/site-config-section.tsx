@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { HttpError, request } from "@/lib/http";
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
@@ -1324,6 +1325,51 @@ function SiteForm({ item, site, busy, onSubmit }: SiteFormProps) {
 }
 
 /* —— CDP 与 Obscura 浏览器控制面板 —— */
+type Envelope<T> = { ok: boolean; data: T };
+
+interface BrowserSettingsData {
+  cdp?: { enabled?: boolean; url?: string };
+  obscura?: { install?: "download" | "preinstalled" };
+  user_agent?: string;
+  browser_sites?: number;
+  managed_browser_sites?: number;
+  incompatible_endpoints?: Record<string, string>;
+}
+
+interface ObscuraStatusData {
+  installed: boolean;
+  running: boolean;
+  downloading: boolean;
+  port: number;
+  cdp_url: string | null;
+  expected_version: string;
+  reported_version: string | null;
+  binary_path: string;
+  install_policy: string;
+  last_error: string | null;
+  not_started_reason: string | null;
+}
+
+interface SyncCdpData {
+  total_cookies_scanned: number;
+  updated_sites: number;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  candidate_sites?: Array<Record<string, any>>;
+}
+
+const NOT_STARTED_REASON_LABELS: Record<string, string> = {
+  switch_off: "Browser 开关未开启",
+  instance_endpoint_configured: "已配置实例 CDP 端点，不需要受管 Obscura",
+  no_managed_browser_sites: "没有启用 Browser 维护且未自带端点的站点",
+  stopped_manually: "已手动停止",
+};
+
+function errorText(e: unknown): string {
+  if (e instanceof HttpError) return e.message;
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
 function CdpBrowserSection() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -1335,22 +1381,24 @@ function CdpBrowserSection() {
   const [cdpUrl, setCdpUrl] = useState("");
   const [obscuraInstall, setObscuraInstall] = useState<"download" | "preinstalled">("preinstalled");
   const [userAgent, setUserAgent] = useState("crawler-media/0.1.0");
-  const [obscuraStatus, setObscuraStatus] = useState<any>(null);
+  const [obscuraStatus, setObscuraStatus] = useState<ObscuraStatusData | null>(null);
+  const [managedBrowserSites, setManagedBrowserSites] = useState<number | null>(null);
+  const [incompatible, setIncompatible] = useState<Record<string, string>>({});
 
-  const [syncResult, setSyncResult] = useState<any>(null);
+  const [syncResult, setSyncResult] = useState<SyncCdpData | null>(null);
 
   async function loadData() {
-    const token = localStorage.getItem("mc_token") || localStorage.getItem("token") || "";
     try {
-      const [bRes, oRes] = await Promise.all([
-        fetch("/api/v1/settings/browser", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/v1/settings/browser/obscura", { headers: { Authorization: `Bearer ${token}` } }),
+      const [bData, oData] = await Promise.all([
+        request<Envelope<BrowserSettingsData>>("/api/v1/settings/browser"),
+        request<Envelope<ObscuraStatusData>>("/api/v1/settings/browser/obscura"),
       ]);
-      const [bData, oData] = await Promise.all([bRes.json(), oRes.json()]);
       if (bData.ok && bData.data) {
         setCdpEnabled(bData.data.cdp?.enabled ?? false);
         setCdpUrl(bData.data.cdp?.url ?? "");
         setUserAgent(bData.data.user_agent ?? "crawler-media/0.1.0");
+        setManagedBrowserSites(bData.data.managed_browser_sites ?? null);
+        setIncompatible(bData.data.incompatible_endpoints ?? {});
         if (bData.data.obscura?.install) {
           setObscuraInstall(bData.data.obscura.install);
         }
@@ -1358,8 +1406,8 @@ function CdpBrowserSection() {
       if (oData.ok && oData.data) {
         setObscuraStatus(oData.data);
       }
-    } catch (e: any) {
-      setMsg({ tone: "error", text: `加载配置失败: ${e.message}` });
+    } catch (e) {
+      setMsg({ tone: "error", text: `加载配置失败: ${errorText(e)}` });
     } finally {
       setLoading(false);
     }
@@ -1373,29 +1421,19 @@ function CdpBrowserSection() {
     setSaving(true);
     setMsg(null);
     try {
-      const token = localStorage.getItem("mc_token") || localStorage.getItem("token") || "";
-      const res = await fetch("/api/v1/settings/browser", {
+      const data = await request<Envelope<BrowserSettingsData>>("/api/v1/settings/browser", {
         method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
         body: JSON.stringify({
           cdp: { enabled: cdpEnabled, url: cdpUrl.trim() },
           obscura: { install: obscuraInstall },
           user_agent: userAgent,
         }),
       });
-      const data = await res.json();
-      if (data.ok) {
-        setMsg({ tone: "success", text: "浏览器配置已保存并完成生命周期对账" });
-        if (data.data?.user_agent) setUserAgent(data.data.user_agent);
-        await loadData();
-      } else {
-        setMsg({ tone: "error", text: data.error?.message || "保存失败" });
-      }
-    } catch (e: any) {
-      setMsg({ tone: "error", text: e.message });
+      setMsg({ tone: "success", text: "浏览器配置已保存，受管 Obscura 将按需在后台启停" });
+      if (data.data?.user_agent) setUserAgent(data.data.user_agent);
+      await loadData();
+    } catch (e) {
+      setMsg({ tone: "error", text: errorText(e) || "保存失败" });
     } finally {
       setSaving(false);
     }
@@ -1405,23 +1443,17 @@ function CdpBrowserSection() {
     setObscuraActing(true);
     setMsg(null);
     try {
-      const token = localStorage.getItem("mc_token") || localStorage.getItem("token") || "";
-      const res = await fetch(`/api/v1/settings/browser/obscura/${action}`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
+      const data = await request<Envelope<ObscuraStatusData>>(
+        `/api/v1/settings/browser/obscura/${action}`,
+        { method: "POST" },
+      );
+      setMsg({
+        tone: "success",
+        text: action === "start" ? "已提交启动，Obscura 正在后台安装/启动" : "已停止 Obscura 浏览器服务",
       });
-      const data = await res.json();
-      if (data.ok) {
-        setMsg({
-          tone: "success",
-          text: action === "start" ? "已成功启动 Obscura 浏览器服务" : "已停止 Obscura 浏览器服务",
-        });
-        setObscuraStatus(data.data);
-      } else {
-        setMsg({ tone: "error", text: data.error?.message || "操作失败" });
-      }
-    } catch (e: any) {
-      setMsg({ tone: "error", text: e.message });
+      setObscuraStatus(data.data);
+    } catch (e) {
+      setMsg({ tone: "error", text: errorText(e) || "操作失败" });
     } finally {
       setObscuraActing(false);
     }
@@ -1432,23 +1464,16 @@ function CdpBrowserSection() {
     setMsg(null);
     setSyncResult(null);
     try {
-      const token = localStorage.getItem("mc_token") || localStorage.getItem("token") || "";
-      const res = await fetch("/api/v1/settings/browser/sync-cdp", {
+      const data = await request<Envelope<SyncCdpData>>("/api/v1/settings/browser/sync-cdp", {
         method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
       });
-      const data = await res.json();
-      if (data.ok) {
-        setSyncResult(data.data);
-        setMsg({
-          tone: "success",
-          text: `CDP 凭据同步成功：共扫描 ${data.data.total_cookies_scanned} 个 Cookie，更新已配置站点 ${data.data.updated_sites} 个！`,
-        });
-      } else {
-        setMsg({ tone: "error", text: data.error?.message || "同步失败" });
-      }
-    } catch (e: any) {
-      setMsg({ tone: "error", text: e.message });
+      setSyncResult(data.data);
+      setMsg({
+        tone: "success",
+        text: `CDP 凭据同步成功：共扫描 ${data.data.total_cookies_scanned} 个 Cookie，更新已配置站点 ${data.data.updated_sites} 个！`,
+      });
+    } catch (e) {
+      setMsg({ tone: "error", text: errorText(e) || "同步失败" });
     } finally {
       setSyncing(false);
     }
@@ -1536,11 +1561,11 @@ function CdpBrowserSection() {
               </button>
             </div>
 
-            {syncResult?.candidate_sites?.length > 0 && (
+            {(syncResult?.candidate_sites?.length ?? 0) > 0 && (
               <div className="rounded-xl border border-white/[0.08] bg-white/[0.03] p-4 text-sub">
                 <p className="font-semibold text-white/90">在浏览器中发现以下支持的未接入站点：</p>
                 <div className="mt-2 flex flex-wrap gap-2">
-                  {syncResult.candidate_sites.map((c: any) => (
+                  {(syncResult?.candidate_sites ?? []).map((c) => (
                     <span
                       key={c.profile_id}
                       className="rounded-lg bg-white/[0.06] px-2.5 py-1 text-caption text-white/80"
@@ -1589,6 +1614,37 @@ function CdpBrowserSection() {
         </div>
 
         <div className="border-t border-white/[0.06] pt-4 space-y-3">
+          {(obscuraStatus?.not_started_reason || obscuraStatus?.last_error || managedBrowserSites !== null ||
+            Object.keys(incompatible).length > 0) && (
+            <div className="space-y-1 text-sub" data-testid="obscura-diagnostics">
+              {managedBrowserSites !== null && (
+                <div>
+                  <span className="text-[var(--text-faint)]">需要受管 Obscura 的站点: </span>
+                  <span className="font-medium text-white/90">{managedBrowserSites}</span>
+                </div>
+              )}
+              {obscuraStatus?.not_started_reason && (
+                <div>
+                  <span className="text-[var(--text-faint)]">未启动原因: </span>
+                  <span className="font-medium text-white/90">
+                    {NOT_STARTED_REASON_LABELS[obscuraStatus.not_started_reason] ?? obscuraStatus.not_started_reason}
+                  </span>
+                </div>
+              )}
+              {obscuraStatus?.last_error && (
+                <div className="text-[#ff6b6b]">
+                  <span className="text-[var(--text-faint)]">最近错误: </span>
+                  {obscuraStatus.last_error}
+                </div>
+              )}
+              {Object.entries(incompatible).map(([endpoint, reason]) => (
+                <div key={endpoint} className="text-[#ff6b6b]">
+                  <span className="text-[var(--text-faint)]">不兼容端点 {endpoint}: </span>
+                  {reason}
+                </div>
+              ))}
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-4 text-sub">
             <div>
               <span className="text-[var(--text-faint)]">安装状态: </span>

@@ -346,11 +346,6 @@ fn member_library_routes() -> Router<ApiState> {
         )
         .route("/settings/languages", get(scrape_settings::languages))
         .route("/settings/countries", get(scrape_settings::countries))
-        .route("/settings/browser", get(settings::get_browser_settings))
-        .route(
-            "/settings/browser/obscura",
-            get(settings::get_obscura_status),
-        )
 }
 
 fn member_playback_routes() -> Router<ApiState> {
@@ -660,7 +655,16 @@ fn admin_ops_routes() -> Router<ApiState> {
             "/settings/scrape",
             put(scrape_settings::put_scrape_settings),
         )
-        .route("/settings/browser", put(settings::put_browser_settings))
+        // Browser settings/status expose the CDP endpoint, managed port and
+        // binary path (a local CDP port can drive the browser): admin-only.
+        .route(
+            "/settings/browser",
+            get(settings::get_browser_settings).put(settings::put_browser_settings),
+        )
+        .route(
+            "/settings/browser/obscura",
+            get(settings::get_obscura_status),
+        )
         .route(
             "/settings/browser/obscura/start",
             post(settings::post_obscura_start),

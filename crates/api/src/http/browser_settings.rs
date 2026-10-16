@@ -195,11 +195,15 @@ pub async fn reconcile_off_runtime(state: &ApiState) {
             .await
             .unwrap_or((ReconcileWant { switch_on: false, instance_endpoint_configured: false, managed_browser_sites: 0 }, crate::obscura_manager::InstallPolicy::PreinstalledOnly))
     };
-    let worker = state.clone();
-    let task = tokio::task::spawn_blocking(move || reconcile_obscura(&worker));
-    if not_started_reason(want).is_some() {
-        let _ = task.await;
+    // Stop decision: clear the endpoint and record the reason now (cheap,
+    // lock-free for the daemon), then let the actual stop run detached so the
+    // request never waits on a concurrent download or the TERM grace period.
+    if let Some(reason) = not_started_reason(want) {
+        state.browser.set_managed_endpoint(None);
+        state.obscura.set_not_started_reason(Some(reason));
     }
+    let worker = state.clone();
+    tokio::task::spawn_blocking(move || reconcile_obscura(&worker));
 }
 
 /// Fire-and-forget reconcile usable from sync code (startup, Site writes).
@@ -208,10 +212,15 @@ pub fn spawn_reconcile(state: &ApiState) {
     // A stop/no-op decision is cheap (settings read, no download): apply it
     // inline so no background task contends for the store lock. Only a start
     // (possible download + readiness wait) goes to the blocking pool.
+    // Inline only when nothing must be stopped (stop() can wait on the
+    // lifecycle lock or the TERM grace period): just record the reason.
     let (want, _) = load_want(state);
-    if not_started_reason(want).is_some() {
-        reconcile_obscura(&worker);
-        return;
+    if let Some(reason) = not_started_reason(want) {
+        state.browser.set_managed_endpoint(None);
+        if !state.obscura.owns_live_daemon() {
+            state.obscura.set_not_started_reason(Some(reason));
+            return;
+        }
     }
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn_blocking(move || reconcile_obscura(&worker));

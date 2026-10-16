@@ -193,15 +193,17 @@ async fn member_cannot_modify_browser_settings_or_sync_cdp() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    // 5. 普通成员可以 GET /api/v1/settings/browser/obscura
-    let req = Request::builder()
-        .method("GET")
-        .uri("/api/v1/settings/browser/obscura")
-        .header("Authorization", format!("Bearer {member_token}"))
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // 5. 普通成员不能读取 Browser 设置/Obscura 状态（含端口、路径、CDP URL）
+    for uri in ["/api/v1/settings/browser/obscura", "/api/v1/settings/browser"] {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {member_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
 }
 
 #[tokio::test]
