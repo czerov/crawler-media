@@ -44,7 +44,7 @@ static TITLE_ENRICH_ATTEMPTS: LazyLock<Mutex<HashMap<(String, u32), std::time::I
 
 /// 同一季的补全尝试间隔；期间不再重新排程（有界，不随请求数增长）。
 const TITLE_ENRICH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(600);
-/// 冷却表的硬上限；超过时先清过期项，仍超上限则整体清空。
+/// 冷却表的硬上限；超过时先清过期项，仍满时拒绝新预约。
 const TITLE_ENRICH_ATTEMPTS_CAP: usize = 1024;
 
 /// 记录一次补全尝试；冷却期内返回 `false`（调用方不再排程）。
@@ -61,7 +61,7 @@ fn reserve_enrichment_attempt(tmdb_id: &str, season: u32) -> bool {
     if attempts.len() >= TITLE_ENRICH_ATTEMPTS_CAP {
         attempts.retain(|_, attempted| now.duration_since(*attempted) < TITLE_ENRICH_COOLDOWN);
         if attempts.len() >= TITLE_ENRICH_ATTEMPTS_CAP {
-            attempts.clear();
+            return false;
         }
     }
     attempts.insert(key, now);
@@ -560,3 +560,27 @@ fn schedule_season_enrichment(state: &ApiState, tmdb_id: &str, season: u32) {
 }
 
 fn error_type(_error: &str) -> &'static str { "catalog" }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 表满时不得为了收下新键而丢弃**仍在冷却期内**的预约。
+    #[test]
+    fn full_enrichment_table_preserves_live_reservations() {
+        for season in 0..TITLE_ENRICH_ATTEMPTS_CAP as u32 {
+            assert!(
+                reserve_enrichment_attempt("capacity-regression", season),
+                "reservation {season} must be accepted below the cap"
+            );
+        }
+        assert!(
+            !reserve_enrichment_attempt("capacity-regression-overflow", 0),
+            "a full table must reject the new reservation instead of clearing live ones"
+        );
+        assert!(
+            !reserve_enrichment_attempt("capacity-regression", 0),
+            "an unexpired reservation must survive a full table"
+        );
+    }
+}

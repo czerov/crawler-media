@@ -99,6 +99,7 @@ async fn drain_removal(state: &ApiState, operation_id: &str) -> Result<(), Strin
     // 封面文件无法进 DB 事务：此时 Library 已冻结且行已删除，没有并发发布能重建它；
     // 启动时的对账（purge_removed_library_covers）负责补做崩溃窗口内漏掉的那次删除。
     crate::library_cover_service::remove_library_cover_files(&covers_dir, &library_id);
+    state.projection.remove_library(&library_id);
     tracing::info!(%operation_id, %library_id, "Library 索引清理完成，删除操作成功");
     Ok(())
 }

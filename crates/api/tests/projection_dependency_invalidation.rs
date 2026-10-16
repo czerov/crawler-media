@@ -213,3 +213,84 @@ fn new_dirty_during_build_is_not_swallowed() {
     let published = store.publish_browse_projection(&build).unwrap();
     assert!(!published, "Publish must be rejected when dirty token advanced during build");
 }
+
+
+
+#[test]
+fn stale_library_dependencies_are_evicted_before_invalidation() {
+    let (_tmp, store) = create_store();
+    let ownership = store.library_ownership().unwrap();
+    let removed_library_id = "removed-library";
+    let deps = Arc::new(Mutex::new(ProjectionDependencies::new()));
+    let consumer = ChangeConsumer::new(deps.clone());
+    consumer.hydrate_ready_dependencies(&store).unwrap();
+    deps.lock().record_library(
+        removed_library_id,
+        [MediaId::new()],
+        [LedgerId::new()],
+        ["/removed/library/file.mkv".to_string()],
+        ["tmdb:/movie/42".to_string()],
+    );
+    consumer.hydrate_ready_dependencies(&store).unwrap();
+
+    store
+        // 台账键与记录的依赖键必须同形（journal key = `source:cache_key`），否则
+        // 匹配永远失败，断言恒真、测不到“已删除库仍被扫描”。
+        .put_catalog_cache("tmdb", "/movie/42", "{}", 1, None)
+        .unwrap();
+    let changes = store
+        .browse_changes(BrowseChangeSource::Catalog, 0, 10)
+        .unwrap();
+    assert!(!consumer
+        .resolve_affected(&store, &ownership, &changes)
+        .iter()
+        .any(|affected| affected == removed_library_id));
+}
+#[test]
+fn acknowledged_coalescing_sentinel_is_pruned_after_interrupted_acknowledgement() {
+    let (_tmp, store) = create_store();
+    let ownership = store.library_ownership().unwrap();
+    let library_id = ownership.libraries()[0].id.clone();
+    store
+        .apply_browse_changes(BrowseChangeSource::App, 0, &[library_id.clone()])
+        .unwrap();
+    let baseline = store.browse_projection_head(&library_id).unwrap().unwrap();
+    for index in 0..=1024 {
+        store
+            .put_catalog_cache("tmdb", &format!("movie:{index}"), "[]", index, None)
+            .unwrap();
+    }
+
+    let sentinel = store
+        .browse_changes(BrowseChangeSource::Catalog, 0, 2048)
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+
+    let catalog_path = store.data_dir().join("catalog.db");
+    let connection = rusqlite::Connection::open(&catalog_path).unwrap();
+    connection
+        .execute_batch("CREATE TRIGGER fail_journal_prune BEFORE DELETE ON _browse_changes BEGIN SELECT RAISE(ABORT, 'simulated crash before pruning'); END;")
+        .unwrap();
+    assert!(store
+        .apply_browse_changes(BrowseChangeSource::Catalog, sentinel.seq, &[])
+        .is_err());
+    connection
+        .execute_batch("DROP TRIGGER fail_journal_prune;")
+        .unwrap();
+
+    let consumer = ChangeConsumer::new(Arc::new(Mutex::new(ProjectionDependencies::new())));
+    store
+        .put_catalog_cache("tmdb", "/movie/999", "{}", 10_000, None)
+        .unwrap();
+    assert!(store
+        .browse_changes(BrowseChangeSource::Catalog, store.browse_change_cursor(BrowseChangeSource::Catalog).unwrap(), 10)
+        .unwrap()
+        .is_empty());
+    consumer
+        .poll_source(&store, &ownership, BrowseChangeSource::Catalog)
+        .unwrap();
+    let updated = store.browse_projection_head(&library_id).unwrap().unwrap();
+    assert!(updated.dirty_token > baseline.dirty_token);
+}

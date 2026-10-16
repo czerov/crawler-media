@@ -485,6 +485,7 @@ pub(crate) fn probe_job_terminal_status(
     completed: usize,
     failed: usize,
     partial: usize,
+    cancelled: usize,
 ) -> Option<&'static str> {
     if completed < total {
         return None;
@@ -494,6 +495,7 @@ pub(crate) fn probe_job_terminal_status(
     }
     match kind {
         "marker_refresh" => None,
+        _ if cancelled > 0 => Some("cancelled"),
         _ if partial > 0 => Some("partial"),
         _ => Some("succeeded"),
     }

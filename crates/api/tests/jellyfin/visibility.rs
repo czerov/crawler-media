@@ -1,6 +1,29 @@
 use super::*;
 
 #[tokio::test]
+async fn parent_library_scope_excludes_nested_library_items() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _, _) = app(tmp.path());
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let parent_root = tmp.path().join("movies");
+    let child_root = parent_root.join("child");
+    std::fs::create_dir_all(&child_root).unwrap();
+    let parent = store.create_library(MediaKind::Movie, "Parent movies", &[parent_root.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    store.create_library(MediaKind::Movie, "Nested movies", &[child_root.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    let path = child_root.join("nested.mkv");
+    std::fs::write(&path, b"nested").unwrap();
+    let movie = Media { id: MediaId::new(), kind: MediaKind::Movie, title: "Nested movie".into(), year: None, original_title: None, tmdb_id: None, douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None };
+    store.insert_media(&movie).unwrap();
+    store.insert_ledger(&LedgerRow { id: LedgerId::new(), media_id: movie.id, path: path.display().to_string(), season: None, episode: None, resolution: None, codec: None, hdr: None, quality_source: QualitySource::Probe, confidence: Confidence::High, filter_score: None }).unwrap();
+    drop(store);
+    let response = app.oneshot(Request::builder().method("GET").uri(format!("/Items?ParentId={}&Recursive=true", parent.id)).header("authorization", "Bearer admin-token").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let items = json(response).await;
+    assert!(items["Items"].as_array().unwrap().is_empty());
+    assert_eq!(items["TotalRecordCount"], 0);
+}
+
+#[tokio::test]
 async fn selected_library_bytes_require_auth_and_visibility() {
     let tmp = tempfile::tempdir().unwrap();
     let (app, _, _) = app(tmp.path());

@@ -52,6 +52,13 @@ impl ProjectionDependencies {
         self.paths_by_library.remove(library_id);
         self.catalog_by_library.remove(library_id);
     }
+
+    fn retain_libraries(&mut self, library_ids: &HashSet<String>) {
+        self.media_by_library.retain(|id, _| library_ids.contains(id));
+        self.ledger_by_library.retain(|id, _| library_ids.contains(id));
+        self.paths_by_library.retain(|id, _| library_ids.contains(id));
+        self.catalog_by_library.retain(|id, _| library_ids.contains(id));
+    }
 }
 
 pub struct ChangeConsumer {
@@ -67,6 +74,12 @@ impl ChangeConsumer {
     pub fn hydrate_ready_dependencies(&self, store: &Store) -> Result<(), StoreError> {
         let ownership = store.library_ownership()?;
         let mut dependencies = self.deps.lock();
+        let current_ids = ownership
+            .libraries()
+            .into_iter()
+            .map(|library| library.id.clone())
+            .collect();
+        dependencies.retain_libraries(&current_ids);
         for library in ownership.libraries() {
             if dependencies.catalog_by_library.contains_key(&library.id) {
                 continue;
@@ -111,6 +124,19 @@ impl ChangeConsumer {
         let cursor = store.browse_change_cursor(source)?;
         let changes = store.browse_changes(source, cursor, *budget_remaining)?;
         if changes.is_empty() {
+            // Retry a coalescing sentinel retained when acknowledgement committed before pruning.
+            if cursor > 0 {
+                let acknowledged = store.browse_changes(source, cursor - 1, 1)?;
+                if acknowledged.last().is_some_and(|change| {
+                    change.seq == cursor && change.entity_kind == "browse_all"
+                }) {
+                    let affected = self.resolve_affected(store, ownership, &acknowledged);
+                    store.apply_browse_changes(source, cursor, &affected)?;
+                    *budget_remaining = budget_remaining.saturating_sub(1);
+                    return Ok((1, true));
+                }
+            }
+            store.apply_browse_changes(source, cursor, &[])?;
             return Ok((0, true));
         }
 
@@ -145,8 +171,8 @@ impl ChangeConsumer {
     ) -> Vec<String> {
         let all_libs = ownership.libraries();
         let mut affected = HashSet::new();
-        let deps = self.deps.lock();
-
+        let mut deps = self.deps.lock();
+        deps.retain_libraries(&all_libs.iter().map(|library| library.id.clone()).collect());
         for c in changes {
             match c.source {
                 BrowseChangeSource::App => match c.entity_kind.as_str() {

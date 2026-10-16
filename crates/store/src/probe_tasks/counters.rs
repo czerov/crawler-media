@@ -72,7 +72,8 @@ impl Store {
         let partial = current.partial + delta.partial;
         let all_done = completed >= total;
         if changed == 1 {
-            let terminal = probe_job_terminal_status(&kind, total, completed, failed, partial);
+            let cancelled = completed - succeeded - failed - partial;
+            let terminal = probe_job_terminal_status(&kind, total, completed, failed, partial, cancelled);
             let mut statement = tx.prepare(
                 "UPDATE probe_jobs SET completed=?2, succeeded=?3, failed=?4, partial=?5,
                      status=COALESCE(?6, 'running'), finished_at_ms=COALESCE(?7, finished_at_ms),

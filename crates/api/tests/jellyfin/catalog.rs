@@ -1,4 +1,29 @@
 use super::*;
+#[tokio::test]
+async fn season_played_mark_updates_episode_rollup_and_next_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _, _) = app(tmp.path());
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("tv-season-mark");
+    std::fs::create_dir_all(&root).unwrap();
+    store.create_library(MediaKind::Tv, "Season mark shows", &[root.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    let show = new_media(MediaKind::Tv, "Season mark show");
+    store.insert_media(&show).unwrap();
+    let first = insert_episode(&store, &root, show.id, 1, 1);
+    insert_episode(&store, &root, show.id, 1, 2);
+    drop(store);
+    let season_id = get_json(&app, &format!("/Shows/{}/Seasons", show.id.to_string().replace('-', ""))).await["Items"][0]["Id"].as_str().unwrap().to_owned();
+    let marked = app.clone().oneshot(Request::builder().method("POST").uri(format!("/UserPlayedItems/{season_id}")).header("authorization", "Bearer admin-token").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(marked.status(), StatusCode::OK);
+    let episode = get_json(&app, &format!("/Items/{}", first.to_string().replace('-', ""))).await;
+    assert_eq!(episode["UserData"]["Played"], true);
+    let listing = get_json(&app, "/Items").await;
+    let series = listing["Items"].as_array().unwrap().iter().find(|item| item["Name"] == "Season mark show").unwrap();
+    assert_eq!(series["UserData"]["Played"], true);
+    assert_eq!(series["UserData"]["UnplayedItemCount"], 0);
+    assert!(get_json(&app, "/Shows/NextUp").await["Items"].as_array().unwrap().is_empty());
+}
+
 
 async fn get_json(app: &axum::Router, uri: &str) -> Value {
     let response = app
@@ -215,6 +240,17 @@ async fn tv_season_filter_resume_and_show_played_marks_work() {
         next_up_after_season["Items"][0]["Id"],
         third_id.to_string().replace('-', "")
     );
+    let season_episode = get_json(&app, &format!("/Items/{}", first_id.to_string().replace('-', ""))).await;
+    assert_eq!(season_episode["UserData"]["Played"], true);
+    let series_listing = get_json(&app, "/Items").await;
+    let listed_series = series_listing["Items"].as_array().unwrap().iter().find(|item| item["Name"] == "Show").unwrap();
+    assert_eq!(listed_series["UserData"]["Played"], false);
+    assert_eq!(listed_series["RecursiveItemCount"], 4);
+    assert_eq!(listed_series["UserData"]["UnplayedItemCount"], 2);
+    let direct_series = get_json(&app, &format!("/Items/{series_id}")).await;
+    assert_eq!(direct_series["UserData"]["Played"], listed_series["UserData"]["Played"]);
+    assert_eq!(direct_series["RecursiveItemCount"], listed_series["RecursiveItemCount"]);
+    assert_eq!(direct_series["UserData"]["UnplayedItemCount"], listed_series["UserData"]["UnplayedItemCount"]);
     let resume_after_season = get_json(
         &app,
         "/Users/00000000-0000-0000-0000-000000000001/Items/Resume",

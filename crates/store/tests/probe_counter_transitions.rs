@@ -48,6 +48,30 @@ fn large_probe_job_finish_work_is_near_linear() {
     assert!(vm_for_1_000 <= vm_for_100 * 15);
 }
 
+
+#[test]
+fn cancelling_the_last_probe_unit_cancels_the_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path()).unwrap();
+    let spec = [ProbeJobUnitSpec {
+        ledger_id: "missing-ledger",
+        kind: "movie",
+        force_fingerprint: false,
+        reuse_fingerprint_cache: false,
+        overwrite_markers: false,
+        reuse_media_info_cache: false,
+    }];
+    store.create_probe_job("cancelled", "scan", "media", None, "scope", &spec).unwrap();
+
+    let (job, changed, all_done) = store
+        .cancel_probe_unit("cancelled", "missing-ledger", "file_deleted")
+        .unwrap();
+
+    assert!(changed);
+    assert!(all_done);
+    assert_eq!(job.status, "cancelled");
+    assert_eq!(store.get_probe_job("cancelled").unwrap().unwrap().status, "cancelled");
+}
 #[test]
 fn transitions_reconcile_and_reject_late_messages() {
     let temp = tempfile::tempdir().unwrap();

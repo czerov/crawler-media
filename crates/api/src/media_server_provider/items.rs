@@ -1,4 +1,4 @@
-use super::user_marks::{item_is_played, unit_play_count, unit_played};
+use super::user_marks::{item_is_played, unit_play_count};
 use super::*;
 use std::time::SystemTime;
 
@@ -27,7 +27,7 @@ pub(super) fn fallback_snapshot(
     is_series: bool,
 ) -> MediaItemSnapshot {
     // 锁内只取 owned DB 事实。
-    let (marker, chapters, ticks, played, play_count, parent_id, facts) = {
+    let (marker, chapters, ticks, played, play_count, parent_id, facts, series_counts) = {
         let store = state.store.lock();
         let marker = store
             .get_media_marker(row.media_id, row.season, row.episode)
@@ -39,31 +39,30 @@ pub(super) fn fallback_snapshot(
             .flatten()
             .unwrap_or_default();
         let ticks = playback_ticks(&store, user_id, &row, &media);
-        let is_episode =
-            media.kind == MediaKind::Tv && row.season.is_some() && row.episode.is_some();
+        let is_episode = media.kind == MediaKind::Tv && row.season.is_some() && row.episode.is_some();
         let parent_id = if is_episode {
             media.id.to_string().replace('-', "")
         } else {
             crate::http::playback::library_id_for(&store, &media, &[&row])
                 .unwrap_or_else(|| media.id.to_string().replace('-', ""))
         };
-        let played = item_is_played(&store, user_id, &row);
-        let play_count = unit_play_count(
-            &store,
-            user_id,
-            row.media_id,
-            row.season
-                .map(|value| value as i32)
-                .unwrap_or(crate::store::UNIT_WHOLE),
-            row.episode
-                .map(|value| value as i32)
-                .unwrap_or(crate::store::UNIT_WHOLE),
-        );
+        let (played, play_count, series_counts) = if is_series {
+            let (played, unplayed, child_counts) = direct_series_rollup(&store, user_id, media.id);
+            (played, 0, Some((unplayed, child_counts)))
+        } else {
+            let played = item_is_played(&store, user_id, &row);
+            let play_count = unit_play_count(
+                &store,
+                user_id,
+                row.media_id,
+                row.season.map(|value| value as i32).unwrap_or(crate::store::UNIT_WHOLE),
+                row.episode.map(|value| value as i32).unwrap_or(crate::store::UNIT_WHOLE),
+            );
+            (played, play_count, None)
+        };
         let (unit, whole_unit) = item_metadata::row_units(&store, user_id, &row, is_series);
         let facts = item_metadata::item_db_facts(&store, &row, is_series, unit.as_ref(), whole_unit.as_ref());
-        (
-            marker, chapters, ticks, played, play_count, parent_id, facts,
-        )
+        (marker, chapters, ticks, played, play_count, parent_id, facts, series_counts)
     };
     // 锁外：NFO / stat / 外部字幕 IO。
     let metadata = with_date_created(
@@ -73,14 +72,14 @@ pub(super) fn fallback_snapshot(
             &row,
             &media,
             is_series,
-            None,
+            series_counts.map(|(_, counts)| counts),
         ),
         file_date_created(state.browse_files.as_ref(), &row.path),
     );
     MediaItemSnapshot {
         played,
         play_count,
-        unplayed_item_count: None,
+        unplayed_item_count: series_counts.map(|(unplayed, _)| unplayed),
         metadata,
         row,
         media,
@@ -93,6 +92,37 @@ pub(super) fn fallback_snapshot(
         outro_start_ms: marker.as_ref().and_then(|item| item.outro_start_ms),
         outro_end_ms: marker.as_ref().and_then(|item| item.outro_end_ms),
     }
+}
+
+fn direct_series_rollup(
+    store: &crate::Store,
+    user_id: UserId,
+    media_id: domain::MediaId,
+) -> (bool, usize, (usize, usize)) {
+    let Ok(snapshot) = super::read_snapshot::collect_server_read(store, user_id, None) else {
+        return (false, 0, (0, 0));
+    };
+    let mut episodes = HashSet::new();
+    let mut seasons = HashSet::new();
+    for row in &snapshot.rows {
+        if row.media_id != media_id { continue; }
+        let Some(media) = snapshot.media.get(&media_id) else { continue };
+        let Some(owner) = snapshot.ownership.owner(std::path::Path::new(&row.path), media.kind) else { continue };
+        let accessible = snapshot.ownership.accepts_work(&owner.id)
+            && if snapshot.is_admin { owner.admin_visible } else { owner.access_mode == "everyone" || owner.member_ids.contains(&user_id) };
+        if accessible && media.kind == MediaKind::Tv {
+            if let (Some(season), Some(episode)) = (row.season, row.episode) {
+                episodes.insert((season, episode));
+                seasons.insert(season);
+            }
+        }
+    }
+    let units = unit_index(&snapshot.units);
+    let played_count = episodes.iter().filter(|(season, episode)| {
+        effective_played(&units, media_id, *season as i32, *episode as i32)
+    }).count();
+    let total = episodes.len();
+    (total == 0 || played_count == total, total.saturating_sub(played_count), (total, seasons.len()))
 }
 
 pub(super) async fn list_visible_items(
@@ -147,6 +177,28 @@ fn find_unit<'a>(units: &UnitIndex<'a>, media_id: domain::MediaId, season: i32, 
     units.get(&(media_id, season, episode)).copied()
 }
 
+fn effective_played(
+    units: &UnitIndex<'_>,
+    media_id: domain::MediaId,
+    season: i32,
+    episode: i32,
+) -> bool {
+    let episode_unit = find_unit(units, media_id, season, episode);
+    if episode_unit.is_some_and(|unit| unit.state.played) {
+        return true;
+    }
+    let episode_updated_at = episode_unit.map(|unit| unit.state.updated_at);
+    if let Some(season_unit) = (season >= 0)
+        .then(|| find_unit(units, media_id, season, crate::store::UNIT_WHOLE))
+        .flatten()
+        .filter(|unit| episode_updated_at.is_none_or(|updated_at| unit.state.updated_at > updated_at))
+    {
+        return season_unit.state.played;
+    }
+    find_unit(units, media_id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)
+        .filter(|unit| episode_updated_at.is_none_or(|updated_at| unit.state.updated_at > updated_at))
+        .is_some_and(|unit| unit.state.played)
+}
 fn unit_counts_from_snapshot(
     units: &UnitIndex<'_>, row: &domain::LedgerRow, media: &domain::Media,
     is_series: bool, show_episodes: &HashMap<domain::MediaId, HashSet<(u32, u32)>>,
@@ -154,16 +206,8 @@ fn unit_counts_from_snapshot(
     if is_series {
         let episodes = show_episodes.get(&media.id);
         let total = episodes.map(HashSet::len).unwrap_or(0);
-        // 整剧已看的 `(-1,-1)` 单元同样让子集算作已看（与单集分支同一规则），
-        // 否则"标记整剧已看"后剧集卡片仍报未看。
-        let show = find_unit(units, media.id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE);
         let played = episodes.into_iter().flat_map(|episodes| episodes.iter()).filter(|(season, episode)| {
-            let unit = find_unit(units, media.id, *season as i32, *episode as i32);
-            let show_played = show.is_some_and(|show| {
-                show.state.played
-                    && unit.is_none_or(|episode| show.state.updated_at > episode.state.updated_at)
-            });
-            show_played || unit.is_some_and(|unit| unit.state.played)
+            effective_played(units, media.id, *season as i32, *episode as i32)
         }).count();
         return (total == 0 || total == played, 0, Some(total.saturating_sub(played)));
     }
@@ -171,18 +215,12 @@ fn unit_counts_from_snapshot(
     let episode = row.episode.map(|value| value as i32).unwrap_or(crate::store::UNIT_WHOLE);
     let unit = find_unit(units, row.media_id, season, episode);
     let played = if media.kind == MediaKind::Tv && season >= 0 && episode >= 0 {
-        let show = find_unit(units, row.media_id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE);
-        let show_played = show.is_some_and(|show| {
-            show.state.played
-                && unit.is_none_or(|episode| show.state.updated_at > episode.state.updated_at)
-        });
-        show_played || unit.is_some_and(|unit| unit.state.played)
+        effective_played(units, row.media_id, season, episode)
     } else {
         unit.is_some_and(|unit| unit.state.played)
     };
     (played, unit.map(|unit| unit.state.play_count).unwrap_or(0), None)
 }
-
 
 fn collect_pending(
     store: &crate::Store,
@@ -191,22 +229,19 @@ fn collect_pending(
 ) -> Result<(Vec<PendingSnapshot>, Vec<(domain::MediaId, String)>), String> {
     let snapshot = super::read_snapshot::collect_server_read(store, user_id, parent_id)?;
     let ServerReadSnapshot { ownership, is_admin, media, rows: ledger_rows, units, .. } = snapshot;
+    let requested_library = parent_id.and_then(|id| ownership.library(id)).map(|library| library.id.as_str());
     let mut show_episodes: HashMap<domain::MediaId, HashSet<(u32, u32)>> = HashMap::new();
     let mut show_seasons: HashMap<domain::MediaId, HashSet<u32>> = HashMap::new();
-    // 可见性判定只用内存里的 ownership（不逐行查库，也不与下面逐行建卡的判定分叉）。
     let row_visible = |row: &domain::LedgerRow| -> bool {
         let Some(item) = media.get(&row.media_id) else { return false };
         let Some(owner) = ownership.owner(std::path::Path::new(&row.path), item.kind) else { return false };
         ownership.accepts_work(&owner.id)
+            && requested_library.is_none_or(|library_id| owner.id == library_id)
             && if is_admin { owner.admin_visible } else { owner.access_mode == "everyone" || owner.member_ids.contains(&user_id) }
     };
-    // 不可见库里的集不得进入汇总：否则受限用户的 `RecursiveItemCount` / 未看计数
-    // 会把看不见的集也算进去。
     for row in &ledger_rows {
         let Some(item) = media.get(&row.media_id) else { continue };
-        if item.kind != MediaKind::Tv || !row_visible(row) {
-            continue;
-        }
+        if item.kind != MediaKind::Tv || !row_visible(row) { continue; }
         if let (Some(season), Some(episode)) = (row.season, row.episode) {
             show_episodes.entry(item.id).or_default().insert((season, episode));
             show_seasons.entry(item.id).or_default().insert(season);
@@ -234,9 +269,7 @@ fn collect_pending(
         let season = row.season.map(|value| value as i32).unwrap_or(crate::store::UNIT_WHOLE);
         let episode = row.episode.map(|value| value as i32).unwrap_or(crate::store::UNIT_WHOLE);
         let unit = find_unit(&units, row.media_id, season, episode);
-        let whole_unit = is_series
-            .then(|| find_unit(&units, row.media_id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE))
-            .flatten();
+        let whole_unit = is_series.then(|| find_unit(&units, row.media_id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)).flatten();
         let facts = item_metadata::item_db_facts(store, &row, is_series, unit, whole_unit);
         let ticks = unit.map(|unit| unit.state.position_ms.saturating_mul(10_000)).unwrap_or(0);
         let stat_path = (!is_series).then(|| row.path.clone());

@@ -47,7 +47,7 @@ fn seed(path: &Path, unrelated: usize) -> (ApiState, domain::UserId, String) {
     }
     let state = ApiState::new(store, "management-secret".into(), ProfileSet::load(None).unwrap(), Arc::new(NoFetch), Arc::new(MemoryDownloader::new(path.join("stage"))), path.join("library")).unwrap();
     let user = state.store().lock().user_id_by_token("management-secret").unwrap().unwrap();
-    (state, user, media.id.to_string())
+    (state, user, library.id)
 }
 
 #[tokio::test]
@@ -66,8 +66,19 @@ async fn parent_scope_protocol_json_is_stable_with_unrelated_growth() {
     let (small_state, _, small_parent) = seed(small.path(), 0);
     let large = tempfile::tempdir().unwrap();
     let (large_state, _, large_parent) = seed(large.path(), 100);
-    let small_json = parent_items_json(small_state, &small_parent).await;
-    let large_json = parent_items_json(large_state, &large_parent).await;
+    let mut small_json = parent_items_json(small_state, &small_parent).await;
+    let mut large_json = parent_items_json(large_state, &large_parent).await;
+    for response in [&mut small_json, &mut large_json] {
+        let item = &mut response["Items"][0];
+        item["Id"] = Value::String("target-item".into());
+        item["Path"] = Value::String("target-path".into());
+        item["ParentId"] = Value::String("target-library".into());
+        item["DateCreated"] = Value::Null;
+        item["UserData"]["ItemId"] = Value::String("target-item".into());
+        item["UserData"]["Key"] = Value::String("target-item".into());
+    }
+    assert!(small_json["Items"].as_array().is_some_and(|items| items.iter().any(|item| item["Name"] == "Target")));
+    assert!(large_json["Items"].as_array().is_some_and(|items| items.iter().any(|item| item["Name"] == "Target")));
     assert_eq!(small_json, large_json);
 }
 

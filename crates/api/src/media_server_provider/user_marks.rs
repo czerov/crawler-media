@@ -7,23 +7,34 @@ pub(super) fn unit_played(
     season: i32,
     episode: i32,
 ) -> bool {
-    let units = if season >= 0 && episode >= 0 {
-        [(season, episode), (season, crate::store::UNIT_WHOLE), (crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)]
-    } else if season >= 0 || episode >= 0 {
-        [(season, episode), (crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE), (crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)]
-    } else {
-        [(season, episode), (season, episode), (season, episode)]
+    let episode_unit = match store.unit_state(user_id, media_id, season, episode) {
+        Ok(unit) => unit,
+        Err(error) => {
+            tracing::warn!(%error, %user_id, %media_id, season, episode, "failed to read Jellyfin played mark");
+            None
+        }
     };
-    let count = if season >= 0 && episode >= 0 { 3 } else if season >= 0 || episode >= 0 { 2 } else { 1 };
-    let mut latest: Option<store::UnitState> = None;
-    for (unit_season, unit_episode) in units.into_iter().take(count) {
+    let episode_played = episode_unit.as_ref().is_some_and(|unit| unit.played);
+    if episode_played {
+        return true;
+    }
+    let episode_updated_at = episode_unit.as_ref().map(|unit| unit.updated_at);
+    let mut latest_broader: Option<store::UnitState> = None;
+    let broader_units = [
+        (season, crate::store::UNIT_WHOLE),
+        (crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE),
+    ];
+    let count = usize::from(season >= 0) + 1;
+    for (unit_season, unit_episode) in broader_units.into_iter().take(count) {
         match store.unit_state(user_id, media_id, unit_season, unit_episode) {
-            Ok(Some(state)) if latest.as_ref().is_none_or(|current| state.updated_at >= current.updated_at) => latest = Some(state),
+            Ok(Some(state)) if latest_broader.as_ref().is_none_or(|current| state.updated_at > current.updated_at) => latest_broader = Some(state),
             Ok(Some(_)) | Ok(None) => {}
             Err(error) => tracing::warn!(%error, %user_id, %media_id, season = unit_season, episode = unit_episode, "failed to read Jellyfin played mark"),
         }
     }
-    latest.is_some_and(|state| state.played)
+    latest_broader.is_some_and(|unit| {
+        unit.played && episode_updated_at.is_none_or(|updated_at| unit.updated_at > updated_at)
+    })
 }
 pub(super) fn item_is_played(
     store: &crate::Store,

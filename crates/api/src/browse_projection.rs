@@ -295,6 +295,13 @@ impl ProjectionService {
         self.dirty_libraries.lock().contains_key(library_id)
     }
 
+    /// Forget all in-memory state for a library after its removal is committed.
+    pub(crate) fn remove_library(&self, library_id: &str) {
+        self.deps.lock().remove_library(library_id);
+        self.dirty_libraries.lock().remove(library_id);
+        self.visited.lock().remove(library_id);
+    }
+
     /// Ensure a valid projection snapshot is available for `library_id`.
     ///
     /// If the snapshot is missing, dirty, or built for a different revision/scope,
