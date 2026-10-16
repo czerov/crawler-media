@@ -133,5 +133,31 @@ async fn lease_loss_stops_jobs_and_gates_manual_run() {
     );
     let (status, _) = h.run_subscribe_raw(id).await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    // Review L-9: every write endpoint is gated, reads stay available.
+    for (method, path) in [
+        ("DELETE", format!("/api/v1/subscriptions/{id}")),
+        ("POST", "/api/v1/downloaders/tasks/remove".to_string()),
+    ] {
+        let response = tower::ServiceExt::oneshot(
+            h.app.clone(),
+            super::common::request(method, &path, Some(super::harness::TOKEN), serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT, "{method} {path}");
+    }
+    let response = tower::ServiceExt::oneshot(
+        h.app.clone(),
+        super::common::request(
+            "GET",
+            &format!("/api/v1/subscriptions/{id}"),
+            Some(super::harness::TOKEN),
+            serde_json::Value::Null,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK, "reads stay available");
+    assert!(h.state.store().lock().get_subscribe(id).unwrap().is_some(), "not deleted");
     handle.shutdown().await.unwrap();
 }
