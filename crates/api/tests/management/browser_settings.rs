@@ -295,3 +295,43 @@ async fn saving_browser_settings_reconciles_managed_obscura() {
     let body = crate::common::json_body(resp).await;
     assert_eq!(body["data"]["not_started_reason"], "cdp_disabled");
 }
+
+#[tokio::test]
+async fn sync_cdp_errors_when_enabled_without_endpoint() {
+    let tmp = tempdir().unwrap();
+    let fetcher = Arc::new(Fixtures {
+        requests: Mutex::new(Vec::new()),
+        bodies: HashMap::new(),
+    });
+    let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("dl")));
+    let state = state(tmp.path(), fetcher, downloader);
+    let app = router(state);
+
+    // Enable CDP with empty URL (and Obscura not running)
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings/browser")
+        .header("Authorization", "Bearer management-secret")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "cdp": { "enabled": true, "url": "" }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Call sync-cdp -> returns 400 cdp.no_endpoint
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/settings/browser/sync-cdp")
+        .header("Authorization", "Bearer management-secret")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = crate::common::json_body(resp).await;
+    assert_eq!(body["error"]["code"], "cdp.no_endpoint");
+}
