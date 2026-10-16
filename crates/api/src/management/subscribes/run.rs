@@ -335,9 +335,11 @@ fn execute(
     Ok((outcome, scrape, library_lease))
 }
 
-fn load_run_facts(state: &ApiState, id: SubscribeId, context: &RunContext)
-    -> Result<subscribe::SubscribeFacts, ApiError>
-{
+fn load_run_facts(
+    state: &ApiState,
+    id: SubscribeId,
+    context: &RunContext,
+) -> Result<subscribe::SubscribeFacts, ApiError> {
     let existing = state.store.lock().load_pending(id)?;
     let facts = state
         .store
@@ -478,8 +480,31 @@ fn persist(
         })
         .collect();
     store.record_pending_submissions(id, &pending_items)?;
+    // G-M2: a broken existing task becomes a rejected source here too.
+    let broken: Vec<_> = routed
+        .broken_torrents()
+        .into_iter()
+        .map(|torrent| {
+            let downloader_id = routed.used_id(&torrent);
+            (
+                0,
+                crate::store::PendingDownload {
+                    torrent,
+                    release_override: None,
+                    downloader_id,
+                    submitted_at: Some(now),
+                },
+            )
+        })
+        .collect();
+    let broken_enclosures: Vec<String> = broken
+        .iter()
+        .map(|(_, p)| p.torrent.enclosure.clone())
+        .collect();
+    store.record_pending_submissions(id, &broken)?;
     store.mark_pending_imported(id, &transferred)?;
     store.mark_pending_rejected(id, &rejected)?;
+    store.mark_pending_rejected(id, &broken_enclosures)?;
     store.save_subscribe_facts(id, &outcome.facts)?;
     // M6: same queue as the Transfer job; deletion failures are retried later.
     for path in &outcome.removed_paths {

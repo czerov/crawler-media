@@ -149,6 +149,8 @@ pub(crate) struct RoutedDownloader<'a> {
     clients: Mutex<HashMap<Option<DownloaderId>, Arc<dyn Downloader>>>,
     /// D-M3: info hash reported by the client right after each submission.
     hashes: Mutex<HashMap<String, String>>,
+    /// G-M2: torrents whose existing client task turned out broken.
+    broken: Mutex<Vec<Torrent>>,
 }
 
 impl<'a> RoutedDownloader<'a> {
@@ -160,6 +162,7 @@ impl<'a> RoutedDownloader<'a> {
             used: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
+            broken: Mutex::new(Vec::new()),
         }
     }
 
@@ -179,12 +182,18 @@ impl<'a> RoutedDownloader<'a> {
             used: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
+            broken: Mutex::new(Vec::new()),
         }
     }
 
     /// D-M3: info hash of a torrent submitted through this router, if known.
     pub(crate) fn submitted_hash(&self, torrent: &Torrent) -> Option<String> {
         self.hashes.lock().get(&torrent.enclosure).cloned()
+    }
+
+    /// G-M2: torrents rejected because their existing task is broken.
+    pub(crate) fn broken_torrents(&self) -> Vec<Torrent> {
+        self.broken.lock().clone()
     }
 
     pub(crate) fn used_id(&self, torrent: &Torrent) -> Option<DownloaderId> {
@@ -291,7 +300,11 @@ impl Downloader for RoutedDownloader<'_> {
         self.used.lock().insert(torrent.enclosure.clone(), id);
         let client = self.client_for(torrent)?;
         if let Err(error) = submit_on(self.state, client.as_ref(), torrent, None) {
-            self.used.lock().remove(&torrent.enclosure);
+            if matches!(error, DownloaderError::ExistingTaskBroken(..)) {
+                self.broken.lock().push(torrent.clone());
+            } else {
+                self.used.lock().remove(&torrent.enclosure);
+            }
             return Err(error);
         }
         match client.owned_identity(torrent) {
