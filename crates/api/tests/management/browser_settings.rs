@@ -62,6 +62,43 @@ async fn test_browser_settings_crud_and_cdp_disabled_guard() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn browser_settings_reject_ws_credentials_and_query_endpoints() {
+    let tmp = tempdir().unwrap();
+    let fetcher = Arc::new(Fixtures {
+        requests: Mutex::new(Vec::new()),
+        bodies: HashMap::new(),
+    });
+    let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("dl")));
+    let state = state(tmp.path(), fetcher, downloader);
+    let app = router(state);
+
+    for bad_url in [
+        "ws://127.0.0.1:9222",
+        "wss://127.0.0.1:9222",
+        "http://user:pass@127.0.0.1:9222",
+        "http://127.0.0.1:9222?token=xyz",
+        "https://127.0.0.1:9222",
+    ] {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/settings/browser")
+            .header("Authorization", "Bearer management-secret")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "cdp": { "enabled": true, "url": bad_url }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = crate::common::json_body(resp).await;
+        assert_eq!(body["error"]["code"], "browser.invalid_endpoint");
+    }
+}
+
 async fn create_and_login_member(app: &axum::Router, username: &str, password: &str) -> String {
     let create_res = app
         .clone()

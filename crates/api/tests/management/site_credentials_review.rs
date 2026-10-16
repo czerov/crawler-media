@@ -29,7 +29,7 @@ fn payload() -> Value {
         "url": "https://base-user:base-password@pt.example/base-path-secret?key=base-query-secret#base-fragment-secret",
         "rss_url": "https://pt.example/rss/rss-path-secret?passkey=rss-passkey-secret#rss-fragment-secret",
         "proxy": "http://proxy-user:proxy-password@proxy.example:8080/proxy-path-secret?token=proxy-query-secret",
-        "cdp_url": "wss://cdp-user:cdp-password@browser.example/cdp-path-secret?token=cdp-query-secret",
+        "cdp_url": "http://browser.example:9222/cdp-path-secret",
         "cookie": "cookie-secret", "api_key": "api-key-secret"
     })
 }
@@ -203,7 +203,7 @@ async fn explicit_url_replacements_and_empty_credential_clears_are_persisted() {
     let uri = format!("/api/v1/sites/{id}");
     let replacements = json!({
         "url": "https://replacement.example/", "rss_url": "https://replacement.example/rss?key=new",
-        "proxy": "http://new:secret@proxy.example/", "cdp_url": "ws://browser.example/new?token=new"
+        "proxy": "http://new:secret@proxy.example/", "cdp_url": "http://browser.example:9222/new"
     });
     call(
         &app,
@@ -292,4 +292,16 @@ async fn switching_back_to_http_and_adding_a_proxy_in_one_patch_is_allowed() {
         "proxy": "http://proxy.example:8080"
     }))).await.unwrap();
     assert_eq!(patch_resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn site_write_rejects_invalid_cdp_url() {
+    let tmp = tempdir().unwrap();
+    let app = app(&tmp);
+    let mut p = payload();
+    p["cdp_url"] = json!("wss://cdp-user:cdp-password@browser.example/cdp?token=x");
+    let resp = app.clone().oneshot(request("POST", "/api/v1/sites", Some("management-secret"), p)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = crate::common::json_body(resp).await;
+    assert_eq!(body["error"]["code"], "site.invalid_endpoint");
 }

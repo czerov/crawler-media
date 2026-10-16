@@ -33,6 +33,9 @@ pub(crate) async fn put_browser_settings(
 fn settings_error(error: BrowserSettingsError) -> Response {
     tracing::error!(%error, "Browser settings operation rejected");
     let (status, code) = match &error {
+        BrowserSettingsError::InvalidEndpoint(_) => {
+            (StatusCode::BAD_REQUEST, "browser.invalid_endpoint")
+        }
         BrowserSettingsError::Invalid(_) => (StatusCode::BAD_REQUEST, "browser.invalid_config"),
         BrowserSettingsError::Store(_) => (StatusCode::INTERNAL_SERVER_ERROR, "store.error"),
     };

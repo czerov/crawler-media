@@ -194,6 +194,15 @@ pub(crate) async fn create_site(
             "浏览器维护方式不支持配置代理",
         );
     }
+    if let Some(cdp_url) = body.cdp_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        if let Err(e) = indexer::BrowserConfig::validate_endpoint(cdp_url.trim()) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "site.invalid_endpoint",
+                &e.to_string(),
+            );
+        }
+    }
     let site = Site {
         id: SiteId::new(),
         name: body.name,
@@ -337,6 +346,16 @@ fn replacement_site(
             "浏览器维护方式不支持配置代理",
         ));
     }
+    let cdp_url = replacement_credential(body.cdp_url, current.cdp_url);
+    if let Some(endpoint) = cdp_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        if let Err(_) = indexer::BrowserConfig::validate_endpoint(endpoint.trim()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "site.invalid_endpoint",
+                "无效的 CDP discovery 端点",
+            ));
+        }
+    }
     Ok(Site {
         id: current.id,
         name: body.name,
@@ -347,7 +366,7 @@ fn replacement_site(
         rss_url: replacement_credential(body.rss_url, current.rss_url),
         proxy,
         rate_limit_per_minute: body.rate_limit_per_minute,
-        cdp_url: replacement_credential(body.cdp_url, current.cdp_url),
+        cdp_url,
         downloader_id,
         enabled: body.enabled,
         maintenance_via,
@@ -436,6 +455,16 @@ pub(crate) async fn patch_site(
         site.rate_limit_per_minute = (rate > 0).then_some(rate);
     }
     if let Some(cdp_url) = body.cdp_url {
+        let trimmed = cdp_url.trim();
+        if !trimmed.is_empty() {
+            if let Err(_) = indexer::BrowserConfig::validate_endpoint(trimmed) {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "site.invalid_endpoint",
+                    "无效的 CDP discovery 端点",
+                );
+            }
+        }
         site.cdp_url = (!cdp_url.is_empty()).then_some(cdp_url);
     }
     if let Some(downloader_id) = body.downloader_id {

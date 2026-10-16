@@ -10,6 +10,8 @@ use crate::{Store, settings_keys as keys};
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserSettingsError {
     #[error("{0}")]
+    InvalidEndpoint(String),
+    #[error("{0}")]
     Invalid(String),
     #[error(transparent)]
     Store(#[from] store::StoreError),
@@ -94,7 +96,7 @@ impl BrowserSettings {
         }
         if self.cdp_enabled && !self.cdp_url.trim().is_empty() {
             BrowserConfig::validate_endpoint(&self.cdp_url)
-                .map_err(|error| invalid(&error.to_string()))?;
+                .map_err(|error| BrowserSettingsError::InvalidEndpoint(error.to_string()))?;
         }
         Ok(())
     }
