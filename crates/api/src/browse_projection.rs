@@ -496,20 +496,40 @@ impl ProjectionService {
                     _ => return false,
                 };
                 drop(store);
-                for f in snap.files {
-                    if let Some(ff) = facts::FileFacts::from_json(&f.facts) {
-                        let path = std::path::Path::new(&ff.row.path);
-                        let meta = files.metadata(path);
-                        let (cur_size, cur_mtime) = match meta {
-                            Ok(m) if m.is_file() => (
-                                m.len(),
-                                m.modified().ok().and_then(|t| {
-                                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_nanos() as i64)
-                                }),
-                            ),
-                            _ => (0, None),
-                        };
-                        if cur_size != ff.size || cur_mtime != ff.modified_ns {
+                for file in snap.files {
+                    let Some(previous) = facts::FileFacts::from_json(&file.facts) else {
+                        return true;
+                    };
+                    let path = std::path::Path::new(&previous.row.path);
+                    let meta = files.metadata(path);
+                    let (cur_size, cur_mtime) = match meta {
+                        Ok(meta) if meta.is_file() => (
+                            meta.len(),
+                            meta.modified().ok().and_then(|time| {
+                                time.duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|duration| duration.as_nanos() as i64)
+                            }),
+                        ),
+                        _ => (0, None),
+                    };
+                    if cur_size != previous.size || cur_mtime != previous.modified_ns {
+                        return true;
+                    }
+                    for (candidate, old_version) in &previous.sidecars {
+                        let old_version = old_version.as_object();
+                        let current = files.metadata(std::path::Path::new(candidate)).ok().filter(|m| m.is_file());
+                        let current_version = current.map(|meta| serde_json::json!({
+                            "size": meta.len(),
+                            "modified_ns": meta.modified().ok().and_then(|time| {
+                                time.duration_since(std::time::UNIX_EPOCH).ok()
+                                    .map(|duration| duration.as_nanos() as i64)
+                            }),
+                        }));
+                        if old_version.is_some() != current_version.is_some()
+                            || old_version.zip(current_version.as_ref().and_then(serde_json::Value::as_object))
+                                .is_some_and(|(old, new)| old != new)
+                        {
                             return true;
                         }
                     }
@@ -526,6 +546,9 @@ impl ProjectionService {
     /// Poll all three sources for changes sharing ONE per-round event budget (D3-03).
     pub fn poll_changes(&self, state: &ApiState) -> Result<bool, ProjectionError> {
         let store = state.store.lock();
+        self.consumer
+            .hydrate_ready_dependencies(&store)
+            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
         let ownership = store
             .library_ownership()
             .map_err(|e| ProjectionError::Failed(e.to_string()))?;
@@ -565,7 +588,8 @@ impl ProjectionService {
             }
         }
         if !sources_complete {
-            return Ok(None);
+            tracing::debug!(library_id = %library_id, "浏览投影等待 journal 完整消费");
+            return Err(ProjectionError::Busy);
         }
         if self.dirty_libraries.lock().contains_key(library_id) {
             return Ok(None);
@@ -617,11 +641,33 @@ fn fresh_snapshot_inner(
 }
 
 /// blocking 线程上的构建 → 发布 → 回读；Store 锁只包住短 DB 读写。
+fn ownership_signature(store: &store::Store) -> Result<String, store::StoreError> {
+    let mut libraries: Vec<_> = store
+        .library_ownership()?
+        .libraries()
+        .iter()
+        .map(|library| {
+            let mut roots: Vec<_> = library.root_paths.iter().map(|root| root.display().to_string()).collect();
+            roots.sort_unstable();
+            format!("{}:{}:{}", library.id, library.kind.as_str(), roots.join("\u{1f}"))
+        })
+        .collect();
+    libraries.sort_unstable();
+    Ok(libraries.join("\u{1e}"))
+}
+
 fn publish_blocking(
     deps: &Arc<Mutex<ProjectionDependencies>>,
     state: &ApiState,
     library_id: &str,
 ) -> BuildOutcome {
+    let ownership_epoch = {
+        let store = state.store.lock();
+        match ownership_signature(&store) {
+            Ok(signature) => signature,
+            Err(error) => return BuildOutcome::Failed(error.to_string()),
+        }
+    };
     let build = match builder::build(state, library_id) {
         Ok(build) => build,
         Err(error) => return BuildOutcome::from_error(error),
@@ -663,6 +709,13 @@ fn publish_blocking(
     );
 
     let store = state.store.lock();
+    let current_epoch = match ownership_signature(&store) {
+        Ok(signature) => signature,
+        Err(error) => return BuildOutcome::Failed(error.to_string()),
+    };
+    if current_epoch != ownership_epoch {
+        return BuildOutcome::StaleScope;
+    }
     match store.publish_browse_projection(&build) {
         Ok(true) => match store.browse_projection(library_id) {
             Ok(Some(snapshot)) => BuildOutcome::Ready(snapshot),

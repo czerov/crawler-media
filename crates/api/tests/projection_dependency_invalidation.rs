@@ -68,6 +68,21 @@ fn unrelated_catalog_search_does_not_rebuild_other_library() {
 }
 
 #[test]
+fn catalog_detail_change_invalidates_unhydrated_library_coverage() {
+    let (_tmp, store) = create_store();
+    let ownership = store.library_ownership().unwrap();
+    let library_id = ownership.libraries()[0].id.clone();
+    let deps = Arc::new(Mutex::new(ProjectionDependencies::new()));
+    let consumer = ChangeConsumer::new(deps);
+    store
+        .put_catalog_cache("tmdb", "/movie/999", "{}", 1, None)
+        .unwrap();
+    consumer
+        .poll_source(&store, &ownership, BrowseChangeSource::Catalog)
+        .unwrap();
+    let after = store.browse_projection_head(&library_id).unwrap().unwrap();
+    assert!(after.dirty_token > 0);
+}
 fn moving_ledger_dirties_old_and_new_owner() {
     let (tmp, store) = create_store();
     let deps = Arc::new(Mutex::new(ProjectionDependencies::new()));

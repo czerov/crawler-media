@@ -41,7 +41,9 @@ pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, Proj
             .entry(row.media_id)
             .or_default()
             .push(row.clone());
-        file_facts.push(file_facts_for(files, row, owned.missing.contains(&row.path)));
+        if let Some(media) = media_map.get(&row.media_id) {
+            file_facts.push(file_facts_for(files, row, media, owned.missing.contains(&row.path)));
+        }
     }
     let media_facts = media_facts_for(&owned.media_ids, &media_map, &rows_by_media, &cache, files);
     let (expected_dirty_token, next_generation) = {
@@ -160,9 +162,21 @@ fn load_catalog_rows(state: &ApiState, media_map: &HashMap<MediaId, Media>) -> V
         })
 }
 
-fn file_facts_for(files: &dyn BrowseFileRead, row: &LedgerRow, missing: bool) -> BrowseFileFacts {
+fn file_facts_for(
+    files: &dyn BrowseFileRead,
+    row: &LedgerRow,
+    media: &Media,
+    missing: bool,
+) -> BrowseFileFacts {
     let path = Path::new(&row.path);
     let (size, has_stat, created_ns, modified_ns) = observe(files, path);
+    let mut sidecars = serde_json::Map::new();
+    for candidate in crate::scrape_metadata::nfo_candidates(path, row, media.kind) {
+        sidecars.insert(candidate.display().to_string(), observe_version(files, &candidate));
+    }
+    for candidate in artwork_candidates(path) {
+        sidecars.insert(candidate.display().to_string(), observe_version(files, &candidate));
+    }
     let facts = FileFacts {
         row: row.clone(),
         size,
@@ -171,12 +185,42 @@ fn file_facts_for(files: &dyn BrowseFileRead, row: &LedgerRow, missing: bool) ->
         modified_ns,
         missing,
         has_still: crate::episode_still::existing_with(path, files).is_some(),
+        sidecars,
     };
     BrowseFileFacts {
         ledger_id: row.id,
         media_id: row.media_id,
         facts: facts.to_json(),
     }
+}
+
+fn observe_version(files: &dyn BrowseFileRead, path: &Path) -> serde_json::Value {
+    match files.metadata(path) {
+        Ok(meta) if meta.is_file() => serde_json::json!({
+            "size": meta.len(),
+            "modified_ns": meta.modified().ok().and_then(to_ns),
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn artwork_candidates(video: &Path) -> Vec<std::path::PathBuf> {
+    let Some(parent) = video.parent() else {
+        return Vec::new();
+    };
+    let stem = video.file_stem().and_then(|value| value.to_str()).unwrap_or_default();
+    let mut candidates = vec![parent.join("poster.jpg"), parent.join("fanart.jpg")];
+    if let Some(up) = parent.parent() {
+        candidates.push(up.join("poster.jpg"));
+        candidates.push(up.join("fanart.jpg"));
+    }
+    candidates.extend([
+        crate::episode_still::path(video),
+        parent.join(format!("{stem}-still.jpg")),
+        parent.join(format!("{stem}.jpg")),
+        parent.join("still.jpg"),
+    ]);
+    candidates
 }
 
 /// 与 `file_stats` 同一口径：只有普通文件计入 size/added_at，缺失或错误留空。

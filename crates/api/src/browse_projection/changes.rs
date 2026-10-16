@@ -63,6 +63,39 @@ impl ChangeConsumer {
         Self { deps }
     }
 
+    /// Load persisted ready projections once their reverse-dependency coverage is absent.
+    pub fn hydrate_ready_dependencies(&self, store: &Store) -> Result<(), StoreError> {
+        let ownership = store.library_ownership()?;
+        let mut dependencies = self.deps.lock();
+        for library in ownership.libraries() {
+            if dependencies.catalog_by_library.contains_key(&library.id) {
+                continue;
+            }
+            let Some(snapshot) = store.browse_projection(&library.id)? else {
+                dependencies.record_library(&library.id, [], [], [], []);
+                continue;
+            };
+            let mut media_ids = HashSet::new();
+            let mut ledger_ids = HashSet::new();
+            let mut paths = HashSet::new();
+            for file in snapshot.files {
+                if let Some(facts) = super::facts::FileFacts::from_json(&file.facts) {
+                    media_ids.insert(facts.row.media_id);
+                    ledger_ids.insert(facts.row.id);
+                    paths.insert(facts.row.path);
+                }
+            }
+            let catalog_keys = snapshot.media.iter().filter_map(|media| {
+                let facts = media.facts.get("media")?;
+                let tmdb_id = facts.get("tmdb_id")?.as_str()?;
+                let kind = facts.get("kind")?.as_str().unwrap_or("movie");
+                Some(format!("tmdb:/{kind}/{tmdb_id}"))
+            });
+            dependencies.record_library(&library.id, media_ids, ledger_ids, paths, catalog_keys);
+        }
+        Ok(())
+    }
+
     /// Poll changes from one source with a caller-supplied event budget.
     /// Updates `budget_remaining` and returns `(events_processed, is_complete)`.
     pub fn poll_source_budgeted(
@@ -131,7 +164,10 @@ impl ChangeConsumer {
                         affected.insert(c.entity_key.clone());
                         for root in c.old_path.iter().chain(c.new_path.iter()) {
                             for (lib_id, paths) in &deps.paths_by_library {
-                                if paths.iter().any(|path| Path::new(path).starts_with(root)) {
+                                if paths.iter().any(|path| {
+                                    Path::new(path).starts_with(root)
+                                        || Path::new(root).starts_with(path)
+                                }) {
                                     affected.insert(lib_id.clone());
                                 }
                             }
@@ -276,16 +312,25 @@ impl ChangeConsumer {
                                 resolved = true;
                             }
                         }
-                        // Known detail-cache paths that are not projected dependencies are
-                        // unrelated. Unknown key shapes remain conservatively invalidated.
                         let known_detail_key = base_key
                             .split_once(':')
                             .is_some_and(|(_, path)| {
                                 path.starts_with('/')
                                     && path.split('/').filter(|part| !part.is_empty()).count() == 2
                             });
-                        if !resolved && !known_detail_key {
-                            affected.extend(all_libs.iter().map(|l| l.id.clone()));
+                        // A matching in-memory dependency proves only that library's
+                        // relationship. Missing entries are unknown after restart, not
+                        // evidence that a ready persisted projection is unrelated.
+                        // Libraries without persisted/in-memory coverage remain unknown.
+                        for lib in all_libs {
+                            if !deps.catalog_by_library.contains_key(&lib.id) {
+                                affected.insert(lib.id.clone());
+                            }
+                        }
+                        if !resolved && (!known_detail_key || all_libs.iter().any(|lib| {
+                            !deps.catalog_by_library.contains_key(&lib.id)
+                        })) {
+                            affected.extend(all_libs.iter().map(|lib| lib.id.clone()));
                         }
                     }
                     _ => {

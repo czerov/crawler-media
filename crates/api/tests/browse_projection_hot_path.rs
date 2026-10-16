@@ -298,6 +298,7 @@ async fn mark_dirty_rebuilds_projection_after_external_file_change() {
     let _ = media_id;
 }
 
+
 #[tokio::test]
 async fn hot_browse_requests_do_zero_file_io() {
     let fix = seeded_fixture();
