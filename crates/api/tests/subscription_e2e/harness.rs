@@ -380,6 +380,13 @@ impl Harness {
         }
         let mut out = Vec::new();
         walk(&self.movie_library_root(), &mut out);
+        let tv = self.state.store().lock().default_library(MediaKind::Tv);
+        if let Ok(Some(tv)) = tv {
+            let tv = PathBuf::from(tv.root_paths[0].clone());
+            if tv != self.movie_library_root() {
+                walk(&tv, &mut out);
+            }
+        }
         out.sort();
         out
     }

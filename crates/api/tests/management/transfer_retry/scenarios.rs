@@ -148,10 +148,9 @@ async fn unrelated_torrent_with_same_episode_does_not_steal_owned_destination() 
         .find(|(row, _, _)| row.path == destination.to_str().unwrap())
         .unwrap();
     assert_eq!(owned_row.2.as_deref(), own_source.to_str());
-    // The unrelated source becomes its own parallel file (non wash-cut) and its
-    // subtitle stays beside that file, so the episode is imported rather than
-    // silently rebound to the owned version.
-    assert_eq!(rows.len(), 2, "parallel version must be its own ledger row");
+    // M2: without wash-cut the episode is already owned, so the unrelated
+    // source is a duplicate and is not imported (no parallel library copy).
+    assert_eq!(rows.len(), 1, "owned episode is not duplicated (M2)");
     fixture.assert_pending(0, 2);
 }
 

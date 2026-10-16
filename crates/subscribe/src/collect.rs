@@ -95,6 +95,8 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
     control: &library::WorkControl,
 ) {
     let mut vetoed = false;
+    // M2: video files skipped because their slots were already owned.
+    let mut duplicate = false;
     let errors_before_torrent = collection_errors.len();
     let completed_files = match added.input.downloader.completed_files(&scored.torrent) {
         Ok(files) => files,
@@ -146,6 +148,7 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
             ledger_sources,
             removed_paths,
             &mut vetoed,
+            &mut duplicate,
             control,
         ) {
             Ok(Some(dest)) => torrent_destinations.push(
@@ -171,6 +174,8 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
             sidecar_destinations.push(mapping.clone());
         }
     }
+    // M2: subtitles of a pure duplicate have no new video to sit beside.
+    let subs = if duplicate && torrent_destinations.is_empty() { Vec::new() } else { subs };
     let subs_count = subs.len();
     for src in subs {
         if control.is_cancelled() {
@@ -189,7 +194,8 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
             }
         }
     }
-    let has_work = !torrent_destinations.is_empty() || subs_count > 0;
+    // A download that only duplicated owned episodes (M2) is finished too.
+    let has_work = !torrent_destinations.is_empty() || subs_count > 0 || duplicate;
     if reported_any && has_work && collection_errors.len() == errors_before_torrent {
         transferred_enclosures.push(scored.torrent.enclosure.clone());
     }
@@ -261,6 +267,7 @@ fn collect_one<D: Downloader + ?Sized>(
     ledger_sources: &mut Vec<LedgerSource>,
     removed_paths: &mut Vec<String>,
     vetoed: &mut bool,
+    duplicate: &mut bool,
     control: &library::WorkControl,
 ) -> Result<Option<PathBuf>, SubscribeError> {
     let file_release = release::parse(
@@ -292,8 +299,27 @@ fn collect_one<D: Downloader + ?Sized>(
     let has_existing = slots
         .iter()
         .any(|(season, episode)| added.input.facts.get(*season, *episode).is_some());
-    // Only unapproved Wash-cut arrivals are blocked; ordinary extra versions coexist.
+    // Only unapproved Wash-cut arrivals are blocked.
     if added.input.subscribe.wash_cut && has_existing && !approved {
+        return Ok(None);
+    }
+    // M2: without wash-cut an arrival whose every slot already has a file
+    // owned before this run is a duplicate (e.g. the owned episode inside a
+    // range pack). Files published earlier in this same run (extras) coexist.
+    let all_owned = !slots.is_empty()
+        && slots.iter().all(|(season, episode)| {
+            added
+                .input
+                .facts
+                .get(*season, *episode)
+                .and_then(|fact| fact.path.as_deref())
+                .is_some_and(|path| {
+                    Path::new(path).exists() && !ledger.iter().any(|row| row.path == path)
+                })
+        });
+    if !added.input.subscribe.wash_cut && all_owned {
+        tracing::info!(torrent = %scored.torrent.title, file = %src.display(), "非洗版：槽位已有在库文件，跳过转存");
+        *duplicate = true;
         return Ok(None);
     }
     // A name can be taken between choosing it and publishing it (another
@@ -355,6 +381,16 @@ fn collect_one<D: Downloader + ?Sized>(
         .copied()
         .filter(|(s, e)| {
             !added.input.subscribe.wash_cut || approved || added.input.facts.get(*s, *e).is_none()
+        })
+        // M2: non-wash never repoints a slot owned before this run.
+        .filter(|(s, e)| {
+            added.input.subscribe.wash_cut
+                || !added
+                    .input
+                    .facts
+                    .get(*s, *e)
+                    .and_then(|fact| fact.path.as_deref())
+                    .is_some_and(|path| !ledger.iter().any(|row| row.path == path))
         })
         .collect();
     commit_video_facts(

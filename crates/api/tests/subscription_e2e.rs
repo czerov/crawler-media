@@ -36,6 +36,8 @@ mod h3_background_reconcile;
 mod h4_season_pack_pending;
 #[path = "subscription_e2e/m1_overlap_policy.rs"]
 mod m1_overlap_policy;
+#[path = "subscription_e2e/m2_owned_slot_skip.rs"]
+mod m2_owned_slot_skip;
 #[path = "subscription_e2e/s1_wash_probe_fail.rs"]
 mod s1_wash_probe_fail;
 
