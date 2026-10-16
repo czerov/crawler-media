@@ -1,6 +1,12 @@
 //! G-M5: only one API instance may drive a data directory. The lease lives in
 //! the app DB, is refreshed by a heartbeat thread and released on drop; a lease
 //! whose heartbeat is older than the TTL can be taken over after a crash.
+//!
+//! Review L-7: the lease compares wall-clock times (`unix_now`) written by
+//! different processes. A large NTP step forward can make a live holder look
+//! stale (takeover; the old holder notices on its next heartbeat and turns
+//! read-only), and a step backward can delay takeover of a crashed holder.
+//! Keep the hosts' clocks synced; the TTL (60 s) is the tolerance window.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;

@@ -1,6 +1,8 @@
 //! F-1: when a pack is chosen only to fill some missing episodes, ask the
 //! client to skip the files of episodes already owned or in flight.
-//! Off unless `subscribe.selective_files` is `true`.
+//! Controlled by the global setting `subscribe.selective_files` (applies to
+//! every subscription; there is no per-subscription switch). Off unless it
+//! is `true`.
 
 use std::collections::BTreeSet;
 
