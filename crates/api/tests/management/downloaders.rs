@@ -490,25 +490,18 @@ async fn list_tasks_does_not_bind_pending_to_same_size_different_title() {
 }
 
 #[tokio::test]
-async fn list_tasks_auto_cleans_stale_absent_pending() {
+async fn list_tasks_keeps_stale_http_pending_when_client_list_is_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let enclosure = "https://pt.example/download.php?id=1";
     seed_pending_at(tmp.path(), enclosure, now_secs() - 30 * 60);
     let app = app(&tmp);
 
-    // 提交超过宽限期、客户端可达但种子不在 → 判定任务已消失，自动清理 pending
-    // 行（下一轮搜索会按订阅重新投递），任务中心不再展示。
+    // Review M-2：客户端返回空列表（刚重启、连错实例）不能证明 HTTP 种子已消失，
+    // pending 必须保留；有归属标签可见时的自动清理由 subscription_e2e d_s1 覆盖。
     let listed = list_tasks_json(&app).await;
-    assert!(
-        task_items(&listed).is_empty(),
-        "超过宽限期的缺失任务应被自动清理"
-    );
-
+    assert_eq!(task_items(&listed).len(), 1, "{listed}");
     let store = Store::open(tmp.path().join("data")).unwrap();
-    assert!(
-        store.list_all_pending().unwrap().is_empty(),
-        "超过宽限期的缺失 pending 行应被删除"
-    );
+    assert_eq!(store.list_all_pending().unwrap().len(), 1);
 }
 
 #[tokio::test]
