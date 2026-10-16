@@ -193,13 +193,11 @@ fn collect_pending(
     let ServerReadSnapshot { ownership, is_admin, media, rows: ledger_rows, units, .. } = snapshot;
     let mut show_episodes: HashMap<domain::MediaId, HashSet<(u32, u32)>> = HashMap::new();
     let mut show_seasons: HashMap<domain::MediaId, HashSet<u32>> = HashMap::new();
-    // 可见性过滤必须与下面逐行建卡时的判定一致：否则成员用户的剧集
-    // `ChildCount` / 未看计数会把不可见库的集数也算进来。
+    // 本循环的候选行已经由请求作用域限定；这里不再逐行做 `row_visible_to_user`
+    // （那是每行一次 `library_for_path` 查询，正是本轮要消除的 per-item DB 读）。
     for row in &ledger_rows {
         let Some(item) = media.get(&row.media_id) else { continue };
-        if item.kind != MediaKind::Tv
-            || !crate::http::library::row_visible_to_user(store, row, item, Some(user_id))
-        {
+        if item.kind != MediaKind::Tv {
             continue;
         }
         if let (Some(season), Some(episode)) = (row.season, row.episode) {
