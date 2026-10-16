@@ -117,6 +117,7 @@ pub fn admit_and_add<D: Downloader + ?Sized>(
             removed_paths: Vec::new(),
             transferred_enclosures: Vec::new(),
             rejected_enclosures: broken.iter().map(|s| s.torrent.enclosure.clone()).collect(),
+            awaiting_probe_enclosures: Vec::new(),
             collection_errors: Vec::new(),
             submission_errors: add_errors.clone(),
             torrents_added,

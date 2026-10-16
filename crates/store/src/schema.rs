@@ -376,6 +376,9 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     // D-M3: torrent info hash recorded at submit time (when known).
     ensure_column(conn, "pending_downloads", "info_hash", "TEXT")?;
     ensure_column(conn, "pending_downloads", "selective_missing", "TEXT")?;
+    // Review N-1: capped wait for a source probe (additive, nullable).
+    ensure_column(conn, "pending_downloads", "probe_wait_attempts", "INTEGER")?;
+    ensure_column(conn, "pending_downloads", "probe_wait_since", "INTEGER")?;
     // Index on (subscribe_id, state) — must come after the state column exists.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS pending_downloads_sub_state_idx \

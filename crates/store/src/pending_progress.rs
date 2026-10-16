@@ -50,6 +50,34 @@ impl Store {
         Ok(())
     }
 
+    /// Review N-1: one more round in which the source could not be probed.
+    /// Returns `(attempts, first_seen)` for the row, `None` for unknown rows.
+    pub fn note_probe_wait(
+        &self,
+        subscribe_id: SubscribeId,
+        enclosure: &str,
+        now: i64,
+    ) -> Result<Option<(i64, i64)>, StoreError> {
+        let id = subscribe_id.to_string();
+        self.subscribe.execute(
+            "UPDATE pending_downloads
+             SET probe_wait_attempts = COALESCE(probe_wait_attempts, 0) + 1,
+                 probe_wait_since = COALESCE(probe_wait_since, ?3)
+             WHERE subscribe_id = ?1 AND enclosure = ?2 AND state = 'active'",
+            params![id, enclosure, now],
+        )?;
+        Ok(self
+            .subscribe
+            .query_row(
+                "SELECT probe_wait_attempts, probe_wait_since FROM pending_downloads
+                 WHERE subscribe_id = ?1 AND enclosure = ?2 AND state = 'active'",
+                params![id, enclosure],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?
+            .and_then(|(a, s)| Some((a?, s?))))
+    }
+
     /// D-M3: remember the info hash the downloader assigned to a pending row.
     pub fn set_pending_info_hash(
         &self,

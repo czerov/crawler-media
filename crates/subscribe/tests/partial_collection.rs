@@ -148,6 +148,7 @@ fn one_failed_file_does_not_discard_successful_files_from_same_torrent() {
             completed: false,
             transferred_enclosures: vec![],
             rejected_enclosures: Vec::new(),
+            awaiting_probe_enclosures: Vec::new(),
             collection_errors: vec![],
             submission_errors: vec![],
             torrents_added: vec![],

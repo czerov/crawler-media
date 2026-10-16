@@ -486,6 +486,11 @@ fn persist(
     };
     let modes =
         crate::worker::transfer::observe_transfer_modes(&outcome.ledger, &default_transfer_mode);
+    // Review N-1: capped wait for a source probe (outside the Store lock).
+    let mut outcome = outcome;
+    let exhausted =
+        crate::probe_wait::exhausted_probe_waits(state, id, &outcome.awaiting_probe_enclosures);
+    outcome.rejected_enclosures.extend(exhausted);
 
     let store = state.store.lock();
     lease

@@ -110,6 +110,12 @@ fn commit_transfer_outcome(
         }
     }
 
+    // Review N-1: capped wait for a source probe; exhausted waits are rejected.
+    let exhausted = crate::probe_wait::exhausted_probe_waits(
+        state,
+        subscribe.id,
+        &outcome.awaiting_probe_enclosures,
+    );
     // M6: queue replaced files instead of deleting inline; a failed delete
     // must not abort the commit and is retried later (outside the Store lock).
     {
@@ -121,6 +127,9 @@ fn commit_transfer_outcome(
         }
         store
             .mark_pending_rejected(subscribe.id, &outcome.rejected_enclosures)
+            .map_err(|e| e.to_string())?;
+        store
+            .mark_pending_rejected(subscribe.id, &exhausted)
             .map_err(|e| e.to_string())?;
     }
     crate::http::file_delete::retry_queued_deletions(&state.store);
@@ -251,6 +260,7 @@ fn build_added_input<'a>(
             completed: false,
             transferred_enclosures: Vec::new(),
             rejected_enclosures: Vec::new(),
+            awaiting_probe_enclosures: Vec::new(),
             collection_errors: Vec::new(),
             submission_errors: Vec::new(),
             torrents_added: Vec::new(),

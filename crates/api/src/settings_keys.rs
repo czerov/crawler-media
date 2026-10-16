@@ -47,6 +47,9 @@ pub const SUBSCRIBE_AIR_DATE_GATE: &str = "subscribe.air_date_gate";
 pub const SUBSCRIBE_OVERLAP_POLICY: &str = "subscribe.overlap_policy";
 /// F-1: download only the files of missing episodes when a pack fills a gap.
 pub const SUBSCRIBE_SELECTIVE_FILES: &str = "subscribe.selective_files";
+/// Review N-1: rounds a wash-cut arrival may wait for a source probe before
+/// it is rejected (default 6; the wait is also capped at 24 hours).
+pub const SUBSCRIBE_PROBE_WAIT_MAX_ATTEMPTS: &str = "subscribe.probe_wait_max_attempts";
 /// D-M2: `copy` (default) or `fail` when a hardlink transfer cannot link.
 pub const LIBRARY_HARDLINK_FALLBACK: &str = "library.hardlink_fallback";
 /// G-M5: "1"/"true" allows several instances on one data directory (unsafe).

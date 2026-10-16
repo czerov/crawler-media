@@ -60,6 +60,9 @@ pub struct RunOutcome {
     /// Wash-cut arrivals whose actual (probed) quality vetoed the replacement
     /// (H2). Persisted as `rejected` so automatic rounds never pick them again.
     pub rejected_enclosures: Vec<String>,
+    /// Review N-1: wash-cut arrivals whose source could not be probed yet;
+    /// nothing was published. The API caps how long they may wait.
+    pub awaiting_probe_enclosures: Vec<String>,
     /// Failures that occurred while collecting a multi-file download. Successful
     /// files remain in the outcome so callers can persist them before retrying.
     pub collection_errors: Vec<String>,

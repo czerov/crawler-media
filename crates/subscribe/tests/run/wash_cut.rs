@@ -144,9 +144,10 @@ fn assert_rejected_probe_preserves_owned(old_score: i32, resolution: &str, codec
         old_lib.to_str()
     );
     assert_eq!(outcome.facts.movie().unwrap().score, old_score);
-    // Review M-4: a probed non-upgrade is rolled back, not kept beside.
+    // Review N-1: a non-upgrade is probed at the source and never published.
     assert!(outcome.ledger.is_empty(), "rejected alternate is not recorded");
-    assert_eq!(outcome.removed_paths.len(), 1, "{:?}", outcome.removed_paths);
+    assert!(outcome.removed_paths.is_empty(), "{:?}", outcome.removed_paths);
+    assert_eq!(outcome.rejected_enclosures.len(), 1);
     assert!(
         old_lib.exists(),
         "标称更高、probe 更低的新文件不能删除在位版本"

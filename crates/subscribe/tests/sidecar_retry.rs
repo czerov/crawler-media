@@ -100,6 +100,7 @@ fn make_added<'a>(
             completed: false,
             transferred_enclosures: vec![],
             rejected_enclosures: Vec::new(),
+            awaiting_probe_enclosures: Vec::new(),
             collection_errors: vec![],
             submission_errors: vec![],
             torrents_added: vec![],

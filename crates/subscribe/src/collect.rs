@@ -57,6 +57,7 @@ pub fn collect_completed_recorded<D: Downloader + ?Sized>(
     let mut removed_paths = Vec::new();
     let mut transferred_enclosures = Vec::new();
     let mut rejected_enclosures = Vec::new();
+    let mut awaiting_probe_enclosures = Vec::new();
     let mut collection_errors = Vec::new();
 
     // 先依据现有已确认的目标映射刷新/协调 facts，确保即便 Downloader 在 Move 模式下不再列出视频，
@@ -80,6 +81,7 @@ pub fn collect_completed_recorded<D: Downloader + ?Sized>(
             &mut removed_paths,
             &mut transferred_enclosures,
             &mut rejected_enclosures,
+            &mut awaiting_probe_enclosures,
             &mut collection_errors,
             control,
             recorder,
@@ -94,6 +96,7 @@ pub fn collect_completed_recorded<D: Downloader + ?Sized>(
         removed_paths,
         transferred_enclosures,
         rejected_enclosures,
+        awaiting_probe_enclosures,
         collection_errors,
         submission_errors: added.add_errors,
         torrents_added: added.outcome.torrents_added,
@@ -110,6 +113,7 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
     removed_paths: &mut Vec<String>,
     transferred_enclosures: &mut Vec<String>,
     rejected_enclosures: &mut Vec<String>,
+    awaiting_probe_enclosures: &mut Vec<String>,
     collection_errors: &mut Vec<String>,
     control: &library::WorkControl,
     recorder: Option<&dyn TransferRecorder>,
@@ -137,6 +141,7 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
         removed_paths,
         transferred_enclosures,
         rejected_enclosures,
+        awaiting_probe_enclosures,
         collection_errors,
         control,
         recorder,
@@ -155,6 +160,7 @@ fn collect_scored_torrent_inner<D: Downloader + ?Sized>(
     removed_paths: &mut Vec<String>,
     transferred_enclosures: &mut Vec<String>,
     rejected_enclosures: &mut Vec<String>,
+    awaiting_probe_enclosures: &mut Vec<String>,
     collection_errors: &mut Vec<String>,
     control: &library::WorkControl,
     recorder: Option<&dyn TransferRecorder>,
@@ -294,6 +300,12 @@ fn collect_scored_torrent_inner<D: Downloader + ?Sized>(
     if vetoed && !rejected_enclosures.contains(&scored.torrent.enclosure) {
         rejected_enclosures.push(scored.torrent.enclosure.clone());
     }
+    if awaiting_probe
+        && !vetoed
+        && !awaiting_probe_enclosures.contains(&scored.torrent.enclosure)
+    {
+        awaiting_probe_enclosures.push(scored.torrent.enclosure.clone());
+    }
 }
 
 fn reconcile_mapping_facts(
@@ -425,6 +437,27 @@ fn collect_one<D: Downloader + ?Sized>(
         *duplicate = true;
         return Ok(None);
     }
+    // Review N-1: an arrival that needs S1 approval is probed at the source
+    // before anything is published, so an unprobeable or non-upgrade file
+    // never enters the Library (no publish/retract churn, no copies).
+    let pre_probed = if added.input.subscribe.wash_cut && has_existing {
+        let (quality, source, confidence) = quality_for(probe, &src, &scored.release, control);
+        control.check()?;
+        if source != QualitySource::Probe {
+            tracing::warn!(file = %src.display(), "源文件 probe 未完成，暂不转入媒体库，等待下一轮");
+            *awaiting_probe = true;
+            return Ok(None);
+        }
+        let (ok, _) = replacement_survives_probe(added, scored, &slots, approved, &quality, true);
+        if !ok {
+            tracing::warn!(file = %src.display(), "源文件 probe 后不构成升级，不转入媒体库");
+            *vetoed = true;
+            return Ok(None);
+        }
+        Some((quality, source, confidence))
+    } else {
+        None
+    };
     // Main's reservation: a retried transfer reuses its reserved destination.
     // Otherwise a name can be taken between choosing it and publishing it
     // (another worker, the user): publication never overwrites (D-H3), so pick
@@ -468,7 +501,10 @@ fn collect_one<D: Downloader + ?Sized>(
             }
         }
     };
-    let (quality, source, confidence) = quality_for(probe, &dest, &scored.release, control);
+    let (quality, source, confidence) = match pre_probed {
+        Some(probed) => probed,
+        None => quality_for(probe, &dest, &scored.release, control),
+    };
     control.check()?;
     // Final deletion approval uses actual (probed) quality, never the download
     // title alone: an unprobed arrival cannot replace an owned slot (S1).
