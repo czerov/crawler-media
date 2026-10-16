@@ -92,9 +92,11 @@ pub fn choose_with_policy(
 ) -> Vec<ScoredTorrent> {
     let mut chosen = Vec::new();
     if subscribe.full_season_pack {
+        let average = single_episode_average_size(admitted);
         if let Some(pack) = admitted
             .iter()
             .filter(|c| is_pack(&c.release, subscribe))
+            .filter(|c| pack_size_plausible(c, subscribe, average))
             .filter(|c| should_take(subscribe, wash_filter, facts, c))
             .max_by_key(|c| c.score)
         {
@@ -572,6 +574,46 @@ fn release_matches_subscribe(subscribe: &Subscribe, media: &Media, release: &Rel
         (Coverage::Tv { .. }, MediaKind::Tv) => !covered_slots(subscribe, release).is_empty(),
         _ => false,
     }
+}
+
+/// L1: average size of admitted single-episode candidates, when known.
+fn single_episode_average_size(admitted: &[ScoredTorrent]) -> Option<u64> {
+    let sizes: Vec<u64> = admitted
+        .iter()
+        .filter(|c| matches!(c.release.episode_span(), Some((from, to)) if from == to))
+        .filter_map(|c| c.torrent.size_bytes)
+        .collect();
+    (!sizes.is_empty()).then(|| sizes.iter().sum::<u64>() / sizes.len() as u64)
+}
+
+/// L1: a bare `S01` (no episode numbers) only counts as a season pack when
+/// its size is at least half of `average single × episodes`. Without a size
+/// or without single-episode references the old behaviour is kept.
+fn pack_size_plausible(
+    candidate: &ScoredTorrent,
+    subscribe: &Subscribe,
+    average: Option<u64>,
+) -> bool {
+    if candidate.release.episode.is_some() {
+        return true;
+    }
+    let (Some(size), Some(average)) = (candidate.torrent.size_bytes, average) else {
+        return true;
+    };
+    let Coverage::Tv {
+        episode_from,
+        episode_to: Some(episode_to),
+        ..
+    } = subscribe.coverage
+    else {
+        return true;
+    };
+    let episodes = u64::from(episode_to.saturating_sub(episode_from) + 1);
+    let plausible = size.saturating_mul(2) >= average.saturating_mul(episodes);
+    if !plausible {
+        tracing::debug!(torrent = %candidate.torrent.title, size, average, episodes, "纯季包体积过小，不视为整季包");
+    }
+    plausible
 }
 
 fn is_pack(release: &Release, subscribe: &Subscribe) -> bool {

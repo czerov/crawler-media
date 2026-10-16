@@ -687,3 +687,24 @@ fn m9_same_quality_falls_back_to_score_tie_break() {
     better.score = 5;
     assert!(choose(&subscribe, None, &[better], &facts).is_empty());
 }
+
+fn bare_pack(size: u64) -> ScoredTorrent {
+    let mut pack = scored("Show.S01.SP", 1, 1, 50);
+    pack.release.episode = None;
+    pack.release.episode_to = None;
+    pack.torrent.size_bytes = Some(size);
+    pack
+}
+
+#[test]
+fn l1_small_bare_season_is_not_a_pack() {
+    let mut subscribe = tv_subscribe(domain::MediaId::new());
+    subscribe.full_season_pack = true;
+    let mut single = scored("Show.S01E01", 1, 1, 10);
+    single.torrent.size_bytes = Some(2_000_000_000);
+    let facts = SubscribeFacts::default();
+    let small = bare_pack(300_000_000);
+    assert!(choose(&subscribe, None, &[small, single.clone()], &facts).is_empty());
+    let big = bare_pack(3_500_000_000);
+    assert_eq!(choose(&subscribe, None, &[big, single], &facts).len(), 1);
+}

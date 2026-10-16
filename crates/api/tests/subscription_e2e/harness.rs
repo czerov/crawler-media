@@ -168,6 +168,19 @@ impl Harness {
         *self.search.html.lock() = nexus_rows(rows);
     }
 
+    /// Like `set_search_rows`, with a per-row size cell such as `"300 MB"`.
+    pub fn set_search_rows_sized(&self, rows: &[(&str, u32, &str)]) {
+        let plain: Vec<(&str, u32)> = rows.iter().map(|(t, id, _)| (*t, *id)).collect();
+        let mut html = nexus_rows(&plain);
+        for (title, _, size) in rows {
+            let marker = format!("title=\"{title}\"");
+            let at = html.find(&marker).expect("row");
+            let cell = html[at..].find("4.00 GB").expect("size cell") + at;
+            html.replace_range(cell..cell + "4.00 GB".len(), size);
+        }
+        *self.search.html.lock() = html;
+    }
+
     /// Seed an owned movie file (library + ledger + facts) of the given quality.
     pub fn seed_owned_movie(
         &self,
