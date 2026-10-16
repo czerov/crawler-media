@@ -72,6 +72,12 @@ pub struct ApiState {
     /// 测试 seam：gallery 实际展开图片 JSON 的组数（生产只读计数，无副作用）。
     /// 用来证明「先按图片存在性剔除空组、再分页」后只渲染本页图片集合。
     pub(crate) gallery_expansions: Arc<std::sync::atomic::AtomicUsize>,
+    /// Jellyfin 选择的候选条数（每次选择每行记一次）：证明一次请求只做一遍
+    /// 候选遍历，而不是每个 series 重读整库。
+    pub(crate) jellyfin_candidates: Arc<std::sync::atomic::AtomicUsize>,
+    /// Jellyfin 选择里真正构建了重元数据（tracks/chapters/NFO/stat）的条目数：
+    /// 证明只有选中的那一页被 enrich。
+    pub(crate) jellyfin_heavy_items: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn apply_admin_bootstrap(
@@ -257,6 +263,8 @@ impl ApiState {
             obscura: Arc::new(crate::obscura_manager::ObscuraManager::new(&data_dir)),
             probe,
             gallery_expansions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            jellyfin_candidates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            jellyfin_heavy_items: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             crate::library_lifecycle::resume_library_removals(&state)
@@ -332,6 +340,27 @@ impl ApiState {
     /// gallery 展开计数（每次为一组图片构建 JSON 记 1）。
     pub fn gallery_expansions(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.gallery_expansions.clone()
+    }
+
+    /// 替换 Jellyfin 选择计数 seam（测试注入自有计数器以观察候选/重元数据条数）。
+    pub fn with_jellyfin_work_counters(
+        mut self,
+        candidates: Arc<std::sync::atomic::AtomicUsize>,
+        heavy_items: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.jellyfin_candidates = candidates;
+        self.jellyfin_heavy_items = heavy_items;
+        self
+    }
+
+    /// Jellyfin 选择遍历过的候选条数。
+    pub fn jellyfin_candidates(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.jellyfin_candidates.clone()
+    }
+
+    /// Jellyfin 选择构建过重元数据的条目数。
+    pub fn jellyfin_heavy_items(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.jellyfin_heavy_items.clone()
     }
 
     /// 替换 notify 发送实现（测试注入阻塞实现以验证预算准入）。

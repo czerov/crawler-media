@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use media_server::provider::{
     AuthenticateError, MediaItemSnapshot, MediaPerson, MediaServerProvider, PlaybackClientInfo,
-    PlaybackEvent, ServerLibrary, ServerUser, SubtitleDeliveryError,
+    PlaybackEvent, ServerItemPage, ServerItemQuery, ServerLibrary, ServerUser,
+    SubtitleDeliveryError,
 };
 
 use crate::subtitle_delivery::SubtitleServiceError;
@@ -32,6 +33,7 @@ use item_metadata::{
 
 mod enrichment;
 mod items;
+mod selection;
 mod user_marks;
 use items::resolve_fallback_item;
 use user_marks::{persist_unplayed_override, resolve_mark_unit, unit_played, write_favorite_mark};
@@ -260,6 +262,26 @@ impl MediaServerProvider for ApiServerProvider {
         library_id: &str,
     ) -> Result<Vec<MediaItemSnapshot>, String> {
         items::list_visible_items_in_library(self, user_id, parent_id, library_id).await
+    }
+
+    /// 生产路径：轻候选 → 完整筛选/排序/计数 → 只为本页构建重元数据。
+    async fn query_visible_items(
+        &self,
+        user_id: UserId,
+        query: ServerItemQuery,
+    ) -> Result<ServerItemPage, String> {
+        selection::query_visible_items(self, user_id, query).await
+    }
+
+    /// 生产路径：一次候选读 + 每 Media 第一条未看 + 整体分页。
+    async fn next_up_items(
+        &self,
+        user_id: UserId,
+        series_id: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ServerItemPage, String> {
+        selection::next_up_items(self, user_id, series_id, offset, limit).await
     }
 
     async fn list_resumable_items(
