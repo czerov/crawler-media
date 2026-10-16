@@ -1,12 +1,25 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{LibraryError, TransferMode};
 
 pub fn transfer_file(src: &Path, dest: &Path, mode: TransferMode) -> Result<(), LibraryError> {
     transfer_file_controlled(src, dest, mode, &crate::WorkControl::default())
+}
+
+static HARDLINK_FALLBACK_COPY: AtomicBool = AtomicBool::new(true);
+static HARDLINK_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// D-M2: whether a failed hardlink falls back to copying (default true).
+pub fn set_hardlink_fallback_copy(allow: bool) {
+    HARDLINK_FALLBACK_COPY.store(allow, Ordering::Relaxed);
+}
+
+/// D-M2: process-wide count of hardlink → copy fallbacks.
+pub fn hardlink_fallback_count() -> u64 {
+    HARDLINK_FALLBACKS.load(Ordering::Relaxed)
 }
 
 pub fn transfer_file_controlled(
@@ -58,14 +71,24 @@ pub fn transfer_file_controlled(
                 copy_controlled(src, &temp, control)
             }
         }
-        TransferMode::Hardlink => {
-            if fs::hard_link(src, &temp).is_err() {
+        TransferMode::Hardlink => match fs::hard_link(src, &temp) {
+            Ok(()) => Ok(()),
+            Err(error) if !HARDLINK_FALLBACK_COPY.load(Ordering::Relaxed) => {
+                Err(LibraryError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "硬链接失败且已禁用复制回退（下载目录与媒体库可能不在同一设备）: {} -> {}: {error}",
+                        src.display(),
+                        dest.display()
+                    ),
+                )))
+            }
+            Err(_) => {
+                HARDLINK_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(src = %src.display(), dest = %dest.display(), "硬链接失败（可能跨设备），回退为复制");
                 copy_controlled(src, &temp, control)
-            } else {
-                Ok(())
             }
-        }
+        },
     };
     if let Err(e) = stage_res {
         if temp.exists() {

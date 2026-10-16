@@ -47,6 +47,8 @@ pub const SUBSCRIBE_AIR_DATE_GATE: &str = "subscribe.air_date_gate";
 pub const SUBSCRIBE_OVERLAP_POLICY: &str = "subscribe.overlap_policy";
 /// F-1: download only the files of missing episodes when a pack fills a gap.
 pub const SUBSCRIBE_SELECTIVE_FILES: &str = "subscribe.selective_files";
+/// D-M2: `copy` (default) or `fail` when a hardlink transfer cannot link.
+pub const LIBRARY_HARDLINK_FALLBACK: &str = "library.hardlink_fallback";
 /// G-M5: "1"/"true" allows several instances on one data directory (unsafe).
 pub const INSTANCE_ALLOW_MULTI: &str = "instance.allow_multi";
 /// H3: days without download progress before a pending is marked stalled (default 7).

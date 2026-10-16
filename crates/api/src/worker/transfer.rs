@@ -326,6 +326,16 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
         .iter()
         .map(|m| m.destination_path.clone())
         .collect();
+    // D-M2: hardlink fallback policy and fallback counting for this round.
+    let fallback_copy = state
+        .store
+        .lock()
+        .get_setting(crate::settings_keys::LIBRARY_HARDLINK_FALLBACK)
+        .ok()
+        .flatten()
+        .is_none_or(|value| value.trim() != "fail");
+    library::set_hardlink_fallback_copy(fallback_copy);
+    let fallbacks_before = library::hardlink_fallback_count();
     let outcome = collect_completed_controlled(
         added,
         &library::Ffprobe::default(),
@@ -352,6 +362,18 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
     commit_transfer_outcome(state, &subscribe, &outcome, &library_lease)?;
 
     crate::http::library::enqueue_probes_for_rows(state, &outcome.ledger);
+    let fallbacks = library::hardlink_fallback_count().saturating_sub(fallbacks_before);
+    if fallbacks > 0 {
+        tracing::warn!(%subscribe_id, fallbacks, "硬链接失败，已回退为复制");
+        super::notify(
+            state,
+            "硬链接回退为复制",
+            &format!(
+                "「{}」有 {fallbacks} 个文件无法硬链接（下载目录与媒体库可能不在同一设备），已改为复制",
+                media.title
+            ),
+        );
+    }
     if ledger_count > 0 {
         super::notify(
             state,
