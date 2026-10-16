@@ -23,6 +23,8 @@
 
 - 2026-10-16 r6：按第五轮复审修订。R5-M1：分组改用 `psl` crate 的可注册域（eTLD+1），IP/单段名/`localhost` 用整个 host（`*.localhost` 归入 `localhost`），补齐堂兄弟、跨层级、IDN 等用例。R5-M2：统一 `normalize_host`（小写、去尾点、`idna` 转 ASCII、IPv6 去方括号），分组、cookie 筛选、`visited_hosts` 共用；T0 加 IDN cookie domain 实测。R5-L1 只记主 frame 导航、跨组 host 告警；R5-L2 时间参数校验；R5-L3 proxy/browser 双向不变式；R5-L4 `no_managed_browser_sites`。
 
+- 2026-10-16 r7：按第六轮复审修订。R6-L1：T0 实测 Obscura 是否拒收公共后缀级 cookie，不拒收时清理一律删除并告警、必要时并发 1；R6-L2：IP 规范化为 `IpAddr::to_string()`；R6-L3：T1 验收确认构建镜像 rustc ≥ 1.88。
+
 ## 起点
 
 分支 `feat/cdp-obscura` 自 `d201fcf` 起，代码与 `main` 相同。**不存在、也不依赖任何本机补丁**；Task 1 从现有代码（`crates/indexer/src/browser.rs` 中 `PageSession::cookie_header` 默认返回 `Ok("session=browser")`、`cdp_page.rs` 未实现 `cookie_header`、`set_cookie_header` 走 `Network.setExtraHTTPHeaders`）直接改起。
@@ -102,13 +104,14 @@ curl -s http://127.0.0.1:$PORT/json/version
 - [ ] **Step 3: 逐项验证方法**
 
 `obscura_compat.rs` 中每个方法一个 `#[ignore]` 测试，用本地 `python3 -m http.server` 服务 fixture：
-`PUT /json/new`（及 GET 回退）、`PUT /json/close/{id}`、`webSocketDebuggerUrl` 的 scheme/host/port、`Network.enable`、`Page.enable`、`Page.setLifecycleEventsEnabled` + `Page.lifecycleEvent(load)`、`Page.navigate`（`frameId`/`loaderId`）、`Runtime.evaluate`（`returnByValue`）、`Network.setCookies`、`Network.getCookies{urls}`、`Network.deleteCookies{name,url}`（**必需**：删除后 `getCookies` 应为空；同时另一 tab 中另一站点的 cookie 不受影响）、`Network.getAllCookies` 与 `Storage.getCookies`（至少一个可用）、带 `domain`+`path` 的 `Network.deleteCookies` 能删除 `path=/forum` 的 cookie、服务器设置父域 cookie（`Domain=.example.test`）后兄弟子域 tab 是否可见、`Target.createBrowserContext` / `Target.disposeBrowserContext`（可选，仅记录）、两个 tab 并发导航不同站点（R4-M1）、IDN 站点（本地 hosts 映射 `例子.test` → 127.0.0.1，服务端 `Set-Cookie: Domain=例子.test` 与 `Domain=xn--fsqu00a.test` 各一次）`getAllCookies` 返回的 cookie domain 形式——预期为小写 punycode，记录实际形式（R5-M2）。另测一次 NexusPHP 签到页：浏览器 GET `attendance.php` 是否真实签到（L7）。
+`PUT /json/new`（及 GET 回退）、`PUT /json/close/{id}`、`webSocketDebuggerUrl` 的 scheme/host/port、`Network.enable`、`Page.enable`、`Page.setLifecycleEventsEnabled` + `Page.lifecycleEvent(load)`、`Page.navigate`（`frameId`/`loaderId`）、`Runtime.evaluate`（`returnByValue`）、`Network.setCookies`、`Network.getCookies{urls}`、`Network.deleteCookies{name,url}`（**必需**：删除后 `getCookies` 应为空；同时另一 tab 中另一站点的 cookie 不受影响）、`Network.getAllCookies` 与 `Storage.getCookies`（至少一个可用）、带 `domain`+`path` 的 `Network.deleteCookies` 能删除 `path=/forum` 的 cookie、服务器设置父域 cookie（`Domain=.example.test`）后兄弟子域 tab 是否可见、`Target.createBrowserContext` / `Target.disposeBrowserContext`（可选，仅记录）、两个 tab 并发导航不同站点（R4-M1）、IDN 站点（本地 hosts 映射 `例子.test` → 127.0.0.1，服务端 `Set-Cookie: Domain=例子.test` 与 `Domain=xn--fsqu00a.test` 各一次）`getAllCookies` 返回的 cookie domain 形式——预期为小写 punycode，记录实际形式（R5-M2）、**公共后缀级 cookie 是否被拒收**（R6-L1）：hosts 映射 `a.github.io`/`b.github.io` → 127.0.0.1，服务端分别返回 `Set-Cookie: x=1; Domain=.github.io` 与 `Domain=github.io`，并另测 `Domain=.co.uk`（映射 `a.example.co.uk`），检查 `getAllCookies` 中是否出现这些 cookie、`b.github.io` 的 tab 能否看到。另测一次 NexusPHP 签到页：浏览器 GET `attendance.php` 是否真实签到（L7）。
 
 - [ ] **Step 4: 写入 ADR「验证边界」**
 
 表格：方法 → 支持/不支持 → 降级方式。约定的降级：
 - 无 `Target.createBrowserContext` → 无影响：v1 用按站点 `Network.deleteCookies` 清理，不依赖独立上下文；独立上下文是后续增强。
 - 无 `Network.getAllCookies` 且无 `Storage.getCookies`，或带 domain+path 的 `deleteCookies` 删不掉 path 级 cookie → 无法精确清理：`Browser` 并发上限**降为 1**（`with_max_sessions` 被钳制），会话结束仍尽力按 `getCookies{urls}` 清理，并在 ADR 写明这一前提。
+- Obscura **不拒收**公共后缀级 cookie（R6-L1）→ eTLD+1 分组的前提不成立：ADR 写明此前提与实测结果；`clear_site_cookies` 对 domain 本身是公共后缀（`psl::suffix_str(d) == Some(d)`）的 cookie **无论是否属于本会话一律删除并 `warn!(domain)`**；并把默认并发设为 1（api 以 `with_precise_cleanup(false)` 构造，与清理不精确同一降级路径）。
 - 无 `Network.deleteCookies` → 改为对每个待删 cookie 发 `Network.setCookie{name, domain, path, expires: 1}` 覆盖删除；仍不可行同样降为并发 1。
 - 无 `Network.getCookies` → `cookie_header` 返回 `Err`，`RenderedPage.cookie_header = None`（保留原 cookie）。
 - 无 `Network.setCookies` → **不渲染带 cookie 的请求**（报 `CdpUnsupported`，回退 HTTP），绝不退回 `setExtraHTTPHeaders`。
@@ -181,7 +184,7 @@ git commit -m "test(indexer): add ignored Obscura CDP compatibility probe and re
 
 **多标签与站点隔离（r4/r5，不依赖 `Target.createBrowserContext`）：**
 - 所有 tab 共用 daemon 的默认 cookie jar。我们注入的 cookie 用 `url` 字段做 host-only 绑定；但服务器在会话中可能写入父域 cookie（`Domain=.example.org`），host-only 只隔离我们注入的部分，因此还需要下面的锁粒度与精确清理。
-- **host 规范化（R5-M2）**：`normalize_host(raw: &str) -> Result<String, IndexerError>`：去掉 IPv6 方括号 → 去掉尾点 → `idna::domain_to_ascii`（同时完成小写与 Unicode→punycode；失败即 `BrowserSetup`）；IP 字面量（`std::net::IpAddr` 可解析）只做小写/去括号，不走 IDNA。站点 host、cookie 的 `domain`（先去前导 `.`）、`visited_hosts` 一律先经过它再比较。
+- **host 规范化（R5-M2）**：`normalize_host(raw: &str) -> Result<String, IndexerError>`：去掉 IPv6 方括号 → 去掉尾点 → `idna::domain_to_ascii`（同时完成小写与 Unicode→punycode；失败即 `BrowserSetup`）；IP 判定放在去括号、去尾点**之后**：能被 `std::net::IpAddr` 解析即返回 `ip.to_string()` 规范写法（`2001:DB8:0:0::1` → `2001:db8::1`；IPv4 映射地址 `::ffff:1.2.3.4` 保持 `IpAddr` 的标准输出），不走 IDNA（R6-L2）。站点 host、cookie 的 `domain`（先去前导 `.`）、`visited_hosts` 一律先经过它再比较。
 - **按可注册域分组串行（R5-M1）**：`group_key(host) -> String`：先 `normalize_host`；IP 字面量、单段名（无 `.`）→ 整个 host；`localhost` 与 `*.localhost` → `"localhost"`；其余用 `psl::domain_str(host)` 取可注册域（eTLD+1），取不到（host 本身就是公共后缀等）→ 整个 host。`BrowserSlots` 持有 `Mutex<SlotState{active, groups: Vec<String>, queue: VecDeque<u64>, next_ticket}>` 和一个 `Condvar`，**同一 group_key 同时最多一个会话**；忽略 scheme 与端口（cookie 不按它们隔离）。`psl` 把公共后缀表编译进二进制，运行时不联网；`*.co.uk`、`*.com.cn` 下不同可注册域的站点可以并发。
 - **全局上限**：`active < effective_max`，`effective_max = if precise_cleanup { max_sessions } else { 1 }`。
 - **有界等待 + FIFO（R4-M2）**：`acquire` 先领票号入队，只有队首且满足名额与分组条件时才出队（被分组阻塞的队首不阻塞后面不冲突的票，按票号顺序扫描第一个可运行的）。最长等待 `min(queue_cap, render_deadline − min_work)`；超时返回 `BrowserBusy`。拿到名额时若剩余时间 `< min_work`，立即释放并返回 `BrowserBusy`。两种情况都发生在 opener 调用之前，属于**导航前失败**，可回退 HTTP。
@@ -301,6 +304,12 @@ fn default_page_session_cookie_header_is_an_error_not_a_fake_session() {
 #[test] fn normalize_host_lowercases_strips_trailing_dot_and_brackets() {
     // "Example.ORG." → "example.org"；"[::1]" → "::1"
 }
+#[test] fn normalize_host_canonicalizes_ip_literals() {
+    // "[2001:DB8:0:0::1]" 与 "2001:db8::1" → 同一 "2001:db8::1"；"10.0.0.1." → "10.0.0.1"；二者 group_key 即自身
+}
+#[test] fn public_suffix_domain_cookies_are_always_deleted_and_warned() {
+    // getAllCookies 含 domain ".github.io" 的 cookie，会话 host 为 a.example.test → 仍被删除并记 warn（R6-L1）
+}
 #[test] fn normalize_host_converts_idn_to_punycode() {
     // "例子.中国" → "xn--fsqu00a.xn--fiqs8s"
 }
@@ -398,7 +407,9 @@ pub use browser::{Browser, BrowserConfig, PageSession, RecordingFetcher, Rendere
 
 - [ ] **Step 8: 运行并确认通过**
 
-Run: `cargo test -p indexer`
+Run: `rustc --version && cargo test -p indexer`
+
+先确认工具链（R6-L3）：新增 `idna = "1"` 会用到 lock 中的 `icu_* 2.3.0`，要求 **rustc ≥ 1.88**。仓库没有 `rust-toolchain` 文件，`Dockerfile:9` 为 `FROM rust:bookworm`（浮动标签）；确认本地、CI 与 NAS 构建镜像 `rustc --version` ≥ 1.88，若需固定则在 `Cargo.toml` 的 `[workspace.package]` 加 `rust-version = "1.88"` 并在 PR 描述说明。
 Expected: Step 1、2、5 的新用例全部通过；既有 `cdp_page`、`browser`、`goldens` 用例不回归。
 
 - [ ] **Step 9: 提交**

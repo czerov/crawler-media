@@ -36,6 +36,8 @@
 - **精确清理**：会话结束时用 `Network.getAllCookies`（或 `Storage.getCookies`）取全部 cookie，筛出 domain 属于本站 host、其父域或本会话跳转访问过的 host 的条目，按每条 cookie **自身的** name+domain+path 调 `Network.deleteCookies` 删除（仅给 url 删不到 `path=/forum` 这类 cookie）；删除后复查，残留只 `warn!`。**不使用** `Network.clearBrowserCookies`（会清掉其它 tab 的 cookie）。不依赖 `Target.createBrowserContext`；每会话独立上下文是后续增强。
 - **host 规范化**：站点 host、cookie domain、会话访问过的 host 统一先小写、去尾点、IDNA 转 ASCII（punycode）、IPv6 去方括号，再比较。
 - **按可注册域分组串行**：忽略 scheme 与端口（cookie 不按它们隔离）；分组 key 为公共后缀表（`psl` crate，编译进二进制、不联网）给出的可注册域（eTLD+1）；IP、单段名用整个 host，`localhost` 与 `*.localhost` 归为一组。同组同一时刻最多一个会话，避免共同祖先域 cookie 串号或被另一会话删除（覆盖兄弟、堂兄弟、跨层级子域）。
+- **前提：浏览器拒收公共后缀级 cookie**（如 `Domain=.co.uk`、`.github.io`）。Chromium 满足；Obscura 以计划 Task 0 实测为准。若不拒收：清理时对 domain 本身为公共后缀的 cookie 一律删除并告警，并发上限降为 1。
+- IP 地址规范化为标准写法（如 `2001:db8::1`），按整个 IP 分组。
 - **只清理主 frame 访问过的 host**：iframe（广告、质询等共享第三方）不纳入清理；主 frame 跳到其它分组的 host（如共享 SSO）只告警。跨分组共享的 SSO/质询主机不保证隔离，需要时把并发设为 1。
 - **有界 FIFO 排队**：拿不到全局名额或分组时按票号先来先服务排队，超过排队上限或剩余时间不足即返回 busy（导航前失败，可回退 HTTP）。登录与签到是后台 Job，排队可接受。
 - 前提以计划 Task 0 实测为准：`getAllCookies`/`Storage.getCookies` 至少一个可用，且带 domain+path 的 `deleteCookies` 能删除 path 级 cookie。不满足时并发上限**降为 1**（`deleteCookies` 缺失时先尝试过期覆盖删除）。

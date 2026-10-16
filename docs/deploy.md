@@ -29,6 +29,8 @@ CRAWLER_MEDIA_UI=$PWD/dist cargo run -p api   # 浏览器打开 http://127.0.0.1
 
 默认监听：后端 `127.0.0.1:18765`，前端 `127.0.0.1:3334`。首次创建管理员时须独立设置 `CRAWLER_MEDIA_ADMIN_PASSWORD`；已有管理员使用当前保存的口令，不能把该启动变量当作每次重启都会覆盖口令。CLI token 与网页登录口令独立。
 
+构建要求：rustc ≥ 1.88（`idna`/`icu` 依赖要求；`Dockerfile` 使用 `rust:bookworm`，自建镜像需确认版本）。
+
 ## Docker Compose
 
 ```bash
@@ -41,7 +43,7 @@ docker compose up --build
 `/usr/share/crawler-media/ui`）+ API + Jellyfin 兼容，浏览器和播放器都打这一个端口。
 镜像内默认 **无 Chromium**。实例级 Browser 开关决定是否使用 CDP：**关闭**时所有请求走 HTTP，不探测端点、不下载、不启动任何浏览器进程，Site 的 `cdp_url` 也不生效；**开启**时端点按 Site `cdp_url` → 实例 `cdp.url` → 受管 Obscura 解析，浏览器只用于 Site 的登录与签到（Site 上选择「浏览器」方式，`maintenance_via = browser`）；**搜索与 RSS 始终走 HTTP**。失败回退规则见下段。端点只接受 `http` CDP discovery URL（不接受 `https`/`ws`/`wss`、内嵌凭据或 query）。
 
-回退规则：登录与签到只在**导航之前**失败（端点不可达、排队超时、target/WebSocket 建立失败、cookie 注入失败）时回退 HTTP 并 warn；导航之后失败直接报错，不会再发一次 HTTP 签到。回退不等于成功。浏览器支持多标签并发（默认 3），同一可注册域（含兄弟、堂兄弟子域，按公共后缀表判定；host 统一规范化，含 IDN）串行；排队有上限，剩余时间不足时在导航前放弃并回退 HTTP；会话结束按 cookie 自身的 domain+path 删除该站点（含父域、跳转 host）的 cookie。浏览器会话**不使用 Site 代理**，浏览器方式与 Site 代理互斥（两个方向都在保存时校验）。
+回退规则：登录与签到只在**导航之前**失败（端点不可达、排队超时、target/WebSocket 建立失败、cookie 注入失败）时回退 HTTP 并 warn；导航之后失败直接报错，不会再发一次 HTTP 签到。回退不等于成功。浏览器支持多标签并发（默认 3），同一可注册域（含兄弟、堂兄弟子域，按公共后缀表判定；host 统一规范化，含 IDN）串行（前提是浏览器拒收 `Domain=.co.uk` 之类公共后缀级 cookie，Obscura 以实测为准，否则并发降为 1）；排队有上限，剩余时间不足时在导航前放弃并回退 HTTP；会话结束按 cookie 自身的 domain+path 删除该站点（含父域、跳转 host）的 cookie。浏览器会话**不使用 Site 代理**，浏览器方式与 Site 代理互斥（两个方向都在保存时校验）。
 
 **升级提示**：升级不会改变任何 Site 的登录/签到方式（全部保持 HTTP），也不会自动打开开关。原有 `cdp_url` 或 `render: true` Profile 的 Site 会在设置页与站点列表中提示——render 搜索已移除，这些站点的搜索改走 HTTP，可能需要换成可直接 HTTP 抓取的 Profile；如需浏览器登录/签到，请在 Site 上手动改为浏览器方式。
 
