@@ -243,6 +243,12 @@ pub fn normalize_name(value: &str) -> String {
 }
 
 /// 标题宽松匹配（双向包含，或分词显著重合）。
+///
+/// # Warning (D-L3)
+/// This is a loose, display-only heuristic: unrelated tasks with similar
+/// titles match. Never use it to choose a task to remove, pause, claim or
+/// delete files of; destructive paths must use ownership tags / info hash.
+/// `api/tests/subscription_e2e/d_l3_loose_match_audit.rs` audits call sites.
 pub fn names_match(client_name: &str, want: &str) -> bool {
     let got = normalize_name(client_name);
     let want_norm = normalize_name(want);

@@ -464,7 +464,9 @@ pub(crate) async fn removal_preview(
         .collect();
 
     // 如果 pending 中由于误判等原因已空，尝试从下载器快照中兜底匹配属于本订阅媒体的任务
-    if torrent_titles.is_empty() {
+    // D-L3: such matches are inferred by title only and flagged as such.
+    let torrents_inferred = torrent_titles.is_empty();
+    if torrents_inferred {
         drop(store);
         match state.downloader.task_snapshots() {
             Ok(snapshots) => {
@@ -498,6 +500,7 @@ pub(crate) async fn removal_preview(
         "library_file_count": files.len(),
         "library_bytes": bytes,
         "torrent_count": torrent_count,
+        "torrent_count_inferred": torrents_inferred && torrent_count > 0,
         "torrent_titles": torrent_titles,
     }))
     .into_response()
