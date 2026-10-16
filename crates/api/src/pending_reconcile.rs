@@ -48,7 +48,9 @@ pub(crate) fn absence_is_provable(
     torrent: &domain::Torrent,
     snapshots: &[downloader::TaskSnapshot],
 ) -> bool {
-    if snapshots.is_empty() || downloader::magnet_info_hash(&torrent.enclosure).is_some() {
+    // Review M-2: an empty list (client just restarted, wrong instance) is
+    // no evidence for HTTP torrents; only a magnet's hash proves absence.
+    if downloader::magnet_info_hash(&torrent.enclosure).is_some() {
         return true;
     }
     snapshots

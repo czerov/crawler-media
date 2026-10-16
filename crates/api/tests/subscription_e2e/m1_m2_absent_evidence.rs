@@ -48,3 +48,25 @@ async fn task_center_keeps_pending_found_by_info_hash() {
         "still present by info hash"
     );
 }
+
+#[tokio::test]
+async fn empty_client_list_does_not_release_http_pending() {
+    let h = Harness::new();
+    h.create_site().await;
+    let id = h.create_movie_subscribe(serde_json::json!({})).await;
+    h.run_subscribe(id).await;
+    h.qb.remove_all(); // e.g. qB restarted and has not loaded its torrents yet
+    h.age_pending(id, 16 * 60);
+    h.list_tasks().await;
+    assert_eq!(
+        h.pending_state(id, "active"),
+        1,
+        "empty list is no evidence"
+    );
+    h.transfer(id).await.ok();
+    assert_eq!(
+        h.pending_state(id, "active"),
+        1,
+        "background reconcile agrees"
+    );
+}
