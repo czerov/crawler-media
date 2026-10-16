@@ -334,3 +334,41 @@ fn archive_entries_must_match_full_top_level_path() {
     assert!(matches!(res, Err(api::obscura_manager::InstallError::InvalidArchive(_))), "{res:?}");
     assert!(!bin_dir.join("obscura").exists());
 }
+
+#[test]
+fn preinstalled_binaries_require_a_matching_manifest() {
+    let tmp = tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::write(bin_dir.join("obscura"), b"bin").unwrap();
+    fs::write(bin_dir.join("obscura-worker"), b"worker").unwrap();
+    let installer = ReleaseInstaller::new();
+    // No archive and no manifest: not installed.
+    assert!(installer.ensure_installed(&bin_dir, InstallPolicy::PreinstalledOnly).is_err());
+    // Wrong manifest: rejected.
+    fs::write(
+        bin_dir.join(api::obscura_manager::PREINSTALLED_MANIFEST),
+        format!("{}  obscura\n{}  obscura-worker\n", sha256_hex(b"other"), sha256_hex(b"worker")),
+    )
+    .unwrap();
+    assert!(installer.ensure_installed(&bin_dir, InstallPolicy::PreinstalledOnly).is_err());
+    // Matching manifest: accepted, and the verified fast path keeps working.
+    fs::write(
+        bin_dir.join(api::obscura_manager::PREINSTALLED_MANIFEST),
+        format!("{}  obscura\n{}  obscura-worker\n", sha256_hex(b"bin"), sha256_hex(b"worker")),
+    )
+    .unwrap();
+    assert!(installer.ensure_installed(&bin_dir, InstallPolicy::PreinstalledOnly).is_ok());
+    assert!(installer.ensure_installed(&bin_dir, InstallPolicy::PreinstalledOnly).is_ok());
+    // Manifest-installed binaries are never accepted under the Download policy marker check
+    // without re-verification; tampering is caught.
+    fs::write(bin_dir.join("obscura"), b"tampered").unwrap();
+    assert!(installer.ensure_installed(&bin_dir, InstallPolicy::PreinstalledOnly).is_err());
+}
+
+#[test]
+fn reported_version_must_mention_the_pinned_release() {
+    assert!(api::obscura_manager::version_matches("Obscura/0.2.3"));
+    assert!(api::obscura_manager::version_matches("obscura v0.2.3"));
+    assert!(!api::obscura_manager::version_matches("Chrome/120.0"));
+}

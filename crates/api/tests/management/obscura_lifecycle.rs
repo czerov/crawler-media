@@ -320,3 +320,30 @@ fn port_race_retries_with_a_new_port() {
     assert!(manager.start(InstallPolicy::Download).is_ok());
     assert_eq!(spawn_count.load(Ordering::SeqCst), 2);
 }
+
+/// Real managed lifecycle against the pinned release archive (T0).
+/// `OBSCURA_ARCHIVE=/path/obscura-x86_64-linux.tar.gz cargo test -p api --test management real_obscura -- --ignored`
+#[test]
+#[ignore = "needs the pinned Obscura release archive (T0)"]
+fn real_obscura_managed_start_survives_spawn_thread_and_stops() {
+    let archive = std::env::var("OBSCURA_ARCHIVE").expect("OBSCURA_ARCHIVE");
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("bin")).unwrap();
+    std::fs::copy(archive, tmp.path().join("bin/obscura.tar.gz")).unwrap();
+    let manager = std::sync::Arc::new(api::obscura_manager::ObscuraManager::new(tmp.path()));
+    let m = manager.clone();
+    std::thread::spawn(move || m.start(api::obscura_manager::InstallPolicy::PreinstalledOnly))
+        .join()
+        .unwrap()
+        .expect("start");
+    let status = manager.status();
+    assert!(status.running, "{status:?}");
+    assert_eq!(status.reported_version.as_deref(), Some("obscura 0.2.3"));
+    assert!(status.last_error.is_none(), "{status:?}");
+    std::thread::sleep(std::time::Duration::from_secs(12));
+    assert!(manager.owns_live_daemon(), "daemon must outlive the spawning thread");
+    let url = manager.cdp_url().expect("cdp url");
+    assert!(url.starts_with("http://127.0.0.1:"));
+    manager.stop();
+    assert!(!manager.owns_live_daemon());
+}

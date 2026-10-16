@@ -13,7 +13,7 @@ use serde_json::Value;
 #[path = "obscura_install.rs"]
 mod install;
 pub use install::{
-    EXPECTED_ENTRIES, InstallError, MAX_ARCHIVE_BYTES, OBSCURA_ASSETS, OBSCURA_VERSION,
+    ALLOW_PRIVATE_NETWORK_ENV, EXPECTED_ENTRIES, InstallError, PREINSTALLED_MANIFEST, MAX_ARCHIVE_BYTES, OBSCURA_ASSETS, OBSCURA_VERSION,
     ProcessLauncher, ReleaseInstaller,
 };
 
@@ -54,10 +54,19 @@ pub trait DaemonHandle: Send + Sync {
     fn pid(&self) -> u32;
     fn try_alive(&self) -> bool;
     fn kill(&self);
+    /// Whether the loopback listener on `port` belongs to this daemon's process
+    /// group. `None` = cannot tell on this platform/handle (treated as unknown).
+    fn owns_port(&self, _port: u16) -> Option<bool> {
+        None
+    }
 }
 
 pub trait DaemonLauncher: Send + Sync {
     fn spawn(&self, binary: &Path, port: u16) -> Result<Box<dyn DaemonHandle>, String>;
+    /// `obscura --version` output, when the launcher can run the binary.
+    fn version(&self, _binary: &Path) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -274,6 +283,16 @@ impl ObscuraManager {
         let bin = self.binary_path();
         let mut last_err = None;
 
+        let version = self.launcher.version(&bin);
+        if let Some(v) = &version {
+            if !version_matches(v) {
+                tracing::warn!(reported = %v, expected = OBSCURA_VERSION, "Obscura binary version mismatch");
+                *self.last_error.lock() =
+                    Some(format!("Obscura 版本不符：期望 {OBSCURA_VERSION}，实际 {v}"));
+            }
+        }
+        *self.reported_version.lock() = version;
+
         for attempt in 0..=2 {
             let port = if let Some(picker) = &self.port_picker {
                 picker()
@@ -307,7 +326,16 @@ impl ObscuraManager {
                 if let Ok(resp) = agent.get(&check_url).call() {
                     if let Ok(val) = resp.into_body().read_json::<Value>() {
                         if let Some(browser_str) = val.get("Browser").and_then(Value::as_str) {
-                            *self.reported_version.lock() = Some(browser_str.to_string());
+                            // The port was chosen before spawn: make sure the
+                            // answering listener is really our child, not a
+                            // local process that grabbed the port meanwhile.
+                            if child.owns_port(port) == Some(false) {
+                                tracing::error!(port, "CDP port is served by a foreign process; refusing it");
+                                break;
+                            }
+                            // /json/version reports a Chrome UA (Chrome/145), not
+                            // the Obscura release; the version comes from --version.
+                            tracing::debug!(browser = browser_str, "Obscura /json/version answered");
                             verified = true;
                             break;
                         }
@@ -318,8 +346,11 @@ impl ObscuraManager {
 
             if verified && child.try_alive() {
                 self.write_pidfile(child.pid(), port);
+                let version_ok = self.reported_version.lock().as_deref().is_none_or(version_matches);
                 *self.child.lock() = Some(child);
-                *self.last_error.lock() = None;
+                if version_ok {
+                    *self.last_error.lock() = None;
+                }
                 *self.not_started_reason.lock() = None;
                 return Ok(());
             }
@@ -407,6 +438,13 @@ impl ObscuraManager {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+/// `Browser` from /json/version must mention the pinned release (with or
+/// without the leading `v`).
+pub fn version_matches(reported: &str) -> bool {
+    let bare = OBSCURA_VERSION.trim_start_matches('v');
+    reported.contains(OBSCURA_VERSION) || reported.contains(bare)
 }
 
 fn pick_free_port() -> u16 {

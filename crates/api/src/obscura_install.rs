@@ -122,7 +122,15 @@ impl crate::obscura_manager::ObscuraInstaller for ReleaseInstaller {
         // 1. Already installed: the marker must name the pinned archive AND the
         //    on-disk binaries must still hash to what was recorded at install.
         if binary_path.is_file() && worker_path.is_file() && hash_path.is_file() {
-            if installed_marker_matches(&hash_path, expected_hash, &binary_path, &worker_path) {
+            let accepted_archive = if policy == InstallPolicy::PreinstalledOnly {
+                vec![expected_hash.to_ascii_lowercase(), MANIFEST_MARKER.to_string()]
+            } else {
+                vec![expected_hash.to_ascii_lowercase()]
+            };
+            if accepted_archive
+                .iter()
+                .any(|a| installed_marker_matches(&hash_path, a, &binary_path, &worker_path))
+            {
                 return Ok(binary_path);
             }
             tracing::warn!(path = %bin_dir.display(), "Obscura install marker or binary hash mismatch; reinstalling");
@@ -135,6 +143,20 @@ impl crate::obscura_manager::ObscuraInstaller for ReleaseInstaller {
         let archive_source_path = match policy {
             InstallPolicy::PreinstalledOnly => {
                 if !preinstalled_archive.is_file() {
+                    // Image-baked binaries: accept them only with an operator
+                    // supplied `obscura.sha256sums` manifest that they match.
+                    let manifest = bin_dir.join(PREINSTALLED_MANIFEST);
+                    if binary_path.is_file() && worker_path.is_file() && manifest.is_file() {
+                        verify_manifest(&manifest, &binary_path, &worker_path)?;
+                        let marker = format!(
+                            "archive={MANIFEST_MARKER}\nobscura={}\nobscura-worker={}\n",
+                            sha256_file(&binary_path)?,
+                            sha256_file(&worker_path)?,
+                        );
+                        fs::write(&hash_path, marker)?;
+                        tracing::info!(path = %binary_path.display(), "Preinstalled Obscura binaries verified against manifest");
+                        return Ok(binary_path);
+                    }
                     return Err(InstallError::NotInstalled);
                 }
                 preinstalled_archive.clone()
@@ -307,6 +329,30 @@ impl crate::obscura_manager::ObscuraInstaller for ReleaseInstaller {
     }
 }
 
+/// Manifest for preinstalled binaries (`sha256sum` format: `<hex>  <name>`).
+pub const PREINSTALLED_MANIFEST: &str = "obscura.sha256sums";
+const MANIFEST_MARKER: &str = "preinstalled-manifest";
+
+fn verify_manifest(manifest: &Path, bin: &Path, worker: &Path) -> Result<(), InstallError> {
+    let text = fs::read_to_string(manifest)?;
+    for (name, path) in [("obscura", bin), ("obscura-worker", worker)] {
+        let expected = text
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                Some((it.next()?, it.next()?.trim_start_matches('*')))
+            })
+            .find(|(_, n)| *n == name)
+            .map(|(h, _)| h.to_ascii_lowercase())
+            .ok_or_else(|| InstallError::InvalidArchive(format!("{PREINSTALLED_MANIFEST} has no entry for {name}")))?;
+        let actual = sha256_file(path)?;
+        if actual != expected {
+            return Err(InstallError::HashMismatch { expected, actual });
+        }
+    }
+    Ok(())
+}
+
 fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut hasher = Sha256::new();
@@ -361,6 +407,59 @@ impl DaemonHandle for ChildHandle {
             terminate_group(&mut child, self.1);
         }
     }
+
+    fn owns_port(&self, port: u16) -> Option<bool> {
+        listener_owned_by_group(port, self.1)
+    }
+}
+
+/// Linux: find the LISTEN socket inode for 127.0.0.1/::1 `port` in
+/// /proc/net/tcp{,6}, then check whether any process in our process group
+/// (pgid == daemon pid) holds that inode.
+#[cfg(target_os = "linux")]
+fn listener_owned_by_group(port: u16, pgid: u32) -> Option<bool> {
+    let port_hex = format!("{port:04X}");
+    let mut inodes = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = fs::read_to_string(table) else { continue };
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 || cols[3] != "0A" {
+                continue;
+            }
+            if cols[1].rsplit(':').next() == Some(port_hex.as_str()) {
+                inodes.push(format!("socket:[{}]", cols[9]));
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return None;
+    }
+    let procs = fs::read_dir("/proc").ok()?;
+    for entry in procs.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+        // pgrp is the 3rd field after the parenthesised comm.
+        let Some(after) = stat.rsplit_once(')').map(|(_, r)| r) else { continue };
+        let pgrp = after.split_whitespace().nth(2).and_then(|v| v.parse::<u32>().ok());
+        if pgrp != Some(pgid) {
+            continue;
+        }
+        let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+        for fd in fds.flatten() {
+            if let Ok(link) = fs::read_link(fd.path()) {
+                if inodes.iter().any(|i| link.as_os_str() == i.as_str()) {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listener_owned_by_group(_port: u16, _pgid: u32) -> Option<bool> {
+    None
 }
 
 /// The daemon is spawned as its own process group leader, so signalling the
@@ -398,7 +497,17 @@ impl Drop for ChildHandle {
     }
 }
 
+/// Env opt-in for `obscura serve --allow-private-network` (default off).
+pub const ALLOW_PRIVATE_NETWORK_ENV: &str = "CRAWLER_MEDIA_OBSCURA_ALLOW_PRIVATE_NETWORK";
+
 impl DaemonLauncher for ProcessLauncher {
+    fn version(&self, binary: &Path) -> Option<String> {
+        let out = Command::new(binary).arg("--version").output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
     fn spawn(&self, binary: &Path, port: u16) -> Result<Box<dyn DaemonHandle>, String> {
         let mut command = Command::new(binary);
         command
@@ -407,23 +516,62 @@ impl DaemonLauncher for ProcessLauncher {
             .arg("127.0.0.1")
             .arg("--port")
             .arg(port.to_string());
+        // Obscura blocks loopback/RFC1918 targets by default (SSRF guard).
+        // LAN-hosted Sites need an explicit operator opt-in.
+        if std::env::var(ALLOW_PRIVATE_NETWORK_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
+            command.arg("--allow-private-network");
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
+            // Own process group so stop() can signal obscura-worker too.
+            // No PR_SET_PDEATHSIG: it is tied to the spawning *thread*, and
+            // the spawn runs on short-lived blocking-pool threads. Crash
+            // cleanup relies on the pidfile reaper and shutdown() instead.
             command.process_group(0);
-            #[cfg(target_os = "linux")]
-            // SAFETY: only async-signal-safe prctl(2) between fork and exec.
-            unsafe {
-                command.pre_exec(|| {
-                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                    Ok(())
-                });
-            }
         }
         let child = command
             .spawn()
             .map_err(|e| format!("Failed to spawn Obscura daemon: {e}"))?;
         let pid = child.id();
         Ok(Box::new(ChildHandle(Mutex::new(Some(child)), pid)))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod port_owner_tests {
+    use super::listener_owned_by_group;
+
+    #[test]
+    fn listener_ownership_is_resolved_by_process_group() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // SAFETY: getpgrp(2) has no preconditions.
+        let own = unsafe { libc::getpgrp() } as u32;
+        assert_eq!(listener_owned_by_group(port, own), Some(true));
+        assert_eq!(listener_owned_by_group(port, own.wrapping_add(7_777_777)), Some(false));
+        drop(listener);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod spawn_thread_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn daemon_survives_the_exit_of_the_thread_that_spawned_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("obscura");
+        fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = fake.clone();
+        let handle = std::thread::spawn(move || ProcessLauncher.spawn(&path, 1).unwrap())
+            .join()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(handle.try_alive(), "spawning thread exit must not kill the daemon");
+        handle.kill();
+        assert!(!handle.try_alive());
     }
 }
