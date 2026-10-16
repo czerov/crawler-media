@@ -88,7 +88,7 @@ fn serve(
     };
     let request = String::from_utf8_lossy(&peek[..length]);
     if request.starts_with("GET /ws") || request.starts_with("GET /devtools") {
-        if mode == "handshake" && request.starts_with("GET /devtools") {
+        if mode == "handshake" {
             let mut bytes = [0; 2048];
             while stream.read(&mut bytes).unwrap_or(0) > 0 {}
             return;
@@ -177,11 +177,21 @@ fn response(command: &Value, mode: &str, authenticated: bool, polls: &mut usize)
         return json!({"id": command["id"], "error": {"code": -1, "message": "cookies error"}});
     }
     let result = match method {
+        "Page.navigate" if mode == "no_page" => {
+            return json!({"id": command["id"], "error": {"code": -32601, "message": "No page for session"}});
+        }
+        "Target.createBrowserContext" if mode == "context_timeout" => {
+            return json!({"id": command["id"], "error": {"code": -32000, "message": "temporarily unavailable"}});
+        }
         "Target.createBrowserContext" if mode == "no_context" => {
             return json!({"id": command["id"], "error": {"code": -32601, "message": "unknown method"}});
         }
         "Target.createBrowserContext" => json!({"browserContextId": "ctx"}),
         "Target.createTarget" => json!({"targetId": "fixture"}),
+        "Target.attachToTarget" if command["params"]["flatten"] == true => json!({"sessionId": "sess-1"}),
+        "Target.attachToTarget" => {
+            return json!({"id": command["id"], "error": {"code": -32000, "message": "flatten required"}});
+        }
         "Page.navigate" if !authenticated || mode == "navigation" => {
             json!({"errorText":"navigation rejected"})
         }
@@ -239,7 +249,7 @@ fn cookie_navigation_and_content_share_authenticated_connection() {
     assert!(
         requests
             .iter()
-            .any(|request| request.contains("/json/close/fixture"))
+            .any(|request| request == "Target.closeTarget")
     );
     assert!(
         requests
@@ -275,7 +285,7 @@ fn initialization_failure_cleans_up_created_target() {
             .lock()
             .unwrap()
             .iter()
-            .any(|request| request.contains("/json/close/fixture"))
+            .any(|request| request == "Target.closeTarget")
     );
 }
 
@@ -291,19 +301,44 @@ fn document_readiness_has_a_finite_deadline() {
 }
 
 #[test]
-fn handshake_timeout_cleans_up_created_target() {
+fn handshake_timeout_is_bounded_setup_error_and_creates_nothing() {
     let fixture = Fixture::start("handshake");
     let start = Instant::now();
-    assert!(open_cdp_session(&fixture.url).is_err());
+    let err = match open_cdp_session(&fixture.url) { Err(e) => e, Ok(_) => panic!("must fail") };
+    assert!(matches!(err, IndexerError::BrowserSetup(_)), "{err:?}");
     assert!(start.elapsed() < Duration::from_secs(7));
-    assert!(
-        fixture
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|request| request.contains("/json/close/fixture"))
-    );
+    assert!(!fixture.requests.lock().unwrap().iter().any(|r| r == "Target.createTarget"));
+}
+
+#[test]
+fn page_commands_use_the_flat_session_and_navigate_minus_32601_is_setup() {
+    let fixture = Fixture::start("success");
+    {
+        let page = open_cdp_session(&fixture.url).unwrap();
+        page.set_site_cookies("https://site.invalid/search", "session=secret").unwrap();
+        page.goto("https://site.invalid/search").unwrap();
+    }
+    let cmds = fixture.commands.lock().unwrap().clone();
+    for c in &cmds {
+        let m = c["method"].as_str().unwrap();
+        let page_level = m.starts_with("Page.") || m.starts_with("Network.") || m.starts_with("Runtime.");
+        if page_level {
+            assert_eq!(c["sessionId"], "sess-1", "{m} must carry the flat sessionId");
+        } else {
+            assert!(c.get("sessionId").is_none(), "{m} is browser-level");
+        }
+    }
+    let fixture = Fixture::start("no_page");
+    let page = open_cdp_session(&fixture.url).unwrap();
+    let err = page.goto("https://site.invalid/").unwrap_err();
+    assert!(matches!(err, IndexerError::BrowserSetup(_)), "{err:?}");
+}
+
+#[test]
+fn transient_context_error_is_not_marked_incompatible() {
+    let fixture = Fixture::start("context_timeout");
+    let err = match open_cdp_session(&fixture.url) { Err(e) => e, Ok(_) => panic!("must fail") };
+    assert!(!err.to_string().contains(indexer::cdp_page::INCOMPATIBLE_PREFIX), "{err}");
 }
 
 #[test]
@@ -373,7 +408,8 @@ fn cookie_readback_deduplicates_same_name_across_paths() {
     let page = open_cdp_session(&fixture.url).unwrap();
     let header = page.cookie_header("https://tracker.example/index.php").unwrap();
     // sid was old (path /) then new (path /forum). BTreeMap dedup preserves the latest value.
-    assert_eq!(header, "sid=new; uid=1");
+    // Only site-wide (path=/) cookies are read back; /forum is ignored.
+    assert_eq!(header, "sid=old; uid=1");
 }
 
 #[test]

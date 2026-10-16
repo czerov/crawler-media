@@ -9,7 +9,7 @@ use crate::browser::PageSession;
 
 #[path = "cdp_page_transport.rs"]
 mod transport;
-use transport::{TIMEOUT, Transport, failure, remaining};
+use transport::{TIMEOUT, Transport, failure, is_method_not_found, remaining};
 
 /// Prefix of the `BrowserSetup` message for endpoints that cannot isolate a
 /// session (no `Target.createBrowserContext`). `Browser` marks such endpoints
@@ -17,10 +17,7 @@ use transport::{TIMEOUT, Transport, failure, remaining};
 pub const INCOMPATIBLE_PREFIX: &str = "endpoint incompatible:";
 
 pub struct CdpPageSession {
-    base_url: String,
     target_id: String,
-    /// Browser-level connection owning the per-session BrowserContext.
-    browser: Mutex<Option<Transport>>,
     context_id: Option<String>,
     transport: Mutex<Option<Transport>>,
     deadline: Mutex<Option<Instant>>,
@@ -61,7 +58,17 @@ impl PageSession for CdpPageSession {
     fn goto(&self, url: &str) -> Result<(), IndexerError> {
         self.with_transport(|transport, deadline| {
             transport.loaded_loaders.clear();
-            let result = transport.command("Page.navigate", json!({"url": url}), deadline)?;
+            // -32601 means the page/method does not exist: nothing was sent to
+            // the site, so this is a pre-navigation (fallback-safe) failure.
+            let result = transport
+                .command("Page.navigate", json!({"url": url}), deadline)
+                .map_err(|error| {
+                    if is_method_not_found(&error) {
+                        IndexerError::BrowserSetup(format!("Page.navigate unsupported: {error}"))
+                    } else {
+                        error
+                    }
+                })?;
             if let Some(error) = result.get("errorText") {
                 return Err(failure("navigation", error));
             }
@@ -148,7 +155,10 @@ impl PageSession for CdpPageSession {
             let mut by_name: BTreeMap<&str, (bool, &str)> = BTreeMap::new();
             for c in cookies {
                 if let (Some(n), Some(v)) = (c["name"].as_str(), c["value"].as_str()) {
-                    if n.is_empty() {
+                    // Obscura's getCookies{urls} does not filter by path; only
+                    // site-wide cookies are merged back into the Site cookie.
+                    let path = c["path"].as_str().unwrap_or("/");
+                    if n.is_empty() || !(path.is_empty() || path == "/") {
                         continue;
                     }
                     let host_only = !c["domain"].as_str().unwrap_or("").starts_with('.');
@@ -198,31 +208,31 @@ fn evaluate(
 
 impl Drop for CdpPageSession {
     fn drop(&mut self) {
+        let cap = self.target_close_cap;
+        let target_id = self.target_id.clone();
+        let context_id = self.context_id.clone();
         if let Ok(Some(transport)) = self.transport.get_mut().map(Option::as_mut) {
-            transport.close();
-        }
-        // Dispose the isolated BrowserContext: drops every cookie this session
-        // created without touching any other context's data.
-        if let (Some(context_id), Ok(Some(browser))) = (
-            self.context_id.as_deref(),
-            self.browser.get_mut().map(Option::as_mut),
-        ) {
-            let deadline = Instant::now() + self.target_close_cap;
-            if let Err(error) = browser.command(
-                "Target.disposeBrowserContext",
-                json!({"browserContextId": context_id}),
-                deadline,
-            ) {
-                tracing::warn!(%error, "CDP browser context dispose failed");
+            // Fresh deadline per cleanup command; transport may have been marked
+            // failed by an earlier timeout, in which case these are skipped.
+            if !target_id.is_empty() {
+                if let Err(error) = transport.command_root(
+                    "Target.closeTarget",
+                    json!({"targetId": target_id}),
+                    Instant::now() + cap,
+                ) {
+                    tracing::warn!(%target_id, %error, "CDP target close failed");
+                }
             }
-            browser.close();
-        }
-        let close_url = format!("{}/json/close/{}", self.base_url, self.target_id);
-        if let Err(error) = http_agent(self.target_close_cap)
-            .put(&close_url)
-            .send_empty()
-        {
-            tracing::warn!(target_id = %self.target_id, %error, "CDP target cleanup failed");
+            if let Some(context_id) = context_id {
+                if let Err(error) = transport.command_root(
+                    "Target.disposeBrowserContext",
+                    json!({"browserContextId": context_id}),
+                    Instant::now() + cap,
+                ) {
+                    tracing::warn!(%error, "CDP browser context dispose failed");
+                }
+            }
+            transport.close();
         }
     }
 }
@@ -282,7 +292,7 @@ fn open_cdp_session_inner(
     if timeout.is_zero() {
         return Err(IndexerError::BrowserBusy);
     }
-    // 1. Browser-level endpoint.
+    // 1. Browser-level endpoint (Obscura has no /json/new or /json/close).
     let version: Value = http_agent(timeout)
         .get(&format!("{base}/json/version"))
         .call()
@@ -295,15 +305,20 @@ fn open_cdp_session_inner(
         .ok_or_else(|| failure("json/version", "missing webSocketDebuggerUrl"))?
         .to_owned();
     check_same_endpoint(base, &browser_ws, cdp_url)?;
-    let mut browser = Transport::connect(&browser_ws)?;
+    let mut transport = Transport::connect(&browser_ws)?;
 
-    // 2. Isolated cookie jar per session. Without it the endpoint is incompatible.
-    let context = browser
-        .command("Target.createBrowserContext", json!({"disposeOnDetach": true}), deadline)
+    // 2. Isolated cookie jar per session. Only an explicit "not supported"
+    //    answer marks the endpoint incompatible; timeouts etc. stay transient.
+    let context = transport
+        .command_root("Target.createBrowserContext", json!({"disposeOnDetach": true}), deadline)
         .map_err(|error| {
-            IndexerError::BrowserSetup(format!(
-                "{INCOMPATIBLE_PREFIX} Target.createBrowserContext unsupported ({error})"
-            ))
+            if is_method_not_found(&error) {
+                IndexerError::BrowserSetup(format!(
+                    "{INCOMPATIBLE_PREFIX} Target.createBrowserContext unsupported ({error})"
+                ))
+            } else {
+                error
+            }
         })?;
     let context_id = context["browserContextId"]
         .as_str()
@@ -311,43 +326,49 @@ fn open_cdp_session_inner(
             IndexerError::BrowserSetup(format!("{INCOMPATIBLE_PREFIX} no browserContextId returned"))
         })?
         .to_owned();
-    let target = match browser.command(
-        "Target.createTarget",
-        json!({"url": "about:blank", "browserContextId": context_id}),
-        deadline,
-    ) {
-        Ok(target) => target,
-        Err(error) => {
-            let _ = browser.command(
-                "Target.disposeBrowserContext",
-                json!({"browserContextId": context_id}),
-                Instant::now() + target_close_cap,
-            );
-            return Err(error);
-        }
-    };
-    let target_id = target["targetId"].as_str().map(str::to_owned);
 
+    // From here on the session owns the context (and later the target), so
+    // Drop cleans up whatever was created even if a later step fails.
     let mut session = CdpPageSession {
-        base_url: base.to_owned(),
-        target_id: target_id.clone().unwrap_or_default(),
-        browser: Mutex::new(Some(browser)),
-        context_id: Some(context_id),
+        target_id: String::new(),
+        context_id: Some(context_id.clone()),
         transport: Mutex::new(None),
         deadline: Mutex::new(Some(deadline)),
         target_close_cap,
     };
-    let target_id = target_id.ok_or_else(|| failure("create target", "missing targetId"))?;
+    let slot = session.transport.get_mut().unwrap_or_else(|p| p.into_inner());
+    *slot = Some(transport);
+    let transport = slot.as_mut().ok_or_else(|| failure("transport", "missing"))?;
 
-    // 3. Page connection on the same host:port as the endpoint.
-    let base_uri: tungstenite::http::Uri = base.parse().map_err(|e| failure("CDP URL", e))?;
-    let authority = base_uri
-        .authority()
-        .ok_or_else(|| failure("CDP URL", "missing authority"))?;
-    let ws_url = format!("ws://{authority}/devtools/page/{target_id}");
-    check_same_endpoint(base, &ws_url, cdp_url)?;
+    let target = transport.command_root(
+        "Target.createTarget",
+        json!({"url": "about:blank", "browserContextId": context_id}),
+        deadline,
+    )?;
+    let target_id = target["targetId"]
+        .as_str()
+        .ok_or_else(|| failure("create target", "missing targetId"))?
+        .to_owned();
+    session.target_id = target_id.clone();
+    let transport = session
+        .transport
+        .get_mut()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+        .ok_or_else(|| failure("transport", "missing"))?;
 
-    let mut transport = Transport::connect(&ws_url)?;
+    // 3. Flat session on the same connection for all page commands.
+    let attached = transport.command_root(
+        "Target.attachToTarget",
+        json!({"targetId": target_id, "flatten": true}),
+        deadline,
+    )?;
+    let session_id = attached["sessionId"]
+        .as_str()
+        .ok_or_else(|| failure("attach target", "missing sessionId"))?
+        .to_owned();
+    transport.session_id = Some(session_id);
+
     transport.command("Network.enable", json!({}), deadline)?;
     transport.command("Page.enable", json!({}), deadline)?;
     transport.command(
@@ -355,10 +376,6 @@ fn open_cdp_session_inner(
         json!({"enabled": true}),
         deadline,
     )?;
-    *session
-        .transport
-        .get_mut()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(transport);
     tracing::debug!(target_id = %session.target_id, "CDP page session opened in isolated context");
     Ok(session)
 }

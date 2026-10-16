@@ -26,6 +26,15 @@ pub(super) struct Transport {
     next_id: u64,
     failed: bool,
     pub(super) loaded_loaders: std::collections::HashSet<String>,
+    /// Flat-mode target session (`Target.attachToTarget{flatten:true}`); page
+    /// commands carry it and only its events are tracked.
+    pub(super) session_id: Option<String>,
+    protocol_error: bool,
+}
+
+/// CDP "method not found / no such page" (`-32601`).
+pub(super) fn is_method_not_found(error: &IndexerError) -> bool {
+    error.to_string().contains("-32601")
 }
 
 impl Transport {
@@ -73,11 +82,35 @@ impl Transport {
             next_id: 0,
             failed: false,
             loaded_loaders: std::collections::HashSet::new(),
+            session_id: None,
+            protocol_error: false,
         })
     }
 
+    /// Page-level command (sent on the attached session when there is one).
     pub(super) fn command(
         &mut self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, IndexerError> {
+        let session = self.session_id.clone();
+        self.command_on(session.as_deref(), method, params, deadline)
+    }
+
+    /// Browser-level command (never carries a sessionId).
+    pub(super) fn command_root(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, IndexerError> {
+        self.command_on(None, method, params, deadline)
+    }
+
+    fn command_on(
+        &mut self,
+        session: Option<&str>,
         method: &str,
         params: Value,
         deadline: Instant,
@@ -85,8 +118,11 @@ impl Transport {
         if self.failed {
             return Err(failure(method, "transport is no longer usable"));
         }
-        let result = self.exchange(method, params, deadline);
-        if result.is_err() {
+        self.protocol_error = false;
+        let result = self.exchange(session, method, params, deadline);
+        // A CDP error *response* leaves the connection usable (cleanup can
+        // still run); I/O errors and timeouts poison it.
+        if result.is_err() && !self.protocol_error {
             self.failed = true;
         }
         result
@@ -94,6 +130,7 @@ impl Transport {
 
     fn exchange(
         &mut self,
+        session: Option<&str>,
         method: &str,
         params: Value,
         deadline: Instant,
@@ -101,7 +138,10 @@ impl Transport {
         self.next_id += 1;
         let id = self.next_id;
         self.set_deadline(deadline)?;
-        let request = json!({"id":id, "method":method, "params":params});
+        let mut request = json!({"id":id, "method":method, "params":params});
+        if let Some(session) = session {
+            request["sessionId"] = json!(session);
+        }
         self.send(request, method, deadline)?;
         loop {
             self.set_deadline(deadline)?;
@@ -119,7 +159,13 @@ impl Transport {
                 Message::Text(text) => {
                     let response: Value = serde_json::from_str(&text)
                         .map_err(|error| failure("invalid protocol JSON", error))?;
-                    if response["method"] == "Page.lifecycleEvent"
+                    let event_session = response["sessionId"].as_str();
+                    let ours = match (&self.session_id, event_session) {
+                        (Some(mine), Some(theirs)) => mine == theirs,
+                        _ => true,
+                    };
+                    if ours
+                        && response["method"] == "Page.lifecycleEvent"
                         && response["params"]["name"] == "load"
                     {
                         if let Some(loader) = response["params"]["loaderId"].as_str() {
@@ -130,6 +176,7 @@ impl Transport {
                         continue;
                     }
                     if let Some(error) = response.get("error") {
+                        self.protocol_error = true;
                         return Err(failure(method, error));
                     }
                     return response
