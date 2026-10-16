@@ -72,6 +72,8 @@ mod d_l1_partial_collect;
 mod d_l2_filtered_info;
 #[path = "subscription_e2e/d_l3_loose_match_audit.rs"]
 mod d_l3_loose_match_audit;
+#[path = "subscription_e2e/g_l1_library_scoped_completion.rs"]
+mod g_l1_library_scoped_completion;
 #[path = "subscription_e2e/m1_overlap_policy.rs"]
 mod m1_overlap_policy;
 #[path = "subscription_e2e/m2_owned_slot_skip.rs"]
