@@ -81,6 +81,7 @@ fn run_live() -> Result<(), Box<dyn std::error::Error>> {
             naming: None,
             preserve_removed: false,
             overlap: Default::default(),
+            absolute: None,
         })?;
         println!(
             "run ledger={} completed={}",

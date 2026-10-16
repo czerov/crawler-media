@@ -154,6 +154,7 @@ fn filter_matched_pending(
     subscribe: &Subscribe,
     media: &Media,
     pending: Vec<(i32, crate::store::PendingDownload)>,
+    absolute: Option<&subscribe::AbsoluteEpisodes>,
 ) -> Vec<ScoredTorrent> {
     pending
         .into_iter()
@@ -161,6 +162,8 @@ fn filter_matched_pending(
             let release = pending
                 .release_override
                 .unwrap_or_else(|| release::parse(&pending.torrent.title));
+            // G-H2b: absolute episode numbers → catalog season + episode.
+            let release = absolute.map_or_else(|| release.clone(), |map| map.apply(&release));
             if !subscribe::candidate_matches_subscribe(subscribe, media, &release) {
                 tracing::error!(subscribe_id = %subscribe.id, media = %media.title,
                     torrent = %pending.torrent.title, "拒绝转存与订阅不匹配的待处理种子");
@@ -279,7 +282,12 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
     let (media, filter, facts, wash_filter) = load_transfer_context(state, &subscribe)?;
     let routed = crate::delivery::RoutedDownloader::with_pending(state, &subscribe, &pending);
     restore_identities(state, &subscribe, &routed, &pending);
-    let chosen = filter_matched_pending(&subscribe, &media, pending);
+    let absolute = crate::season_check::absolute_map(
+        state,
+        &media,
+        pending.iter().map(|(_, p)| p.torrent.title.as_str()),
+    );
+    let chosen = filter_matched_pending(&subscribe, &media, pending, absolute.as_ref());
 
     let plan = resolve_transfer_plan(state, &media, &subscribe)?;
     let library_lease = state.acquire_library_work(&plan.library_id)?;
@@ -303,6 +311,7 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
             naming: Some(&plan.naming),
             preserve_removed: true,
             overlap: Default::default(),
+            absolute: absolute.as_ref(),
         },
         chosen,
     );

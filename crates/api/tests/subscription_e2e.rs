@@ -44,6 +44,8 @@ mod h3_background_reconcile;
 mod h3_stalled_timeout;
 #[path = "subscription_e2e/h4_season_pack_pending.rs"]
 mod h4_season_pack_pending;
+#[path = "subscription_e2e/g_h2b_absolute_episode.rs"]
+mod g_h2b_absolute_episode;
 #[path = "subscription_e2e/m1_overlap_policy.rs"]
 mod m1_overlap_policy;
 #[path = "subscription_e2e/m2_owned_slot_skip.rs"]

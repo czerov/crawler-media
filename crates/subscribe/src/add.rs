@@ -31,6 +31,23 @@ pub fn admit_and_add<D: Downloader + ?Sized>(
     let admitted = admission
         .admitted
         .into_iter()
+        .filter_map(|mut candidate| {
+            // G-H2b: absolute episode numbers → catalog season + episode.
+            if let Some(map) = input.absolute {
+                match map.remap(&candidate.release) {
+                    Ok(Some(mapped)) => {
+                        tracing::info!(torrent = %candidate.torrent.title, season = ?mapped.season, episode = ?mapped.episode, "绝对集号映射为季+集");
+                        candidate.release = mapped;
+                    }
+                    Ok(None) => {}
+                    Err(()) => {
+                        tracing::info!(torrent = %candidate.torrent.title, "绝对集号跨季或超出目录，跳过");
+                        return None;
+                    }
+                }
+            }
+            Some(candidate)
+        })
         .filter(|candidate| {
             let m = candidate_matches_subscribe_with_keywords(
                 input.subscribe,
@@ -74,7 +91,9 @@ pub fn admit_and_add<D: Downloader + ?Sized>(
             .and_then(|()| input.downloader.add(&scored.torrent).map_err(Into::into));
         match result {
             Ok(()) => submitted.push(scored),
-            Err(SubscribeError::Downloader(downloader::DownloaderError::ExistingTaskBroken(hash))) => {
+            Err(SubscribeError::Downloader(downloader::DownloaderError::ExistingTaskBroken(
+                hash,
+            ))) => {
                 tracing::warn!(torrent = %scored.torrent.title, %hash, "下载器中已有任务处于错误/缺文件状态，拒绝该来源以便换源");
                 broken.push(scored);
             }
@@ -126,12 +145,18 @@ fn split_admission<D: Downloader + ?Sized>(
     wash: &domain::Filter,
 ) -> filter::AdmitOutcome {
     let fills_gap = |c: &ScoredTorrent| {
-        crate::choose::covered_slots(input.subscribe, &c.release)
+        let release = input
+            .absolute
+            .map_or_else(|| c.release.clone(), |m| m.apply(&c.release));
+        crate::choose::covered_slots(input.subscribe, &release)
             .iter()
             .any(|(s, e)| input.facts.get(*s, *e).is_none())
     };
     let touches_owned = |c: &ScoredTorrent| {
-        crate::choose::covered_slots(input.subscribe, &c.release)
+        let release = input
+            .absolute
+            .map_or_else(|| c.release.clone(), |m| m.apply(&c.release));
+        crate::choose::covered_slots(input.subscribe, &release)
             .iter()
             .any(|(s, e)| input.facts.get(*s, *e).is_some())
     };
@@ -142,12 +167,20 @@ fn split_admission<D: Downloader + ?Sized>(
         outcome.admitted.push(candidate);
     }
     for candidate in washed.admitted.into_iter().filter(|c| touches_owned(c)) {
-        if !outcome.admitted.iter().any(|c| c.torrent.enclosure == candidate.torrent.enclosure) {
+        if !outcome
+            .admitted
+            .iter()
+            .any(|c| c.torrent.enclosure == candidate.torrent.enclosure)
+        {
             outcome.admitted.push(candidate);
         }
     }
     for candidate in washed.rejected {
-        if !outcome.admitted.iter().any(|c| c.torrent.enclosure == candidate.torrent.enclosure) {
+        if !outcome
+            .admitted
+            .iter()
+            .any(|c| c.torrent.enclosure == candidate.torrent.enclosure)
+        {
             outcome.rejected.push(candidate);
         }
     }

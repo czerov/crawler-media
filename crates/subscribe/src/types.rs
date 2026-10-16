@@ -42,6 +42,8 @@ pub struct RunInput<'a, D: Downloader + ?Sized> {
     pub preserve_removed: bool,
     /// M1: how overlapping range packs and single episodes are resolved.
     pub overlap: crate::choose::OverlapPolicy,
+    /// G-H2b: catalog season lengths for mapping absolute episode numbers.
+    pub absolute: Option<&'a crate::AbsoluteEpisodes>,
 }
 
 pub struct RunOutcome {

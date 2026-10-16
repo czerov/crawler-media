@@ -175,7 +175,11 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
         }
     }
     // M2: subtitles of a pure duplicate have no new video to sit beside.
-    let subs = if duplicate && torrent_destinations.is_empty() { Vec::new() } else { subs };
+    let subs = if duplicate && torrent_destinations.is_empty() {
+        Vec::new()
+    } else {
+        subs
+    };
     let subs_count = subs.len();
     for src in subs {
         if control.is_cancelled() {
@@ -275,12 +279,20 @@ fn collect_one<D: Downloader + ?Sized>(
             .and_then(|name| name.to_str())
             .unwrap_or_default(),
     );
+    // G-H2b: an absolute-numbered file maps onto the catalog season too.
+    // Only for torrents whose own title has no season marker.
+    let (file_release, torrent_release) = match added.input.absolute {
+        Some(map) if !release::has_explicit_season(&scored.torrent.title) => {
+            (map.apply(&file_release), map.apply(&scored.release))
+        }
+        _ => (file_release, scored.release.clone()),
+    };
     let release = match crate::file_identity::resolve_file_release(
         added.input.subscribe,
         added.input.media,
         &src,
         &file_release,
-        &scored.release,
+        &torrent_release,
         single_file,
     ) {
         Some(release) => release,
@@ -542,10 +554,12 @@ fn dest_path(
             return Ok(candidate);
         }
     }
-    Err(SubscribeError::Library(library::LibraryError::Io(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!("no free alternate name for {}", dest.display()),
-    ))))
+    Err(SubscribeError::Library(library::LibraryError::Io(
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("no free alternate name for {}", dest.display()),
+        ),
+    )))
 }
 
 const MAX_ALTERNATE_NAMES: usize = 100;

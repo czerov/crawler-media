@@ -175,6 +175,8 @@ fn admit_candidates(
         crate::delivery::RoutedDownloader::with_pending(state, subscribe, &context.existing);
     let facts = facts_with_pending(context.facts.clone(), &context.existing, subscribe, media);
     let overlap = overlap_policy(state);
+    let absolute =
+        crate::season_check::absolute_map(state, media, torrents.iter().map(|t| t.title.as_str()));
     let selective = crate::selective_files::enabled(state).then(|| facts.clone());
     let added = admit_and_add(RunInput {
         subscribe,
@@ -192,6 +194,7 @@ fn admit_candidates(
         naming: Some(&context.naming),
         preserve_removed: false,
         overlap,
+        absolute: absolute.as_ref(),
     })
     .map_err(|e| {
         tracing::error!(subscribe_id = %subscribe.id, media = %media.title, error = %e, "收录并添加种子失败");

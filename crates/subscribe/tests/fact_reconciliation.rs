@@ -118,6 +118,7 @@ fn season_pack_retry_only_reconciles_mapped_slots_without_forging_facts() {
         naming: Some(&naming),
         preserve_removed: true,
         overlap: Default::default(),
+        absolute: None,
     };
 
     let added = Added {
@@ -206,6 +207,7 @@ fn stale_facts_pointing_at_missing_file_are_reconciled_to_new_destination() {
         naming: Some(&naming),
         preserve_removed: true,
         overlap: Default::default(),
+        absolute: None,
     };
 
     let added = Added {

@@ -44,3 +44,50 @@ pub(crate) fn drop_misnumbered(
         })
         .collect()
 }
+
+/// G-H2b: catalog season lengths, built only when some title has an inferred
+/// season and an episode number beyond the catalog's S01. Call without the
+/// store lock (catalog I/O).
+pub(crate) fn absolute_map<'t>(
+    state: &ApiState,
+    media: &Media,
+    titles: impl IntoIterator<Item = &'t str>,
+) -> Option<subscribe::AbsoluteEpisodes> {
+    const MAX_SEASONS: u32 = 50;
+    let (MediaKind::Tv, Some(tmdb_id)) = (media.kind, media.tmdb_id.as_deref()) else {
+        return None;
+    };
+    let highest = titles
+        .into_iter()
+        .filter_map(|title| {
+            let release = release::parse(title);
+            release
+                .season_inferred
+                .then(|| release.episode_span())
+                .flatten()
+        })
+        .map(|(_, to)| to)
+        .max()?;
+    let count = |season: u32| {
+        state
+            .catalog
+            .season_episodes(tmdb_id, season)
+            .ok()
+            .and_then(|eps| eps.iter().map(|e| e.episode_number).max())
+    };
+    let s01 = count(1)?;
+    if highest <= s01 {
+        return None;
+    }
+    let mut counts = vec![(1, s01)];
+    let mut total = s01;
+    for season in 2..=MAX_SEASONS {
+        let Some(n) = count(season) else { break };
+        counts.push((season, n));
+        total += n;
+        if total >= highest {
+            break;
+        }
+    }
+    Some(subscribe::AbsoluteEpisodes::new(counts))
+}

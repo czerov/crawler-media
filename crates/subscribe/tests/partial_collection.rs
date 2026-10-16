@@ -116,6 +116,7 @@ fn one_failed_file_does_not_discard_successful_files_from_same_torrent() {
             naming: None,
             preserve_removed: false,
             overlap: Default::default(),
+            absolute: None,
         },
         chosen: vec![ScoredTorrent {
             release: domain::Release {

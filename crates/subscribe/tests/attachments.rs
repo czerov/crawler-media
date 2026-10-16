@@ -107,6 +107,7 @@ fn attachments_are_not_treated_as_video() {
         naming: None,
         preserve_removed: false,
         overlap: Default::default(),
+        absolute: None,
     })
     .unwrap();
 

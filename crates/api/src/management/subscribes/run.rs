@@ -304,6 +304,11 @@ fn execute(
         .imported_destinations()
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let overlap = crate::worker::finish_search::overlap_policy(state);
+    let absolute = crate::season_check::absolute_map(
+        state,
+        &context.media,
+        torrents.iter().map(|t| t.title.as_str()),
+    );
     let mut outcome = subscribe::run_with_destinations_controlled(
         RunInput {
             subscribe: &context.subscribe,
@@ -321,6 +326,7 @@ fn execute(
             naming: Some(&naming),
             preserve_removed: true,
             overlap,
+            absolute: absolute.as_ref(),
         },
         &library::Ffprobe::default(),
         &destinations,

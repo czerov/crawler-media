@@ -91,6 +91,7 @@ fn veto_hook_prevents_add_to_downloader() {
         naming: None,
         preserve_removed: false,
         overlap: Default::default(),
+        absolute: None,
     });
     assert!(result.is_err());
     assert!(downloader.added().is_empty());
