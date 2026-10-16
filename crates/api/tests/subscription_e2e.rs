@@ -38,6 +38,8 @@ mod h4_season_pack_pending;
 mod m1_overlap_policy;
 #[path = "subscription_e2e/m2_owned_slot_skip.rs"]
 mod m2_owned_slot_skip;
+#[path = "subscription_e2e/m3_split_admission.rs"]
+mod m3_split_admission;
 #[path = "subscription_e2e/s1_wash_probe_fail.rs"]
 mod s1_wash_probe_fail;
 
