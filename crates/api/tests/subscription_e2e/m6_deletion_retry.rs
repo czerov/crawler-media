@@ -95,7 +95,15 @@ async fn failed_delete_is_queued_and_retried_on_next_transfer() {
         .unwrap();
     assert_eq!(queued, vec![owned_s.clone()]);
 
-    // Permission restored: the next Transfer job finishes the deletion.
+    // Review M-3: inside the backoff window the row is not retried.
+    h.transfer(id).await.unwrap();
+    assert!(owned.exists(), "backoff respected");
+    // Backoff expired: the next Transfer job finishes the deletion.
+    h.state
+        .store()
+        .lock()
+        .reset_file_deletion_backoff(&owned_s)
+        .unwrap();
     h.transfer(id).await.unwrap();
     assert!(!owned.exists());
     assert!(!h.ledger_paths().contains(&owned_s));
@@ -106,5 +114,47 @@ async fn failed_delete_is_queued_and_retried_on_next_transfer() {
             .list_pending_file_deletions()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn queued_deletion_never_removes_a_new_file_at_the_same_path() {
+    let h = Harness::new();
+    let (id, owned) = wash_owning_locked_1080p(&h).await;
+    let locked = owned.parent().unwrap().to_path_buf();
+    h.run_subscribe(id).await;
+    let video = probed_video(2160, "hevc", false);
+    h.qb.complete(0, MATRIX_TITLE, &[(&format!("{MATRIX_TITLE}.mkv"), &video)]);
+    set_mode(&locked, 0o555);
+    let _ = h.transfer(id).await;
+    set_mode(&locked, 0o755);
+    let owned_s = owned.display().to_string();
+    assert_eq!(
+        h.state
+            .store()
+            .lock()
+            .list_pending_file_deletions()
+            .unwrap(),
+        vec![owned_s.clone()]
+    );
+
+    // The user puts a different file at the same path before the retry.
+    std::fs::remove_file(&owned).unwrap();
+    std::fs::write(&owned, b"a different, user-provided file").unwrap();
+    h.state
+        .store()
+        .lock()
+        .reset_file_deletion_backoff(&owned_s)
+        .unwrap();
+    h.transfer(id).await.unwrap();
+    assert!(owned.is_file(), "reused path must not be deleted");
+    assert!(
+        h.state
+            .store()
+            .lock()
+            .list_pending_file_deletions()
+            .unwrap()
+            .is_empty(),
+        "stale queue row dropped"
     );
 }

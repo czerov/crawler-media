@@ -249,6 +249,10 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(tables::LIBRARY_TABLES)?;
     // ledger.missing_at：文件核验标记（老库补列，幂等）。
     ensure_column(conn, "ledger", "missing_at", "INTEGER")?;
+    // Review M-3: identity of a queued deletion (additive).
+    ensure_column(conn, "pending_file_deletions", "ledger_id", "TEXT")?;
+    ensure_column(conn, "pending_file_deletions", "file_size", "INTEGER")?;
+    ensure_column(conn, "pending_file_deletions", "file_inode", "INTEGER")?;
     ensure_column(conn, "ledger", "transfer_mode", "TEXT")?;
     ensure_column(conn, "ledger", "source_path", "TEXT")?;
     ensure_column(conn, "ledger", "transfer_pending", "INTEGER NOT NULL DEFAULT 0")?;
