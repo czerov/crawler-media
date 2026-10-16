@@ -1180,6 +1180,9 @@ function SiteForm({ item, site, busy, onSubmit }: SiteFormProps) {
     site?.auth_type ?? options[0]?.auth_type ?? "cookie",
   );
   const [siteUrl, setSiteUrl] = useState(site?.url ?? "");
+  const [maintenanceVia, setMaintenanceVia] = useState<"http" | "browser">(
+    site?.maintenance_via ?? "http",
+  );
   // 各字段值。编辑时出于安全后端不回传敏感值，故一律留空，需用户重新填写。
   const [values, setValues] = useState<Record<string, string>>({});
 
@@ -1192,6 +1195,7 @@ function SiteForm({ item, site, busy, onSubmit }: SiteFormProps) {
     const payload: SiteConfigPayload = {
       auth_type: authType,
       enabled: site?.enabled ?? true,
+      maintenance_via: maintenanceVia,
       ...(siteUrl.trim() ? { url: siteUrl.trim() } : {}),
     };
     for (const f of fields) {
@@ -1202,6 +1206,35 @@ function SiteForm({ item, site, busy, onSubmit }: SiteFormProps) {
 
   return (
     <div className="space-y-4">
+      {/* 维护保活方式 */}
+      <div>
+        <label className="mb-1.5 block text-sub font-medium text-[var(--text-muted)]">
+          登录与签到维护方式
+        </label>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => setMaintenanceVia("http")}
+            data-active={maintenanceVia === "http"}
+            className="glass-row nav-item !w-auto px-3 py-1.5 text-sub font-medium"
+          >
+            标准 HTTP (支持代理)
+          </button>
+          <button
+            type="button"
+            onClick={() => setMaintenanceVia("browser")}
+            data-active={maintenanceVia === "browser"}
+            className="glass-row nav-item !w-auto px-3 py-1.5 text-sub font-medium"
+          >
+            无头浏览器 (CDP / Obscura)
+          </button>
+        </div>
+        {maintenanceVia === "browser" && (
+          <p className="mt-1 text-caption text-[var(--text-faint)]">
+            浏览器维护方式不支持配置代理。若浏览器执行异常，系统将自动回退到 HTTP 流程。
+          </p>
+        )}
+      </div>
       {/* 授权类型选择（多于一种时才展示） */}
       {options.length > 1 && (
         <div>
@@ -1295,36 +1328,45 @@ function CdpBrowserSection() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [obscuraActing, setObscuraActing] = useState(false);
   const [msg, setMsg] = useState<{ tone: "success" | "error"; text: string } | null>(null);
 
   const [cdpEnabled, setCdpEnabled] = useState(false);
-  const [cdpUrl, setCdpUrl] = useState("http://127.0.0.1:9222");
-
-  const [obscuraEnabled, setObscuraEnabled] = useState(false);
-  const [obscuraUrl, setObscuraUrl] = useState("http://127.0.0.1:9223");
+  const [cdpUrl, setCdpUrl] = useState("");
+  const [obscuraInstall, setObscuraInstall] = useState<"download" | "preinstalled">("preinstalled");
   const [userAgent, setUserAgent] = useState("crawler-media/0.1.0");
-  const [obscuraConfigured, setObscuraConfigured] = useState(false);
+  const [obscuraStatus, setObscuraStatus] = useState<any>(null);
 
   const [syncResult, setSyncResult] = useState<any>(null);
 
-  useEffect(() => {
+  async function loadData() {
     const token = localStorage.getItem("mc_token") || localStorage.getItem("token") || "";
-    fetch("/api/v1/settings/browser", {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.ok && data.data) {
-          setCdpEnabled(data.data.cdp?.enabled ?? false);
-          setCdpUrl(data.data.cdp?.url ?? "http://127.0.0.1:9222");
-          setObscuraEnabled(data.data.obscura?.enabled ?? false);
-          setObscuraUrl(data.data.obscura?.url ?? "http://127.0.0.1:9223");
-          setUserAgent(data.data.user_agent ?? "crawler-media/0.1.0");
-          setObscuraConfigured(data.data.obscura?.configured ?? false);
+    try {
+      const [bRes, oRes] = await Promise.all([
+        fetch("/api/v1/settings/browser", { headers: { Authorization: `Bearer ${token}` } }),
+        fetch("/api/v1/settings/browser/obscura", { headers: { Authorization: `Bearer ${token}` } }),
+      ]);
+      const [bData, oData] = await Promise.all([bRes.json(), oRes.json()]);
+      if (bData.ok && bData.data) {
+        setCdpEnabled(bData.data.cdp?.enabled ?? false);
+        setCdpUrl(bData.data.cdp?.url ?? "");
+        setUserAgent(bData.data.user_agent ?? "crawler-media/0.1.0");
+        if (bData.data.obscura?.install) {
+          setObscuraInstall(bData.data.obscura.install);
         }
-      })
-      .catch((e) => setMsg({ tone: "error", text: `加载配置失败: ${e.message}` }))
-      .finally(() => setLoading(false));
+      }
+      if (oData.ok && oData.data) {
+        setObscuraStatus(oData.data);
+      }
+    } catch (e: any) {
+      setMsg({ tone: "error", text: `加载配置失败: ${e.message}` });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadData();
   }, []);
 
   async function handleSave() {
@@ -1339,18 +1381,16 @@ function CdpBrowserSection() {
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          cdp: { enabled: cdpEnabled, url: cdpUrl },
-          obscura: { enabled: obscuraEnabled, url: obscuraUrl },
+          cdp: { enabled: cdpEnabled, url: cdpUrl.trim() },
+          obscura: { install: obscuraInstall },
           user_agent: userAgent,
         }),
       });
       const data = await res.json();
       if (data.ok) {
-        setMsg({ tone: "success", text: "配置已保存并即时用于后续请求；外部 CDP 连通性尚未验证" });
-        if (data.data?.obscura) {
-          setObscuraConfigured(data.data.obscura.configured ?? false);
-        }
+        setMsg({ tone: "success", text: "浏览器配置已保存并完成生命周期对账" });
         if (data.data?.user_agent) setUserAgent(data.data.user_agent);
+        await loadData();
       } else {
         setMsg({ tone: "error", text: data.error?.message || "保存失败" });
       }
@@ -1358,6 +1398,32 @@ function CdpBrowserSection() {
       setMsg({ tone: "error", text: e.message });
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleObscuraAction(action: "start" | "stop") {
+    setObscuraActing(true);
+    setMsg(null);
+    try {
+      const token = localStorage.getItem("mc_token") || localStorage.getItem("token") || "";
+      const res = await fetch(`/api/v1/settings/browser/obscura/${action}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setMsg({
+          tone: "success",
+          text: action === "start" ? "已成功启动 Obscura 浏览器服务" : "已停止 Obscura 浏览器服务",
+        });
+        setObscuraStatus(data.data);
+      } else {
+        setMsg({ tone: "error", text: data.error?.message || "操作失败" });
+      }
+    } catch (e: any) {
+      setMsg({ tone: "error", text: e.message });
+    } finally {
+      setObscuraActing(false);
     }
   }
 
@@ -1392,6 +1458,12 @@ function CdpBrowserSection() {
     return <div className="p-8 text-center text-sub text-[var(--text-muted)]">正在加载设置…</div>;
   }
 
+  const currentMode = !cdpEnabled
+    ? "已停用（全部请求使用普通 HTTP）"
+    : cdpUrl.trim().length > 0
+    ? "外部 Chrome CDP（连接配置的调试端点）"
+    : "受管 Obscura 引擎（自动拉起轻量防检测浏览器）";
+
   return (
     <div className="space-y-6">
       {msg && (
@@ -1407,18 +1479,20 @@ function CdpBrowserSection() {
       )}
 
       <div className="rounded-xl border border-white/[0.08] bg-white/[0.02] p-4 text-sub text-[var(--text-muted)]">
-        当前 Browser 仅支持外部 HTTP(S) CDP discovery，不下载或启动受管 Chromium/Obscura，不接受 ws/wss 地址。
-        渲染路由优先级为 Site 专属 CDP → 已启用的 Obscura → 已启用的全局 CDP。保存即时生效，无需重启。
-        “已启用”仅代表配置意图；首次实际请求才验证连接，未验证端点不会显示为可用。
+        浏览器支持单开关设计：开启后，如果配置了外部 CDP 地址则使用外部浏览器；如果未配置则使用内置受管 Obscura 引擎。
+        若外部浏览器或受管引擎执行失败，系统将自动回退到普通 HTTP 流程。
+        <span className="mt-1 block font-semibold text-white/90">
+          注意：搜索与 RSS 种子检索始终使用普通 HTTP，不消耗任何浏览器资源；浏览器仅用于登录和签到保活。
+        </span>
       </div>
 
-      {/* CDP Cookie Sync 开关与设置 */}
+      {/* 单一 CDP 开关与路由选择 */}
       <div className="rounded-xl border border-white/[0.08] bg-white/[0.02] p-5">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h3 className="text-ui font-semibold text-[var(--text)]">全局外部 CDP 与凭据提取</h3>
+            <h3 className="text-ui font-semibold text-[var(--text)]">启用 CDP 浏览器功能</h3>
             <p className="mt-1 text-sub text-[var(--text-muted)]">
-              开启后，此地址作为 JS 渲染请求的全局 CDP 备用端点，也用于提取已登录 Site 的 Cookie。仅 render Profile 使用 Browser，普通 HTTP 请求不自动切换。
+              当前运行模式：<span className="font-semibold text-white/90">{currentMode}</span>
             </p>
           </div>
           <label className="relative inline-flex cursor-pointer items-center">
@@ -1436,18 +1510,18 @@ function CdpBrowserSection() {
           <div className="mt-4 space-y-4 border-t border-white/[0.06] pt-4">
             <div>
               <label className="text-micro font-medium text-[var(--text-faint)]">
-                Chrome 远程调试地址 (remote-debugging-port)
+                外部 Chrome 远程调试地址 (选填，留空则使用内置 Obscura 引擎)
               </label>
               <input
                 type="text"
                 value={cdpUrl}
                 onChange={(e) => setCdpUrl(e.target.value)}
-                placeholder="http://127.0.0.1:9222"
+                placeholder="留空使用受管 Obscura，或填 http://127.0.0.1:9222"
                 className="mt-1.5 w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-3.5 py-2 text-ui text-[var(--text)] outline-none focus:border-[var(--accent)]"
               />
               <p className="mt-1.5 text-micro text-[var(--text-faint)]">
-                提示：本地启动 Chrome 时带上参数{" "}
-                <code className="text-white/80">--remote-debugging-port=9222</code> 即可开启调试端点。
+                若需使用本地已登录的 Chrome/Edge，带参数{" "}
+                <code className="text-white/80">--remote-debugging-port=9222</code> 启动浏览器并填入该地址。
               </p>
             </div>
 
@@ -1458,7 +1532,7 @@ function CdpBrowserSection() {
                 disabled={syncing}
                 className="btn-accent rounded-full px-4 py-1.5 text-sub font-semibold disabled:opacity-50"
               >
-                {syncing ? "正在提取并同步中…" : "立即从 Chrome 扫描并同步 Cookie"}
+                {syncing ? "正在提取并同步中…" : "立即从浏览器扫描并同步 Cookie"}
               </button>
             </div>
 
@@ -1481,44 +1555,101 @@ function CdpBrowserSection() {
         )}
       </div>
 
-      {/* Obscura 防检测无头浏览器开关与设置 */}
-      <div className="rounded-xl border border-white/[0.08] bg-white/[0.02] p-5">
+      {/* 受管 Obscura 状态与控制卡片 */}
+      <div className="rounded-xl border border-white/[0.08] bg-white/[0.02] p-5 space-y-4">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h3 className="text-ui font-semibold text-[var(--text)]">Obscura 防检测浏览器集成</h3>
+            <h3 className="text-ui font-semibold text-[var(--text)]">受管 Obscura 浏览器状态</h3>
             <p className="mt-1 text-sub text-[var(--text-muted)]">
-              连接您已运行且兼容 HTTP CDP discovery 的 Obscura 服务，用于 render Profile。不会自动处理 Cloudflare 质询，也不保证第三方服务的渲染能力。
+              内置轻量级无头浏览器守护进程。无需任何外部依赖，在未配置外部 CDP 时按需拉起并自动管理生命周期。
             </p>
           </div>
-          <label className="relative inline-flex cursor-pointer items-center">
-            <input
-              type="checkbox"
-              checked={obscuraEnabled}
-              onChange={(e) => setObscuraEnabled(e.target.checked)}
-              className="peer sr-only"
-            />
-            <div className="peer h-6 w-11 rounded-full bg-white/10 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-all after:content-[''] peer-checked:bg-[var(--accent)] peer-checked:after:translate-x-full" />
-          </label>
+          {obscuraStatus && (
+            <div className="flex items-center gap-2">
+              <span
+                className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-caption font-medium ${
+                  obscuraStatus.running
+                    ? "bg-[#51cf66]/10 text-[#51cf66]"
+                    : "bg-white/10 text-[var(--text-muted)]"
+                }`}
+              >
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    obscuraStatus.running ? "bg-[#51cf66]" : "bg-white/30"
+                  }`}
+                />
+                {obscuraStatus.running
+                  ? `运行中 (端口: ${obscuraStatus.port})`
+                  : obscuraStatus.downloading
+                  ? "下载安装中…"
+                  : "未启动"}
+              </span>
+            </div>
+          )}
         </div>
 
-        {obscuraEnabled && (
-          <div className="mt-4 space-y-3 border-t border-white/[0.06] pt-4">
-            <label className="text-micro font-medium text-[var(--text-faint)]">
-              Obscura HTTP(S) CDP discovery 地址
-              <input
-                type="text"
-                value={obscuraUrl}
-                onChange={(e) => setObscuraUrl(e.target.value)}
-                placeholder="http://127.0.0.1:9223"
-                className="mt-1.5 w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-3.5 py-2 text-ui text-[var(--text)] outline-none focus:border-[var(--accent)]"
-              />
-            </label>
-            <p className="text-micro text-[var(--text-faint)]">
-              {obscuraConfigured ? "已保存端点配置，运行状态与 CDP 可用性未验证。" : "尚未保存有效端点。"}
-              保存不会下载、安装或启动 Obscura；服务必须由您自行运行。进程或端口存活不代表渲染可用。
-            </p>
+        <div className="border-t border-white/[0.06] pt-4 space-y-3">
+          <div className="grid grid-cols-2 gap-4 text-sub">
+            <div>
+              <span className="text-[var(--text-faint)]">安装状态: </span>
+              <span className="font-medium text-white/90">
+                {obscuraStatus?.installed ? "已安装" : "未安装"}
+              </span>
+            </div>
+            <div>
+              <span className="text-[var(--text-faint)]">引擎版本: </span>
+              <span className="font-medium text-white/90">
+                {obscuraStatus?.reported_version ?? obscuraStatus?.expected_version ?? "v0.2.3"}
+              </span>
+            </div>
           </div>
-        )}
+
+          <div>
+            <label className="text-micro font-medium text-[var(--text-faint)]">
+              安装策略 (二进制获取方式)
+            </label>
+            <div className="mt-1 flex gap-2">
+              <button
+                type="button"
+                onClick={() => setObscuraInstall("preinstalled")}
+                data-active={obscuraInstall === "preinstalled"}
+                className="glass-row nav-item !w-auto px-3 py-1.5 text-sub font-medium"
+              >
+                仅预安装 (离线环境)
+              </button>
+              <button
+                type="button"
+                onClick={() => setObscuraInstall("download")}
+                data-active={obscuraInstall === "download"}
+                className="glass-row nav-item !w-auto px-3 py-1.5 text-sub font-medium"
+              >
+                自动下载 (SHA256 哈希校验)
+              </button>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3 pt-2">
+            {obscuraStatus?.running ? (
+              <button
+                type="button"
+                onClick={() => handleObscuraAction("stop")}
+                disabled={obscuraActing}
+                className="rounded-full border border-red-500/40 bg-red-500/10 px-4 py-1.5 text-sub font-semibold text-red-400 hover:bg-red-500/20 disabled:opacity-50"
+              >
+                {obscuraActing ? "停止中…" : "停止 Obscura 服务"}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => handleObscuraAction("start")}
+                disabled={obscuraActing || obscuraStatus?.downloading}
+                className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-4 py-1.5 text-sub font-semibold text-emerald-400 hover:bg-emerald-500/20 disabled:opacity-50"
+              >
+                {obscuraActing ? "启动中…" : "手动启动 Obscura"}
+              </button>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* User-Agent 网络标识配置 */}
@@ -1526,7 +1657,7 @@ function CdpBrowserSection() {
         <div>
           <h3 className="text-ui font-semibold text-[var(--text)]">全局统一 User-Agent 请求标识</h3>
           <p className="mt-1 text-sub text-[var(--text-muted)]">
-            统一管理系统对外发起 HTTP 请求（TMDB/TVDB/Bangumi 等）与 STRM 媒体探测（ffprobe/ffmpeg）时的标准 User-Agent（类似 Emby/Jellyfin）。注：站点专属 UA 与豆瓣防爬仍保持独立。
+            统一管理系统对外发起 HTTP 请求（TMDB/TVDB/Bangumi 等）与 STRM 媒体探测（ffprobe/ffmpeg）时的标准 User-Agent。
           </p>
         </div>
 
