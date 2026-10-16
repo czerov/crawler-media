@@ -158,3 +158,36 @@ async fn queued_deletion_never_removes_a_new_file_at_the_same_path() {
         "stale queue row dropped"
     );
 }
+
+/// Review L-10: exhausted deletions are listed for the user.
+#[tokio::test]
+async fn stuck_deletions_are_listed() {
+    let h = Harness::new();
+    {
+        let store = h.state.store();
+        let store = store.lock();
+        store
+            .enqueue_file_deletion("/nowhere/x.mkv", "wash_replaced")
+            .unwrap();
+        for _ in 0..store::MAX_FILE_DELETION_ATTEMPTS {
+            store
+                .record_file_deletion_failure("/nowhere/x.mkv", 0, "EACCES")
+                .unwrap();
+        }
+    }
+    let response = tower::ServiceExt::oneshot(
+        h.app.clone(),
+        super::common::request(
+            "GET",
+            "/api/v1/library/pending-deletions",
+            Some(TOKEN),
+            serde_json::Value::Null,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = super::common::json_body(response).await;
+    assert_eq!(body["data"]["queued"], 1, "{body}");
+    assert_eq!(body["data"]["stuck"][0]["last_error"], "EACCES", "{body}");
+}

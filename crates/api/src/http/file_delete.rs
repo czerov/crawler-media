@@ -129,3 +129,23 @@ pub(crate) async fn remove_rows(
     }
     (removed, errors)
 }
+
+/// Review L-10: `GET /library/pending-deletions` — deletions that stopped
+/// retrying (with their last error) and how many are still queued.
+pub(crate) async fn pending_deletions(
+    axum::extract::State(state): axum::extract::State<crate::management::ApiState>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let store = state.store.lock();
+    let queued = store
+        .list_pending_file_deletions()
+        .map(|q| q.len())
+        .unwrap_or(0);
+    let stuck: Vec<_> = store
+        .list_stuck_file_deletions()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(path, error)| serde_json::json!({ "path": path, "last_error": error }))
+        .collect();
+    crate::http::ok(serde_json::json!({ "queued": queued, "stuck": stuck })).into_response()
+}

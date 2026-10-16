@@ -507,6 +507,10 @@ fn admin_library_routes() -> Router<ApiState> {
     Router::new()
         // libraries：实体增删改 + 条目/文件删除
         .route("/library-removals/{operation_id}", get(library_deletion::status))
+        .route(
+            "/library/pending-deletions",
+            get(file_delete::pending_deletions),
+        )
         .route("/libraries", post(library_config::create_library))
         .route(
             "/libraries/{id}",

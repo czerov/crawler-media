@@ -5,6 +5,10 @@ use rusqlite::{OptionalExtension, params};
 
 use super::{Store, StoreError};
 
+/// Review L-10: after this many failed attempts a deletion is no longer
+/// retried automatically; it stays listed (with its last error) for the user.
+pub const MAX_FILE_DELETION_ATTEMPTS: i64 = 20;
+
 /// Review M-3: a due deletion together with the identity recorded when it
 /// was queued. The file is only deleted while that identity still holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,9 +67,9 @@ impl Store {
     pub fn list_due_file_deletions(&self, now: i64) -> Result<Vec<QueuedFileDeletion>, StoreError> {
         let mut stmt = self.library.prepare(
             "SELECT path, ledger_id, file_size, file_inode FROM pending_file_deletions
-             WHERE next_retry_at <= ?1 ORDER BY rowid",
+             WHERE next_retry_at <= ?1 AND attempts < ?2 ORDER BY rowid",
         )?;
-        let rows = stmt.query_map([now], |row| {
+        let rows = stmt.query_map(params![now, MAX_FILE_DELETION_ATTEMPTS], |row| {
             Ok(QueuedFileDeletion {
                 path: row.get(0)?,
                 ledger_id: row.get(1)?,
@@ -84,10 +88,22 @@ impl Store {
         Ok(())
     }
 
+    /// Review L-10: deletions that exhausted their retries, with last error.
+    pub fn list_stuck_file_deletions(&self) -> Result<Vec<(String, Option<String>)>, StoreError> {
+        let mut stmt = self.library.prepare(
+            "SELECT path, last_error FROM pending_file_deletions
+             WHERE attempts >= ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([MAX_FILE_DELETION_ATTEMPTS], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Make a queued deletion due now (manual "retry now").
     pub fn reset_file_deletion_backoff(&self, path: &str) -> Result<(), StoreError> {
         self.library.execute(
-            "UPDATE pending_file_deletions SET next_retry_at = 0 WHERE path = ?1",
+            "UPDATE pending_file_deletions SET next_retry_at = 0, attempts = 0 WHERE path = ?1",
             [path],
         )?;
         Ok(())
