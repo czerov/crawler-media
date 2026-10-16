@@ -190,23 +190,17 @@ pub(super) async fn resume_items(
     require_user_path(state.provider.as_ref(), user.id, path.user_id.as_deref()).await?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let mut rows = if query.parent_id.is_none() {
-        state.provider.list_resumable_items(user.id, limit).await.unwrap_or_default()
+        state.provider.list_resumable_items(user.id, usize::MAX).await.unwrap_or_default()
     } else {
         let root_rows = state
             .provider
             .list_visible_items(user.id, query.parent_id.as_deref())
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let mut filtered = Vec::new();
-        for item in root_rows {
-            if item.ticks > 0 && !item.played {
-                filtered.push(item);
-                if filtered.len() >= limit {
-                    break;
-                }
-            }
-        }
-        filtered
+        root_rows
+            .into_iter()
+            .filter(|item| item.ticks > 0 && !item.played)
+            .collect()
     };
     let total = rows.len();
     let start_index = query.start_index.unwrap_or(0);

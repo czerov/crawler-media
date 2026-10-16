@@ -313,6 +313,78 @@ async fn resume_fills_the_page_after_dropping_effectively_played_rows() {
     assert_eq!(ids, expected);
     assert!(resumed["Items"].as_array().unwrap().iter().all(|item| item["UserData"]["Played"] == false));
 }
+
+#[tokio::test]
+async fn resume_uses_first_eligible_episode_per_series() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _, _) = app(tmp.path());
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("tv-resume-series-dedup");
+    std::fs::create_dir_all(&root).unwrap();
+    store
+        .create_library(MediaKind::Tv, "Resume dedup", &[root.to_str().unwrap()], "everyone", true, &[])
+        .unwrap();
+    let show = new_media(MediaKind::Tv, "Resume dedup show");
+    store.insert_media(&show).unwrap();
+    let season_one = insert_episode(&store, &root, show.id, 1, 1);
+    let season_two = insert_episode(&store, &root, show.id, 2, 1);
+    let user = store.admin_user_id().unwrap();
+    store
+        .upsert_unit(user, show.id, 1, 1, 7_500, Some(false), None, None, None, None, false, 30)
+        .unwrap();
+    store
+        .upsert_unit(user, show.id, 1, -1, 0, Some(true), None, None, None, None, false, 40)
+        .unwrap();
+    store
+        .upsert_unit(user, show.id, 2, 1, 7_500, Some(false), None, None, None, None, false, 20)
+        .unwrap();
+    drop(store);
+
+    let resumed = get_json(
+        &app,
+        "/Users/00000000-0000-0000-0000-000000000001/Items/Resume?Limit=1",
+    )
+    .await;
+    let items = resumed["Items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["Id"], season_two.to_string().replace('-', ""));
+    assert_ne!(items[0]["Id"], season_one.to_string().replace('-', ""));
+}
+
+#[tokio::test]
+async fn resume_paginates_after_collecting_all_eligible_items() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _, _) = app(tmp.path());
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("tv-resume-pagination");
+    std::fs::create_dir_all(&root).unwrap();
+    store
+        .create_library(MediaKind::Tv, "Resume pagination", &[root.to_str().unwrap()], "everyone", true, &[])
+        .unwrap();
+    let user = store.admin_user_id().unwrap();
+    let mut expected = Vec::new();
+    for index in 0..3 {
+        let show = new_media(MediaKind::Tv, &format!("Resume pagination {index}"));
+        store.insert_media(&show).unwrap();
+        let episode_root = root.join(format!("show-{index}"));
+        std::fs::create_dir_all(&episode_root).unwrap();
+        let episode = insert_episode(&store, &episode_root, show.id, 1, 1);
+        store
+            .upsert_unit(user, show.id, 1, 1, 7_500, Some(false), None, None, None, None, false, 30 - index)
+            .unwrap();
+        expected.push(episode.to_string().replace('-', ""));
+    }
+    drop(store);
+
+    let resumed = get_json(
+        &app,
+        "/Users/00000000-0000-0000-0000-000000000001/Items/Resume?StartIndex=1&Limit=1",
+    )
+    .await;
+    assert_eq!(resumed["TotalRecordCount"], 3);
+    assert_eq!(resumed["Items"].as_array().unwrap().len(), 1);
+    assert_eq!(resumed["Items"][0]["Id"], expected[1]);
+}
 #[tokio::test]
 async fn newer_season_unplayed_mark_wins_detail_and_listing() {
     let tmp = tempfile::tempdir().unwrap();

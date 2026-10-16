@@ -238,6 +238,114 @@ fn old_schema_migrates_without_resetting_user_facts() {
 }
 
 #[test]
+fn schema_six_keeps_unknown_favorite_times_while_schema_five_backfills_once() {
+    let schema_six = tempfile::tempdir().unwrap();
+    let schema_six_dir = schema_six.path().join("data");
+    std::fs::create_dir_all(&schema_six_dir).unwrap();
+    seed_pre_clock_subscribe(&schema_six_dir.join("subscribe.db"), 6, true);
+    let _ = Store::open(&schema_six_dir).unwrap();
+    let schema_six_conn = rusqlite::Connection::open(schema_six_dir.join("subscribe.db")).unwrap();
+    let unknown: i64 = schema_six_conn
+        .query_row(
+            "SELECT favorite_at FROM playback_units WHERE user_id = 'unknown'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let known: i64 = schema_six_conn
+        .query_row(
+            "SELECT favorite_at FROM playback_units WHERE user_id = 'known'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unknown, 0, "schema 6 already owns the clock; zero stays unknown");
+    assert_eq!(known, 50, "a recorded favourite time must not move");
+    let order: Vec<String> = schema_six_conn
+        .prepare("SELECT user_id FROM playback_units WHERE favorite != 0 ORDER BY favorite_at DESC, user_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(order, ["known", "unknown"], "an advanced playback clock must not reorder the unknown favourite");
+
+    let schema_five = tempfile::tempdir().unwrap();
+    let schema_five_dir = schema_five.path().join("data");
+    std::fs::create_dir_all(&schema_five_dir).unwrap();
+    seed_pre_clock_subscribe(&schema_five_dir.join("subscribe.db"), 5, false);
+    let _ = Store::open(&schema_five_dir).unwrap();
+    let schema_five_conn = rusqlite::Connection::open(schema_five_dir.join("subscribe.db")).unwrap();
+    let backfilled: i64 = schema_five_conn
+        .query_row(
+            "SELECT favorite_at FROM playback_units WHERE user_id = 'unknown'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(backfilled, 200, "schema 5 predates the clock and gets the one-time backfill");
+}
+
+fn seed_pre_clock_subscribe(path: &std::path::Path, version: i64, with_favorite_at: bool) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(&format!("PRAGMA user_version = {version};")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE playback_units (
+            user_id TEXT NOT NULL,
+            media_id TEXT NOT NULL,
+            season INTEGER NOT NULL,
+            episode INTEGER NOT NULL,
+            position_ms INTEGER NOT NULL DEFAULT 0,
+            played INTEGER NOT NULL DEFAULT 0,
+            favorite INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER,
+            audio_track TEXT,
+            subtitle_track TEXT,
+            play_count INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, media_id, season, episode)
+        );
+        CREATE TABLE playback_sessions (
+            device_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            media_id TEXT NOT NULL,
+            play_method TEXT NOT NULL DEFAULT 'DirectPlay',
+            position_ms INTEGER NOT NULL DEFAULT 0,
+            last_report_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, device_id)
+        );
+        CREATE TABLE pending_downloads (
+            id TEXT PRIMARY KEY,
+            subscribe_id TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'active'
+        );",
+    )
+    .unwrap();
+    if with_favorite_at {
+        conn.execute_batch("ALTER TABLE playback_units ADD COLUMN favorite_at INTEGER NOT NULL DEFAULT 0;")
+            .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO playback_units
+            (user_id, media_id, season, episode, favorite, updated_at)
+         VALUES ('unknown', 'm-unknown', -1, -1, 1, 200)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO playback_units
+            (user_id, media_id, season, episode, favorite, updated_at)
+         VALUES ('known', 'm-known', -1, -1, 1, 80)",
+        [],
+    )
+    .unwrap();
+    if with_favorite_at {
+        conn.execute("UPDATE playback_units SET favorite_at = 50 WHERE user_id = 'known'", [])
+            .unwrap();
+    }
+}
+
+#[test]
 fn expiry_keeps_active_and_is_bounded_500() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path().join("data")).unwrap();

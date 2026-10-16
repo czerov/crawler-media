@@ -274,7 +274,7 @@ impl MediaServerProvider for ApiServerProvider {
         let mut results = Vec::new();
         let mut seen_media = std::collections::HashSet::new();
         for (media_id, season, episode, _pos, _updated) in targets {
-            if !seen_media.insert(media_id) {
+            if seen_media.contains(&media_id) {
                 continue;
             }
             if resume_effectively_played(&self.state, user_id, media_id, season, episode) {
@@ -312,6 +312,7 @@ impl MediaServerProvider for ApiServerProvider {
                 if sn.played {
                     continue;
                 }
+                seen_media.insert(media_id);
                 results.push(sn);
                 if results.len() >= limit {
                     break;

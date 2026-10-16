@@ -64,7 +64,17 @@ impl Store {
         favorite: bool,
         now: i64,
     ) -> Result<(), StoreError> {
-        let favorite_at = if favorite { now } else { 0 };
+        let existing = self.unit_state(user_id, media_id, season, episode)?;
+        let favorite_at = match existing {
+            Some(unit) if favorite && unit.favorite && unit.favorite_at != 0 => unit.favorite_at,
+            _ => {
+                if favorite {
+                    now
+                } else {
+                    0
+                }
+            }
+        };
         // A missing unit is favourite-only. Do not insert an empty canonical
         // row first: that would block the legacy whole-file copy above.
         let changed = self.subscribe.execute(
@@ -167,8 +177,11 @@ impl Store {
     }
 
     /// Copy a legacy `(0, 0)` watch unit onto the canonical `(-1, -1)` unit for
-    /// whole-file media, then retire that obsolete row. TV keeps `(0, 0)` as a
-    /// real season/episode pair. Both writes stay in the caller's transaction.
+    /// whole-file media, then retire that obsolete row. A canonical row that
+    /// only records a favourite has no playback authority: its playback fields
+    /// are filled from the legacy row and its favourite clock is kept. TV keeps
+    /// `(0, 0)` as a real season/episode pair. Both writes stay in the caller's
+    /// transaction.
     pub fn copy_legacy_movie_unit_if_missing(
         &self,
         user_id: UserId,
@@ -178,6 +191,8 @@ impl Store {
             Some(media) if media.kind != domain::MediaKind::Tv => {}
             _ => return Ok(()),
         }
+        let user = user_id.to_string();
+        let media = media_id.to_string();
         self.subscribe.execute(
             "INSERT OR IGNORE INTO playback_units
                 (user_id, media_id, season, episode, position_ms, played, favorite,
@@ -186,7 +201,39 @@ impl Store {
                     duration_ms, audio_track, subtitle_track, play_count, updated_at, favorite_at
              FROM playback_units
              WHERE user_id = ?1 AND media_id = ?2 AND season = 0 AND episode = 0",
-            params![user_id.to_string(), media_id.to_string()],
+            params![user, media],
+        )?;
+        // Favourite-only canonical rows carry no playback facts. Fill those
+        // fields from the legacy row without replacing an independently
+        // recorded favourite or its clock.
+        self.subscribe.execute(
+            "UPDATE playback_units AS canonical
+             SET position_ms = legacy.position_ms,
+                 played = legacy.played,
+                 duration_ms = legacy.duration_ms,
+                 audio_track = legacy.audio_track,
+                 subtitle_track = legacy.subtitle_track,
+                 play_count = legacy.play_count,
+                 updated_at = legacy.updated_at
+             FROM playback_units AS legacy
+             WHERE canonical.user_id = ?1 AND canonical.media_id = ?2
+               AND canonical.season = -1 AND canonical.episode = -1
+               AND legacy.user_id = canonical.user_id
+               AND legacy.media_id = canonical.media_id
+               AND legacy.season = 0 AND legacy.episode = 0
+               AND canonical.position_ms = 0 AND canonical.played = 0
+               AND canonical.play_count = 0 AND canonical.updated_at = 0
+               AND canonical.duration_ms IS NULL
+               AND canonical.audio_track IS NULL
+               AND canonical.subtitle_track IS NULL
+               AND (
+                   legacy.position_ms != 0 OR legacy.played != 0
+                   OR legacy.play_count != 0 OR legacy.updated_at != 0
+                   OR legacy.duration_ms IS NOT NULL
+                   OR legacy.audio_track IS NOT NULL
+                   OR legacy.subtitle_track IS NOT NULL
+               )",
+            params![user, media],
         )?;
         self.subscribe.execute(
             "DELETE FROM playback_units
@@ -196,8 +243,22 @@ impl Store {
                    WHERE canonical.user_id = playback_units.user_id
                      AND canonical.media_id = playback_units.media_id
                      AND canonical.season = -1 AND canonical.episode = -1
+                     AND (
+                         canonical.position_ms != 0 OR canonical.played != 0
+                         OR canonical.play_count != 0 OR canonical.updated_at != 0
+                         OR canonical.duration_ms IS NOT NULL
+                         OR canonical.audio_track IS NOT NULL
+                         OR canonical.subtitle_track IS NOT NULL
+                         OR (
+                             playback_units.position_ms = 0 AND playback_units.played = 0
+                             AND playback_units.play_count = 0 AND playback_units.updated_at = 0
+                             AND playback_units.duration_ms IS NULL
+                             AND playback_units.audio_track IS NULL
+                             AND playback_units.subtitle_track IS NULL
+                         )
+                     )
                )",
-            params![user_id.to_string(), media_id.to_string()],
+            params![user, media],
         )?;
         Ok(())
     }

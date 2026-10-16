@@ -277,6 +277,63 @@ fn jellyfin_first_favorite_keeps_legacy_resume_played_and_play_count() {
 }
 
 #[test]
+fn favoriting_legacy_movie_fills_existing_favorite_only_canonical_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let user = UserId::new();
+    let movie = media(MediaKind::Movie, "Blocked legacy favorite", None);
+    store.insert_media(&movie).unwrap();
+    store
+        .upsert_unit(
+            user,
+            movie.id,
+            0,
+            0,
+            600_000,
+            Some(false),
+            Some(false),
+            Some(7_200_000),
+            Some("audio-old"),
+            Some("subtitle-old"),
+            true,
+            42,
+        )
+        .unwrap();
+    // A previous round created the canonical key as favourite-only before the
+    // legacy copy could run. That row has no playback authority.
+    {
+        let db = rusqlite::Connection::open(tmp.path().join("data/subscribe.db")).unwrap();
+        db.execute(
+            "INSERT INTO playback_units
+                (user_id, media_id, season, episode, position_ms, played, favorite,
+                 duration_ms, audio_track, subtitle_track, play_count, updated_at, favorite_at)
+             VALUES (?1, ?2, -1, -1, 0, 0, 1, NULL, NULL, NULL, 0, 0, 15)",
+            rusqlite::params![user.to_string(), movie.id.to_string()],
+        )
+        .unwrap();
+    }
+
+    store
+        .set_unit_favorite(user, movie.id, -1, -1, true, 99)
+        .unwrap();
+
+    let canonical = store.unit_state(user, movie.id, -1, -1).unwrap().unwrap();
+    assert_eq!(canonical.position_ms, 600_000, "the only playback position must transfer");
+    assert_eq!(canonical.play_count, 1, "the only play count must transfer");
+    assert_eq!(canonical.duration_ms, Some(7_200_000));
+    assert_eq!(canonical.audio_track.as_deref(), Some("audio-old"));
+    assert_eq!(canonical.subtitle_track.as_deref(), Some("subtitle-old"));
+    assert_eq!(canonical.updated_at, 42, "legacy activity must move with the playback state");
+    assert!(canonical.favorite);
+    assert_eq!(canonical.favorite_at, 15, "an independently recorded favourite clock must survive");
+    assert!(!canonical.played);
+    assert!(
+        store.unit_state(user, movie.id, 0, 0).unwrap().is_none(),
+        "the legacy row retires only after its playback fields move"
+    );
+}
+
+#[test]
 fn favoriting_legacy_movie_does_not_duplicate_resume_rows() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path().join("data")).unwrap();

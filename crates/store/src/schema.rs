@@ -210,16 +210,19 @@ fn ensure_column(
     column: &str,
     decl: &str,
 ) -> Result<(), StoreError> {
-    let has: bool = conn
+    if !column_exists(conn, table, column)? {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    Ok(conn
         .prepare(&format!("PRAGMA table_info({table})"))?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?
         .iter()
-        .any(|name| name == column);
-    if !has {
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
-    }
-    Ok(())
+        .any(|name| name == column))
 }
 
 pub fn migrate_catalog(conn: &Connection) -> Result<(), StoreError> {
@@ -389,16 +392,18 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     read_revisions::create_revision_trigger(conn, "playback_units", "sub_units")?;
     // subscribe schema 6: favourite activity has its own clock so a favourite
     // write cannot reorder played marks or invent a viewing timestamp.
-    // subscribe schema 7: that backfill runs once. A later playback must not
-    // be captured as the historical favourite time, so zero stays unknown.
+    // Databases that already have that clock keep a zero as unknown time.
+    // Only a database that predates the column, or is receiving it now, gets
+    // the one-time backfill from the playback clock.
     let previous = read_schema_version(conn)?;
+    let favorite_at_existed = column_exists(conn, "playback_units", "favorite_at")?;
     ensure_column(
         conn,
         "playback_units",
         "favorite_at",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    if previous < 7 {
+    if previous < 6 || !favorite_at_existed {
         conn.execute_batch(
             "UPDATE playback_units SET favorite_at = updated_at
              WHERE favorite != 0 AND favorite_at = 0 AND updated_at != 0;",
