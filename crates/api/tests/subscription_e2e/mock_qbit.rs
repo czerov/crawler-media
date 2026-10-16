@@ -37,6 +37,8 @@ pub struct MockQbit {
     pub resumes: Mutex<Vec<String>>,
     pub logins: AtomicUsize,
     pub info_calls: AtomicUsize,
+    /// D-L2: `torrents/info` calls without a `tag`/`hashes` filter.
+    pub unfiltered_info_calls: AtomicUsize,
     /// Reject every authenticated request with 403 while > 0 (decrements per request).
     pub forbid_next: AtomicUsize,
     /// When set, login answers like a wrong password (200 `Fails.`, no cookie).
@@ -66,6 +68,7 @@ impl MockQbit {
             deletes: Mutex::new(Vec::new()),
             logins: AtomicUsize::new(0),
             info_calls: AtomicUsize::new(0),
+            unfiltered_info_calls: AtomicUsize::new(0),
             forbid_next: AtomicUsize::new(0),
             reject_login: std::sync::atomic::AtomicBool::new(false),
             torrent_file: Mutex::new(None),
@@ -249,9 +252,23 @@ impl MockQbit {
         }
         if req.contains("/api/v2/torrents/info") {
             self.info_calls.fetch_add(1, Ordering::SeqCst);
+            let tag = query_param(req, "tag").map(|t| percent_decode(&t));
+            let hashes = query_param(req, "hashes");
+            if tag.is_none() && hashes.is_none() {
+                self.unfiltered_info_calls.fetch_add(1, Ordering::SeqCst);
+            }
             let tasks = self.tasks.lock();
             let body: Vec<_> = tasks
                 .iter()
+                .filter(|t| {
+                    tag.as_ref()
+                        .is_none_or(|tag| t.tags.iter().any(|x| x == tag))
+                })
+                .filter(|t| {
+                    hashes
+                        .as_ref()
+                        .is_none_or(|hs| hs.split('|').any(|h| h.eq_ignore_ascii_case(&t.hash)))
+                })
                 .map(|t| {
                     json!({
                         "hash": t.hash, "name": t.name, "progress": t.progress,
@@ -367,6 +384,24 @@ fn query_param(req: &str, key: &str) -> Option<String> {
         let (k, v) = pair.split_once('=')?;
         (k == key).then(|| v.to_string())
     })
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn form_field(req: &str, key: &str) -> Option<String> {

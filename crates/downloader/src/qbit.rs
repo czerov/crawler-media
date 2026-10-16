@@ -491,13 +491,24 @@ impl QbitDownloader {
         Ok(true)
     }
 
-    fn exact_existing_hash(&self, torrent: &Torrent) -> Result<Option<String>, DownloaderError> {
-        let body = self.get(&join(&self.config.url, "/api/v2/torrents/info"))?;
-        let infos: Vec<TorrentInfo> =
-            serde_json::from_str(&body).map_err(|e| DownloaderError::Message(e.to_string()))?;
+    /// D-L2: tasks that may belong to `torrent`, asked for with a `hashes=`
+    /// (magnet) or `tag=` filter so the client does not list every task.
+    /// Results are still checked here, so a client ignoring the filter
+    /// stays correct.
+    fn candidate_infos(&self, torrent: &Torrent) -> Result<Vec<TorrentInfo>, DownloaderError> {
         let magnet = crate::magnet_info_hash(&torrent.enclosure);
         let tag = crate::ownership_tag(&torrent.enclosure);
-        let hashes = infos
+        let filter = match &magnet {
+            Some(hash) => format!("hashes={}", form_enc(hash)),
+            None => format!("tag={}", form_enc(&tag)),
+        };
+        let url = format!(
+            "{}?{filter}",
+            join(&self.config.url, "/api/v2/torrents/info")
+        );
+        let infos: Vec<TorrentInfo> = serde_json::from_str(&self.get(&url)?)
+            .map_err(|e| DownloaderError::Message(e.to_string()))?;
+        Ok(infos
             .into_iter()
             .filter(|info| {
                 if let Some(hash) = &magnet {
@@ -506,6 +517,13 @@ impl QbitDownloader {
                     info.tags.split(',').any(|item| item.trim() == tag)
                 }
             })
+            .collect())
+    }
+
+    fn exact_existing_hash(&self, torrent: &Torrent) -> Result<Option<String>, DownloaderError> {
+        let hashes = self
+            .candidate_infos(torrent)?
+            .into_iter()
             .map(|info| info.hash)
             .collect();
         crate::owned::proven_hashes(hashes)
@@ -522,13 +540,12 @@ impl QbitDownloader {
     }
 
     fn owned_info(&self, torrent: &Torrent) -> Result<Option<TorrentInfo>, DownloaderError> {
-        let Some(hash) = self.exact_existing_hash(torrent)? else {
+        // D-L2: one filtered request instead of two full listings.
+        let infos = self.candidate_infos(torrent)?;
+        let hashes = infos.iter().map(|info| info.hash.clone()).collect();
+        let Some(hash) = crate::owned::proven_hashes(hashes)? else {
             return Ok(None);
         };
-        let url = join(&self.config.url, "/api/v2/torrents/info");
-        let body = self.get(&url)?;
-        let infos: Vec<TorrentInfo> =
-            serde_json::from_str(&body).map_err(|err| DownloaderError::Message(err.to_string()))?;
         Ok(infos
             .into_iter()
             .find(|info| info.hash.eq_ignore_ascii_case(&hash)))
