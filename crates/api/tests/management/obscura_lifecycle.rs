@@ -147,7 +147,8 @@ fn start_installs_then_spawns_and_reports_running() {
     assert!(installer.called.load(Ordering::SeqCst));
     assert!(manager.owns_live_daemon());
     assert!(manager.cdp_url().is_some());
-    assert_eq!(manager.status().reported_version.as_deref(), Some("Obscura/0.2.3"));
+    // Version now comes from `obscura --version` (DaemonLauncher::version); the fake has none.
+    assert_eq!(manager.status().reported_version.as_deref(), None);
 
     manager.stop();
     assert!(!manager.owns_live_daemon());
