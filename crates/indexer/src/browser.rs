@@ -68,15 +68,15 @@ impl BrowserConfig {
     pub fn validate_endpoint(endpoint: &str) -> Result<(), IndexerError> {
         let uri = endpoint
             .parse::<tungstenite::http::Uri>()
-            .map_err(|_| IndexerError::Fetch("Browser requires a valid HTTP CDP discovery URL; only http scheme is supported without credentials or query".into()))?;
+            .map_err(|_| IndexerError::BrowserSetup("Browser requires a valid HTTP CDP discovery URL; only http scheme is supported without credentials or query".into()))?;
         if uri.scheme_str() != Some("http") {
-            return Err(IndexerError::Fetch("仅支持 http CDP discovery（建议仅回环或受信内网）".into()));
+            return Err(IndexerError::BrowserSetup("仅支持 http CDP discovery（建议仅回环或受信内网）".into()));
         }
         if uri.host().is_none_or(|host| host.is_empty())
             || uri.authority().is_some_and(|a| a.as_str().contains('@'))
             || uri.path_and_query().is_some_and(|p| p.query().is_some())
         {
-            return Err(IndexerError::Fetch("Browser requires a valid HTTP CDP discovery URL; empty, credentials, query and ws/wss endpoints are unsupported".into()));
+            return Err(IndexerError::BrowserSetup("Browser requires a valid HTTP CDP discovery URL; empty, credentials, query and ws/wss endpoints are unsupported".into()));
         }
         Ok(())
     }
@@ -126,6 +126,8 @@ pub struct Browser {
     queue_cap: Duration,
     min_work: Duration,
     target_close_cap: Duration,
+    /// Endpoints found unable to isolate sessions (see `cdp_page::INCOMPATIBLE_PREFIX`).
+    incompatible: Arc<parking_lot::Mutex<std::collections::BTreeMap<String, String>>>,
 }
 
 impl Browser {
@@ -142,6 +144,7 @@ impl Browser {
             queue_cap: Duration::from_secs(15),
             min_work: Duration::from_secs(10),
             target_close_cap: Duration::from_secs(2),
+            incompatible: Arc::new(parking_lot::Mutex::new(Default::default())),
         }
     }
 
@@ -202,6 +205,16 @@ impl Browser {
         Ok(())
     }
 
+    /// Endpoints marked incompatible (endpoint -> reason).
+    pub fn incompatible_endpoints(&self) -> std::collections::BTreeMap<String, String> {
+        self.incompatible.lock().clone()
+    }
+
+    /// Forget incompatibility marks (e.g. after the user changes endpoints).
+    pub fn clear_incompatible(&self) {
+        self.incompatible.lock().clear();
+    }
+
     pub fn set_managed_endpoint(&self, endpoint: Option<String>) {
         *self.managed_endpoint.write() = endpoint;
     }
@@ -235,6 +248,9 @@ impl Browser {
             Some((ep, r)) => (ep, r),
             None => return Err(IndexerError::BrowserSetup("CDP disabled".into())),
         };
+        if let Some(reason) = self.incompatible.lock().get(&endpoint).cloned() {
+            return Err(IndexerError::BrowserSetup(reason));
+        }
         tracing::debug!(?route, endpoint = %endpoint, "Opening external Browser session");
         let session = match &self.opener {
             Some(opener) => opener(Some(&endpoint)),
@@ -242,6 +258,12 @@ impl Browser {
                 .map(|session| Arc::new(session) as Arc<dyn PageSession>),
         };
         session.inspect_err(|error| {
+            if let IndexerError::BrowserSetup(message) = error {
+                if message.starts_with(crate::cdp_page::INCOMPATIBLE_PREFIX) {
+                    tracing::error!(endpoint = %endpoint, %message, "Marking Browser endpoint incompatible");
+                    self.incompatible.lock().insert(endpoint.clone(), message.clone());
+                }
+            }
             tracing::error!(%error, ?route, "Browser session open failed");
         })
     }
@@ -266,7 +288,9 @@ impl Browser {
         let slot = self
             .slots
             .acquire(&group, deadline, self.queue_cap, self.min_work)?;
-        let page = self.open_until(request.cdp_url.as_deref(), deadline)?;
+        let page = self
+            .open_until(request.cdp_url.as_deref(), deadline)
+            .map_err(crate::cdp_page::into_setup)?;
         page.set_deadline(deadline);
 
         let result = (|| {

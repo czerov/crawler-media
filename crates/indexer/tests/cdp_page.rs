@@ -87,8 +87,8 @@ fn serve(
         thread::sleep(Duration::from_millis(1));
     };
     let request = String::from_utf8_lossy(&peek[..length]);
-    if request.starts_with("GET /ws") {
-        if mode == "handshake" {
+    if request.starts_with("GET /ws") || request.starts_with("GET /devtools") {
+        if mode == "handshake" && request.starts_with("GET /devtools") {
             let mut bytes = [0; 2048];
             while stream.read(&mut bytes).unwrap_or(0) > 0 {}
             return;
@@ -102,8 +102,8 @@ fn serve(
     log.lock()
         .unwrap()
         .push(request.lines().next().unwrap().into());
-    let body = if request.contains("/json/new") {
-        json!({"id":"fixture", "webSocketDebuggerUrl":format!("ws://{address}/ws")}).to_string()
+    let body = if request.contains("/json/version") {
+        json!({"Browser":"Fixture/1", "webSocketDebuggerUrl":format!("ws://{address}/ws/browser")}).to_string()
     } else {
         "true".into()
     };
@@ -177,6 +177,11 @@ fn response(command: &Value, mode: &str, authenticated: bool, polls: &mut usize)
         return json!({"id": command["id"], "error": {"code": -1, "message": "cookies error"}});
     }
     let result = match method {
+        "Target.createBrowserContext" if mode == "no_context" => {
+            return json!({"id": command["id"], "error": {"code": -32601, "message": "unknown method"}});
+        }
+        "Target.createBrowserContext" => json!({"browserContextId": "ctx"}),
+        "Target.createTarget" => json!({"targetId": "fixture"}),
         "Page.navigate" if !authenticated || mode == "navigation" => {
             json!({"errorText":"navigation rejected"})
         }
@@ -424,4 +429,28 @@ fn browser_session_never_deletes_or_clears_cookies() {
     assert!(!requests.iter().any(|r| r == "Network.deleteCookies"));
     assert!(!requests.iter().any(|r| r == "Network.clearBrowserCookies"));
     assert!(!requests.iter().any(|r| r == "Storage.clearCookies"));
+}
+
+#[test]
+fn each_session_runs_in_its_own_browser_context_and_disposes_it() {
+    let fixture = Fixture::start("success");
+    {
+        let page = open_cdp_session(&fixture.url).unwrap();
+        page.set_site_cookies("https://site.invalid/", "session=secret").unwrap();
+    }
+    let cmds = fixture.commands.lock().unwrap().clone();
+    let create = cmds.iter().find(|c| c["method"] == "Target.createTarget").expect("createTarget");
+    assert_eq!(create["params"]["browserContextId"], "ctx");
+    assert!(cmds.iter().any(|c| c["method"] == "Target.disposeBrowserContext"
+        && c["params"]["browserContextId"] == "ctx"));
+}
+
+#[test]
+fn endpoint_without_browser_contexts_is_incompatible_setup_error() {
+    let fixture = Fixture::start("no_context");
+    let err = match open_cdp_session(&fixture.url) { Err(e) => e, Ok(_) => panic!("must fail") };
+    match err {
+        IndexerError::BrowserSetup(m) => assert!(m.starts_with(indexer::cdp_page::INCOMPATIBLE_PREFIX), "{m}"),
+        other => panic!("expected BrowserSetup, got {other:?}"),
+    }
 }

@@ -160,10 +160,10 @@ fn browser_with_external_cdp_propagates_injected_connection_failure() {
         proxy: None,
         cdp_url: Some("http://fixture.invalid:9222".into()),
     };
-    assert_eq!(
-        browser.fetch_html(&req).unwrap_err().to_string(),
-        "fixture CDP connection failed"
-    );
+    // Open failures happen before navigation, so they surface as BrowserSetup.
+    let err = browser.fetch_html(&req).unwrap_err();
+    assert!(matches!(err, IndexerError::BrowserSetup(_)), "{err:?}");
+    assert!(err.to_string().contains("fixture CDP connection failed"));
 }
 
 #[test]

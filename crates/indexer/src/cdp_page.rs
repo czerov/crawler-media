@@ -11,9 +11,17 @@ use crate::browser::PageSession;
 mod transport;
 use transport::{TIMEOUT, Transport, failure, remaining};
 
+/// Prefix of the `BrowserSetup` message for endpoints that cannot isolate a
+/// session (no `Target.createBrowserContext`). `Browser` marks such endpoints
+/// incompatible instead of running sessions in a shared cookie jar.
+pub const INCOMPATIBLE_PREFIX: &str = "endpoint incompatible:";
+
 pub struct CdpPageSession {
     base_url: String,
     target_id: String,
+    /// Browser-level connection owning the per-session BrowserContext.
+    browser: Mutex<Option<Transport>>,
+    context_id: Option<String>,
     transport: Mutex<Option<Transport>>,
     deadline: Mutex<Option<Instant>>,
     target_close_cap: Duration,
@@ -135,11 +143,20 @@ impl PageSession for CdpPageSession {
             let cookies = result["cookies"]
                 .as_array()
                 .ok_or_else(|| failure("getCookies", "missing cookies field"))?;
-            let mut by_name: BTreeMap<&str, &str> = BTreeMap::new();
+            // Deterministic duplicates: a host-only cookie (domain without a
+            // leading dot) wins over a Domain= cookie of the same name.
+            let mut by_name: BTreeMap<&str, (bool, &str)> = BTreeMap::new();
             for c in cookies {
                 if let (Some(n), Some(v)) = (c["name"].as_str(), c["value"].as_str()) {
-                    if !n.is_empty() {
-                        by_name.insert(n, v);
+                    if n.is_empty() {
+                        continue;
+                    }
+                    let host_only = !c["domain"].as_str().unwrap_or("").starts_with('.');
+                    match by_name.get(n) {
+                        Some((true, _)) if !host_only => {}
+                        _ => {
+                            by_name.insert(n, (host_only, v));
+                        }
                     }
                 }
             }
@@ -148,7 +165,7 @@ impl PageSession for CdpPageSession {
             }
             let header = by_name
                 .iter()
-                .map(|(n, v)| format!("{n}={v}"))
+                .map(|(n, (_, v))| format!("{n}={v}"))
                 .collect::<Vec<_>>()
                 .join("; ");
             Ok(header)
@@ -183,6 +200,22 @@ impl Drop for CdpPageSession {
     fn drop(&mut self) {
         if let Ok(Some(transport)) = self.transport.get_mut().map(Option::as_mut) {
             transport.close();
+        }
+        // Dispose the isolated BrowserContext: drops every cookie this session
+        // created without touching any other context's data.
+        if let (Some(context_id), Ok(Some(browser))) = (
+            self.context_id.as_deref(),
+            self.browser.get_mut().map(Option::as_mut),
+        ) {
+            let deadline = Instant::now() + self.target_close_cap;
+            if let Err(error) = browser.command(
+                "Target.disposeBrowserContext",
+                json!({"browserContextId": context_id}),
+                deadline,
+            ) {
+                tracing::warn!(%error, "CDP browser context dispose failed");
+            }
+            browser.close();
         }
         let close_url = format!("{}/json/close/{}", self.base_url, self.target_id);
         if let Err(error) = http_agent(self.target_close_cap)
@@ -225,58 +258,96 @@ fn default_port(uri: &tungstenite::http::Uri) -> u16 {
     })
 }
 
+fn check_same_endpoint(base: &str, ws_url: &str, cdp_url: &str) -> Result<(), IndexerError> {
+    let base_uri: tungstenite::http::Uri = base.parse().map_err(|e| failure("CDP URL", e))?;
+    let ws_uri: tungstenite::http::Uri = ws_url.parse().map_err(|e| failure("WS URL", e))?;
+    let norm_base = crate::browser_host::normalize_host(base_uri.host().unwrap_or(""))?;
+    let norm_ws = crate::browser_host::normalize_host(ws_uri.host().unwrap_or(""))?;
+    if norm_base != norm_ws || default_port(&base_uri) != default_port(&ws_uri) {
+        return Err(IndexerError::BrowserSetup(format!(
+            "mismatched debugger url: {ws_url} for endpoint {cdp_url}"
+        )));
+    }
+    Ok(())
+}
+
 fn open_cdp_session_inner(
     cdp_url: &str,
     deadline: Instant,
     target_close_cap: Duration,
 ) -> Result<CdpPageSession, IndexerError> {
     let base = cdp_url.trim_end_matches('/');
-    let new_url = format!("{base}/json/new");
     let now = Instant::now();
     let timeout = TIMEOUT.min(deadline.saturating_duration_since(now));
     if timeout.is_zero() {
         return Err(IndexerError::BrowserBusy);
     }
-    let response: Value = http_agent(timeout)
-        .put(&new_url)
-        .send_empty()
-        .map_err(|error| failure("无法连接外部 CDP 端点创建 target", error))?
+    // 1. Browser-level endpoint.
+    let version: Value = http_agent(timeout)
+        .get(&format!("{base}/json/version"))
+        .call()
+        .map_err(|error| failure("无法连接 CDP 端点 /json/version", error))?
         .into_body()
         .read_json()
-        .map_err(|error| failure("target JSON", error))?;
-    let target_id = response["id"]
+        .map_err(|error| failure("version JSON", error))?;
+    let browser_ws = version["webSocketDebuggerUrl"]
         .as_str()
-        .ok_or_else(|| failure("create target", "missing target id"))?
+        .ok_or_else(|| failure("json/version", "missing webSocketDebuggerUrl"))?
         .to_owned();
+    check_same_endpoint(base, &browser_ws, cdp_url)?;
+    let mut browser = Transport::connect(&browser_ws)?;
+
+    // 2. Isolated cookie jar per session. Without it the endpoint is incompatible.
+    let context = browser
+        .command("Target.createBrowserContext", json!({"disposeOnDetach": true}), deadline)
+        .map_err(|error| {
+            IndexerError::BrowserSetup(format!(
+                "{INCOMPATIBLE_PREFIX} Target.createBrowserContext unsupported ({error})"
+            ))
+        })?;
+    let context_id = context["browserContextId"]
+        .as_str()
+        .ok_or_else(|| {
+            IndexerError::BrowserSetup(format!("{INCOMPATIBLE_PREFIX} no browserContextId returned"))
+        })?
+        .to_owned();
+    let target = match browser.command(
+        "Target.createTarget",
+        json!({"url": "about:blank", "browserContextId": context_id}),
+        deadline,
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = browser.command(
+                "Target.disposeBrowserContext",
+                json!({"browserContextId": context_id}),
+                Instant::now() + target_close_cap,
+            );
+            return Err(error);
+        }
+    };
+    let target_id = target["targetId"].as_str().map(str::to_owned);
 
     let mut session = CdpPageSession {
         base_url: base.to_owned(),
-        target_id,
+        target_id: target_id.clone().unwrap_or_default(),
+        browser: Mutex::new(Some(browser)),
+        context_id: Some(context_id),
         transport: Mutex::new(None),
         deadline: Mutex::new(Some(deadline)),
         target_close_cap,
     };
+    let target_id = target_id.ok_or_else(|| failure("create target", "missing targetId"))?;
 
-    let ws_url = response["webSocketDebuggerUrl"]
-        .as_str()
-        .ok_or_else(|| failure("create target", "missing WebSocket URL"))?;
-
-    // Host & Port matching validation
+    // 3. Page connection on the same host:port as the endpoint.
     let base_uri: tungstenite::http::Uri = base.parse().map_err(|e| failure("CDP URL", e))?;
-    let ws_uri: tungstenite::http::Uri = ws_url.parse().map_err(|e| failure("WS URL", e))?;
-    let base_host = base_uri.host().unwrap_or("");
-    let ws_host = ws_uri.host().unwrap_or("");
-    let base_port = default_port(&base_uri);
-    let ws_port = default_port(&ws_uri);
-    let norm_base = crate::browser_host::normalize_host(base_host)?;
-    let norm_ws = crate::browser_host::normalize_host(ws_host)?;
-    if norm_base != norm_ws || base_port != ws_port {
-        return Err(IndexerError::BrowserSetup(format!(
-            "mismatched debugger url: {ws_url} for endpoint {cdp_url}"
-        )));
-    }
+    let authority = base_uri
+        .authority()
+        .ok_or_else(|| failure("CDP URL", "missing authority"))?;
+    let ws_url = format!("ws://{authority}/devtools/page/{target_id}");
+    check_same_endpoint(base, &ws_url, cdp_url)?;
 
-    let mut transport = Transport::connect(ws_url)?;
+    let mut transport = Transport::connect(&ws_url)?;
     transport.command("Network.enable", json!({}), deadline)?;
     transport.command("Page.enable", json!({}), deadline)?;
     transport.command(
@@ -288,7 +359,7 @@ fn open_cdp_session_inner(
         .transport
         .get_mut()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(transport);
-    tracing::debug!(target_id = %session.target_id, "CDP page session opened");
+    tracing::debug!(target_id = %session.target_id, "CDP page session opened in isolated context");
     Ok(session)
 }
 
