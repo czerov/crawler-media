@@ -193,11 +193,18 @@ fn collect_pending(
     let ServerReadSnapshot { ownership, is_admin, media, rows: ledger_rows, units, .. } = snapshot;
     let mut show_episodes: HashMap<domain::MediaId, HashSet<(u32, u32)>> = HashMap::new();
     let mut show_seasons: HashMap<domain::MediaId, HashSet<u32>> = HashMap::new();
-    // 本循环的候选行已经由请求作用域限定；这里不再逐行做 `row_visible_to_user`
-    // （那是每行一次 `library_for_path` 查询，正是本轮要消除的 per-item DB 读）。
+    // 可见性判定只用内存里的 ownership（不逐行查库，也不与下面逐行建卡的判定分叉）。
+    let row_visible = |row: &domain::LedgerRow| -> bool {
+        let Some(item) = media.get(&row.media_id) else { return false };
+        let Some(owner) = ownership.owner(std::path::Path::new(&row.path), item.kind) else { return false };
+        ownership.accepts_work(&owner.id)
+            && if is_admin { owner.admin_visible } else { owner.access_mode == "everyone" || owner.member_ids.contains(&user_id) }
+    };
+    // 不可见库里的集不得进入汇总：否则受限用户的 `RecursiveItemCount` / 未看计数
+    // 会把看不见的集也算进去。
     for row in &ledger_rows {
         let Some(item) = media.get(&row.media_id) else { continue };
-        if item.kind != MediaKind::Tv {
+        if item.kind != MediaKind::Tv || !row_visible(row) {
             continue;
         }
         if let (Some(season), Some(episode)) = (row.season, row.episode) {
@@ -208,16 +215,14 @@ fn collect_pending(
     let units = unit_index(&units);
     let ingest_paths = ledger_rows.iter().filter_map(|row| {
         let item = media.get(&row.media_id)?;
-        let owner = ownership.owner(std::path::Path::new(&row.path), item.kind)?;
-        let visible = ownership.accepts_work(&owner.id) && if is_admin { owner.admin_visible } else { owner.access_mode == "everyone" || owner.member_ids.contains(&user_id) };
-        visible.then(|| (item.id, row.path.clone()))
+        row_visible(row).then(|| (item.id, row.path.clone()))
     }).collect::<Vec<_>>();
     let mut seen_series = HashSet::new();
     let mut pending = Vec::new();
     for row in ledger_rows {
         let Some(media) = media.get(&row.media_id).cloned() else { continue };
         let Some(owner) = ownership.owner(std::path::Path::new(&row.path), media.kind) else { continue };
-        if !ownership.accepts_work(&owner.id) || !(if is_admin { owner.admin_visible } else { owner.access_mode == "everyone" || owner.member_ids.contains(&user_id) }) { continue; }
+        if !row_visible(&row) { continue; }
         let series_id = media.id.to_string().replace('-', "");
         let requested_series = media.kind == MediaKind::Tv && parent_id.is_some_and(|id| id == series_id || id == media.id.to_string());
         let is_series = media.kind == MediaKind::Tv && !requested_series;

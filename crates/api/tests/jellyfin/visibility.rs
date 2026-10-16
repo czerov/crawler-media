@@ -340,7 +340,7 @@ async fn items_series_counts_only_episodes_from_visible_libraries() {
         .iter()
         .find(|item| item["Name"] == "Shared series")
         .unwrap();
-    assert_eq!(series["ChildCount"], 1);
+    assert_eq!(series["RecursiveItemCount"], 1);
 }
 
 
