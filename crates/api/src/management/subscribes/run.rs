@@ -309,9 +309,10 @@ fn execute(
         &context.media,
         torrents.iter().map(|t| t.title.as_str()),
     );
+    let chooser = crate::pack_fallback::effective(state, &context.subscribe);
     let mut outcome = subscribe::run_with_destinations_controlled(
         RunInput {
-            subscribe: &context.subscribe,
+            subscribe: &chooser,
             media: &context.media,
             filter: &context.filter,
             wash_filter: context.wash_filter.as_ref(),

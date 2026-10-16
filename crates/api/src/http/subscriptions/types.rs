@@ -33,6 +33,9 @@ pub(crate) struct CreateSubscriptionInput {
     /// G-M3: create the next season's subscription once this one completes.
     #[serde(default)]
     pub(super) auto_next_season: bool,
+    /// G-M4: full-season-pack only; fall back to single episodes after N days.
+    #[serde(default)]
+    pub(super) pack_fallback_after_days: Option<u32>,
     #[serde(default)]
     pub(super) search_interval_secs: Option<u32>,
 }
@@ -97,6 +100,9 @@ pub(crate) struct PatchSubscriptionInput {
     /// G-M3: see `CreateSubscriptionInput::auto_next_season`.
     #[serde(default)]
     pub(super) auto_next_season: Option<bool>,
+    /// G-M4: days before falling back to single episodes; 0 clears it.
+    #[serde(default)]
+    pub(super) pack_fallback_after_days: Option<u32>,
     #[serde(default)]
     pub(super) search_interval_secs: Option<u32>,
     /// 调整订阅的季范围（前端 selected_seasons）：取最小季为 coverage 季，

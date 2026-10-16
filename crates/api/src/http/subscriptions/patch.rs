@@ -32,12 +32,16 @@ pub(crate) async fn patch_subscription(
         );
     }
     let auto_next_season = body.auto_next_season;
+    let pack_fallback_after_days = body.pack_fallback_after_days;
     let (previous, subscribe, media) = match load_and_patch(&state, sid, user_id, body) {
         Ok(result) => result,
         Err(response) => return response,
     };
     if let Err(response) = persist_subscription(&state, &previous, &subscribe) {
         return response;
+    }
+    if let Some(days) = pack_fallback_after_days {
+        crate::pack_fallback::set_after_days(&state, subscribe.id, (days > 0).then_some(days));
     }
     if let Some(auto) = auto_next_season {
         crate::completion::set_auto_next_season(&state, subscribe.id, auto);

@@ -54,6 +54,8 @@ mod g_h2b_absolute_episode;
 mod g_m1_overlapping_subscriptions;
 #[path = "subscription_e2e/g_m3_auto_next_season.rs"]
 mod g_m3_auto_next_season;
+#[path = "subscription_e2e/g_m4_pack_fallback.rs"]
+mod g_m4_pack_fallback;
 #[path = "subscription_e2e/m1_overlap_policy.rs"]
 mod m1_overlap_policy;
 #[path = "subscription_e2e/m2_owned_slot_skip.rs"]

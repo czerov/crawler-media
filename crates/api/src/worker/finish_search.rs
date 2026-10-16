@@ -178,8 +178,9 @@ fn admit_candidates(
     let absolute =
         crate::season_check::absolute_map(state, media, torrents.iter().map(|t| t.title.as_str()));
     let selective = crate::selective_files::enabled(state).then(|| facts.clone());
+    let chooser = crate::pack_fallback::effective(state, subscribe);
     let added = admit_and_add(RunInput {
-        subscribe,
+        subscribe: &chooser,
         media,
         filter,
         wash_filter: context.wash_filter.as_ref(),

@@ -160,6 +160,7 @@ fn persist_subscription(
     body: CreateSubscriptionInput,
 ) -> Response {
     let auto_next_season = body.auto_next_season;
+    let pack_fallback_after_days = body.pack_fallback_after_days;
     let incoming = incoming_media(media_kind, media_input);
     let subscribe =
         match subscribe_from_input(&state, user_id, incoming.id, fetch_mode, coverage, &body) {
@@ -184,6 +185,9 @@ fn persist_subscription(
                 );
             }
         };
+    if let Some(days) = pack_fallback_after_days {
+        crate::pack_fallback::set_after_days(&state, subscribe.id, Some(days));
+    }
     if auto_next_season {
         crate::completion::set_auto_next_season(&state, subscribe.id, true);
     }
