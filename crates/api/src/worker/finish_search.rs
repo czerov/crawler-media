@@ -231,7 +231,7 @@ fn admit_candidates(
     })?;
     let deferred = selective
         .as_ref()
-        .map(|before| crate::selective_files::apply(&routed, subscribe, &added.chosen, before))
+        .map(|before| crate::selective_files::apply(&routed, subscribe, &added.chosen, before, absolute.as_ref()))
         .unwrap_or_default();
     notify_search_additions(state, subscribe, media, &added);
     merge_added_pending(state, subscribe, &added, &routed)?;
