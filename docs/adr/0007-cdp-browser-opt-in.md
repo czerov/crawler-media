@@ -27,20 +27,19 @@
 
 - **登录 / Check-in**：只有**导航之前**的失败（端点解析、排队超时 `BrowserBusy`、target / WebSocket 建立、cookie 注入失败——服务端尚未收到请求）才回退 HTTP，并 `warn!`（Site、route、原因）。**导航已发出之后**的失败不回退，直接报错，避免重复签到或重复登录请求。
 - 回退不等于成功；HTTP 遇到质询照常报错，不重试浏览器路径。
-- 单个浏览器会话有总时限（默认 30s，可配置，含排队），各步骤共用剩余时间；排队另有独立上限（默认 15s），拿到名额后剩余时间不足 10s 即在导航前返回 busy（可回退 HTTP），避免排队把失败推到「导航后」；会话结束的 cookie 清理与 target 关闭另有独立上限（默认 2s），超时只 `warn!`，因此单会话最长占用为「总时限 + 2 × 清理上限」。
+- 单个浏览器会话有总时限（默认 30s，可配置，含排队），各步骤共用剩余时间；排队另有独立上限（默认 15s），拿到名额后剩余时间不足 10s 即在导航前返回 busy（可回退 HTTP）。关闭 CDP target 有独立上限（默认 2s），超时只 `warn!`，单会话最多额外占用该清理上限。cookie 不做 session-end 清理。
 
 ### 并发与 cookie 隔离
 
-- 站点 cookie 只经 `Network.setCookies` 按站点 host 注入（host-only，https 置 `secure`），**不得**使用 `Network.setExtraHTTPHeaders`（会发给第三方主机）。
-- **多标签并发**：所有 tab 共用 daemon 的 cookie jar。我们注入的 cookie 按 host 绑定，但服务器可能在会话中写入父域 cookie，因此另需下面的分组串行与精确清理。全局并发上限默认 3（1–8 可配）。
-- **精确清理**：会话结束时用 `Network.getAllCookies`（或 `Storage.getCookies`）取全部 cookie，筛出 domain 属于本站 host、其父域或本会话跳转访问过的 host 的条目，按每条 cookie **自身的** name+domain+path 调 `Network.deleteCookies` 删除（仅给 url 删不到 `path=/forum` 这类 cookie）；删除后复查，残留只 `warn!`。**不使用** `Network.clearBrowserCookies`（会清掉其它 tab 的 cookie）。不依赖 `Target.createBrowserContext`；每会话独立上下文是后续增强。
-- **host 规范化**：站点 host、cookie domain、会话访问过的 host 统一先小写、去尾点、IDNA 转 ASCII（punycode）、IPv6 去方括号，再比较。
-- **按可注册域分组串行**：忽略 scheme 与端口（cookie 不按它们隔离）；分组 key 为公共后缀表（`psl` crate，编译进二进制、不联网）给出的可注册域（eTLD+1）；IP、单段名用整个 host，`localhost` 与 `*.localhost` 归为一组。同组同一时刻最多一个会话，避免共同祖先域 cookie 串号或被另一会话删除（覆盖兄弟、堂兄弟、跨层级子域）。
-- **前提：浏览器拒收公共后缀级 cookie**（如 `Domain=.co.uk`、`.github.io`）。Chromium 满足；Obscura 以计划 Task 0 实测为准。若不拒收：清理时对 domain 本身为公共后缀的 cookie 一律删除并告警，并发上限降为 1。
+- **多标签并发**：同一 CDP endpoint 的 tab 共用 cookie jar；实例全局并发上限默认 3（1–8 可配），同一可注册域串行以避免同一 cookie 范围内的并发覆盖。外部/第三方 Browser 的 cookie jar 不视为应用私有数据。
+- **不主动删除 cookie**：不调用 `Network.deleteCookies`、`Network.clearBrowserCookies` 或 `Storage.clearCookies`，不遍历 jar 做批量清理。外部/第三方 Browser 的既有 cookie 与会话中新建或更新的 cookie 都保留在原 jar，由正常浏览器/站点过期策略管理。
+- **host-only 注入与定向回读**：Site 已配置的 cookie 只经 `Network.setCookies` 使用当前 Site URL 做 host-only 注入；不得使用 `Network.setExtraHTTPHeaders`（会发给第三方主机）。读取 cookie 只发 `Network.getCookies{urls:[当前 Site URL]}`，结果按 name 去重后合并回该 Site 的 cookie 字段；不读取或回写无关域的 cookie。
+- **host 规范化**：Site URL host 用于 cookie host-only 注入与并发分组时统一小写、去尾点、IDNA 转 ASCII、IPv6 去方括号并规范化；不遍历或归类 cookie domain。
+- **公共后缀 cookie 前提**：Task 0 实测 Obscura 是否拒收公共后缀级 cookie（如 `Domain=.co.uk`、`.github.io`）。若该 endpoint 接受此类 cookie，视为 cookie 隔离不兼容，不用它执行 Browser maintenance；不以删除全局 cookie 补救。
 - IP 地址规范化为标准写法（如 `2001:db8::1`），按整个 IP 分组。
-- **只清理主 frame 访问过的 host**：iframe（广告、质询等共享第三方）不纳入清理；主 frame 跳到其它分组的 host（如共享 SSO）只告警。跨分组共享的 SSO/质询主机不保证隔离，需要时把并发设为 1。
-- **有界 FIFO 排队**：拿不到全局名额或分组时按票号先来先服务排队，超过排队上限或剩余时间不足即返回 busy（导航前失败，可回退 HTTP）。登录与签到是后台 Job，排队可接受。
-- 前提以计划 Task 0 实测为准：`getAllCookies`/`Storage.getCookies` 至少一个可用，且带 domain+path 的 `deleteCookies` 能删除 path 级 cookie。不满足时并发上限**降为 1**（`deleteCookies` 缺失时先尝试过期覆盖删除）。
+- **跳转 host**：不扫描、不回写、不删除跳转到的 SSO/质询 host cookie；`cookie_header` 只读取当前 Site URL 可见的 cookie，因此跨 host SSO 的认证状态不保证合并回 Site。
+- **有界 FIFO 排队**：拿不到全局名额或分组时按票号先来先服务排队，超过排队上限或剩余时间不足即返回 busy（导航前失败，可回退 HTTP）。
+- 运行前提仅为 `Network.setCookies` 和 `Network.getCookies{urls}`。不要求 `Network.getAllCookies` / `Storage.getCookies` / `Network.deleteCookies`；浏览器 target 关闭不改变 cookie jar。
 
 ### 受管 Obscura 生命周期
 
@@ -69,15 +68,13 @@
 - 设置写失败返回非 200 并恢复先前配置。保存只表示配置成功，不做联网连通性检查。
 - 浏览器只能由 Admin 在 Site 上选择 `maintenance_via = browser` 触发；Profile（含插件提供的 YAML）无法触发浏览器。浏览器网络栈不经过 net-guard，若插件将来能创建 Site，插件方案须禁止其设置 `maintenance_via`/`cdp_url`。
 
-### 迁移规则（一次性，启动时）
+### Fresh-start 数据边界（不做兼容迁移）
 
-- `cdp.enabled` 已存在 → 不迁移。
-- 否则 `cdp.enabled = cdp.sync.enabled || obscura.enabled`。**不**因为 Site 配了 `cdp_url` 而打开开关：旧 Site 端点只服务已删除的搜索渲染。
-- `cdp.url` 为空且 `obscura.url` 非空 → 写入 `cdp.url`。
-- Site 新增 `maintenance_via`，迁移后**所有 Site 均为 `http`**。旧版本生产代码的登录与签到只走 HTTP（`crates/api/src/check_in.rs` 与 `crates/api/src/http/sites.rs` 的 `site_login`/`site_check_in` 只用 HTTP 插件，浏览器登录只存在于 hooks 测试），因此保持 `http` 才是保持旧行为；升级不得在用户不知情时改变登录/签到方式、打开开关或触发受管 Obscura。
-- 原有 `cdp_url` 或使用 `render: true` Profile 的 Site 在 `/settings/browser` 的 `legacy_site_notices` 与 Site 列表中提示：「原 CDP 端点已不再用于搜索」「render 搜索已移除，搜索改走 HTTP，可能拿不到结果，请改用可直接 HTTP 抓取的 Profile」；如需浏览器登录/签到，由用户手动改为浏览器方式。
-- 写入新 key 后删除三个旧 key；迁移代码在下一个 minor 版本删除。
-- 已保存的 `https://` 实例或 Site 端点在新规则下非法：**不自动改写**，记 `warn!`，并在 `/settings/browser` 的 `invalid_endpoints` 中列出，由 UI 提示用户修改；在修改前这些 Site 的浏览器会话在导航前失败并回退 HTTP。
+- 本功能从空数据目录开始；上线此分支前，运维需自行备份需要保留的数据，并删除旧 `<data>` 后再启动。应用**不得自动删除**用户数据。
+- 新建数据库的 `sites` 基表包含 `maintenance_via TEXT NOT NULL DEFAULT 'http'`；所有新 Site 默认 HTTP。新设置只读写 `cdp.enabled`、`cdp.url` 与 `obscura.install`，不读取、不迁移、不兼容 `cdp.sync.enabled`、`obscura.enabled`、`obscura.url`。
+- 旧 schema/旧数据目录不受支持。启动时应在任何 schema 写入前明确报错并提示删除旧数据目录；不自动 ALTER/backfill 旧 Site、不自动改变 `maintenance_via`，不因旧 `cdp_url` 或 Profile `render: true` 自动开启 CDP。
+- Profile 中遗留的 `render: true` 不再控制搜索，加载时忽略并 `warn!`；不创建旧 Site 的 `legacy_site_notices`、旧端点扫描或兼容迁移 API。
+- 新写入的实例/Site 端点只接受 `http`；内嵌凭据、query、`https`、`ws`/`wss` 在写入时 400 拒绝。无需扫描或修复旧端点，因为旧数据目录不受支持。
 
 ### 凭据
 

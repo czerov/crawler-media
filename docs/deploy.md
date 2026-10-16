@@ -43,9 +43,9 @@ docker compose up --build
 `/usr/share/crawler-media/ui`）+ API + Jellyfin 兼容，浏览器和播放器都打这一个端口。
 镜像内默认 **无 Chromium**。实例级 Browser 开关决定是否使用 CDP：**关闭**时所有请求走 HTTP，不探测端点、不下载、不启动任何浏览器进程，Site 的 `cdp_url` 也不生效；**开启**时端点按 Site `cdp_url` → 实例 `cdp.url` → 受管 Obscura 解析，浏览器只用于 Site 的登录与签到（Site 上选择「浏览器」方式，`maintenance_via = browser`）；**搜索与 RSS 始终走 HTTP**。失败回退规则见下段。端点只接受 `http` CDP discovery URL（不接受 `https`/`ws`/`wss`、内嵌凭据或 query）。
 
-回退规则：登录与签到只在**导航之前**失败（端点不可达、排队超时、target/WebSocket 建立失败、cookie 注入失败）时回退 HTTP 并 warn；导航之后失败直接报错，不会再发一次 HTTP 签到。回退不等于成功。浏览器支持多标签并发（默认 3），同一可注册域（含兄弟、堂兄弟子域，按公共后缀表判定；host 统一规范化，含 IDN）串行（前提是浏览器拒收 `Domain=.co.uk` 之类公共后缀级 cookie，Obscura 以实测为准，否则并发降为 1）；排队有上限，剩余时间不足时在导航前放弃并回退 HTTP；会话结束按 cookie 自身的 domain+path 删除该站点（含父域、跳转 host）的 cookie。浏览器会话**不使用 Site 代理**，浏览器方式与 Site 代理互斥（两个方向都在保存时校验）。
+回退规则：登录与签到只在**导航之前**失败（端点不可达、排队超时、target/WebSocket 建立失败、cookie 注入失败）时回退 HTTP 并 warn；导航之后失败直接报错，不会再发一次 HTTP 签到。回退不等于成功。浏览器支持多标签并发（默认 3），同一可注册域按公共后缀表串行。Site cookie 通过 host-only `Network.setCookies` 注入，读取仅限定当前 Site URL；会话期间及结束时**不发送任何 cookie 删除/清空命令**。第三方浏览器原有 cookie、本站点 cookie 和 SSO/跳转 host cookie 都留在原 jar，由浏览器/站点过期策略管理。若 endpoint 不支持 host-only 注入/当前 URL 回读，或接受公共后缀级 cookie，则不用于 Browser maintenance，导航前回退 HTTP。浏览器会话**不使用 Site 代理**，浏览器方式与 Site 代理互斥（两个方向都在保存时校验）。
 
-**升级提示**：升级不会改变任何 Site 的登录/签到方式（全部保持 HTTP），也不会自动打开开关。原有 `cdp_url` 或 `render: true` Profile 的 Site 会在设置页与站点列表中提示——render 搜索已移除，这些站点的搜索改走 HTTP，可能需要换成可直接 HTTP 抓取的 Profile；如需浏览器登录/签到，请在 Site 上手动改为浏览器方式。
+**Fresh start（不做数据迁移）**：此功能版本要求使用空的数据目录。部署前请自行备份需要保留的文件，并手动删除/换新 `<data>`；应用不会自动删除用户数据。旧 schema/旧设置不兼容，启动时会明确提示重置数据目录，不迁移 `cdp.sync.enabled`、`obscura.enabled/url` 或旧 Site 记录。新 Site 默认 `maintenance_via = http`，CDP 开关默认关闭；需要浏览器登录/签到时由管理员手动开启开关并选择 Site 的浏览器方式。Profile 的 `render: true` 不再控制搜索，搜索始终走 HTTP。
 
 **受管 Obscura 启动条件**：开关开启、未配置 `cdp.url`、至少有一个启用的 Site 选择浏览器登录/签到且没有自己的 `cdp_url`、二进制可用。不满足时设置页显示未启动原因（`no_managed_browser_sites`、`not_installed` 等）。受管 daemon 每次启动使用随机空闲端口并只绑定 `127.0.0.1`；只管理本进程拉起的 daemon，关闭开关或应用退出会停止它，外部服务不受影响。
 
@@ -58,7 +58,7 @@ docker compose up --build
 
 **`network_mode: host` 风险**：受管 daemon 虽只绑定回环，但同宿主的任何进程都能访问该无鉴权 CDP 端口并读取站点 cookie；在共享宿主上请使用 bridge 网络或改用独立容器中的外部端点。
 
-也可自行运行外部 Browser 并在设置中填 `cdp.url`。升级后旧的 `https://` 端点不会被自动改写，会在设置页 `invalid_endpoints` 中提示修改。保存配置即时生效，但不等于连通性验证。
+也可自行运行外部 Browser 并在设置中填 `cdp.url`。非法端点在保存时会被拒绝；保存合法地址只表示配置成功，不等于连通性验证。
 
 ## 下载器
 
@@ -68,7 +68,7 @@ qBittorrent / Transmission 通过 `/api/v1/downloaders` 配置（持久化到 SQ
 
 ## 环境变量
 
-主要服务启动配置由 [config](<../crates/api/src/config.rs>) 解析，并对未注册的 `CRAWLER_MEDIA_*` 打 warning。部分运行时工具仍有独立读取点，下面是部署常用变量，不是全部运行时配置的唯一注册表；typed settings 的完整收敛仍待实施。
+主要服务启动配置由 [config](<../crates/api/src/config.rs>) 解析，并对未注册的 `CRAWLER_MEDIA_*` 打 warning。Web 构建、类型检查与测试要求 **Node.js ≥ 22**（`web/package.json`）；Docker 构建镜像使用 Node 22。部分运行时工具仍有独立读取点，下面是部署常用变量，不是全部运行时配置的唯一注册表；typed settings 的完整收敛仍待实施。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
