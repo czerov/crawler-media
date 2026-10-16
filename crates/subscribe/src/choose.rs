@@ -546,6 +546,12 @@ fn is_pack(release: &Release, subscribe: &Subscribe) -> bool {
         || (release.episode.is_none() && release.episode_to.is_none())
 }
 
+/// Whether a bounded, non-wash subscription owns every unit.
+///
+/// M4b: wash-cut and open-window subscriptions are never "complete" here by
+/// design: they keep tracking upgrades / future episodes. The persisted
+/// `completed` tracking state (M4a, `api::completion`) applies only to
+/// bounded, non-wash coverage.
 pub fn is_complete(subscribe: &Subscribe, facts: &SubscribeFacts) -> bool {
     if subscribe.wash_cut {
         return false;

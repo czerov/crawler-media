@@ -113,6 +113,7 @@ export function subscriptionStatus(
   sub: Pick<Subscription, "follow_future" | "media" | "progress" | "tracking_state">,
 ): SubscriptionStatus {
   if (sub.tracking_state === "paused") return "paused";
+  if (sub.tracking_state === "completed") return "completed";
   if (sub.media.kind === "movie") return sub.progress.imported > 0 ? "completed" : "active";
   // 剧集只有在总集数已知（total > 0）且已全部入库（imported >= total 且 missing === 0）时才能算 completed（已收齐）！
   // 如果 total === 0（未开播或待定档）或 imported === 0（一集没下），绝对不能判定为已收齐！

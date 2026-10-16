@@ -135,7 +135,8 @@ export interface Subscription {
   /** Explicit target availability; never silently resets library_id. */
   target_library_status: "ready" | "deleting" | "missing";
   target_library_error: string | null;
-  tracking_state: "active" | "paused";
+  /** completed：后端 M4a 判定已全部入库（非洗版有界订阅），搜索跳过索引站。 */
+  tracking_state: "active" | "paused" | "completed";
   follow_future: boolean;
   /** Seconds between automatic Site searches. Default 1800. */
   search_interval_secs: number;
