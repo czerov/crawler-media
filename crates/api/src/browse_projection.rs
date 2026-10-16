@@ -301,7 +301,13 @@ impl ProjectionService {
         self.dirty_libraries.lock().remove(library_id);
         self.visited.lock().remove(library_id);
     }
+    pub fn has_dependencies(&self, library_id: &str) -> bool {
+        self.deps.lock().contains_library(library_id)
+    }
 
+    pub fn available_build_permits(&self) -> usize {
+        self.build_budget.available_permits()
+    }
     /// Ensure a valid projection snapshot is available for `library_id`.
     ///
     /// If the snapshot is missing, dirty, or built for a different revision/scope,
@@ -365,10 +371,19 @@ impl ProjectionService {
                 };
             }
         };
-
         let dirty_version_before = self.dirty_libraries.lock().get(&library_id).copied();
+
+        let lease = match state.acquire_library_work(&library_id) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let outcome = BuildOutcome::Cancelled;
+                tracing::debug!(library_id = %library_id, %error, "拒绝已冻结 Library 的投影构建");
+                self.publish_terminal(&library_id, &entry, outcome.clone());
+                return outcome_result(outcome);
+            }
+        };
         let outcome = self
-            .build_and_publish(state, library_id.clone(), entry, dirty_version_before)
+            .build_and_publish(state, library_id.clone(), entry, dirty_version_before, lease)
             .await;
 
         outcome_result(outcome)
@@ -386,6 +401,7 @@ impl ProjectionService {
         library_id: String,
         entry: Arc<Inflight>,
         dirty_version_before: Option<u64>,
+        lease: crate::library_lifecycle::LibraryWorkLease,
     ) -> BuildOutcome {
         let budget = self.build_budget.clone();
         let deadline = self.deadline;
@@ -406,7 +422,7 @@ impl ProjectionService {
                     barrier,
                     outcome: None,
                 };
-                let outcome = publish_blocking(&deps, &state, &job_library);
+                let outcome = publish_blocking(&deps, &state, &job_library, &lease);
                 if matches!(outcome, BuildOutcome::Ready(_)) {
                     let mut dirty = dirty_libraries.lock();
                     if dirty.get(&job_library).copied() == dirty_version_before {
@@ -680,6 +696,7 @@ fn publish_blocking(
     deps: &Arc<Mutex<ProjectionDependencies>>,
     state: &ApiState,
     library_id: &str,
+    lease: &crate::library_lifecycle::LibraryWorkLease,
 ) -> BuildOutcome {
     let ownership_epoch = {
         let store = state.store.lock();
@@ -720,30 +737,32 @@ fn publish_blocking(
             Some(format!("tmdb:/{kind}/{tmdb_id}"))
         })
         .collect();
-    deps.lock().record_library(
-        library_id,
-        media_ids,
-        ledger_ids,
-        paths,
-        catalog_keys,
-    );
-
-    let store = state.store.lock();
-    let current_epoch = match ownership_signature(&store) {
-        Ok(signature) => signature,
-        Err(error) => return BuildOutcome::Failed(error.to_string()),
-    };
-    if current_epoch != ownership_epoch {
-        return BuildOutcome::StaleScope;
-    }
-    match store.publish_browse_projection(&build) {
-        Ok(true) => match store.browse_projection(library_id) {
-            Ok(Some(snapshot)) => BuildOutcome::Ready(snapshot),
-            Ok(None) => BuildOutcome::Failed("Projection missing after publish".into()),
+    let published = lease.publish(|| {
+        let store = state.store.lock();
+        let current_epoch = ownership_signature(&store).map_err(|error| error.to_string())?;
+        if current_epoch != ownership_epoch {
+            return Ok(BuildOutcome::StaleScope);
+        }
+        let outcome = match store.publish_browse_projection(&build) {
+            Ok(true) => match store.browse_projection(library_id) {
+                Ok(Some(snapshot)) => BuildOutcome::Ready(snapshot),
+                Ok(None) => BuildOutcome::Failed("Projection missing after publish".into()),
+                Err(error) => BuildOutcome::Failed(error.to_string()),
+            },
+            Ok(false) => BuildOutcome::StaleScope,
             Err(error) => BuildOutcome::Failed(error.to_string()),
-        },
-        Ok(false) => BuildOutcome::StaleScope,
-        Err(error) => BuildOutcome::Failed(error.to_string()),
+        };
+        if matches!(outcome, BuildOutcome::Ready(_)) {
+            deps.lock().record_library(library_id, media_ids, ledger_ids, paths, catalog_keys);
+        }
+        Ok(outcome)
+    });
+    match published {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::debug!(library_id, %error, "Library 移除期间取消投影发布");
+            BuildOutcome::Cancelled
+        }
     }
 }
 

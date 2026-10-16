@@ -52,6 +52,13 @@ impl ProjectionDependencies {
         self.paths_by_library.remove(library_id);
         self.catalog_by_library.remove(library_id);
     }
+    pub fn contains_library(&self, library_id: &str) -> bool {
+        self.media_by_library.contains_key(library_id)
+            || self.ledger_by_library.contains_key(library_id)
+            || self.paths_by_library.contains_key(library_id)
+            || self.catalog_by_library.contains_key(library_id)
+    }
+
 
     fn retain_libraries(&mut self, library_ids: &HashSet<String>) {
         self.media_by_library.retain(|id, _| library_ids.contains(id));

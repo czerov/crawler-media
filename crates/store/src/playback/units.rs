@@ -37,6 +37,27 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn set_unit_favorite(
+        &self,
+        user_id: UserId,
+        media_id: MediaId,
+        season: i32,
+        episode: i32,
+        favorite: bool,
+        played: bool,
+    ) -> Result<(), StoreError> {
+        self.subscribe.execute(
+            "INSERT INTO playback_units
+                (user_id, media_id, season, episode, position_ms, played, favorite,
+                 duration_ms, audio_track, subtitle_track, play_count, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, NULL, NULL, NULL, 0, 0)
+             ON CONFLICT(user_id, media_id, season, episode) DO UPDATE SET
+                favorite = excluded.favorite",
+            params![user_id.to_string(), media_id.to_string(), season, episode, played as i64, favorite as i64],
+        )?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_unit(
         &self,

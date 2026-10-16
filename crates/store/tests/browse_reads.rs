@@ -112,6 +112,21 @@ fn playback_units_for_user_keeps_full_state_for_partial_progress() {
 }
 
 #[test]
+fn favorite_only_update_preserves_played_activity_timestamp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let user = UserId::new();
+    let media = media(MediaKind::Tv, "Favorite timestamp", None);
+    store.insert_media(&media).unwrap();
+    store.upsert_unit(user, media.id, 1, -1, 0, Some(true), Some(false), None, None, None, false, 10).unwrap();
+    store.set_unit_favorite(user, media.id, 1, -1, true, true).unwrap();
+    let state = store.unit_state(user, media.id, 1, -1).unwrap().unwrap();
+    assert!(state.played);
+    assert!(state.favorite);
+    assert_eq!(state.updated_at, 10);
+}
+
+#[test]
 fn playback_units_for_user_is_scoped_to_one_user() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path().join("data")).unwrap();

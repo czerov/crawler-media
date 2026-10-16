@@ -288,9 +288,27 @@ fn acknowledged_coalescing_sentinel_is_pruned_after_interrupted_acknowledgement(
         .browse_changes(BrowseChangeSource::Catalog, store.browse_change_cursor(BrowseChangeSource::Catalog).unwrap(), 10)
         .unwrap()
         .is_empty());
-    consumer
+    let replay = consumer
         .poll_source(&store, &ownership, BrowseChangeSource::Catalog)
         .unwrap();
+    assert_eq!(replay, (1, true), "replay must consume exactly one budget unit");
+    assert!(store
+        .browse_changes(BrowseChangeSource::Catalog, sentinel.seq - 1, 1)
+        .unwrap()
+        .is_empty(), "replay must prune the acknowledged coalescing sentinel");
+
+    store
+        .put_catalog_cache("tmdb", "/movie/1000", "{}", 10_001, None)
+        .unwrap();
+    let after_replay = consumer
+        .poll_source(&store, &ownership, BrowseChangeSource::Catalog)
+        .unwrap();
+    assert_eq!(after_replay, (1, true), "a later catalog change must be consumable");
     let updated = store.browse_projection_head(&library_id).unwrap().unwrap();
     assert!(updated.dirty_token > baseline.dirty_token);
+
+    let idle = consumer
+        .poll_source(&store, &ownership, BrowseChangeSource::Catalog)
+        .unwrap();
+    assert_eq!(idle, (0, true), "an idle poll must process no events");
 }

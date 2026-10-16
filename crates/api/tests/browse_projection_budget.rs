@@ -622,3 +622,51 @@ async fn late_follower_replays_stale_scope_outcome() {
         "leader 必须回报 StaleScope"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_removal_waits_for_blocked_projection_build() {
+    let fix = PresenceFixture::new();
+    fix.insert_media_and_ledger("Gated.mkv");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let files = Arc::new(GatedFiles {
+        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let state = fix.state.clone().with_browse_file_read(files).with_projection_service(
+        Arc::new(ProjectionService::new().with_build_capacity(1)),
+    );
+    let leader_state = state.clone();
+    let leader_library = fix.library_id.clone();
+    let leader = tokio::spawn(async move {
+        leader_state.projection.ensure(leader_state.clone(), leader_library).await
+    });
+    started_rx.await.expect("projection build must enter gated metadata read");
+
+    let removal = api::library_lifecycle::start_library_removal(&state, &fix.library_id).unwrap();
+    let completed_while_blocked = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            let current = state.store().lock().library_removal(&removal.operation_id).unwrap().unwrap();
+            if current.state == "succeeded" { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.is_ok();
+    release_tx.send(()).unwrap();
+    assert!(!completed_while_blocked, "removal must drain the in-flight projection build");
+    assert!(leader.await.unwrap().is_err());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let current = state.store().lock().library_removal(&removal.operation_id).unwrap().unwrap();
+            let dependencies_remain = state.projection.has_dependencies(&fix.library_id);
+            if current.state == "succeeded" && !dependencies_remain { break; }
+            assert_ne!(current.state, "failed", "{:?}", current.error);
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(state.store().lock().get_library(&fix.library_id).unwrap().is_none());
+    assert!(!state.projection.has_dependencies(&fix.library_id), "deleted Library must have no dependency entries");
+
+    let retry = state.projection.ensure(state.clone(), fix.library_id.clone()).await;
+    assert!(retry.is_err(), "deleted Library must not retain a buildable projection");
+    assert_eq!(state.projection.available_build_permits(), 1, "completed worker must release capacity");
+}

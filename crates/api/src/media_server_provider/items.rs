@@ -183,21 +183,12 @@ fn effective_played(
     season: i32,
     episode: i32,
 ) -> bool {
-    let episode_unit = find_unit(units, media_id, season, episode);
-    if episode_unit.is_some_and(|unit| unit.state.played) {
-        return true;
-    }
-    let episode_updated_at = episode_unit.map(|unit| unit.state.updated_at);
-    if let Some(season_unit) = (season >= 0)
-        .then(|| find_unit(units, media_id, season, crate::store::UNIT_WHOLE))
-        .flatten()
-        .filter(|unit| episode_updated_at.is_none_or(|updated_at| unit.state.updated_at > updated_at))
-    {
-        return season_unit.state.played;
-    }
-    find_unit(units, media_id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)
-        .filter(|unit| episode_updated_at.is_none_or(|updated_at| unit.state.updated_at > updated_at))
-        .is_some_and(|unit| unit.state.played)
+    super::user_marks::resolve_effective_played(
+        find_unit(units, media_id, season, episode).map(|unit| (&unit.state, unit.state.updated_at)),
+        find_unit(units, media_id, season, crate::store::UNIT_WHOLE).map(|unit| (&unit.state, unit.state.updated_at)),
+        find_unit(units, media_id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)
+            .map(|unit| (&unit.state, unit.state.updated_at)),
+    )
 }
 fn unit_counts_from_snapshot(
     units: &UnitIndex<'_>, row: &domain::LedgerRow, media: &domain::Media,
