@@ -131,6 +131,7 @@ fn one_failed_file_does_not_discard_successful_files_from_same_torrent() {
                 audio_language: None,
                 group: None,
                 confidence: Confidence::High,
+                season_inferred: false,
             },
             torrent,
             score: 80,

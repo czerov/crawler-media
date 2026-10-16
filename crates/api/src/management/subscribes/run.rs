@@ -55,6 +55,12 @@ fn run_subscribe_inner(
     let search_context = load_search_context(state, id, user_id)?;
     reject_if_inactive(state, id, &search_context.subscribe)?;
     let (torrents, search_keywords) = fetch_torrents(state, id, &search_context)?;
+    let torrents = crate::season_check::drop_misnumbered(
+        state,
+        &search_context.subscribe,
+        &search_context.media,
+        torrents,
+    );
     let admitted = admit_after_search(state, id, user_id, torrents, search_keywords)?;
     if admitted.scrape {
         for row in &admitted.ledger {

@@ -31,6 +31,7 @@ fn release(title: &str) -> Release {
         audio_language: None,
         group: None,
         confidence: domain::Confidence::High,
+        season_inferred: false,
     }
 }
 
@@ -194,6 +195,7 @@ fn scored(title: &str, from: u32, to: u32, score: i32) -> ScoredTorrent {
             audio_language: None,
             group: None,
             confidence: domain::Confidence::High,
+            season_inferred: false,
         },
         score,
     }
@@ -561,4 +563,19 @@ fn wash_target_cutoff_prevents_further_upgrades_when_target_reached() {
         chosen.is_empty(),
         "达到 WashTarget 截止线后必须停止继续升级"
     );
+}
+
+#[test]
+fn inferred_season_never_matches_a_later_season_subscribe() {
+    let mut m = media("The Long Watch", None);
+    m.kind = MediaKind::Tv;
+    let mut subscribe = tv_subscribe(m.id);
+    subscribe.coverage = Coverage::Tv { season: 2, episode_from: 1, episode_to: Some(2) };
+    let mut guessed = release("The Long Watch Episode 1");
+    guessed.season = Some(2);
+    guessed.episode = Some(1);
+    guessed.season_inferred = true;
+    assert!(!candidate_matches_subscribe(&subscribe, &m, &guessed));
+    guessed.season_inferred = false;
+    assert!(candidate_matches_subscribe(&subscribe, &m, &guessed));
 }

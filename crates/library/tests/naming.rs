@@ -48,6 +48,7 @@ fn release_movie() -> Release {
         audio_language: None,
         group: None,
         confidence: Confidence::High,
+        season_inferred: false,
     }
 }
 
@@ -66,6 +67,7 @@ fn release_ep() -> Release {
         audio_language: None,
         group: None,
         confidence: Confidence::High,
+        season_inferred: false,
     }
 }
 

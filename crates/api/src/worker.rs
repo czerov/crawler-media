@@ -164,6 +164,7 @@ fn search(state: &ApiState, job: &Job, rss_batch: Option<&RssBatch>) -> Result<(
             "换源搜索已排除卡住的种子"
         );
     }
+    let torrents = crate::season_check::drop_misnumbered(state, &subscribe, &media, torrents);
     finish_search(state, &subscribe, torrents, search_keywords)
 }
 
@@ -418,6 +419,7 @@ mod tests {
             audio_language: None,
             group: None,
             confidence: domain::Confidence::High,
+            season_inferred: false,
         };
         let units = super::covered_units(&release);
         assert_eq!(units.len(), domain::Coverage::MAX_EPISODES as usize);

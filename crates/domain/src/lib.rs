@@ -571,6 +571,8 @@ pub struct Release {
     pub audio_language: Option<String>,
     pub group: Option<String>,
     pub confidence: Confidence,
+    /// G-H2: the title carried no season marker; `season` is the parser's S01 default.
+    pub season_inferred: bool,
 }
 
 impl Release {
@@ -621,6 +623,7 @@ mod tests {
             audio_language: None,
             group: None,
             confidence: Confidence::High,
+            season_inferred: false,
         }
     }
 

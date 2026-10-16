@@ -41,6 +41,7 @@ fn release_with(resolution: Option<&str>, source: Option<&str>) -> Release {
         audio_language: None,
         group: None,
         confidence: domain::Confidence::High,
+        season_inferred: false,
     }
 }
 

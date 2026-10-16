@@ -123,6 +123,7 @@ mod tests {
                 audio_language: None,
                 group: None,
                 confidence: domain::Confidence::High,
+                season_inferred: false,
             },
             score: 100,
         };

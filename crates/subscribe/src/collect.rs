@@ -550,6 +550,12 @@ fn replacement_survives_probe<D: Downloader + ?Sized>(
             .get(*s, *e)
             .is_some_and(|fact| fact.path.is_some())
     });
+    if owns_file && scored.release.season_inferred {
+        // G-H2: the season was guessed from a title without season marker;
+        // that is not enough evidence to delete an owned file.
+        tracing::warn!(torrent = %scored.torrent.title, "季号由解析器推断，拒绝洗版替换在位文件");
+        return (false, 0);
+    }
     if owns_file && !was_probed {
         tracing::warn!(
             torrent = %scored.torrent.title,

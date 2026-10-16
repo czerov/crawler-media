@@ -478,6 +478,8 @@ fn release_matches_subscribe(subscribe: &Subscribe, media: &Media, release: &Rel
         (Coverage::Movie, MediaKind::Movie) => {
             release.season.is_none() && release.episode.is_none() && release.episode_to.is_none()
         }
+        // G-H2: a defaulted S01 never stands in for another season.
+        (Coverage::Tv { season, .. }, MediaKind::Tv) if release.season_inferred && *season != 1 => false,
         (Coverage::Tv { .. }, MediaKind::Tv) => !covered_slots(subscribe, release).is_empty(),
         _ => false,
     }

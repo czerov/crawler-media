@@ -52,6 +52,7 @@ fn apply_admit_release_override(
         audio_language: base.audio_language,
         group: base.group,
         confidence: domain::Confidence::High,
+        season_inferred: false,
     }
 }
 

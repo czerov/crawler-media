@@ -45,6 +45,7 @@ fn release_from_json(value: Option<&serde_json::Value>) -> Option<Release> {
         audio_language: None,
         group: None,
         confidence: domain::Confidence::High,
+        season_inferred: false,
     })
 }
 
