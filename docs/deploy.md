@@ -39,7 +39,7 @@ docker compose up --build
 
 镜像内单进程（`crawler-media`）监听 18765：静态 UI（`web/dist` 拷入
 `/usr/share/crawler-media/ui`）+ API + Jellyfin 兼容，浏览器和播放器都打这一个端口。
-镜像内默认 **无 Chromium**。当前 Browser 仅支持外部 HTTP(S) CDP discovery；JS 渲染 Site 可配置专属 `cdp_url`，或在 Browser 设置中启用 Obscura/全局 CDP 地址。自行运行外部 Browser，保存配置不会安装或启动进程。`CRAWLER_MEDIA_BROWSER=1` 请求不支持的 managed 能力，会在启动时明确报错。渲染路由为 Site CDP → 启用的 Obscura → 启用的全局 CDP；保存即时生效，端点配置不等于可用性验证。
+镜像内默认 **无 Chromium**。实例级 Browser 开关决定是否使用 CDP：**关闭**时所有请求走 HTTP，不探测端点、不下载、不启动任何浏览器进程，Site 的 `cdp_url` 也不生效；**开启**时端点按 Site `cdp_url` → 实例 `cdp.url` → 受管 Obscura 解析，任一 CDP 环节失败都回退到不用 CDP 的 HTTP 流程并记 warn 日志（回退覆盖 render 搜索、登录与签到，且不等于成功）。未配置 `cdp.url` 时由应用按需下载并启动受管 Obscura（默认本地 `127.0.0.1:9223`，首次使用需能访问其发布地址；离线部署请预置二进制或改为配置外部端点）。也可自行运行外部 Browser 并在设置中填端点；受管进程只管理本进程拉起的 daemon，关闭开关不会杀掉外部服务。保存配置即时生效，但不等于连通性验证。
 
 ## 下载器
 
@@ -59,7 +59,7 @@ qBittorrent / Transmission 通过 `/api/v1/downloaders` 配置（持久化到 SQ
 | `CRAWLER_MEDIA_LISTEN` | `127.0.0.1:18765` | 监听地址 |
 | `CRAWLER_MEDIA_UI` | 空 | 前端静态产物目录 |
 | `CRAWLER_MEDIA_CORS_ORIGINS` | 空 | CORS 白名单（逗号分隔） |
-| `CRAWLER_MEDIA_BROWSER` | 关 | 旧 managed 开关；`1`/`true`/`yes` 现因能力不支持而拒绝启动，请配置外部 CDP |
+| `CRAWLER_MEDIA_BROWSER` | 关 | 启动期 Browser 开关默认值（`1`/`true`/`yes`/`on`）；置位不再导致启动失败，行为等同在设置中打开开关 |
 | `CRAWLER_MEDIA_TMDB_KEY` | 空 | 非空 env／_FILE 固定 TMDB API Key 时，UI PUT 返回409；清除env pin后才可由UI修改 |
 | `CRAWLER_MEDIA_TVDB_KEY` | 空 | TVDB API Key |
 | `CRAWLER_MEDIA_QB_URL` / `_USER` / `_PASS` / `_CATEGORY` | 空 | qBittorrent 覆盖 |
