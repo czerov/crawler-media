@@ -34,14 +34,14 @@ fn item_is_favorite(store: &Store, user_id: UserId, row: &domain::LedgerRow) -> 
     }
 }
 
-/// 锁内只取的 owned DB 事实：进度与已探测轨道。
+/// Owned per-item playback and probe facts collected with the Jellyfin batch.
 pub(super) struct ItemDbFacts {
     resume_state: Option<crate::store::UnitState>,
     tracks: library::Tracks,
     is_favorite: bool,
 }
 
-/// 必须在 Store 锁内调用；只做 DB 读取，不做任何文件 IO。
+/// Load one item's DB facts while the shared snapshot's Store guard is held.
 pub(super) fn item_db_facts(
     store: &Store,
     user_id: UserId,
@@ -49,30 +49,13 @@ pub(super) fn item_db_facts(
     is_series: bool,
 ) -> ItemDbFacts {
     let resume_state = row.season.zip(row.episode).and_then(|(season, episode)| {
-        store
-            .unit_state(user_id, row.media_id, season as i32, episode as i32)
-            .ok()
-            .flatten()
+        store.unit_state(user_id, row.media_id, season as i32, episode as i32).ok().flatten()
     });
-    let tracks = store
-        .get_file_meta(&row.id.to_string())
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let tracks = store.get_file_meta(&row.id.to_string()).ok().flatten().unwrap_or_default();
     let favorite_row = if is_series {
-        domain::LedgerRow {
-            season: None,
-            episode: None,
-            ..row.clone()
-        }
-    } else {
-        row.clone()
-    };
-    ItemDbFacts {
-        resume_state,
-        tracks,
-        is_favorite: item_is_favorite(store, user_id, &favorite_row),
-    }
+        domain::LedgerRow { season: None, episode: None, ..row.clone() }
+    } else { row.clone() };
+    ItemDbFacts { resume_state, tracks, is_favorite: item_is_favorite(store, user_id, &favorite_row) }
 }
 
 /// 锁外渲染：NFO/stat/外部字幕 IO 都在这里，调用方必须先释放 Store 锁。

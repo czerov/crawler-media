@@ -21,6 +21,14 @@ struct RunContext {
     sites: Vec<Site>,
 }
 
+struct RunFactsObservation {
+    facts: subscribe::SubscribeFacts,
+    saved: subscribe::SubscribeFacts,
+    rows: Vec<domain::LedgerRow>,
+    qualities: std::collections::HashMap<domain::LedgerId, Result<domain::Release, String>>,
+    ownership_libraries: Vec<store::Library>,
+}
+
 pub(crate) async fn run_subscribe(
     State(state): State<ApiState>,
     axum::Extension(user_id): axum::Extension<UserId>,
@@ -271,6 +279,7 @@ fn execute(
         .map_err(|error| ApiError::internal(error.to_string()))?;
     {
         let store = state.store.lock();
+        validate_facts_observation(&store, context, &facts)?;
         crate::worker::transfer::validate_transfer_plan(
             &store, &context.subscribe, &library_lease, &plan.revisions, &plan,
         ).map_err(ApiError::internal)?;
@@ -289,7 +298,7 @@ fn execute(
             wash_filter: context.wash_filter.as_ref(),
             torrents,
             search_keywords,
-            facts,
+            facts: facts.facts.clone(),
             downloader: routed,
             library_root: &plan.root,
             transfer_mode: plan.mode,
@@ -321,15 +330,15 @@ fn execute(
 }
 
 fn load_run_facts(state: &ApiState, id: SubscribeId, context: &RunContext)
-    -> Result<subscribe::SubscribeFacts, ApiError>
+    -> Result<RunFactsObservation, ApiError>
 {
     let existing = state.store.lock().load_pending(id)?;
-    let mut facts = crate::subscribe_library_read::read_subscribe_library_facts(
-        state,
-        &context.subscribe,
-        context.media.kind,
-    )
-    .map_err(|e| ApiError::internal(e))?;
+    let snapshot = state.store.lock()
+        .subscribe_library_snapshot(&context.subscribe, context.media.kind)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut facts = crate::subscribe_library_read::evaluate_subscribe_facts_out_of_lock_with(
+        &snapshot, state.browse_files.as_ref(),
+    ).map_err(|e| ApiError::internal(e.to_string()))?;
     for (_, pending) in &existing {
         let release = pending
             .release_override
@@ -353,15 +362,38 @@ fn load_run_facts(state: &ApiState, id: SubscribeId, context: &RunContext)
                 facts.upsert(
                     season,
                     episode,
-                    subscribe::QualityFact {
-                        score: 0,
-                        path: None,
-                    },
+                    subscribe::QualityFact { score: 0, path: None },
                 );
             }
         }
     }
-    Ok(facts)
+    Ok(RunFactsObservation {
+        facts,
+        saved: snapshot.saved,
+        rows: snapshot.rows,
+        qualities: snapshot.qualities,
+        ownership_libraries: snapshot.ownership.libraries().to_vec(),
+    })
+}
+
+fn validate_facts_observation(
+    store: &store::Store,
+    context: &RunContext,
+    observed: &RunFactsObservation,
+) -> Result<(), ApiError> {
+    let current = store
+        .subscribe_library_snapshot(&context.subscribe, context.media.kind)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if current.saved != observed.saved
+        || current.rows != observed.rows
+        || current.qualities != observed.qualities
+        || current.ownership.libraries() != observed.ownership_libraries
+    {
+        tracing::warn!(subscribe_id = %context.subscribe.id,
+            "Subscribe facts source rows or ownership changed after filesystem observation");
+        return Err(ApiError::internal("Subscribe facts source changed during admission".into()));
+    }
+    Ok(())
 }
 
 fn fetch_torrents(

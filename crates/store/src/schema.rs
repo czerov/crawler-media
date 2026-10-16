@@ -15,7 +15,7 @@ mod scan_operations;
 /// The version is stored via `PRAGMA user_version` on each database file.
 pub const APP_SCHEMA_VERSION: i64 = 7;
 pub const CATALOG_SCHEMA_VERSION: i64 = 2;
-pub const LIBRARY_SCHEMA_VERSION: i64 = 13;
+pub const LIBRARY_SCHEMA_VERSION: i64 = 14;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 5;
 
 /// Read the current schema version from a database file.
@@ -271,6 +271,8 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
         "reuse_fingerprint_cache",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column(conn, "probe_jobs", "partial", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "probe_jobs", "error", "TEXT")?;
     fingerprint::migrate_library_fingerprint(conn)?;
     probe_state::migrate_probe_state(conn)?;
     // library schema 8: ledger_probe_obligations 表用于扫描原子登记后的 probe 义务跟踪与恢复

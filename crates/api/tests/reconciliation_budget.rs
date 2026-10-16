@@ -193,6 +193,16 @@ async fn reconciliation_bounds_budget_and_depth() {
     assert!(!idx_full.candidates.contains_key(std::ffi::OsStr::new("deep_file.mp4")));
 }
 
+#[test]
+fn missing_configured_reconciliation_root_marks_index_incomplete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("missing-root");
+    let index = api::library_reconciliation::index_basenames(
+        &[missing], &library::WorkControl::default(), 100,
+    ).unwrap();
+    assert!(index.incomplete, "an unavailable configured root was not examined");
+}
+
 #[tokio::test]
 async fn housekeeping_uses_bounded_blocking_admission() {
     let tmp = tempfile::tempdir().unwrap();
@@ -229,8 +239,8 @@ async fn housekeeping_uses_bounded_blocking_admission() {
     release_tx.send(()).unwrap();
     occupied.await.unwrap();
     for (endpoint, status) in statuses {
-        assert_eq!(status, StatusCode::REQUEST_TIMEOUT,
-            "{endpoint} must enter the same bounded work budget as reconciliation preview");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE,
+            "{endpoint} must return service unavailable when blocking admission is full");
     }
     assert!(state.store().lock().ledger_by_path(
         root.join("OldDir/test_movie1.mkv").to_str().unwrap()).unwrap().is_some(),

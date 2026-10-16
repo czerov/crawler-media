@@ -1,25 +1,38 @@
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
-use crate::http::library::poster_path;
 use crate::http::ok;
 use crate::management::ApiState;
 
-/// 一条续看计划：阶段一锁内收集，阶段二锁外查季详情，阶段三锁内组装。
+use std::sync::LazyLock;
+use parking_lot::Mutex;
+
+/// A local up-next plan, with a separate key for background name enrichment.
 #[derive(Clone)]
 struct UpNextPlan {
     media_id: domain::MediaId,
+    kind: domain::MediaKind,
     tmdb_id: Option<String>,
     season: u32,
     next_episode: i32,
-    /// 用户在本季看过（看完）至少一集 → 前端显示「看完上一集」。
     advanced: bool,
-    /// 该用户对此媒体最后一次播放活动的 unix 秒；0 = 从未播放。
     last_activity: i64,
 }
 
+type EpisodeTitleKey = (String, u32, i32);
+type SeasonFlightKey = (String, String, u32);
+static TITLE_FLIGHTS: LazyLock<Mutex<HashSet<SeasonFlightKey>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+struct SeasonFlightLease(SeasonFlightKey);
+
+impl Drop for SeasonFlightLease {
+    fn drop(&mut self) {
+        TITLE_FLIGHTS.lock().remove(&self.0);
+    }
+}
 /// GET /playback/up-next?limit= — next unwatched unit per in-progress TV / Movie
 /// subscription or watched local library items, with poster + resume position.
 ///
@@ -87,6 +100,7 @@ pub(crate) async fn up_next(
                         seen_media.insert(media.id);
                         plans.push(UpNextPlan {
                             media_id: media.id,
+                            kind: media.kind,
                             tmdb_id: media.tmdb_id.clone(),
                             season: 0,
                             next_episode: 0,
@@ -138,6 +152,7 @@ pub(crate) async fn up_next(
                         seen_media.insert(media.id);
                         plans.push(UpNextPlan {
                             media_id: media.id,
+                            kind: media.kind,
                             tmdb_id: media.tmdb_id.clone(),
                             season: target_s,
                             next_episode: target_e as i32,
@@ -212,6 +227,7 @@ pub(crate) async fn up_next(
             seen_media.insert(media.id);
             plans.push(UpNextPlan {
                 media_id: media.id,
+                kind: media.kind,
                 tmdb_id: media.tmdb_id.clone(),
                 season,
                 next_episode,
@@ -224,29 +240,29 @@ pub(crate) async fn up_next(
         }
     }
 
-    // 阶段二：锁外批量预取季详情（同步 ureq 挪到 spawn_blocking）。
-    let state_clone = state.clone();
-    let plans_clone = plans.clone();
-    let titles: std::collections::HashMap<(String, u32, i32), Option<String>> =
-        tokio::task::spawn_blocking(move || {
-            let catalog: &dyn crate::catalog::Catalog = state_clone.catalog.as_ref();
-            let mut out = std::collections::HashMap::new();
-            for plan in plans_clone {
-                if let Some(ref tmdb_id) = plan.tmdb_id {
-                    let title = catalog
-                        .season_details(tmdb_id, plan.season)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .find(|m| m.episode_number == plan.next_episode as u32)
-                        .and_then(|m| m.name);
-                    out.insert((tmdb_id.clone(), plan.season, plan.next_episode), title);
+    // A local cache hit may supply the episode name; misses are refreshed asynchronously.
+    let mut titles: HashMap<EpisodeTitleKey, Option<String>> = HashMap::new();
+    for plan in &plans {
+        if plan.kind != domain::MediaKind::Tv { continue; }
+        let Some(tmdb_id) = plan.tmdb_id.as_deref() else { continue; };
+        match state.catalog.cached_season_details(tmdb_id, plan.season) {
+            Ok(Some(details)) => {
+                let title = details.into_iter()
+                    .find(|episode| episode.episode_number == plan.next_episode as u32)
+                    .and_then(|episode| episode.name);
+                if title.is_none() {
+                    schedule_season_enrichment(&state, tmdb_id, plan.season);
                 }
+                titles.insert((tmdb_id.to_owned(), plan.season, plan.next_episode), title);
             }
-            out
-        })
-        .await
-        .unwrap_or_default();
-
+            Ok(None) => schedule_season_enrichment(&state, tmdb_id, plan.season),
+            Err(error) => {
+                tracing::warn!(kind = "tv", season = plan.season, error_type = error_type(&error),
+                    "up-next cached season lookup failed");
+                schedule_season_enrichment(&state, tmdb_id, plan.season);
+            }
+        }
+    }
     // 阶段三：锁内物化行与状态（纯 DB 读，无 IO）。
     struct UpNextCandidate {
         media: domain::Media,
@@ -271,9 +287,7 @@ pub(crate) async fn up_next(
             let Some(media) = store.get_media(plan.media_id).ok().flatten() else {
                 continue;
             };
-            let episode_title = plan
-                .tmdb_id
-                .as_ref()
+            let episode_title = plan.tmdb_id.as_ref()
                 .and_then(|tmdb_id| titles.get(&(tmdb_id.clone(), plan.season, plan.next_episode)))
                 .cloned()
                 .flatten();
@@ -425,7 +439,10 @@ pub(crate) async fn up_next(
                     "episode_still_url": still,
                     "season_number": cand.plan_season,
                     "episode_number": cand.plan_next_episode,
-                    "episode_title": cand.episode_title,
+                    "episode_title": cand.next_row.as_ref()
+                        .and_then(|row| files.read_nfo(std::path::Path::new(&row.path)))
+                        .and_then(|nfo| nfo.title)
+                        .or(cand.episode_title),
                     "unwatched_ahead_count": 0,
                     "position_ms": cand.position,
                     "duration_ms": cand.duration,
@@ -468,3 +485,31 @@ pub(crate) async fn up_next(
 fn millis(unix_secs: i64) -> String {
     (unix_secs as i128 * 1000).to_string()
 }
+fn schedule_season_enrichment(state: &ApiState, tmdb_id: &str, season: u32) {
+    let key = ("tv".to_owned(), tmdb_id.to_owned(), season);
+    {
+        let mut flights = TITLE_FLIGHTS.lock();
+        if !flights.insert(key.clone()) { return; }
+    }
+    let catalog = state.catalog.clone();
+    let search_work = state.search_work.clone();
+    tokio::spawn(async move {
+        let worker_key = key.clone();
+        let lease = SeasonFlightLease(key);
+        let result = search_work.run_to_completion(move || {
+            let _lease = lease;
+            let result = catalog.season_details(&worker_key.1, worker_key.2);
+            if let Err(error) = &result {
+                tracing::warn!(kind = "tv", tmdb_id = %worker_key.1, season = worker_key.2,
+                    error_type = error_type(error), "up-next cached season lookup failed");
+            }
+            result
+        }).await;
+        if result.is_err() {
+            tracing::debug!(kind = "tv", season, error_type = "worker",
+                "up-next enrichment worker unavailable");
+        }
+    });
+}
+
+fn error_type(_error: &str) -> &'static str { "catalog" }

@@ -331,6 +331,16 @@ impl Catalog for FanoutCatalog {
         }
         Ok(Vec::new())
     }
+    fn cached_season_details(
+        &self,
+        tmdb_id: &str,
+        season: u32,
+    ) -> Result<Option<Vec<media::EpisodeMeta>>, String> {
+        if let Some(tmdb) = self.source("tmdb") {
+            return tmdb.cached_season_details(tmdb_id, season);
+        }
+        Ok(None)
+    }
     fn season_details_lang(
         &self,
         tmdb_id: &str,

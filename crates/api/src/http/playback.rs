@@ -185,9 +185,15 @@ pub(crate) async fn item(
         .await
     {
         Ok(url) => url,
-        Err(error) => {
-            tracing::error!(%error, media_id = %media.id, "读取播放条目海报失败");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "playback.timeout", "加载条目超时");
+        Err(crate::blocking_budget::BlockingError::Busy) => {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "runtime.busy", "服务繁忙，请重试");
+        }
+        Err(crate::blocking_budget::BlockingError::Timeout) => {
+            return err(StatusCode::GATEWAY_TIMEOUT, "playback.timeout", "加载条目超时");
+        }
+        Err(crate::blocking_budget::BlockingError::Worker(message)) => {
+            tracing::error!(%message, media_id = %media.id, "读取播放条目海报失败");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "runtime.worker", "加载条目失败");
         }
     };
     ok(json!({
@@ -339,8 +345,17 @@ pub(crate) async fn episodes(
         .await;
 
     let rows = match rows_res {
-        Ok(r) => r,
-        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "playback.timeout", "加载集列表超时"),
+        Ok(rows) => rows,
+        Err(crate::blocking_budget::BlockingError::Busy) => {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "runtime.busy", "服务繁忙，请重试");
+        }
+        Err(crate::blocking_budget::BlockingError::Timeout) => {
+            return err(StatusCode::GATEWAY_TIMEOUT, "playback.timeout", "加载集列表超时");
+        }
+        Err(crate::blocking_budget::BlockingError::Worker(message)) => {
+            tracing::error!(%message, media_id = %media.id, "读取播放集列表 blocking worker 失败");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "runtime.worker", "加载集列表失败");
+        }
     };
     ok(json!({ "season_number": season_number, "episodes": rows })).into_response()
 }

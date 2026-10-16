@@ -33,23 +33,31 @@ fn unrelated_catalog_search_does_not_rebuild_other_library() {
     let deps = Arc::new(Mutex::new(ProjectionDependencies::new()));
     let consumer = ChangeConsumer::new(deps.clone());
 
-    // Setup library 1
-    let lib1_id = "lib-1";
-    let media1_id = MediaId::new();
-    let lid1 = LedgerId::new();
-    deps.lock().record_library(
-        lib1_id,
-        [media1_id],
-        [lid1],
-        ["/movies/M1/m1.mkv".to_string()],
-        ["tmdb:movie:100".to_string()],
-    );
-
-    // Initial dirty token for lib-1
-    store
-        .apply_browse_changes(BrowseChangeSource::App, 0, &[lib1_id.to_string()])
+    let root = _tmp.path().join("movies");
+    std::fs::create_dir_all(&root).unwrap();
+    let library = store
+        .create_library(
+            MediaKind::Movie,
+            "Movies",
+            &[root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        )
         .unwrap();
-    let initial_head = store.browse_projection_head(lib1_id).unwrap().unwrap();
+    let library_id = library.id;
+
+    let _ = consumer.poll_source(
+        &store,
+        &store.library_ownership().unwrap(),
+        BrowseChangeSource::App,
+    );
+    let _ = consumer.poll_source(
+        &store,
+        &store.library_ownership().unwrap(),
+        BrowseChangeSource::Library,
+    );
+    let initial_head = store.browse_projection_head(&library_id).unwrap().unwrap();
 
     // Insert unrelated catalog search
     store
@@ -62,9 +70,9 @@ fn unrelated_catalog_search_does_not_rebuild_other_library() {
         .unwrap();
     assert!(complete);
 
-    // lib-1 dirty_token should remain unchanged!
-    let unchanged_head = store.browse_projection_head(lib1_id).unwrap().unwrap();
+    let unchanged_head = store.browse_projection_head(&library_id).unwrap().unwrap();
     assert_eq!(unchanged_head.dirty_token, initial_head.dirty_token);
+    assert_eq!(unchanged_head.generation, initial_head.generation);
 }
 
 #[test]
@@ -83,6 +91,8 @@ fn catalog_detail_change_invalidates_unhydrated_library_coverage() {
     let after = store.browse_projection_head(&library_id).unwrap().unwrap();
     assert!(after.dirty_token > 0);
 }
+
+#[test]
 fn moving_ledger_dirties_old_and_new_owner() {
     let (tmp, store) = create_store();
     let deps = Arc::new(Mutex::new(ProjectionDependencies::new()));
@@ -116,7 +126,7 @@ fn moving_ledger_dirties_old_and_new_owner() {
         )
         .unwrap();
 
-    // Initialize heads
+    // Model both libraries as having published projections before the ledger change.
     store
         .apply_browse_changes(
             BrowseChangeSource::Library,
@@ -124,9 +134,13 @@ fn moving_ledger_dirties_old_and_new_owner() {
             &[lib_a.id.clone(), lib_b.id.clone()],
         )
         .unwrap();
-    let initial_old = store.browse_projection_head(&lib_a.id).unwrap().unwrap();
-    let initial_new = store.browse_projection_head(&lib_b.id).unwrap().unwrap();
 
+    // Initialize heads and drain fixture setup journal before capturing baselines.
+    let _ = consumer.poll_source(
+        &store,
+        &store.library_ownership().unwrap(),
+        BrowseChangeSource::Library,
+    );
     let old_path = root_a.join("movie.mkv").display().to_string();
     let new_path = root_b.join("movie.mkv").display().to_string();
 
@@ -134,17 +148,15 @@ fn moving_ledger_dirties_old_and_new_owner() {
     let mid = MediaId::new();
     let row = sample_ledger_row(lid, mid, &old_path);
     store.insert_ledger(&row).unwrap();
-
-    // Record lib-a dependency on old_path
     deps.lock().record_library(&lib_a.id, [mid], [lid], [old_path.clone()], []);
-
-    // Clear cursor for clean move test
     let _ = consumer.poll_source(
         &store,
         &store.library_ownership().unwrap(),
         BrowseChangeSource::Library,
     );
-
+    let initial_old = store.browse_projection_head(&lib_a.id).unwrap().unwrap();
+    let initial_new = store.browse_projection_head(&lib_b.id).unwrap().unwrap();
+    // Baselines follow setup journal drain; the move must advance both owner tokens.
     // Move row from A to B: delete old ledger path and insert new ledger row at new path with same media id
     store.delete_ledger_path(&old_path).unwrap();
     let new_lid = LedgerId::new();
@@ -164,6 +176,8 @@ fn moving_ledger_dirties_old_and_new_owner() {
     assert!(old_owner_head.dirty_token > initial_old.dirty_token);
     assert!(new_owner_head.dirty_token > initial_new.dirty_token);
 }
+
+
 
 #[test]
 fn new_dirty_during_build_is_not_swallowed() {

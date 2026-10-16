@@ -163,12 +163,28 @@ impl ChangeConsumer {
                     "library_root" => {
                         affected.insert(c.entity_key.clone());
                         for root in c.old_path.iter().chain(c.new_path.iter()) {
+                            let root_kind = all_libs
+                                .iter()
+                                .find(|library| library.id == c.entity_key)
+                                .map(|library| library.kind);
                             for (lib_id, paths) in &deps.paths_by_library {
-                                if paths.iter().any(|path| {
+                                for path in paths.iter().filter(|path| {
                                     Path::new(path).starts_with(root)
                                         || Path::new(root).starts_with(path)
                                 }) {
                                     affected.insert(lib_id.clone());
+                                    if let Some(kind) = root_kind {
+                                        if let Some(owner) = ownership.owner(Path::new(path), kind) {
+                                            affected.insert(owner.id.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(kind) = root_kind {
+                                if let Some(owner) = ownership.owner(Path::new(root), kind) {
+                                    affected.insert(owner.id.clone());
+                                } else if let Some(default) = ownership.default_for(kind) {
+                                    affected.insert(default.id.clone());
                                 }
                             }
                         }
@@ -214,17 +230,24 @@ impl ChangeConsumer {
                             }
                         }
                         if let Some(new_p) = &c.new_path {
-                            if let Some(owner) = all_libs
-                                .iter()
-                                .filter_map(|lib| ownership.owner(Path::new(new_p), lib.kind))
-                                .find(|owner| {
-                                    ownership.owner(Path::new(new_p), owner.kind)
-                                        .is_some_and(|matched| matched.id == owner.id)
-                                        && owner.root_paths.iter().any(|root| Path::new(new_p).starts_with(root))
-                                })
-                            {
-                                affected.insert(owner.id.clone());
-                                resolved_any = true;
+                            let actual_kind = store
+                                .ledger_by_path(new_p)
+                                .ok()
+                                .flatten()
+                                .and_then(|row| store.get_media(row.media_id).ok().flatten())
+                                .map(|media| media.kind);
+                            if let Some(kind) = actual_kind {
+                                if let Some(owner) = ownership.owner(Path::new(new_p), kind) {
+                                    affected.insert(owner.id.clone());
+                                    resolved_any = true;
+                                }
+                            } else {
+                                for kind in [domain::MediaKind::Movie, domain::MediaKind::Tv] {
+                                    if let Some(owner) = ownership.owner(Path::new(new_p), kind) {
+                                        affected.insert(owner.id.clone());
+                                        resolved_any = true;
+                                    }
+                                }
                             }
                         }
                         if !resolved_any {

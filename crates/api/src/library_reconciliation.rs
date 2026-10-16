@@ -39,8 +39,12 @@ pub fn index_basenames(
     let mut visited_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for root in roots {
-        if !root.is_dir() {
-            continue;
+        match std::fs::metadata(root) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) | Err(_) => {
+                index.incomplete = true;
+                continue;
+            }
         }
 
         let canonical_root = match std::fs::canonicalize(root) {

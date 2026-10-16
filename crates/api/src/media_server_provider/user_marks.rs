@@ -7,25 +7,24 @@ pub(super) fn unit_played(
     season: i32,
     episode: i32,
 ) -> bool {
-    let mut units = vec![(season, episode)];
-    if season >= 0 && episode >= 0 {
-        units.push((season, crate::store::UNIT_WHOLE));
-    }
-    if season >= 0 || episode >= 0 {
-        units.push((crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE));
-    }
-    for (unit_season, unit_episode) in units {
+    let units = if season >= 0 && episode >= 0 {
+        [(season, episode), (season, crate::store::UNIT_WHOLE), (crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)]
+    } else if season >= 0 || episode >= 0 {
+        [(season, episode), (crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE), (crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)]
+    } else {
+        [(season, episode), (season, episode), (season, episode)]
+    };
+    let count = if season >= 0 && episode >= 0 { 3 } else if season >= 0 || episode >= 0 { 2 } else { 1 };
+    let mut latest: Option<store::UnitState> = None;
+    for (unit_season, unit_episode) in units.into_iter().take(count) {
         match store.unit_state(user_id, media_id, unit_season, unit_episode) {
-            Ok(Some(state)) => return state.played,
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(%error, %user_id, %media_id, season = unit_season, episode = unit_episode, "failed to read Jellyfin played mark")
-            }
+            Ok(Some(state)) if latest.as_ref().is_none_or(|current| state.updated_at >= current.updated_at) => latest = Some(state),
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => tracing::warn!(%error, %user_id, %media_id, season = unit_season, episode = unit_episode, "failed to read Jellyfin played mark"),
         }
     }
-    false
+    latest.is_some_and(|state| state.played)
 }
-
 pub(super) fn item_is_played(
     store: &crate::Store,
     user_id: UserId,

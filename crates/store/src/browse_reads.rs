@@ -285,6 +285,32 @@ impl Store {
         Ok((collected, vm_steps))
     }
 
+
+    /// Restrict a Jellyfin parent request to ownership candidates before loading
+    /// media and playback facts.
+    pub fn jellyfin_ledger_candidates(
+        &self,
+        ownership: &LibraryOwnership,
+        parent_id: Option<&str>,
+    ) -> Result<Vec<LedgerRow>, StoreError> {
+        match parent_id {
+            Some(id) if ownership.library(id).is_some() => self.ledger_candidates_for_library(ownership, id),
+            Some(id) => match id.parse::<MediaId>() {
+                Ok(media_id) => self.ledger_for_media(media_id),
+                Err(_) => Ok(Vec::new()),
+            },
+            None => self.list_ledger(),
+        }
+    }
+
+    pub fn jellyfin_ledger_candidates_with_vm_steps(
+        &self,
+        ownership: &LibraryOwnership,
+        parent_id: &str,
+    ) -> Result<(Vec<LedgerRow>, i64), StoreError> {
+        self.ledger_candidates_with_vm_steps(ownership, parent_id)
+    }
+
     /// Missing-file markers for the given ledger paths only, chunked under the
     /// SQLite variable limit. Unrelated missing rows are not read, so a growing
     /// instance ledger does not grow this read.

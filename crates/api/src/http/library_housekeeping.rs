@@ -24,8 +24,19 @@ struct Reconciliation {
     source: Option<(domain::LedgerRow, Option<domain::MediaKind>)>,
 }
 
-fn reconciliation_error() -> Response {
-    err(StatusCode::REQUEST_TIMEOUT, "reconciliation.timeout", "目录索引超时")
+fn reconciliation_error(error: crate::blocking_budget::BlockingError) -> Response {
+    match error {
+        crate::blocking_budget::BlockingError::Busy => {
+            err(StatusCode::SERVICE_UNAVAILABLE, "runtime.busy", "服务繁忙，请重试")
+        }
+        crate::blocking_budget::BlockingError::Timeout => {
+            err(StatusCode::GATEWAY_TIMEOUT, "reconciliation.timeout", "目录索引超时")
+        }
+        crate::blocking_budget::BlockingError::Worker(message) => {
+            tracing::error!(%message, "Reconciliation observation worker failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "runtime.worker", "目录核对失败")
+        }
+    }
 }
 
 /// POST /libraries/{id}/path-reconciliation-preview — 台账失联行 + 库内新候选。
@@ -82,7 +93,16 @@ pub(crate) async fn path_reconciliation_preview(
     let (missing, examined, incomplete) = match preview_res {
         Ok(Ok(data)) => data,
         Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, "reconciliation.index_failed", &e),
-        Err(_) => return err(StatusCode::REQUEST_TIMEOUT, "reconciliation.timeout", "目录索引超时"),
+        Err(crate::blocking_budget::BlockingError::Busy) => {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "runtime.busy", "服务繁忙，请重试");
+        }
+        Err(crate::blocking_budget::BlockingError::Timeout) => {
+            return err(StatusCode::GATEWAY_TIMEOUT, "reconciliation.timeout", "目录索引超时");
+        }
+        Err(crate::blocking_budget::BlockingError::Worker(message)) => {
+            tracing::error!(%message, "目录索引 blocking worker 失败");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "runtime.worker", "目录索引失败");
+        }
     };
 
     ok(json!({
@@ -122,7 +142,7 @@ pub(crate) async fn path_reconciliations(
         Ok(observed) => observed,
         Err(error) => {
             tracing::warn!(%error, "Reconciliation observation failed");
-            return reconciliation_error();
+            return reconciliation_error(error);
         }
     };
     let mut reconciled = 0usize;
@@ -285,7 +305,7 @@ pub(crate) async fn root_consolidation_preview(
         Ok(duplicates) => ok(json!({ "duplicates": duplicates })).into_response(),
         Err(error) => {
             tracing::warn!(%error, "Root consolidation observation failed");
-            reconciliation_error()
+            reconciliation_error(error)
         }
     }
 }

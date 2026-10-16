@@ -185,6 +185,7 @@ pub(super) const LIBRARY_TABLES: &str = r#"
             completed INTEGER NOT NULL DEFAULT 0,
             succeeded INTEGER NOT NULL DEFAULT 0,
             failed INTEGER NOT NULL DEFAULT 0,
+            partial INTEGER NOT NULL DEFAULT 0,
             error TEXT,
             created_at_ms INTEGER NOT NULL,
             started_at_ms INTEGER,

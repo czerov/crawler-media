@@ -13,6 +13,16 @@ use crate::subtitle_delivery::SubtitleServiceError;
 use library::DeliveryError;
 
 use crate::management::ApiState;
+mod read_snapshot;
+use store::PlaybackUnitSnapshot;
+
+struct ServerReadSnapshot {
+    ownership: store::LibraryOwnership,
+    is_admin: bool,
+    media: HashMap<domain::MediaId, domain::Media>,
+    rows: Vec<domain::LedgerRow>,
+    units: Vec<PlaybackUnitSnapshot>,
+}
 mod item_metadata;
 mod person_images;
 mod playback;
@@ -42,12 +52,7 @@ pub(crate) fn default_library_cover(kind: MediaKind) -> Result<Vec<u8>, String> 
 fn library_cover_tag(cover_path: Option<&std::path::Path>, kind: MediaKind) -> String {
     if let Some(path) = cover_path {
         if let Ok(meta) = std::fs::metadata(path) {
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let mtime = meta.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map(|duration| duration.as_secs()).unwrap_or(0);
             return format!("cover-{:x}-{:x}", meta.len(), mtime);
         }
     }
@@ -221,26 +226,24 @@ impl MediaServerProvider for ApiServerProvider {
     }
 
     async fn list_visible_libraries(&self, user_id: UserId) -> Result<Vec<ServerLibrary>, String> {
-        let store = self.state.store.lock();
-        let libraries = store.list_libraries().map_err(|e| e.to_string())?;
-        let mut list = Vec::new();
-        for lib in libraries {
-            if !crate::http::library::library_visible(&store, &lib, Some(user_id)) {
-                continue;
+        let state = self.state.clone();
+        let budget = state.http_work.clone();
+        budget.run(std::time::Duration::from_secs(30), move || {
+            let store = state.store.lock();
+            let ownership = store.library_ownership().map_err(|error| error.to_string())?;
+            let role = store.user_role(user_id).map_err(|error| error.to_string())?;
+            let libraries = store.list_libraries().map_err(|error| error.to_string())?;
+            let mut list = Vec::new();
+            for lib in libraries {
+                let visible = ownership.accepts_work(&lib.id) && if role == "admin" { lib.admin_visible } else { lib.access_mode == "everyone" || lib.member_ids.contains(&user_id) };
+                if !visible { continue; }
+                let cover_path = crate::http::library::library_cover_path(&store, &lib);
+                let cover_tag = library_cover_tag(cover_path.as_deref(), lib.kind);
+                list.push(ServerLibrary { id: lib.id, name: lib.name, kind: lib.kind, exclude_from_home: lib.exclude_from_home,
+                    root_paths: lib.root_paths, cover_path: cover_path.map(|path| path.display().to_string()), cover_tag });
             }
-            let cover_path = crate::http::library::library_cover_path(&store, &lib);
-            let cover_tag = library_cover_tag(cover_path.as_deref(), lib.kind);
-            list.push(ServerLibrary {
-                id: lib.id,
-                name: lib.name,
-                kind: lib.kind,
-                exclude_from_home: lib.exclude_from_home,
-                root_paths: lib.root_paths,
-                cover_path: cover_path.map(|path| path.display().to_string()),
-                cover_tag,
-            });
-        }
-        Ok(list)
+            Ok::<_, String>(list)
+        }).await.map_err(|error| error.to_string())?
     }
 
     async fn list_visible_items(
@@ -248,7 +251,7 @@ impl MediaServerProvider for ApiServerProvider {
         user_id: UserId,
         parent_id: Option<&str>,
     ) -> Result<Vec<MediaItemSnapshot>, String> {
-        items::list_visible_items(self, user_id, parent_id)
+        items::list_visible_items(self, user_id, parent_id).await
     }
 
     async fn list_resumable_items(

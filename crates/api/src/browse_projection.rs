@@ -209,7 +209,7 @@ impl Drop for InflightFinish {
 pub struct ProjectionService {
     dirty_libraries: Arc<Mutex<HashMap<String, u64>>>,
     /// Per-source completeness from the most recent poll.
-    sources_complete: Mutex<bool>,
+    sources_complete: std::sync::Arc<Mutex<bool>>,
     /// 至少被浏览过一次的 Library；周期刷新只覆盖这些库。
     visited: Mutex<HashSet<String>>,
     inflight: Arc<Mutex<InflightMap>>,
@@ -238,7 +238,7 @@ impl ProjectionService {
         let consumer = Arc::new(ChangeConsumer::new(deps.clone()));
         Self {
             dirty_libraries: Arc::new(Mutex::new(HashMap::new())),
-            sources_complete: Mutex::new(true),
+            sources_complete: std::sync::Arc::new(Mutex::new(true)),
             visited: Mutex::new(HashSet::new()),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             build_budget: Arc::new(BlockingBudget::new(PROJECTION_BUILD_CAPACITY)),
@@ -545,31 +545,7 @@ impl ProjectionService {
 
     /// Poll all three sources for changes sharing ONE per-round event budget (D3-03).
     pub fn poll_changes(&self, state: &ApiState) -> Result<bool, ProjectionError> {
-        let store = state.store.lock();
-        self.consumer
-            .hydrate_ready_dependencies(&store)
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
-        let ownership = store
-            .library_ownership()
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
-        let sources = [
-            store::BrowseChangeSource::App,
-            store::BrowseChangeSource::Library,
-            store::BrowseChangeSource::Catalog,
-        ];
-        let mut all_complete = true;
-        let mut shared_budget = changes::MAX_EVENTS_PER_ROUND;
-        for source in sources {
-            let (_count, complete) = self
-                .consumer
-                .poll_source_budgeted(&store, &ownership, source, &mut shared_budget)
-                .map_err(|e| ProjectionError::Failed(e.to_string()))?;
-            if !complete {
-                all_complete = false;
-            }
-        }
-        *self.sources_complete.lock() = all_complete;
-        Ok(all_complete)
+        poll_changes_inner(&self.consumer, state, &self.sources_complete)
     }
 
     /// 新鲜度检查的 DB 读也在 blocking 预算里执行，不在 async worker 上持 Store 锁。
@@ -580,13 +556,32 @@ impl ProjectionService {
     ) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
         // A ready projection is usable only after this request has consumed a bounded
         // amount of pending journal work. Incomplete sources force the build path.
-        let mut sources_complete = false;
-        for _ in 0..FRESHNESS_JOURNAL_ROUNDS {
-            sources_complete = self.poll_changes(state)?;
-            if sources_complete {
-                break;
-            }
-        }
+        let budget = state.http_work.clone();
+        let consumer = self.consumer.clone();
+        let state_for_poll = state.clone();
+        let sources_complete_for_poll = self.sources_complete.clone();
+        let sources_complete = budget
+            .run(
+                crate::http::library::selection::BROWSE_DEADLINE,
+                move || {
+                    for _ in 0..FRESHNESS_JOURNAL_ROUNDS {
+                        if poll_changes_inner(
+                            &consumer,
+                            &state_for_poll,
+                            &sources_complete_for_poll,
+                        )? {
+                            return Ok::<bool, ProjectionError>(true);
+                        }
+                    }
+                    Ok(false)
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                BlockingError::Busy => ProjectionError::Busy,
+                BlockingError::Timeout => ProjectionError::Timeout,
+                BlockingError::Worker(message) => ProjectionError::Failed(message),
+            })??;
         if !sources_complete {
             tracing::debug!(library_id = %library_id, "浏览投影等待 journal 完整消费");
             return Err(ProjectionError::Busy);
@@ -638,6 +633,34 @@ fn fresh_snapshot_inner(
         snapshot
     };
     Ok(current)
+}
+
+fn poll_changes_inner(
+    consumer: &ChangeConsumer,
+    state: &ApiState,
+    sources_complete: &Mutex<bool>,
+) -> Result<bool, ProjectionError> {
+    let store = state.store.lock();
+    consumer
+        .hydrate_ready_dependencies(&store)
+        .map_err(|error| ProjectionError::Failed(error.to_string()))?;
+    let ownership = store
+        .library_ownership()
+        .map_err(|error| ProjectionError::Failed(error.to_string()))?;
+    let mut all_complete = true;
+    let mut shared_budget = changes::MAX_EVENTS_PER_ROUND;
+    for source in [
+        store::BrowseChangeSource::App,
+        store::BrowseChangeSource::Library,
+        store::BrowseChangeSource::Catalog,
+    ] {
+        let (_, complete) = consumer
+            .poll_source_budgeted(&store, &ownership, source, &mut shared_budget)
+            .map_err(|error| ProjectionError::Failed(error.to_string()))?;
+        all_complete &= complete;
+    }
+    *sources_complete.lock() = all_complete;
+    Ok(all_complete)
 }
 
 /// blocking 线程上的构建 → 发布 → 回读；Store 锁只包住短 DB 读写。
