@@ -33,7 +33,10 @@ impl indexer::Fetcher for SearchFixture {
         if request.key.starts_with("search:") {
             Ok(self.html.lock().clone())
         } else {
-            Err(indexer::IndexerError::Fetch(format!("no fixture for {}", request.key)))
+            Err(indexer::IndexerError::Fetch(format!(
+                "no fixture for {}",
+                request.key
+            )))
         }
     }
 }
@@ -69,6 +72,15 @@ impl Harness {
     }
 
     pub fn with_search_html(html: &'static str) -> Self {
+        Self::build(html, None)
+    }
+
+    /// Harness whose Catalog (TMDB stand-in) is `catalog`.
+    pub fn with_catalog(catalog: Arc<dyn api::catalog::Catalog>) -> Self {
+        Self::build(nexusphp(), Some(catalog))
+    }
+
+    fn build(html: &str, catalog: Option<Arc<dyn api::catalog::Catalog>>) -> Self {
         install_fake_ffprobe();
         let tmp = tempfile::tempdir().unwrap();
         let qb = MockQbit::start(&tmp.path().join("downloads"));
@@ -86,8 +98,28 @@ impl Harness {
             tmp.path().join("library"),
         )
         .unwrap();
+        let state = match catalog {
+            Some(catalog) => state.with_catalog(catalog),
+            None => state,
+        };
         let app = router(state.clone());
-        Self { search, tmp, state, app, qb }
+        Self {
+            search,
+            tmp,
+            state,
+            app,
+            qb,
+        }
+    }
+
+    /// Number of keyword searches the indexer fixture has served.
+    pub fn search_requests(&self) -> usize {
+        self.search
+            .requests
+            .lock()
+            .iter()
+            .filter(|k| k.starts_with("search:"))
+            .count()
     }
 
     pub fn set_search_rows(&self, rows: &[(&str, u32)]) {
@@ -95,8 +127,21 @@ impl Harness {
     }
 
     /// Seed an owned movie file (library + ledger + facts) of the given quality.
-    pub fn seed_owned_movie(&self, id: SubscribeId, height: u32, codec: &str, score: i32) -> PathBuf {
-        let media_id = self.state.store().lock().get_subscribe(id).unwrap().unwrap().media_id;
+    pub fn seed_owned_movie(
+        &self,
+        id: SubscribeId,
+        height: u32,
+        codec: &str,
+        score: i32,
+    ) -> PathBuf {
+        let media_id = self
+            .state
+            .store()
+            .lock()
+            .get_subscribe(id)
+            .unwrap()
+            .unwrap()
+            .media_id;
         let owned = self
             .movie_library_root()
             .join("The Matrix (1999)")
@@ -117,9 +162,19 @@ impl Harness {
             filter_score: Some(score),
         };
         let mut facts = subscribe::SubscribeFacts::default();
-        facts.replace(None, None, subscribe::QualityFact { score, path: Some(row.path.clone()) });
+        facts.replace(
+            None,
+            None,
+            subscribe::QualityFact {
+                score,
+                path: Some(row.path.clone()),
+            },
+        );
         let codec_tag = if codec == "hevc" { "x265" } else { "x264" };
-        facts.set_quality(row.path.clone(), release::parse(&format!("The.Matrix.1999.{height}p.WEB-DL.{codec_tag}")));
+        facts.set_quality(
+            row.path.clone(),
+            release::parse(&format!("The.Matrix.1999.{height}p.WEB-DL.{codec_tag}")),
+        );
         let store = self.state.store();
         let store = store.lock();
         store.insert_ledger(&row).unwrap();
@@ -128,7 +183,13 @@ impl Harness {
     }
 
     pub fn owned_movie_path(&self, id: SubscribeId) -> Option<String> {
-        self.state.store().lock().load_subscribe_facts(id).unwrap().movie().and_then(|f| f.path.clone())
+        self.state
+            .store()
+            .lock()
+            .load_subscribe_facts(id)
+            .unwrap()
+            .movie()
+            .and_then(|f| f.path.clone())
     }
 
     /// Site whose download links point at the mock (serves `torrent_file`).
@@ -199,7 +260,12 @@ impl Harness {
         let response = self
             .app
             .clone()
-            .oneshot(request("POST", &format!("/api/v1/subscriptions/{id}/run"), Some(TOKEN), Value::Null))
+            .oneshot(request(
+                "POST",
+                &format!("/api/v1/subscriptions/{id}/run"),
+                Some(TOKEN),
+                Value::Null,
+            ))
             .await
             .unwrap();
         let status = response.status();
@@ -212,8 +278,15 @@ impl Harness {
         tokio::task::spawn_blocking(move || {
             use jobs::Runner;
             let payload = json!({ "subscribe_id": id.to_string() }).to_string();
-            let job = state.jobs().lock().enqueue(jobs::JobKind::SubscribeSearch, &payload, 0).unwrap();
-            api::worker::StateRunner { state: state.clone() }.run(&job)
+            let job = state
+                .jobs()
+                .lock()
+                .enqueue(jobs::JobKind::SubscribeSearch, &payload, 0)
+                .unwrap();
+            api::worker::StateRunner {
+                state: state.clone(),
+            }
+            .run(&job)
         })
         .await
         .unwrap()
@@ -315,4 +388,3 @@ impl Harness {
 pub fn wash_payload() -> Value {
     json!({ "wash_cut": true })
 }
-

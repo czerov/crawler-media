@@ -107,6 +107,12 @@ fn search(state: &ApiState, job: &Job, rss_batch: Option<&RssBatch>) -> Result<(
     if subscribe.tracking_state == "paused" {
         return Ok(());
     }
+    if job.kind == JobKind::SubscribeSearch
+        && subscribe.fetch_mode != FetchMode::Rss
+        && crate::air_gate::all_wanted_unaired(state, &subscribe, &media)
+    {
+        return Ok(());
+    }
     let (mut torrents, search_keywords, succeeded, failures) =
         match (job.kind, subscribe.fetch_mode) {
             (JobKind::SubscribeRss, _) | (_, FetchMode::Rss) => {

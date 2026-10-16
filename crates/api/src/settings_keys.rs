@@ -40,3 +40,5 @@ pub const OBSCURA_URL: &str = "obscura.url";
 pub const PROBE_CONCURRENCY: &str = "probe.concurrency";
 /// 系统全局统一 User-Agent（默认 crawler-media/0.1.0）。
 pub const GLOBAL_USER_AGENT: &str = "network.user_agent";
+/// G-H1 air-date gate for scheduled TV searches ("0"/"false" disables; default on).
+pub const SUBSCRIBE_AIR_DATE_GATE: &str = "subscribe.air_date_gate";

@@ -9,14 +9,21 @@ mod harness;
 #[path = "subscription_e2e/mock_qbit.rs"]
 mod mock_qbit;
 
-#[path = "subscription_e2e/golden_path.rs"]
-mod golden_path;
-#[path = "subscription_e2e/d_s1_pending_cleanup.rs"]
-mod d_s1_pending_cleanup;
-#[path = "subscription_e2e/s1_wash_probe_fail.rs"]
-mod s1_wash_probe_fail;
+#[path = "subscription_e2e/fake_catalog.rs"]
+mod fake_catalog;
+
+#[path = "subscription_e2e/d_h1_qbit_relogin.rs"]
+mod d_h1_qbit_relogin;
+#[path = "subscription_e2e/d_h2_existing_infohash.rs"]
+mod d_h2_existing_infohash;
 #[path = "subscription_e2e/d_h3_m8_no_overwrite.rs"]
 mod d_h3_m8_no_overwrite;
+#[path = "subscription_e2e/d_s1_pending_cleanup.rs"]
+mod d_s1_pending_cleanup;
+#[path = "subscription_e2e/g_h1_air_date_gate.rs"]
+mod g_h1_air_date_gate;
+#[path = "subscription_e2e/golden_path.rs"]
+mod golden_path;
 #[path = "subscription_e2e/h1_wash_in_flight.rs"]
 mod h1_wash_in_flight;
 #[path = "subscription_e2e/h2_probe_rejected.rs"]
@@ -25,10 +32,8 @@ mod h2_probe_rejected;
 mod h3_background_reconcile;
 #[path = "subscription_e2e/h4_season_pack_pending.rs"]
 mod h4_season_pack_pending;
-#[path = "subscription_e2e/d_h1_qbit_relogin.rs"]
-mod d_h1_qbit_relogin;
-#[path = "subscription_e2e/d_h2_existing_infohash.rs"]
-mod d_h2_existing_infohash;
+#[path = "subscription_e2e/s1_wash_probe_fail.rs"]
+mod s1_wash_probe_fail;
 
 pub(crate) fn is_video(path: &std::path::Path) -> bool {
     matches!(
