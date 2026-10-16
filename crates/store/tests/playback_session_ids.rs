@@ -193,7 +193,7 @@ fn old_schema_migrates_without_resetting_user_facts() {
     let version: i64 = sub_conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6, "subscribe.db schema version must be 6");
+    assert_eq!(version, 7, "subscribe.db schema version must be 7");
 
     // Check session backfilled last_report_at_ms = 1234 * 1000
     let (last_report_at_ms, play_session_id): (i64, Option<String>) = sub_conn
@@ -213,6 +213,28 @@ fn old_schema_migrates_without_resetting_user_facts() {
         )
         .unwrap();
     assert_eq!(favorite_at, 42, "an old favourite keeps its activity as favorite_at");
+    // A later playback must not be captured as the historical favourite time.
+    sub_conn
+        .execute(
+            "UPDATE playback_units SET updated_at = 900 WHERE user_id = 'u1'",
+            [],
+        )
+        .unwrap();
+    drop(sub_conn);
+    let _ = Store::open(&data_dir).unwrap();
+    let sub_conn = rusqlite::Connection::open(&sub_path).unwrap();
+    let favorite_at_after_playback: i64 = sub_conn
+        .query_row(
+            "SELECT favorite_at FROM playback_units WHERE user_id = 'u1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        favorite_at_after_playback,
+        42,
+        "reopening must not replace a backfilled favourite time with a later playback timestamp"
+    );
 }
 
 #[test]

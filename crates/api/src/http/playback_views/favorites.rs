@@ -186,7 +186,7 @@ fn favorite_entries(
             if !row.favorite {
                 continue;
             }
-            let favorited_at = if row.favorite_at != 0 { row.favorite_at } else { row.updated_at };
+            let favorited_at = row.favorite_at;
             let entry = by_media
                 .entry(media_id)
                 .or_insert((0, row.season, row.episode));

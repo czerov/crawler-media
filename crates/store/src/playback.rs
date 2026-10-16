@@ -22,8 +22,9 @@ pub struct UnitState {
     pub subtitle_track: Option<String>,
     pub play_count: i64,
     pub updated_at: i64,
-    /// When this unit was last favourited. Zero means never favourited, or
-    /// favourited before this clock existed (those rows keep `updated_at`).
+    /// When this unit was last favourited. Zero means never favourited, or a
+    /// historical favourite whose time is unknown. Callers must not substitute
+    /// `updated_at`: that clock still moves on playback.
     pub favorite_at: i64,
 }
 

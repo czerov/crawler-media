@@ -237,6 +237,82 @@ fn favorite_only_insert_does_not_materialize_inherited_played() {
 }
 
 #[test]
+fn jellyfin_first_favorite_keeps_legacy_resume_played_and_play_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let user = UserId::new();
+    let movie = media(MediaKind::Movie, "Jellyfin legacy favorite", None);
+    store.insert_media(&movie).unwrap();
+    store
+        .upsert_unit(
+            user,
+            movie.id,
+            0,
+            0,
+            600_000,
+            Some(true),
+            Some(false),
+            Some(7_200_000),
+            Some("audio-old"),
+            Some("subtitle-old"),
+            true,
+            42,
+        )
+        .unwrap();
+
+    store
+        .set_unit_favorite(user, movie.id, -1, -1, true, 99)
+        .unwrap();
+
+    let canonical = store.unit_state(user, movie.id, -1, -1).unwrap().unwrap();
+    assert!(canonical.favorite);
+    assert_eq!(canonical.position_ms, 600_000, "first favourite must keep the legacy resume");
+    assert!(canonical.played, "first favourite must keep the legacy played mark");
+    assert_eq!(canonical.play_count, 1, "first favourite must keep the legacy play count");
+    assert_eq!(canonical.duration_ms, Some(7_200_000));
+    assert_eq!(canonical.audio_track.as_deref(), Some("audio-old"));
+    assert_eq!(canonical.subtitle_track.as_deref(), Some("subtitle-old"));
+    assert_eq!(canonical.updated_at, 42);
+    assert_eq!(canonical.favorite_at, 99);
+}
+
+#[test]
+fn favoriting_legacy_movie_does_not_duplicate_resume_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let user = UserId::new();
+    let legacy = media(MediaKind::Movie, "Legacy resume", None);
+    let other = media(MediaKind::Movie, "Other resume", None);
+    let show = media(MediaKind::Tv, "Real episode zero", None);
+    store.insert_media(&legacy).unwrap();
+    store.insert_media(&other).unwrap();
+    store.insert_media(&show).unwrap();
+    store
+        .upsert_unit(user, legacy.id, 0, 0, 120_000, Some(false), Some(false), None, None, None, false, 10)
+        .unwrap();
+    store
+        .upsert_unit(user, other.id, -1, -1, 30_000, Some(false), Some(false), None, None, None, false, 20)
+        .unwrap();
+    store
+        .upsert_unit(user, show.id, 0, 0, 45_000, Some(false), Some(false), None, None, None, false, 5)
+        .unwrap();
+
+    store.set_unit_marks(user, legacy.id, -1, -1, None, Some(true), 30).unwrap();
+
+    let rows = store.user_resumable_units(user).unwrap();
+    assert_eq!(
+        rows.iter().filter(|row| row.0 == legacy.id).count(),
+        1,
+        "a favourited legacy movie must not leave two resumable rows: {rows:?}"
+    );
+    assert!(rows.iter().any(|row| row.0 == other.id), "the other title must remain resumable: {rows:?}");
+    assert!(
+        rows.iter().any(|row| row.0 == show.id && row.1 == 0 && row.2 == 0),
+        "a real TV (0, 0) episode must stay resumable: {rows:?}"
+    );
+}
+
+#[test]
 fn playback_units_for_user_is_scoped_to_one_user() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path().join("data")).unwrap();

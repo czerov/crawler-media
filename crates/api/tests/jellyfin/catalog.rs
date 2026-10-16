@@ -92,7 +92,14 @@ async fn folder_episode_expansion_stays_within_folder() {
     let folder_episodes = folder_listing["Items"].as_array().unwrap();
     assert_eq!(folder_episodes.len(), 1);
     assert_eq!(folder_episodes[0]["Id"], episode_a.to_string().replace('-', ""));
-
+    let folder_b_listing = get_json(
+        &app,
+        &format!("/Items?ParentId={}&Recursive=true&IncludeItemTypes=Episode", folder_id(&root_b)),
+    ).await;
+    assert_eq!(folder_b_listing["Items"].as_array().unwrap().len(), 1);
+    assert_eq!(folder_b_listing["Items"][0]["Id"], episode_b.to_string().replace('-', ""));
+    assert_eq!(folder_b_listing["TotalRecordCount"], 1);
+    assert_eq!(folder_listing["TotalRecordCount"], 1);
     let all_listing = get_json(&app, "/Items?Recursive=true&IncludeItemTypes=Episode").await;
     let all_episodes = all_listing["Items"].as_array().unwrap();
     assert_eq!(all_episodes.len(), 2);
@@ -105,6 +112,72 @@ async fn folder_episode_expansion_stays_within_folder() {
     assert_eq!(series_episodes.len(), 2);
     assert!(series_episodes.iter().any(|episode| episode["Id"] == episode_b.to_string().replace('-', "")));
 }
+#[tokio::test]
+async fn folder_series_id_returns_only_series_episodes_in_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _, _) = app(tmp.path());
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root_a = tmp.path().join("tv-series-scope-a");
+    let root_b = tmp.path().join("tv-series-scope-b");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+    let library = store.create_library(
+        MediaKind::Tv,
+        "Series scope shows",
+        &[root_a.to_str().unwrap(), root_b.to_str().unwrap()],
+        "everyone",
+        true,
+        &[],
+    ).unwrap();
+    store.set_default_library(&library.id).unwrap();
+    let show = new_media(MediaKind::Tv, "Folder constrained show");
+    store.insert_media(&show).unwrap();
+    let episode_a = insert_episode(&store, &root_a, show.id, 1, 1);
+    insert_episode(&store, &root_b, show.id, 1, 2);
+    drop(store);
+
+    let folder_id = format!(
+        "folder_{}",
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, root_a.to_string_lossy().as_bytes()).simple()
+    );
+    let listing = get_json(
+        &app,
+        &format!("/Items?ParentId={folder_id}&SeriesId={}&Recursive=true&IncludeItemTypes=Episode", show.id),
+    ).await;
+    let episodes = listing["Items"].as_array().unwrap();
+    assert_eq!(episodes.len(), 1);
+    assert_eq!(episodes[0]["Id"], episode_a.to_string().replace('-', ""));
+    assert_eq!(listing["TotalRecordCount"], 1);
+}
+
+#[tokio::test]
+async fn series_and_episode_types_return_both_series_and_episodes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _, _) = app(tmp.path());
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("tv-series-and-episode");
+    std::fs::create_dir_all(&root).unwrap();
+    let library = store.create_library(MediaKind::Tv, "Combined types", &[root.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    let show = new_media(MediaKind::Tv, "Combined type show");
+    store.insert_media(&show).unwrap();
+    let episode = insert_episode(&store, &root, show.id, 1, 1);
+    drop(store);
+
+    // This fixture has one visible series row and its one episode row.
+    let combined = get_json(&app, &format!("/Items?ParentId={}&Recursive=true&IncludeItemTypes=Series,Episode", library.id)).await;
+    let combined_items = combined["Items"].as_array().unwrap();
+    assert_eq!(combined_items.len(), 2);
+    assert_eq!(combined_items.iter().filter(|item| item["Type"] == "Series").count(), 1);
+    assert_eq!(combined_items.iter().filter(|item| item["Type"] == "Episode").count(), 1);
+    assert!(combined_items.iter().any(|item| item["Id"] == show.id.to_string().replace('-', "")));
+    assert!(combined_items.iter().any(|item| item["Id"] == episode.to_string().replace('-', "")));
+    assert_eq!(combined["TotalRecordCount"], 2);
+
+    let episodes_only = get_json(&app, "/Items?Recursive=true&IncludeItemTypes=Episode").await;
+    assert_eq!(episodes_only["Items"].as_array().unwrap().len(), 1);
+    assert_eq!(episodes_only["Items"][0]["Id"], episode.to_string().replace('-', ""));
+}
+
 
 #[tokio::test]
 async fn newer_show_played_mark_supersedes_older_unplayed_season_everywhere() {
@@ -123,6 +196,122 @@ async fn newer_show_played_mark_supersedes_older_unplayed_season_everywhere() {
     drop(store);
     assert_eq!(get_json(&app, &format!("/Items/{}", episode.to_string().replace('-', ""))).await["UserData"]["Played"], true);
     assert!(get_json(&app, "/Shows/NextUp").await["Items"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn resume_hides_episode_whose_effective_played_comes_from_a_newer_show_mark() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _, _) = app(tmp.path());
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("tv-resume-effective");
+    std::fs::create_dir_all(&root).unwrap();
+    store
+        .create_library(
+            MediaKind::Tv,
+            "Resume effective",
+            &[root.to_str().unwrap()],
+            "everyone",
+            true,
+            &[],
+        )
+        .unwrap();
+    let show = new_media(MediaKind::Tv, "Resume effective show");
+    store.insert_media(&show).unwrap();
+    let episode = insert_episode(&store, &root, show.id, 1, 1);
+    let user = store.admin_user_id().unwrap();
+    // Raw episode unit is still in progress. A later whole-show mark is the
+    // only source of played=true; resume SQL sees only the raw unit.
+    store
+        .upsert_unit(user, show.id, 1, 1, 7_500, Some(false), None, None, None, None, false, 10)
+        .unwrap();
+    store
+        .upsert_unit(user, show.id, -1, -1, 0, Some(true), None, None, None, None, false, 20)
+        .unwrap();
+    let raw = store.user_resumable_units(user).unwrap();
+    let raw_played = store.unit_state(user, show.id, 1, 1).unwrap().unwrap().played;
+    drop(store);
+    let episode_id = episode.to_string().replace('-', "");
+    let detail = get_json(&app, &format!("/Items/{episode_id}")).await;
+    let resumed = get_json(
+        &app,
+        "/Users/00000000-0000-0000-0000-000000000001/Items/Resume",
+    )
+    .await;
+    let listed = resumed["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["Id"] == episode_id);
+    assert!(
+        raw.iter().any(|row| row.0 == show.id && row.1 == 1 && row.2 == 1),
+        "raw resume query must admit the in-progress episode, got {raw:?}"
+    );
+    assert!(!raw_played, "raw episode unit must stay played=false");
+    assert_eq!(detail["UserData"]["Played"], true, "effective played must be true");
+    assert!(
+        !listed,
+        "resume must not return an item whose UserData.Played is true"
+    );
+}
+
+#[tokio::test]
+async fn resume_fills_the_page_after_dropping_effectively_played_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _, _) = app(tmp.path());
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("tv-resume-page");
+    std::fs::create_dir_all(&root).unwrap();
+    store
+        .create_library(MediaKind::Tv, "Resume page", &[root.to_str().unwrap()], "everyone", true, &[])
+        .unwrap();
+    let user = store.admin_user_id().unwrap();
+    let mut expected = Vec::new();
+    for index in 0..3 {
+        let show = new_media(MediaKind::Tv, &format!("Resume page {index}"));
+        store.insert_media(&show).unwrap();
+        let episode_number = index + 1;
+        let episode = insert_episode(&store, &root, show.id, 1, episode_number);
+        let updated_at = 30 - index as i64;
+        store
+            .upsert_unit(
+                user,
+                show.id,
+                1,
+                episode_number as i32,
+                7_500,
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+                false,
+                updated_at,
+            )
+            .unwrap();
+        if index == 0 {
+            store
+                .upsert_unit(user, show.id, 1, -1, 0, Some(true), None, None, None, None, false, updated_at + 1)
+                .unwrap();
+        } else {
+            expected.push(episode.to_string().replace('-', ""));
+        }
+    }
+    drop(store);
+
+    let resumed = get_json(
+        &app,
+        "/Users/00000000-0000-0000-0000-000000000001/Items/Resume?Limit=2",
+    )
+    .await;
+    let ids = resumed["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["Id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(resumed["TotalRecordCount"], 2);
+    assert_eq!(ids, expected);
+    assert!(resumed["Items"].as_array().unwrap().iter().all(|item| item["UserData"]["Played"] == false));
 }
 #[tokio::test]
 async fn newer_season_unplayed_mark_wins_detail_and_listing() {
@@ -213,6 +402,46 @@ async fn favorite_only_episode_does_not_survive_history_clear_as_played() {
     assert_eq!(
         get_json(&app, &format!("/Items/{}", episode.to_string().replace('-', ""))).await["UserData"]["Played"],
         false
+    );
+}
+
+#[tokio::test]
+async fn favoriting_episode_does_not_flip_inherited_played_to_unplayed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _, _) = app(tmp.path());
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("favorite-played-episode");
+    std::fs::create_dir_all(&root).unwrap();
+    store
+        .create_library(MediaKind::Tv, "Favorite played", &[root.to_str().unwrap()], "everyone", true, &[])
+        .unwrap();
+    let show = new_media(MediaKind::Tv, "Favorite played show");
+    store.insert_media(&show).unwrap();
+    let episode = insert_episode(&store, &root, show.id, 1, 1);
+    let user = store.admin_user_id().unwrap();
+    store
+        .upsert_unit(user, show.id, 1, -1, 0, Some(true), None, None, None, None, false, 0)
+        .unwrap();
+    drop(store);
+
+    let episode_id = episode.to_string().replace('-', "");
+    let marked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/UserFavoriteItems/{episode_id}"))
+                .header("authorization", "Bearer admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(marked.status(), StatusCode::OK);
+    assert_eq!(
+        get_json(&app, &format!("/Items/{episode_id}")).await["UserData"]["Played"],
+        true,
+        "favouriting must not defeat an inherited played mark"
     );
 }
 

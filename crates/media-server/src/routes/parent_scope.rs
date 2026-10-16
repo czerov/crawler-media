@@ -62,19 +62,19 @@ pub(super) async fn resolve_parent_scope(
         .map(|value| value.starts_with("folder_"))
         .unwrap_or(false);
     let is_library = library_parent(parent, libraries).is_some();
-    let is_series = series.is_some()
-        || (!is_library
-            && !is_folder
-            && match parent {
-                Some(id) => provider
-                    .resolve_single_item(user, id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|item| item.is_series)
-                    .unwrap_or(false),
-                None => false,
-            });
+    let is_series = !is_folder
+        && (series.is_some()
+            || (!is_library
+                && match parent {
+                    Some(id) => provider
+                        .resolve_single_item(user, id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|item| item.is_series)
+                        .unwrap_or(false),
+                    None => false,
+                }));
     if is_library {
         return Ok(ParentScope::Library(parent.unwrap_or_default().to_string()));
     }

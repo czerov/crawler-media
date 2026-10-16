@@ -43,12 +43,26 @@ pub(super) async fn items(
         .list_visible_items(user.id, parent_id_for_provider)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if matches!(scope, ParentScope::Folder(_)) {
+        if let Some(series_id) = series {
+            rows = state
+                .provider
+                .list_visible_items(user.id, Some(&series_id.replace('-', "")))
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+    }
     let is_library_parent = matches!(scope, ParentScope::Library(_));
     let is_folder_id = parent.map(|pid| pid.starts_with("folder_")).unwrap_or(false);
     let wants_episodes = query
         .include_item_types
         .as_deref()
         .map(|types| types.split(',').any(|t| t.trim().eq_ignore_ascii_case("Episode")))
+        .unwrap_or(false);
+    let wants_series = query
+        .include_item_types
+        .as_deref()
+        .map(|types| types.split(',').any(|t| t.trim().eq_ignore_ascii_case("Series")))
         .unwrap_or(false);
     let is_folder_query = query.is_folder.unwrap_or(false);
     let recursive = query.recursive.unwrap_or(true);
@@ -78,19 +92,6 @@ pub(super) async fn items(
             }
         }
     }
-    if is_folder_id {
-        if let Some(target_folder_id) = query.parent_id.as_deref() {
-            rows.retain(|item| match &scope {
-                // scope 已经解析出该 folder_ id 对应的库根。
-                ParentScope::Folder(root) => {
-                    std::path::Path::new(&item.row.path).starts_with(root)
-                }
-                // folder_ + SeriesId 的既有组合：provider 收到的是 folder id，
-                // 这里按原逻辑兜底（结果同样是空）。
-                _ => folder_id_matches(&libraries, &target_folder_id, &item.row.path),
-            });
-        }
-    }
     if wants_episodes && rows.iter().any(|r| r.is_series) {
         let mut expanded = Vec::new();
         for item in rows {
@@ -105,13 +106,21 @@ pub(super) async fn items(
                 if let Ok(episodes) = episodes {
                     expanded.extend(episodes);
                 }
+                if wants_series {
+                    expanded.push(item);
+                }
             } else {
                 expanded.push(item);
             }
         }
         rows = expanded;
-        if let ParentScope::Folder(root) = &scope {
-            rows.retain(|item| std::path::Path::new(&item.row.path).starts_with(root));
+    }
+    if is_folder_id {
+        if let Some(target_folder_id) = query.parent_id.as_deref() {
+            rows.retain(|item| match &scope {
+                ParentScope::Folder(root) => std::path::Path::new(&item.row.path).starts_with(root),
+                _ => folder_id_matches(&libraries, target_folder_id, &item.row.path),
+            });
         }
     }
     // genre/studio 判定保持既有位置（folder 过滤与分集展开之后）。认不出 genre/studio

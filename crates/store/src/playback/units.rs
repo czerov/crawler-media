@@ -47,15 +47,29 @@ impl Store {
         favorite: bool,
         now: i64,
     ) -> Result<(), StoreError> {
+        self.playback_write(|store| {
+            if (season, episode) == (UNIT_WHOLE, UNIT_WHOLE) {
+                store.copy_legacy_movie_unit_if_missing(user_id, media_id)?;
+            }
+            store.set_unit_favorite_inner(user_id, media_id, season, episode, favorite, now)
+        })
+    }
+
+    fn set_unit_favorite_inner(
+        &self,
+        user_id: UserId,
+        media_id: MediaId,
+        season: i32,
+        episode: i32,
+        favorite: bool,
+        now: i64,
+    ) -> Result<(), StoreError> {
         let favorite_at = if favorite { now } else { 0 };
-        self.subscribe.execute(
-            "INSERT INTO playback_units
-                (user_id, media_id, season, episode, position_ms, played, favorite,
-                 duration_ms, audio_track, subtitle_track, play_count, updated_at, favorite_at)
-             VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, NULL, NULL, NULL, 0, 0, ?6)
-             ON CONFLICT(user_id, media_id, season, episode) DO UPDATE SET
-                favorite = excluded.favorite,
-                favorite_at = excluded.favorite_at",
+        // A missing unit is favourite-only. Do not insert an empty canonical
+        // row first: that would block the legacy whole-file copy above.
+        let changed = self.subscribe.execute(
+            "UPDATE playback_units SET favorite = ?5, favorite_at = ?6
+             WHERE user_id = ?1 AND media_id = ?2 AND season = ?3 AND episode = ?4",
             params![
                 user_id.to_string(),
                 media_id.to_string(),
@@ -65,6 +79,22 @@ impl Store {
                 favorite_at,
             ],
         )?;
+        if changed == 0 {
+            self.subscribe.execute(
+                "INSERT INTO playback_units
+                    (user_id, media_id, season, episode, position_ms, played, favorite,
+                     duration_ms, audio_track, subtitle_track, play_count, updated_at, favorite_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, NULL, NULL, NULL, 0, 0, ?6)",
+                params![
+                    user_id.to_string(),
+                    media_id.to_string(),
+                    season,
+                    episode,
+                    favorite as i64,
+                    favorite_at,
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -137,7 +167,8 @@ impl Store {
     }
 
     /// Copy a legacy `(0, 0)` watch unit onto the canonical `(-1, -1)` unit for
-    /// whole-file media; TV keeps `(0, 0)` as a real season/episode pair.
+    /// whole-file media, then retire that obsolete row. TV keeps `(0, 0)` as a
+    /// real season/episode pair. Both writes stay in the caller's transaction.
     pub fn copy_legacy_movie_unit_if_missing(
         &self,
         user_id: UserId,
@@ -155,6 +186,17 @@ impl Store {
                     duration_ms, audio_track, subtitle_track, play_count, updated_at, favorite_at
              FROM playback_units
              WHERE user_id = ?1 AND media_id = ?2 AND season = 0 AND episode = 0",
+            params![user_id.to_string(), media_id.to_string()],
+        )?;
+        self.subscribe.execute(
+            "DELETE FROM playback_units
+             WHERE user_id = ?1 AND media_id = ?2 AND season = 0 AND episode = 0
+               AND EXISTS (
+                   SELECT 1 FROM playback_units AS canonical
+                   WHERE canonical.user_id = playback_units.user_id
+                     AND canonical.media_id = playback_units.media_id
+                     AND canonical.season = -1 AND canonical.episode = -1
+               )",
             params![user_id.to_string(), media_id.to_string()],
         )?;
         Ok(())
@@ -187,20 +229,23 @@ impl Store {
         Ok(result)
     }
 
-    /// User's in-progress (resume) units, ordered by most recently updated first.
+    /// In-progress units (`position_ms > 0 AND played = 0`), newest first.
+    ///
+    /// This is the raw unit only. A newer season or show mark can still make
+    /// the episode effectively played, so callers that page a resume list must
+    /// apply that check before taking `limit` rows. A copied non-TV `(0, 0)`
+    /// row is retired with its canonical copy, so it cannot take a second slot.
     pub fn user_resumable_units(
         &self,
         user_id: UserId,
-        limit: usize,
     ) -> Result<Vec<(MediaId, i32, i32, i64, i64)>, StoreError> {
         let mut stmt = self.subscribe.prepare(
             "SELECT media_id, season, episode, position_ms, updated_at
              FROM playback_units
              WHERE user_id = ?1 AND position_ms > 0 AND played = 0
-             ORDER BY updated_at DESC
-             LIMIT ?2",
+             ORDER BY updated_at DESC",
         )?;
-        let rows = stmt.query_map(params![user_id.to_string(), limit as i64], |row| {
+        let rows = stmt.query_map(params![user_id.to_string()], |row| {
             let media_str: String = row.get(0)?;
             let season: i32 = row.get(1)?;
             let episode: i32 = row.get(2)?;
@@ -219,15 +264,14 @@ impl Store {
     }
 
     /// Favourited units ordered by favourite activity, newest first.
-    /// A pre-migration favourite (`favorite_at = 0`) keeps its playback
-    /// timestamp as the ordering key.
+    /// `favorite_at = 0` is an unknown historical time and sorts last; readers
+    /// must not substitute the still-changing playback clock.
     pub fn favorite_rows(&self, user_id: UserId) -> Result<Vec<(MediaId, i64, i32, i32)>, StoreError> {
         let mut stmt = self.subscribe.prepare(
-            "SELECT media_id, season, episode,
-                    CASE WHEN favorite_at != 0 THEN favorite_at ELSE updated_at END AS favorited
+            "SELECT media_id, season, episode, favorite_at
              FROM playback_units
              WHERE user_id = ?1 AND favorite != 0
-             ORDER BY favorited DESC, media_id, season, episode",
+             ORDER BY favorite_at DESC, media_id, season, episode",
         )?;
         let rows = stmt.query_map(params![user_id.to_string()], |row| {
             Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -302,7 +346,7 @@ impl Store {
             // Favourite activity is its own clock. Playback fields stay on the
             // row that already owns them; a missing unit is favourite-only.
             if played.is_none() {
-                self.set_unit_favorite(user_id, media_id, season, episode, favorite, now)?;
+                self.set_unit_favorite_inner(user_id, media_id, season, episode, favorite, now)?;
             } else {
                 let existing = self.unit_state(user_id, media_id, season, episode)?;
                 self.upsert_unit(
