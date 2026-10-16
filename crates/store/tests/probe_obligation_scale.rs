@@ -93,9 +93,12 @@ fn probe_obligations_migration_upgrade_and_idempotence() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
 
-    // 1. First open: creates schema v11 with index
+    // 1. First open: creates the library schema with the obligation index
     let store = Store::open(&data_dir).unwrap();
-    assert_eq!(library_schema_version(&store), 11);
+    assert!(
+        library_schema_version(&store) >= 11,
+        "library schema must include the obligation index migration"
+    );
 
     // Seed durable data through public API before downgrade:
     // Include two obligations sharing one created_at_ms to exercise ledger_id tie order.
@@ -132,9 +135,12 @@ fn probe_obligations_migration_upgrade_and_idempotence() {
 
     drop(store);
 
-    // 2. Re-open is a no-op and preserves version 11
+    // 2. Re-open is a no-op and preserves the schema
     let store = Store::open(&data_dir).unwrap();
-    assert_eq!(library_schema_version(&store), 11);
+    assert!(
+        library_schema_version(&store) >= 11,
+        "reopening must keep the migrated library schema"
+    );
     drop(store);
 
     // 3. Opening twice successively does not error
@@ -155,9 +161,12 @@ fn probe_obligations_migration_upgrade_and_idempotence() {
         .unwrap();
     drop(lib_conn);
 
-    // Helper to check version 11, index presence, ledger rows, and obligations
+    // Helper to check the migrated schema, index presence, ledger rows, and obligations
     let assert_state = |st: &Store| {
-        assert_eq!(library_schema_version(st), 11);
+        assert!(
+            library_schema_version(st) >= 11,
+            "the obligation index migration must be applied"
+        );
         let conn = rusqlite::Connection::open(data_dir.join("library.db")).unwrap();
         let idx_count: i64 = conn
             .query_row(
@@ -188,9 +197,9 @@ fn probe_obligations_migration_upgrade_and_idempotence() {
     assert_state(&reopened_store);
     drop(reopened_store);
 
-    // 5. Older binary pre-check: a database with user_version > 11 must be refused
+    // 5. Older binary pre-check: a database with a newer user_version must be refused
     let lib_conn = rusqlite::Connection::open(data_dir.join("library.db")).unwrap();
-    lib_conn.pragma_update(None, "user_version", 12).unwrap();
+    lib_conn.pragma_update(None, "user_version", 99).unwrap();
     drop(lib_conn);
 
     let err = match Store::open(&data_dir) {

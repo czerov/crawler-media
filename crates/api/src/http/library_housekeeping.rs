@@ -12,6 +12,8 @@ use crate::http::{err, ok};
 use crate::management::ApiState;
 
 use super::library::missing_library;
+use crate::library_reconciliation::index_basenames;
+
 
 fn canonical(path: &FsPath) -> Option<PathBuf> {
     fs_canonicalize(path).ok()
@@ -22,61 +24,70 @@ fn fs_canonicalize(path: &FsPath) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(path)
 }
 
-/// 深度受限的文件名搜索（库根下找被移走的文件候选）。
-fn find_by_basename(root: &FsPath, name: &str, depth: u32) -> Option<PathBuf> {
-    if depth > 5 {
-        return None;
-    }
-    let entries = std::fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_by_basename(&path, name, depth + 1) {
-                return Some(found);
-            }
-        } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
-            return Some(path);
-        }
-    }
-    None
-}
 
 /// POST /libraries/{id}/path-reconciliation-preview — 台账失联行 + 库内新候选。
 pub(crate) async fn path_reconciliation_preview(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Response {
-    let store = state.store.lock();
-    let Some(library) = store.get_library(&id).ok().flatten() else {
-        return missing_library();
+    let (library, rows) = {
+        let store = state.store.lock();
+        let Some(library) = store.get_library(&id).ok().flatten() else {
+            return missing_library();
+        };
+        let rows = super::library::rows_in_library(&store, &library);
+        (library, rows)
     };
-    let mut missing = Vec::new();
-    for row in super::library::rows_in_library(&store, &library) {
-        if FsPath::new(&row.path).is_file() {
-            continue;
-        }
-        let name = FsPath::new(&row.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        let mut candidates = Vec::new();
-        for root in &library.root_paths {
-            if let Some(found) = find_by_basename(FsPath::new(root), &name, 0) {
-                if found != FsPath::new(&row.path) {
-                    candidates.push(found.display().to_string());
+
+    let roots = library.root_paths.clone();
+    let control = library::WorkControl::default();
+
+    let preview_res = state
+        .http_work
+        .run(std::time::Duration::from_secs(30), move || -> Result<(Vec<serde_json::Value>, usize, bool), String> {
+            let index = index_basenames(&roots, &control, 100_000)?;
+            let mut missing = Vec::new();
+            for row in rows {
+                let row_path = FsPath::new(&row.path);
+                if row_path.is_file() {
+                    continue;
                 }
+                let name_os = row_path.file_name().unwrap_or_default();
+                let name_str = name_os.to_str().unwrap_or_default().to_string();
+
+                let mut candidates = Vec::new();
+                if let Some(matches) = index.candidates.get(name_os) {
+                    for cand in matches {
+                        if cand != row_path {
+                            candidates.push(cand.display().to_string());
+                        }
+                    }
+                }
+
+                missing.push(json!({
+                    "file_id": row.id.to_string(),
+                    "media_id": row.media_id.to_string(),
+                    "path": row.path,
+                    "file_name": name_str,
+                    "candidates": candidates,
+                }));
             }
-        }
-        missing.push(json!({
-            "file_id": row.id.to_string(),
-            "media_id": row.media_id.to_string(),
-            "path": row.path,
-            "file_name": name,
-            "candidates": candidates,
-        }));
-    }
-    ok(json!({ "missing": missing })).into_response()
+            Ok((missing, index.examined, index.incomplete))
+        })
+        .await;
+
+    let (missing, examined, incomplete) = match preview_res {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, "reconciliation.index_failed", &e),
+        Err(_) => return err(StatusCode::REQUEST_TIMEOUT, "reconciliation.timeout", "目录索引超时"),
+    };
+
+    ok(json!({
+        "missing": missing,
+        "examined": examined,
+        "incomplete": incomplete,
+    }))
+    .into_response()
 }
 
 /// POST /libraries/{id}/path-reconciliations — 应用重关联。

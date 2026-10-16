@@ -44,11 +44,22 @@ pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, Proj
         file_facts.push(file_facts_for(files, row, owned.missing.contains(&row.path)));
     }
     let media_facts = media_facts_for(&owned.media_ids, &media_map, &rows_by_media, &cache, files);
+    let (expected_dirty_token, next_generation) = {
+        let store = state.store.lock();
+        let head = store
+            .browse_projection_head(library_id)
+            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
+        match head {
+            Some(h) => (Some(h.dirty_token), h.generation + 1),
+            None => (None, 1),
+        }
+    };
     Ok(ProjectionBuild {
         library_id: library_id.to_string(),
-        generation: 1,
+        generation: next_generation,
         scope_signature: scope_signature(&owned.library),
         revisions: owned.revisions,
+        expected_dirty_token,
         files: file_facts,
         media: media_facts,
     })

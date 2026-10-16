@@ -16,60 +16,151 @@ fn attach_metadata_and_chapters(state: &ApiState, media: &Media, rows: &[LedgerR
     }
 }
 
+pub(crate) fn observe_transfer_modes(rows: &[LedgerRow], default_mode: &str) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            let p = std::path::Path::new(&row.path);
+            if p.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("strm"))
+            {
+                return "strm".to_string();
+            }
+            let is_hardlink = std::fs::metadata(&row.path)
+                .map(|meta| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        meta.nlink() > 1
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if is_hardlink {
+                "hardlink".to_string()
+            } else {
+                default_mode.to_string()
+            }
+        })
+        .collect()
+}
+
 fn commit_transfer_outcome(
     state: &ApiState,
     subscribe: &Subscribe,
     outcome: &RunOutcome,
     lease: &crate::library_lifecycle::LibraryWorkLease,
+    plan: &TransferPlan,
+    observation_revisions: &store::ReadRevisions,
 ) -> Result<(), String> {
-    let store = state.store.lock();
-    lease.control().check().map_err(|e| e.to_string())?;
-    if !store
-        .library_accepts_work(lease.library_id())
-        .map_err(|e| e.to_string())?
+    // Re-validate observation against current DB state before side effect
+    let default_transfer_mode = {
+        let store = state.store.lock();
+        lease.control().check().map_err(|e| e.to_string())?;
+        if !store
+            .library_accepts_work(lease.library_id())
+            .map_err(|e| e.to_string())?
+        {
+            return Err("目标 Library 正在删除或已不存在".into());
+        }
+        let current_revisions = store.read_revisions().map_err(|e| e.to_string())?;
+        // Only the app-side revision (media/libraries/config) is a valid observation
+        // guard here: the library revision is bumped by every ledger write, including
+        // this batch's own earlier commits, so comparing it would reject a valid
+        // transfer after the file was already published. Library freeze/removal is
+        // re-checked above and the destination is re-read inside the commit section.
+        if current_revisions.app != observation_revisions.app {
+            return Err("Library 配置或台账在观察期间已变更，放弃本轮提交".into());
+        }
+        // Identity re-validation: the coarse app revision cannot see ledger-only changes,
+        // so a path may have been claimed by a DIFFERENT media since the observation.
+        // Never publish over, or delete, a foreign identity.
+        for row in &outcome.ledger {
+            if let Some(existing) = store
+                .ledger_by_path(&row.path)
+                .map_err(|e| e.to_string())?
+            {
+                if existing.media_id != subscribe.media_id {
+                    return Err("目标路径已被其他媒体占用，放弃本轮提交".into());
+                }
+            }
+        }
+        for path in &outcome.removed_paths {
+            if let Some(existing) = store.ledger_by_path(path).map_err(|e| e.to_string())? {
+                if existing.media_id != subscribe.media_id {
+                    return Err("待替换路径已被其他媒体占用，放弃本轮提交".into());
+                }
+            }
+        }
+        store.transfer_mode().unwrap_or_else(|_| "copy".into())
+    };
+
+    // Observe transfer modes outside Store lock
+    let observed_modes = observe_transfer_modes(&outcome.ledger, &default_transfer_mode);
+
+    // Commit replacement ledger/source mapping and facts in a short Store section
     {
-        return Err("目标 Library 正在删除或已不存在".into());
-    }
-    // T1 / plan §95: 先持久化新 replacement ledger/source mapping 与 facts，
-    // 旧文件物理删除绝不早于新 replacement 记录的持久化。
-    for row in &outcome.ledger {
-        let source_path = outcome
-            .ledger_sources
-            .iter()
-            .find(|source| source.ledger_path == row.path)
-            .map(|source| source.source_path.as_str());
-        match source_path {
-            Some(source_path) => store
-                .insert_ledger_with_source(row, std::path::Path::new(source_path))
-                .map_err(|e| e.to_string())?,
-            None => store.insert_ledger(row).map_err(|e| e.to_string())?,
+        let store = state.store.lock();
+        lease.control().check().map_err(|e| e.to_string())?;
+        if !store
+            .library_accepts_work(lease.library_id())
+            .map_err(|e| e.to_string())?
+        {
+            return Err("目标 Library 正在删除或已不存在".into());
+        }
+
+        for (row, mode) in outcome.ledger.iter().zip(observed_modes.iter()) {
+            let source_path = outcome
+                .ledger_sources
+                .iter()
+                .find(|source| source.ledger_path == row.path)
+                .map(|source| source.source_path.as_str());
+            store
+                .insert_ledger_with_mode_and_source(row, Some(mode), source_path)
+                .map_err(|e| e.to_string())?;
+        }
+        store
+            .save_subscribe_facts(subscribe.id, &outcome.facts)
+            .map_err(|e| e.to_string())?;
+
+        let now = crate::job_loop::unix_now();
+        for row in &outcome.ledger {
+            store
+                .mark_wanted_imported(subscribe.id, row.season, row.episode, now)
+                .map_err(|e| e.to_string())?;
+        }
+        store
+            .mark_pending_imported(subscribe.id, &outcome.transferred_enclosures)
+            .map_err(|e| e.to_string())?;
+        for row in &outcome.ledger {
+            store.clear_ledger_missing(&row.path).map_err(|error| {
+                tracing::error!(path = %row.path, %error, "清理 Library 缺失标记失败");
+                error.to_string()
+            })?;
         }
     }
-    store
-        .save_subscribe_facts(subscribe.id, &outcome.facts)
-        .map_err(|e| e.to_string())?;
 
+    // Physical deletion of replaced files outside Store lock (after DB durability)
     for path in &outcome.removed_paths {
-        crate::http::file_delete::remove_file_and_ledger(&store, path)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::error!(path, %e, "物理删除旧文件失败"),
+        }
     }
-    let now = crate::job_loop::unix_now();
-    for row in &outcome.ledger {
-        store
-            .mark_wanted_imported(subscribe.id, row.season, row.episode, now)
-            .map_err(|e| e.to_string())?;
+
+    // Delete removed ledger rows in short Store section
+    if !outcome.removed_paths.is_empty() {
+        let store = state.store.lock();
+        for path in &outcome.removed_paths {
+            let _ = store.delete_ledger_path(path);
+        }
     }
-    store
-        .mark_pending_imported(subscribe.id, &outcome.transferred_enclosures)
-        .map_err(|e| e.to_string())?;
-    for row in &outcome.ledger {
-        store.clear_ledger_missing(&row.path).map_err(|error| {
-            tracing::error!(path = %row.path, %error, "清理 Library 缺失标记失败");
-            error.to_string()
-        })?;
-    }
+
     let library_id = lease.library_id().to_string();
-    drop(store);
-    // Transfer 写入新 ledger 行并可能删除旧文件：该 Library 的投影必须重建。
     state.projection.mark_dirty(&library_id);
     Ok(())
 }
@@ -83,29 +174,35 @@ fn load_transfer_context(
         domain::Filter,
         SubscribeFacts,
         Option<domain::Filter>,
+        store::ReadRevisions,
     ),
     String,
 > {
-    let store = state.store.lock();
-    let media = store
-        .get_media(subscribe.media_id)
-        .map_err(|e| e.to_string())?
-        .ok_or("Media not found")?;
-    let filter = store
-        .get_filter(subscribe.filter_id)
-        .map_err(|e| e.to_string())?
-        .ok_or("Filter not found")?;
-    let facts = store
-        .load_library_subscribe_facts(subscribe, media.kind)
-        .map_err(|e| e.to_string())?;
-    let wash_filter = subscribe
-        .wash_cut_filter_id
-        .map(|fid| store.get_filter(fid))
-        .transpose()
-        .map_err(|e| e.to_string())?
-        .flatten()
-        .or_else(|| store.get_filter(subscribe.filter_id).ok().flatten());
-    Ok((media, filter, facts, wash_filter))
+    let (media, filter, wash_filter) = {
+        let store = state.store.lock();
+        let media = store
+            .get_media(subscribe.media_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Media not found")?;
+        let filter = store
+            .get_filter(subscribe.filter_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Filter not found")?;
+        let wash_filter = subscribe
+            .wash_cut_filter_id
+            .map(|fid| store.get_filter(fid))
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .or_else(|| store.get_filter(subscribe.filter_id).ok().flatten());
+        (media, filter, wash_filter)
+    };
+    let obs = crate::subscribe_library_read::observe_subscribe_library_facts(
+        state,
+        subscribe,
+        media.kind,
+    )?;
+    Ok((media, filter, obs.facts, wash_filter, obs.revisions))
 }
 
 struct TransferPlan {
@@ -236,7 +333,7 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
         return Ok(());
     }
 
-    let (media, filter, facts, wash_filter) = load_transfer_context(state, &subscribe)?;
+    let (media, filter, facts, wash_filter, observation_revisions) = load_transfer_context(state, &subscribe)?;
     let routed = crate::delivery::RoutedDownloader::with_pending(state, &subscribe, &pending);
     let chosen = filter_matched_pending(&subscribe, &media, pending);
 
@@ -285,7 +382,7 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
 
     library_lease.control().check().map_err(|e| e.to_string())?;
     let ledger_count = outcome.ledger.len();
-    commit_transfer_outcome(state, &subscribe, &outcome, &library_lease)?;
+    commit_transfer_outcome(state, &subscribe, &outcome, &library_lease, &plan, &observation_revisions)?;
 
     crate::http::library::enqueue_probes_for_rows(state, &outcome.ledger);
     if ledger_count > 0 {

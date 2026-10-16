@@ -6,6 +6,7 @@ mod fingerprint;
 mod library_deletion;
 mod probe_state;
 mod tables;
+mod browse_changes;
 mod browse_projection;
 mod read_revisions;
 mod scan_operations;
@@ -14,7 +15,7 @@ mod scan_operations;
 /// The version is stored via `PRAGMA user_version` on each database file.
 pub const APP_SCHEMA_VERSION: i64 = 7;
 pub const CATALOG_SCHEMA_VERSION: i64 = 2;
-pub const LIBRARY_SCHEMA_VERSION: i64 = 11;
+pub const LIBRARY_SCHEMA_VERSION: i64 = 12;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 5;
 
 /// Read the current schema version from a database file.
@@ -122,6 +123,7 @@ pub fn migrate_app(conn: &Connection) -> Result<(), StoreError> {
     read_revisions::migrate_read_revisions("app", conn)?;
     read_revisions::create_revision_trigger(conn, "media", "app_media")?;
     read_revisions::create_revision_trigger(conn, "libraries", "app_libraries")?;
+    browse_changes::migrate_browse_changes_app(conn)?;
     set_schema_version(conn, APP_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -236,6 +238,7 @@ pub fn migrate_catalog(conn: &Connection) -> Result<(), StoreError> {
     )?;
     read_revisions::migrate_read_revisions("catalog", conn)?;
     read_revisions::create_revision_trigger(conn, "catalog_cache", "cat_cache")?;
+    browse_changes::migrate_browse_changes_catalog(conn)?;
     set_schema_version(conn, CATALOG_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -290,6 +293,13 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
     read_revisions::create_revision_trigger(conn, "ledger", "lib_ledger")?;
     read_revisions::create_revision_trigger(conn, "file_meta", "lib_file_meta")?;
     read_revisions::create_revision_trigger(conn, "media_markers", "lib_markers")?;
+    ensure_column(
+        conn,
+        "browse_generations",
+        "dirty_token",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    browse_changes::migrate_browse_changes_library(conn)?;
     set_schema_version(conn, LIBRARY_SCHEMA_VERSION)?;
     Ok(())
 }

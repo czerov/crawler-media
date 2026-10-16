@@ -30,8 +30,10 @@ use crate::blocking_budget::{BlockingBudget, BlockingError};
 use crate::management::ApiState;
 
 pub mod builder;
+pub mod changes;
 pub mod facts;
 
+use changes::{ChangeConsumer, ProjectionDependencies};
 /// 投影构建与 follower 等待共用的等待预算。
 pub(crate) const PROJECTION_DEADLINE: Duration = Duration::from_secs(30);
 /// 共享构建容量：不同 Library 的 leader 并发重建不得超过该数，超出即 503。
@@ -204,9 +206,10 @@ impl Drop for InflightFinish {
 
 pub struct ProjectionService {
     dirty_libraries: Arc<Mutex<HashMap<String, u64>>>,
+    /// Per-source completeness from the most recent poll.
+    sources_complete: Mutex<bool>,
     /// 至少被浏览过一次的 Library；周期刷新只覆盖这些库。
     visited: Mutex<HashSet<String>>,
-    /// 每个 Library 至多一个进行中的构建；条目由 blocking 闭包在结束时移除。
     inflight: Arc<Mutex<InflightMap>>,
     /// 有界构建容量：permit 由 blocking 构建闭包持有到真正结束。
     build_budget: Arc<BlockingBudget>,
@@ -216,6 +219,8 @@ pub struct ProjectionService {
     disabled: bool,
     /// 测试 seam：终态发布后、条目移除前的屏障（生产为 `None`）。
     publish_barrier: Option<PublishBarrier>,
+    deps: Arc<Mutex<ProjectionDependencies>>,
+    consumer: Arc<ChangeConsumer>,
 }
 
 /// 锁内取得的当前状态：revision、scope 指纹与已发布投影。
@@ -227,14 +232,19 @@ struct Current {
 
 impl ProjectionService {
     pub fn new() -> Self {
+        let deps = Arc::new(Mutex::new(ProjectionDependencies::new()));
+        let consumer = Arc::new(ChangeConsumer::new(deps.clone()));
         Self {
             dirty_libraries: Arc::new(Mutex::new(HashMap::new())),
+            sources_complete: Mutex::new(true),
             visited: Mutex::new(HashSet::new()),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             build_budget: Arc::new(BlockingBudget::new(PROJECTION_BUILD_CAPACITY)),
             deadline: PROJECTION_DEADLINE,
             disabled: false,
             publish_barrier: None,
+            deps,
+            consumer,
         }
     }
 
@@ -378,6 +388,7 @@ impl ProjectionService {
         let barrier = self.publish_barrier.clone();
         let job_library = library_id.clone();
         let job_entry = entry.clone();
+        let deps = self.deps.clone();
         let result = budget
             .run(deadline, move || {
                 // 守卫在闭包内创建：Busy（未取得 permit、闭包未运行）时不存在守卫，
@@ -389,7 +400,7 @@ impl ProjectionService {
                     barrier,
                     outcome: None,
                 };
-                let outcome = publish_blocking(&state, &job_library);
+                let outcome = publish_blocking(&deps, &state, &job_library);
                 if matches!(outcome, BuildOutcome::Ready(_)) {
                     let mut dirty = dirty_libraries.lock();
                     if dirty.get(&job_library).copied() == dirty_version_before {
@@ -438,15 +449,19 @@ impl ProjectionService {
         }
     }
 
-    /// Refresh dirty libraries in a background loop every 60 seconds.
+    /// Refresh dirty libraries and observe external files in a background loop every 60 seconds (D3-04).
+    /// Cadence is an upper bound (60s check period + work latency).
     pub fn start_periodic_refresh(self: Arc<Self>, state: ApiState) {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                // 已访问库的文件事实可能被外部修改（NFO/图片/STRM），revision 不会动，
-                // 因此周期标脏：稳态请求仍读投影，刷新在后台有界顺序执行。
-                self.mark_all_dirty();
+                // 周期检查：通过 poll_changes 增量消费源变化，而不是无条件全部标脏
+                let _ = self.poll_changes(&state);
                 let visited: Vec<String> = self.visited.lock().iter().cloned().collect();
+                for lib_id in &visited {
+                    // Bounded off-lock external file observation (D3-04)
+                    self.observe_external_files(&state, lib_id).await;
+                }
                 for lib_id in visited {
                     match self.ensure(state.clone(), lib_id.clone()).await {
                         Ok(_) => {}
@@ -463,12 +478,85 @@ impl ProjectionService {
         });
     }
 
+    /// Bounded off-lock external file observation (D3-04):
+    /// Reads current file facts off-lock, compares with stored projection facts,
+    /// and marks library dirty only if an external change (mtime/size/existence) was detected.
+    async fn observe_external_files(&self, state: &ApiState, library_id: &str) {
+        let files = state.browse_files.clone();
+        let state_clone = state.clone();
+        let lib_id = library_id.to_string();
+        let has_changes = state.http_work.run(
+            crate::http::library::selection::BROWSE_DEADLINE,
+            move || {
+                let store = state_clone.store.lock();
+                let snap = match store.browse_projection(&lib_id) {
+                    Ok(Some(s)) => s,
+                    _ => return false,
+                };
+                drop(store);
+                for f in snap.files {
+                    if let Some(ff) = facts::FileFacts::from_json(&f.facts) {
+                        let path = std::path::Path::new(&ff.row.path);
+                        let meta = files.metadata(path);
+                        let (cur_size, cur_mtime) = match meta {
+                            Ok(m) if m.is_file() => (
+                                m.len(),
+                                m.modified().ok().and_then(|t| {
+                                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_nanos() as i64)
+                                }),
+                            ),
+                            _ => (0, None),
+                        };
+                        if cur_size != ff.size || cur_mtime != ff.modified_ns {
+                            return true;
+                        }
+                    }
+                }
+                false
+            },
+        ).await.unwrap_or(false);
+
+        if has_changes {
+            self.mark_dirty(library_id);
+        }
+    }
+
+    /// Poll all three sources for changes sharing ONE per-round event budget (D3-03).
+    pub fn poll_changes(&self, state: &ApiState) -> Result<bool, ProjectionError> {
+        let store = state.store.lock();
+        let ownership = store
+            .library_ownership()
+            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
+        let sources = [
+            store::BrowseChangeSource::App,
+            store::BrowseChangeSource::Library,
+            store::BrowseChangeSource::Catalog,
+        ];
+        let mut all_complete = true;
+        let mut shared_budget = changes::MAX_EVENTS_PER_ROUND;
+        for source in sources {
+            let (_count, complete) = self
+                .consumer
+                .poll_source_budgeted(&store, &ownership, source, &mut shared_budget)
+                .map_err(|e| ProjectionError::Failed(e.to_string()))?;
+            if !complete {
+                all_complete = false;
+            }
+        }
+        *self.sources_complete.lock() = all_complete;
+        Ok(all_complete)
+    }
+
     /// 新鲜度检查的 DB 读也在 blocking 预算里执行，不在 async worker 上持 Store 锁。
     async fn fresh_snapshot(
         &self,
         state: &ApiState,
         library_id: &str,
     ) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
+        if !*self.sources_complete.lock() {
+            // Incomplete source prevents generation from being accepted as fresh (D3-03)
+            return Ok(None);
+        }
         if self.dirty_libraries.lock().contains_key(library_id) {
             return Ok(None);
         }
@@ -490,41 +578,80 @@ impl ProjectionService {
     }
 }
 
-/// 锁内读当前 revision / scope 指纹 / 投影，公共事实全部一致才返回 ready 快照。
+/// 锁内读当前 scope 指纹 / 投影状态，仅依据 per-library dirty_token 与 state='ready'
+/// 判定普通新鲜度（D3-01 / D3-02），全局 revisions 仅保留在发布时的回退检查中。
 fn fresh_snapshot_inner(
     state: &ApiState,
     library_id: &str,
 ) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
     let current = {
         let store = state.store.lock();
-        let revisions = store
-            .read_revisions()
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
         let scope_signature = store
             .get_library(library_id)
             .map_err(|e| ProjectionError::Failed(e.to_string()))?
             .map(|library| builder::scope_signature(&library));
-        let snapshot = store
-            .browse_projection(library_id)
+        let head = store
+            .browse_projection_head(library_id)
             .map_err(|e| ProjectionError::Failed(e.to_string()))?;
-        Current {
-            revisions,
-            scope_signature,
-            snapshot,
-        }
+        let snapshot = match head {
+            Some(h) if h.ready && Some(h.scope_signature.as_str()) == scope_signature.as_deref() => {
+                store
+                    .browse_projection(library_id)
+                    .map_err(|e| ProjectionError::Failed(e.to_string()))?
+            }
+            _ => None,
+        };
+        snapshot
     };
-    Ok(current.snapshot.filter(|snap| {
-        snap.revisions.public_matches(&current.revisions)
-            && Some(snap.scope_signature.as_str()) == current.scope_signature.as_deref()
-    }))
+    Ok(current)
 }
 
 /// blocking 线程上的构建 → 发布 → 回读；Store 锁只包住短 DB 读写。
-fn publish_blocking(state: &ApiState, library_id: &str) -> BuildOutcome {
+fn publish_blocking(
+    deps: &Arc<Mutex<ProjectionDependencies>>,
+    state: &ApiState,
+    library_id: &str,
+) -> BuildOutcome {
     let build = match builder::build(state, library_id) {
         Ok(build) => build,
         Err(error) => return BuildOutcome::from_error(error),
     };
+    let media_ids: Vec<_> = build.media.iter().map(|m| m.media_id).collect();
+    let ledger_ids: Vec<_> = build.files.iter().map(|f| f.ledger_id).collect();
+    let paths: Vec<String> = {
+        let store = state.store.lock();
+        build
+            .files
+            .iter()
+            .filter_map(|f| store.get_ledger(&f.ledger_id.to_string()).ok().flatten().map(|r| r.path))
+            .collect()
+    };
+    let catalog_keys: Vec<String> = build
+        .media
+        .iter()
+        .filter_map(|m| {
+            let tmdb_id = m
+                .facts
+                .get("media")
+                .and_then(|v| v.get("tmdb_id"))
+                .and_then(|v| v.as_str())?;
+            let kind = m
+                .facts
+                .get("media")
+                .and_then(|v| v.get("kind"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("movie");
+            Some(format!("tmdb:/{kind}/{tmdb_id}"))
+        })
+        .collect();
+    deps.lock().record_library(
+        library_id,
+        media_ids,
+        ledger_ids,
+        paths,
+        catalog_keys,
+    );
+
     let store = state.store.lock();
     match store.publish_browse_projection(&build) {
         Ok(true) => match store.browse_projection(library_id) {

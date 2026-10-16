@@ -581,35 +581,79 @@ pub(crate) async fn item_episodes(
             }
         }
     }
-    let store = state.store.lock();
-    let Some(library) = store.get_library(&id).ok().flatten() else {
-        return missing_library();
+    let (library_rows, unit_states) = {
+        let store = state.store.lock();
+        let Some(library) = store.get_library(&id).ok().flatten() else {
+            return missing_library();
+        };
+        let Some(media) = store.get_media(media_id).ok().flatten() else {
+            return err(StatusCode::NOT_FOUND, "library.item_missing", "条目不存在");
+        };
+        let all_rows = store.list_ledger().unwrap_or_default();
+        let library_rows: Vec<domain::LedgerRow> = all_rows
+            .into_iter()
+            .filter(|row| row.media_id == media_id)
+            .filter(|row| {
+                library_for_row(&store, row, &media).is_some_and(|owner| owner.id == library.id)
+            })
+            .collect();
+
+        let mut unit_states = HashMap::new();
+        if let Some(uid) = user_id {
+            for row in &library_rows {
+                let Some(e) = row.episode else { continue };
+                let s = row.season.unwrap_or(1);
+                if let Ok(st) = store.unit_state(uid, media.id, s as i32, e as i32) {
+                    unit_states.insert((s, e), st);
+                }
+            }
+        }
+        (library_rows, unit_states)
     };
-    let Some(media) = store.get_media(media_id).ok().flatten() else {
-        return err(StatusCode::NOT_FOUND, "library.item_missing", "条目不存在");
-    };
-    let all_rows = store.list_ledger().unwrap_or_default();
-    let library_rows: Vec<domain::LedgerRow> = all_rows
-        .into_iter()
-        .filter(|row| row.media_id == media_id)
-        .filter(|row| {
-            library_for_row(&store, row, &media).is_some_and(|owner| owner.id == library.id)
-        })
-        .collect();
 
     let mut season_metas_grouped: HashMap<u32, HashMap<u32, media::EpisodeMeta>> = HashMap::new();
     if let Some(target_season) = season_param {
         season_metas_grouped.insert(target_season, season_meta);
     }
 
-    let episode_rows = crate::http::playback::episodes::aggregate_visible_episodes(
-        &store,
-        &media,
-        &library_rows,
-        season_param,
-        user_id,
-        &season_metas_grouped,
-    );
+    let files = state.browse_files.clone();
+    let rows_res = state
+        .http_work
+        .run(std::time::Duration::from_secs(30), move || {
+            crate::http::playback::episodes::aggregate_visible_episodes_owned(
+                &library_rows,
+                season_param,
+                &unit_states,
+                &season_metas_grouped,
+                files.as_ref(),
+            )
+        })
+        .await;
+
+    let episode_rows = match rows_res {
+        Ok(rows) => rows,
+        Err(crate::blocking_budget::BlockingError::Busy) => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime.busy",
+                "服务繁忙，请重试",
+            );
+        }
+        Err(crate::blocking_budget::BlockingError::Timeout) => {
+            return err(
+                StatusCode::GATEWAY_TIMEOUT,
+                "library.timeout",
+                "加载集列表超时",
+            );
+        }
+        Err(crate::blocking_budget::BlockingError::Worker(msg)) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "library.worker",
+                &msg,
+            );
+        }
+    };
     let rows = crate::http::playback::episodes::format_episodes_json(&episode_rows, &item_id);
     ok_list(rows).into_response()
 }

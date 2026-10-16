@@ -33,11 +33,18 @@ impl Store {
         self.insert_ledger_with_optional_source(row, source.to_str())
     }
 
-    fn insert_ledger_with_optional_source(
+    /// Insert ledger row with caller-observed transfer mode and optional source path,
+    /// avoiding filesystem metadata inspection under the Store lock.
+    pub fn insert_ledger_with_mode_and_source(
         &self,
         row: &LedgerRow,
+        transfer_mode: Option<&str>,
         source_path: Option<&str>,
     ) -> Result<(), StoreError> {
+        let mode = match transfer_mode {
+            Some(m) => m.to_string(),
+            None => self.transfer_mode_for_path(&row.path),
+        };
         self.library.execute(
             "INSERT INTO ledger (
                 id, media_id, path, season, episode, resolution, codec, hdr,
@@ -67,11 +74,19 @@ impl Store {
                 row.quality_source.as_str(),
                 row.confidence.as_str(),
                 row.filter_score,
-                self.transfer_mode_for_path(&row.path),
+                mode,
                 source_path,
             ],
         )?;
         Ok(())
+    }
+
+    fn insert_ledger_with_optional_source(
+        &self,
+        row: &LedgerRow,
+        source_path: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.insert_ledger_with_mode_and_source(row, None, source_path)
     }
 
     fn transfer_mode_for_path(&self, path: &str) -> String {

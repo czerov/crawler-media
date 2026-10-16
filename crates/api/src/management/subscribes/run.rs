@@ -331,10 +331,12 @@ fn load_run_facts(state: &ApiState, id: SubscribeId, context: &RunContext)
     -> Result<subscribe::SubscribeFacts, ApiError>
 {
     let existing = state.store.lock().load_pending(id)?;
-    let mut facts = state
-        .store
-        .lock()
-        .load_library_subscribe_facts(&context.subscribe, context.media.kind)?;
+    let mut facts = crate::subscribe_library_read::read_subscribe_library_facts(
+        state,
+        &context.subscribe,
+        context.media.kind,
+    )
+    .map_err(|e| ApiError::internal(e))?;
     for (_, pending) in &existing {
         let release = pending
             .release_override
@@ -452,6 +454,14 @@ fn persist(
     routed: &RoutedDownloader<'_>,
     lease: &crate::library_lifecycle::LibraryWorkLease,
 ) -> Result<(), ApiError> {
+    // Transfer-mode observation is filesystem work: observe it before taking the lock.
+    let default_transfer_mode = {
+        let store = state.store.lock();
+        store.transfer_mode().unwrap_or_else(|_| "copy".into())
+    };
+    let modes =
+        crate::worker::transfer::observe_transfer_modes(&outcome.ledger, &default_transfer_mode);
+
     let store = state.store.lock();
     lease
         .control()
@@ -463,18 +473,13 @@ fn persist(
             "目标 Library 正在删除或已不存在",
         ));
     }
-    for row in &outcome.ledger {
+    for (row, mode) in outcome.ledger.iter().zip(modes.iter()) {
         let source_path = outcome
             .ledger_sources
             .iter()
             .find(|source| source.ledger_path == row.path)
             .map(|source| source.source_path.as_str());
-        match source_path {
-            Some(source_path) => {
-                store.insert_ledger_with_source(row, std::path::Path::new(source_path))?
-            }
-            None => store.insert_ledger(row)?,
-        }
+        store.insert_ledger_with_mode_and_source(row, Some(mode), source_path)?;
     }
     let now = crate::job_loop::unix_now();
     let transferred = outcome.transferred_enclosures;
@@ -497,11 +502,27 @@ fn persist(
     store.record_pending_submissions(id, &pending_items)?;
     store.mark_pending_imported(id, &transferred)?;
     store.save_subscribe_facts(id, &outcome.facts)?;
-    for path in &outcome.removed_paths {
-        crate::http::file_delete::remove_file_and_ledger(&store, path)
-            .map_err(ApiError::internal)?;
-    }
     drop(store);
+
+    // Physical deletion of replaced files OUTSIDE the Store lock (after the database
+    // commit is durable), then remove their ledger rows in one short critical section.
+    let removed_paths = outcome.removed_paths.clone();
+    if !removed_paths.is_empty() {
+        for path in &removed_paths {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::error!(path, %error, "物理删除旧文件失败"),
+            }
+        }
+        let store = state.store.lock();
+        for path in &removed_paths {
+            if let Err(error) = store.delete_ledger_path(path) {
+                tracing::error!(path, %error, "删除已替换文件的台账行失败");
+            }
+        }
+    }
+
     crate::http::library::enqueue_probes_for_rows(state, &outcome.ledger);
     Ok(())
 }

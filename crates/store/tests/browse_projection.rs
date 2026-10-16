@@ -90,6 +90,7 @@ fn projection_publication_and_retrieval() {
         generation: 1,
         scope_signature: "sig-v1".to_string(),
         revisions,
+        expected_dirty_token: None,
         files: vec![BrowseFileFacts {
             ledger_id,
             media_id,

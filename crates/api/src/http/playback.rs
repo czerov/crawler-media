@@ -198,29 +198,128 @@ pub(crate) async fn episodes(
         },
         None => None,
     };
-    let store = state.store.lock();
-    let Some(media_id) = resolve_media_id(&id) else {
-        return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
+    let (media, visible_cloned, unit_states) = {
+        let store = state.store.lock();
+        let Some(media_id) = resolve_media_id(&id) else {
+            return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
+        };
+        let Some(media) = store.get_media(media_id).ok().flatten() else {
+            return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
+        };
+        let all_rows = store.list_ledger().unwrap_or_default();
+        let visible_rows = visible_rows_for_media(&store, &media, &all_rows, user_id);
+        if visible_rows.is_empty() {
+            return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
+        }
+        let visible_cloned: Vec<domain::LedgerRow> = visible_rows.into_iter().cloned().collect();
+        let mut unit_states = std::collections::HashMap::new();
+        if let Some(uid) = user_id {
+            for row in &visible_cloned {
+                let Some(e) = row.episode else { continue };
+                let s = row.season.unwrap_or(1);
+                if let Ok(st) = store.unit_state(uid, media.id, s as i32, e as i32) {
+                    unit_states.insert((s, e), st);
+                }
+            }
+        }
+        (media, visible_cloned, unit_states)
     };
-    let Some(media) = store.get_media(media_id).ok().flatten() else {
-        return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
+
+    let files = state.browse_files.clone();
+    let id_clone = id.clone();
+    let rows_res = state
+        .http_work
+        .run(std::time::Duration::from_secs(30), move || {
+            let mut grouped: std::collections::HashMap<
+                (u32, u32),
+                (Vec<String>, String, Option<String>, Option<String>),
+            > = std::collections::HashMap::new();
+
+            for row in &visible_cloned {
+                let Some(ep_num) = row.episode else {
+                    continue;
+                };
+                let season_num = row.season.unwrap_or(1);
+                if let Some(target) = season_number {
+                    if season_num != target {
+                        continue;
+                    }
+                }
+
+                let file_path = std::path::Path::new(&row.path);
+                let file_name = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+
+                let local_still = crate::episode_still::existing_with(file_path, files.as_ref())
+                    .map(|_| crate::http::library::artwork_url("stills", row.id));
+                let backdrop = if row.season.is_some()
+                    && crate::http::library::backdrop_path_with(row, files.as_ref()).is_some()
+                {
+                    Some(crate::http::library::artwork_url("fanart", row.id))
+                } else {
+                    None
+                };
+
+                let entry = grouped
+                    .entry((season_num, ep_num))
+                    .or_insert_with(|| (Vec::new(), file_name, local_still, backdrop));
+                entry.0.push(row.id.to_string());
+            }
+
+            let mut keys: Vec<(u32, u32)> = grouped.keys().copied().collect();
+            keys.sort();
+
+            let episode_rows: Vec<episodes::EpisodeRow> = keys
+                .into_iter()
+                .map(|(season, episode)| {
+                    let (file_ids, file_name, local_still, backdrop) =
+                        grouped.remove(&(season, episode)).unwrap();
+
+                    let (position_ms, played, progress_percent) = match unit_states.get(&(season, episode)).and_then(|state| state.as_ref()) {
+                        Some(ps) => {
+                            let percent = if !ps.played {
+                                ps.duration_ms.and_then(|d| {
+                                    if d > 0 {
+                                        Some(((ps.position_ms * 100) / d).clamp(0, 100))
+                                    } else {
+                                        None
+                                    }
+                                })
+                            } else {
+                                None
+                            };
+                            (ps.position_ms, ps.played, percent)
+                        }
+                        None => (0, false, None),
+                    };
+
+                    episodes::EpisodeRow {
+                        season,
+                        episode,
+                        file_ids,
+                        file_name,
+                        local_still,
+                        tmdb_still: None,
+                        backdrop,
+                        name: None,
+                        overview: None,
+                        position_ms,
+                        played,
+                        progress_percent,
+                    }
+                })
+                .collect();
+            episodes::format_episodes_json(&episode_rows, &id_clone)
+        })
+        .await;
+
+    let rows = match rows_res {
+        Ok(r) => r,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "playback.timeout", "加载集列表超时"),
     };
-    let all_rows = store.list_ledger().unwrap_or_default();
-    let visible_rows = visible_rows_for_media(&store, &media, &all_rows, user_id);
-    if visible_rows.is_empty() {
-        return err(StatusCode::NOT_FOUND, "playback.item_missing", "条目不存在");
-    }
-    let season_metas = std::collections::HashMap::new();
-    let visible_cloned: Vec<domain::LedgerRow> = visible_rows.into_iter().cloned().collect();
-    let episode_rows = episodes::aggregate_visible_episodes(
-        &store,
-        &media,
-        &visible_cloned,
-        season_number,
-        user_id,
-        &season_metas,
-    );
-    let rows = episodes::format_episodes_json(&episode_rows, &id);
     ok(json!({ "season_number": season_number, "episodes": rows })).into_response()
 }
 

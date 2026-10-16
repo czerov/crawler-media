@@ -49,6 +49,7 @@ pub struct ProjectionBuild {
     pub generation: i64,
     pub scope_signature: String,
     pub revisions: ReadRevisions,
+    pub expected_dirty_token: Option<i64>,
     pub files: Vec<BrowseFileFacts>,
     pub media: Vec<BrowseMediaFacts>,
 }
@@ -111,81 +112,213 @@ impl Store {
 
     /// Publish a rebuilt browse projection within a single Immediate transaction in library.db.
     ///
-    /// Verifies that library.db revision has not changed during build.
+    /// Verifies that library.db dirty token and scope have not changed during build.
     pub fn publish_browse_projection(&self, build: &ProjectionBuild) -> Result<bool, StoreError> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.library,
             rusqlite::TransactionBehavior::Immediate,
         )?;
 
-        // 只核对公共事实 revision：构建期间的 `playback_units` 写入不应丢弃
-        // 已经建好的公共图片/NFO 投影（用户 unit 每请求实时批量读取）。
-        let cur_revs = self.read_revisions()?;
-        if !cur_revs.public_matches(&build.revisions) {
-            return Ok(false);
+        // CAS check: verify dirty_token in library.db
+        let current_head: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT dirty_token, scope_signature FROM browse_generations WHERE library_id = ?1",
+                [&build.library_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        if let Some((cur_dirty_token, _)) = current_head {
+            if let Some(expected_dirty) = build.expected_dirty_token {
+                if cur_dirty_token != expected_dirty {
+                    return Ok(false);
+                }
+            }
         }
 
+        // Revalidate against the current authoritative library scope in app.db (D3-05)
+        if let Ok(Some(current_lib)) = self.get_library(&build.library_id) {
+            let mut roots: Vec<String> = current_lib
+                .root_paths
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect();
+            roots.sort_unstable();
+            let authoritative_scope = format!("{}|{}", current_lib.kind.as_str(), roots.join("\u{1f}"));
+            if authoritative_scope != build.scope_signature {
+                return Ok(false);
+            }
+        }
+
+        let cur_revs = self.read_revisions()?;
+        if !build.revisions.public_matches(&cur_revs) {
+            return Ok(false);
+        }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
-        // Delete previous projection data for this library
-        tx.execute(
-            "DELETE FROM browse_files WHERE library_id = ?1",
-            [&build.library_id],
-        )?;
-        tx.execute(
-            "DELETE FROM browse_media WHERE library_id = ?1",
-            [&build.library_id],
-        )?;
+        // Read existing files and media to patch only changed rows
+        let mut existing_files: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT ledger_id, facts_json FROM browse_files WHERE library_id = ?1",
+            )?;
+            let rows = stmt.query_map([&build.library_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                let (lid, facts) = r?;
+                existing_files.insert(lid, facts);
+            }
+        }
 
-        // Insert new files
+        let mut new_file_keys = std::collections::HashSet::new();
         for f in &build.files {
-            tx.execute(
-                "INSERT INTO browse_files (library_id, ledger_id, media_id, generation, facts_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    build.library_id,
-                    f.ledger_id.to_string(),
-                    f.media_id.to_string(),
-                    build.generation,
-                    f.facts.to_string()
-                ],
-            )?;
+            let lid_str = f.ledger_id.to_string();
+            let facts_str = f.facts.to_string();
+            new_file_keys.insert(lid_str.clone());
+
+            if let Some(existing_facts) = existing_files.get(&lid_str) {
+                if existing_facts != &facts_str {
+                    tx.execute(
+                        "UPDATE browse_files
+                         SET media_id = ?1, generation = ?2, facts_json = ?3
+                         WHERE library_id = ?4 AND ledger_id = ?5",
+                        params![
+                            f.media_id.to_string(),
+                            build.generation,
+                            facts_str,
+                            build.library_id,
+                            lid_str
+                        ],
+                    )?;
+                }
+            } else {
+                tx.execute(
+                    "INSERT INTO browse_files (library_id, ledger_id, media_id, generation, facts_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        build.library_id,
+                        lid_str,
+                        f.media_id.to_string(),
+                        build.generation,
+                        facts_str
+                    ],
+                )?;
+            }
         }
 
-        // Insert new media
+        // Delete files that are no longer in build
+        for old_lid in existing_files.keys() {
+            if !new_file_keys.contains(old_lid) {
+                tx.execute(
+                    "DELETE FROM browse_files WHERE library_id = ?1 AND ledger_id = ?2",
+                    params![build.library_id, old_lid],
+                )?;
+            }
+        }
+
+        // Read existing media
+        let mut existing_media: std::collections::HashMap<String, (String, Option<u16>, String)> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT media_id, title, year, facts_json FROM browse_media WHERE library_id = ?1",
+            )?;
+            let rows = stmt.query_map([&build.library_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<u16>>(2)?,
+                        r.get::<_, String>(3)?,
+                    ),
+                ))
+            })?;
+            for r in rows {
+                let (mid, data) = r?;
+                existing_media.insert(mid, data);
+            }
+        }
+
+        let mut new_media_keys = std::collections::HashSet::new();
         for m in &build.media {
-            tx.execute(
-                "INSERT INTO browse_media (library_id, media_id, generation, title, year, facts_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    build.library_id,
-                    m.media_id.to_string(),
-                    build.generation,
-                    m.title,
-                    m.year,
-                    m.facts.to_string()
-                ],
-            )?;
+            let mid_str = m.media_id.to_string();
+            let facts_str = m.facts.to_string();
+            new_media_keys.insert(mid_str.clone());
+
+            if let Some((cur_title, cur_year, cur_facts)) = existing_media.get(&mid_str) {
+                if cur_title != &m.title || cur_year != &m.year || cur_facts != &facts_str {
+                    tx.execute(
+                        "UPDATE browse_media
+                         SET generation = ?1, title = ?2, year = ?3, facts_json = ?4
+                         WHERE library_id = ?5 AND media_id = ?6",
+                        params![
+                            build.generation,
+                            m.title,
+                            m.year,
+                            facts_str,
+                            build.library_id,
+                            mid_str
+                        ],
+                    )?;
+                }
+            } else {
+                tx.execute(
+                    "INSERT INTO browse_media (library_id, media_id, generation, title, year, facts_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        build.library_id,
+                        mid_str,
+                        build.generation,
+                        m.title,
+                        m.year,
+                        facts_str
+                    ],
+                )?;
+            }
         }
 
+        // Delete media no longer in build
+        for old_mid in existing_media.keys() {
+            if !new_media_keys.contains(old_mid) {
+                tx.execute(
+                    "DELETE FROM browse_media WHERE library_id = ?1 AND media_id = ?2",
+                    params![build.library_id, old_mid],
+                )?;
+            }
+        }
+
+        let dirty_token = build.expected_dirty_token.unwrap_or(0);
         // Upsert generation
         tx.execute(
-            "INSERT OR REPLACE INTO browse_generations
+            "INSERT INTO browse_generations
                 (library_id, generation, scope_signature, state, refreshed_at_ms,
-                 app_revision, library_revision, catalog_revision, subscribe_revision)
-             VALUES (?1, ?2, ?3, 'ready', ?4, ?5, ?6, ?7, ?8)",
+                 app_revision, library_revision, catalog_revision, subscribe_revision, dirty_token)
+             VALUES (?1, ?2, ?3, 'ready', ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(library_id) DO UPDATE SET
+                 generation = ?2,
+                 scope_signature = ?3,
+                 state = 'ready',
+                 refreshed_at_ms = ?4,
+                 app_revision = ?5,
+                 library_revision = ?6,
+                 catalog_revision = ?7,
+                 subscribe_revision = ?8,
+                 dirty_token = ?9",
             params![
                 build.library_id,
                 build.generation,
                 build.scope_signature,
                 now_ms,
-                build.revisions.app,
-                build.revisions.library,
-                build.revisions.catalog,
-                build.revisions.subscribe
+                cur_revs.app,
+                cur_revs.library,
+                cur_revs.catalog,
+                cur_revs.subscribe,
+                dirty_token
             ],
         )?;
 

@@ -497,16 +497,23 @@ async fn unrelated_ledger_and_catalog_growth_does_not_add_target_file_io() {
     }
 
     // 重建：无关行只参与 scope 过滤（CPU），不得触发额外文件 IO。
+    // D3 起，热页 freshness 由每库 dirty/generation 驱动（不再比较全局 revision），
+    // 因此另一个 Library 的 ledger/catalog 增长必须完全不重建目标 Library：
+    // 这里期望 0 次文件观察，而基线构建仍必须观察过目标文件。
     files.reset();
     state
         .projection
         .ensure(state.clone(), fix.library_id.clone())
         .await
         .unwrap();
+    assert!(
+        baseline_build_io > 0,
+        "基线构建必须观察目标文件（否则本断言无意义）"
+    );
     assert_eq!(
         files.total(),
-        baseline_build_io,
-        "无关 ledger/catalog 增长不得增加目标 Library 的构建文件 IO"
+        0,
+        "无关 ledger/catalog 增长不得重建目标 Library（不得产生文件 IO）"
     );
 
     for suffix in ["items", "gallery", "facets"] {

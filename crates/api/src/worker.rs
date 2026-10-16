@@ -7,7 +7,7 @@ mod finish_search;
 use finish_search::finish_search;
 mod search;
 pub(crate) use search::{report_site_failures, search_torrents_for_media};
-mod transfer;
+pub(crate) mod transfer;
 pub use transfer::transfer_one;
 
 type RssBatch = (Vec<domain::Torrent>, bool, Vec<String>);

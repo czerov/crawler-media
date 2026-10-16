@@ -39,6 +39,10 @@ pub mod management;
 pub mod library_lifecycle;
 pub mod library_presence;
 pub mod maintenance;
+/// Pure, testable reconciliation helper (depth limit 5, 100,000-entry budget,
+/// symlinks never followed out of scope, `incomplete` reported honestly, and
+/// the result is NOT an authorization decision).
+pub mod library_reconciliation;
 pub mod marker_resolver;
 pub mod media_posters;
 pub mod media_server_provider;
@@ -54,6 +58,8 @@ pub mod scan_probe_dispatch;
 pub mod ui;
 pub mod visible_scope;
 pub use poster_fetch::PosterFetch;
+pub mod subscribe_library_read;
+pub use subscribe_library_read::read_subscribe_library_facts;
 pub mod anilist_http;
 pub mod bangumi_http;
 pub mod blocking_budget;

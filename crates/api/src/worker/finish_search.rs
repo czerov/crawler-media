@@ -43,6 +43,26 @@ pub(super) fn finish_search(
     };
 
     let context = load_search_context(state, &subscribe, &media)?;
+    let library_lease = state.acquire_library_work(&context.library_id)?;
+    library_lease.control().check().map_err(|e| e.to_string())?;
+
+    // Re-validate observation against current DB state before side effect
+    {
+        let store = state.store.lock();
+        if !store
+            .library_accepts_work(&context.library_id)
+            .map_err(|e| e.to_string())?
+        {
+            return Err("目标 Library 正在删除或已不存在".into());
+        }
+        let current_revisions = store.read_revisions().map_err(|e| e.to_string())?;
+        if current_revisions.library != context.observation_revisions.library
+            || current_revisions.app != context.observation_revisions.app
+        {
+            return Err("Library 配置或台账在观察期间已变更，放弃本轮提交".into());
+        }
+    }
+
     tracing::info!(
         subscribe_id = %subscribe.id,
         media = %media.title,
@@ -75,10 +95,12 @@ struct SearchContext {
     facts: subscribe::SubscribeFacts,
     wash_filter: Option<domain::Filter>,
     existing: Vec<(i32, crate::store::PendingDownload)>,
+    library_id: String,
     library_root: std::path::PathBuf,
     transfer_mode: Option<library::TransferMode>,
     scrape: bool,
     naming: String,
+    observation_revisions: store::ReadRevisions,
 }
 
 fn load_search_context(
@@ -86,16 +108,20 @@ fn load_search_context(
     subscribe: &domain::Subscribe,
     media: &domain::Media,
 ) -> Result<SearchContext, String> {
-    let (facts, wash_filter) = {
+    let obs = crate::subscribe_library_read::observe_subscribe_library_facts(
+        state,
+        subscribe,
+        media.kind,
+    )?;
+    let facts = obs.facts;
+    let library_id = obs.library_id;
+    let observation_revisions = obs.revisions;
+    let wash_filter = {
         let store = state.store.lock();
-        let facts = store
-            .load_library_subscribe_facts(subscribe, media.kind)
-            .map_err(|error| error.to_string())?;
-        let wash_filter = subscribe
+        subscribe
             .wash_cut_filter_id
             .and_then(|id| store.get_filter(id).ok().flatten())
-            .or_else(|| store.get_filter(subscribe.filter_id).ok().flatten());
-        (facts, wash_filter)
+            .or_else(|| store.get_filter(subscribe.filter_id).ok().flatten())
     };
     let (library_root, transfer_mode, scrape) =
         crate::directory::transfer_plan_for_library(
@@ -117,10 +143,12 @@ fn load_search_context(
         facts,
         wash_filter,
         existing,
+        library_id,
         library_root,
         transfer_mode,
         scrape,
         naming,
+        observation_revisions,
     })
 }
 
