@@ -160,6 +160,8 @@ fn collect_scored_torrent_inner<D: Downloader + ?Sized>(
     recorder: Option<&dyn TransferRecorder>,
 ) {
     let mut vetoed = false;
+    // Review M-4: a veto caused by an unfinished probe; the row stays active.
+    let mut awaiting_probe = false;
     // M2: video files skipped because their slots were already owned.
     let mut duplicate = false;
     let errors_before_torrent = collection_errors.len();
@@ -226,6 +228,7 @@ fn collect_scored_torrent_inner<D: Downloader + ?Sized>(
             ledger_sources,
             removed_paths,
             &mut vetoed,
+            &mut awaiting_probe,
             &mut duplicate,
             control,
             recorder,
@@ -280,7 +283,12 @@ fn collect_scored_torrent_inner<D: Downloader + ?Sized>(
     }
     // A download that only duplicated owned episodes (M2) is finished too.
     let has_work = !torrent_destinations.is_empty() || subs_count > 0 || duplicate;
-    if task_done && reported_any && has_work && collection_errors.len() == errors_before_torrent {
+    if task_done
+        && reported_any
+        && has_work
+        && !awaiting_probe
+        && collection_errors.len() == errors_before_torrent
+    {
         transferred_enclosures.push(scored.torrent.enclosure.clone());
     }
     if vetoed && !rejected_enclosures.contains(&scored.torrent.enclosure) {
@@ -351,6 +359,7 @@ fn collect_one<D: Downloader + ?Sized>(
     ledger_sources: &mut Vec<LedgerSource>,
     removed_paths: &mut Vec<String>,
     vetoed: &mut bool,
+    awaiting_probe: &mut bool,
     duplicate: &mut bool,
     control: &library::WorkControl,
     recorder: Option<&dyn TransferRecorder>,
@@ -472,7 +481,22 @@ fn collect_one<D: Downloader + ?Sized>(
         source == QualitySource::Probe,
     );
     if added.input.subscribe.wash_cut && has_existing && !approved {
-        *vetoed = true;
+        // Review M-4: only a finished probe that disproves the upgrade is a
+        // final rejection; an unfinished probe waits for the next round.
+        let probed = source == QualitySource::Probe;
+        if probed {
+            *vetoed = true;
+        } else {
+            *awaiting_probe = true;
+        }
+        // Roll back the side-by-side publish (queued deletion of file and
+        // ledger row). Move took the file out of the download: keep it.
+        let mode = resolve_mode(&src, added.input.library_root, added.input.transfer_mode);
+        if !matches!(mode, library::TransferMode::Move) {
+            tracing::warn!(dest = %dest.display(), probed, "替换未获批准，撤回已转入的并列文件");
+            removed_paths.push(dest.display().to_string());
+            return Ok(None);
+        }
         tracing::warn!(
             dest = %dest.display(),
             resolution = ?quality.resolution,

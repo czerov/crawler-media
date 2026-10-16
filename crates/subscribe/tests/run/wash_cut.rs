@@ -144,11 +144,9 @@ fn assert_rejected_probe_preserves_owned(old_score: i32, resolution: &str, codec
         old_lib.to_str()
     );
     assert_eq!(outcome.facts.movie().unwrap().score, old_score);
-    assert_eq!(
-        outcome.ledger[0].filter_score,
-        Some(0),
-        "rejected alternate cannot outrank owned facts after reload"
-    );
+    // Review M-4: a probed non-upgrade is rolled back, not kept beside.
+    assert!(outcome.ledger.is_empty(), "rejected alternate is not recorded");
+    assert_eq!(outcome.removed_paths.len(), 1, "{:?}", outcome.removed_paths);
     assert!(
         old_lib.exists(),
         "标称更高、probe 更低的新文件不能删除在位版本"
@@ -352,7 +350,7 @@ fn wash_cut_keep_old_versions_keeps_both_files() {
     let dl = MemoryDownloader::new(tmp.path().join("stage"));
     map_file(&dl, &better, src);
 
-    let outcome = run(run_input(
+    let outcome = subscribe::run_with_probe(run_input(
         &sub,
         &media,
         &filter,
@@ -360,7 +358,7 @@ fn wash_cut_keep_old_versions_keeps_both_files() {
         facts,
         &dl,
         &tmp.path().join("lib"),
-    ))
+    ), &FileProbe)
     .unwrap();
 
     assert!(
@@ -410,7 +408,15 @@ fn wash_cut_probe_failure_keeps_owned_file_and_fact() {
 
     assert_eq!(dl.added().len(), 1, "title looks like an upgrade, so it is downloaded");
     assert!(old_lib.exists(), "unprobed replacement must not delete the owned file");
-    assert!(outcome.removed_paths.is_empty());
+    // Review M-4: only the unapproved new copy is withdrawn; the row stays
+    // active (neither transferred nor rejected) until a probe decides.
+    assert!(
+        !outcome.removed_paths.contains(&old_lib.display().to_string()),
+        "{:?}",
+        outcome.removed_paths
+    );
+    assert!(outcome.transferred_enclosures.is_empty());
+    assert!(outcome.rejected_enclosures.is_empty());
     let fact = outcome.facts.movie().unwrap();
     assert_eq!(fact.path.as_deref(), Some(old_lib.display().to_string().as_str()));
     assert_eq!(fact.score, 50);
