@@ -256,31 +256,40 @@ impl Store {
         now: i64,
     ) -> Result<(), StoreError> {
         if let Some(favorite) = favorite {
-            let existing = self.unit_state(user_id, media_id, season, episode)?;
-            let played = played
-                .or(existing.as_ref().map(|u| u.played))
-                .unwrap_or(false);
-            self.upsert_unit(
-                user_id,
-                media_id,
-                season,
-                episode,
-                existing.as_ref().map(|u| u.position_ms).unwrap_or(0),
-                Some(played),
-                Some(favorite),
-                existing.as_ref().and_then(|u| u.duration_ms),
-                existing.as_ref().and_then(|u| u.audio_track.as_deref()),
-                existing.as_ref().and_then(|u| u.subtitle_track.as_deref()),
-                false,
-                now,
-            )?;
-            // 当取消整剧收藏（season=-1, episode=-1）时，级联将名下所有的单集/单季收藏一并置为 false，
-            // 避免出现整剧已取消收藏但列表中依然因为某集残留而被判定为已收藏。
+            // Favorite-only changes preserve the existing played value and activity time.
+            if played.is_none() {
+                let existing = self.unit_state(user_id, media_id, season, episode)?;
+                self.set_unit_favorite(
+                    user_id,
+                    media_id,
+                    season,
+                    episode,
+                    favorite,
+                    existing.as_ref().is_some_and(|unit| unit.played),
+                )?;
+            } else {
+                let existing = self.unit_state(user_id, media_id, season, episode)?;
+                self.upsert_unit(
+                    user_id,
+                    media_id,
+                    season,
+                    episode,
+                    existing.as_ref().map(|unit| unit.position_ms).unwrap_or(0),
+                    played,
+                    Some(favorite),
+                    existing.as_ref().and_then(|unit| unit.duration_ms),
+                    existing.as_ref().and_then(|unit| unit.audio_track.as_deref()),
+                    existing.as_ref().and_then(|unit| unit.subtitle_track.as_deref()),
+                    false,
+                    now,
+                )?;
+            }
+            // Cascaded favorite changes must not reorder playback activity.
             if !favorite && season == UNIT_WHOLE && episode == UNIT_WHOLE {
                 self.subscribe.execute(
-                    "UPDATE playback_units SET favorite = 0, updated_at = ?3
+                    "UPDATE playback_units SET favorite = 0
                      WHERE user_id = ?1 AND media_id = ?2",
-                    params![user_id.to_string(), media_id.to_string(), now],
+                    params![user_id.to_string(), media_id.to_string()],
                 )?;
             }
         }

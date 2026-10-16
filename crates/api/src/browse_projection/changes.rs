@@ -58,6 +58,11 @@ impl ProjectionDependencies {
             || self.paths_by_library.contains_key(library_id)
             || self.catalog_by_library.contains_key(library_id)
     }
+    pub fn has_media_dependency(&self, library_id: &str, media_id: MediaId) -> bool {
+        self.media_by_library
+            .get(library_id)
+            .is_some_and(|media_ids| media_ids.contains(&media_id))
+    }
 
 
     fn retain_libraries(&mut self, library_ids: &HashSet<String>) {

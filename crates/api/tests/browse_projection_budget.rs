@@ -106,6 +106,52 @@ fn second_library(fix: &PresenceFixture) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn media_batch_read_failure_does_not_publish_projection() {
+    let fix = PresenceFixture::new();
+    let (media_id, _) = fix.insert_media_and_ledger("Unreadable.mkv");
+    let db_path = fix.state.store().lock().app_db_path().to_path_buf();
+    rusqlite::Connection::open(db_path)
+        .unwrap()
+        .execute_batch("DROP TABLE media;")
+        .unwrap();
+
+    let state = fix.state.clone().with_projection_service(Arc::new(
+        ProjectionService::new().with_build_capacity(1),
+    ));
+    let result = state
+        .projection
+        .ensure(state.clone(), fix.library_id.clone())
+        .await;
+
+    assert!(matches!(result, Err(ProjectionError::Failed(_))), "Media read failure must be surfaced: {result:?}");
+    let store = state.store();
+    let guard = store.lock();
+    assert!(guard.browse_projection(&fix.library_id).unwrap().is_none());
+    assert!(!state.projection.has_media_dependency(&fix.library_id, media_id));
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publication_store_failure_is_failed_and_keeps_library_visited() {
+    let fix = PresenceFixture::new();
+    let (media_id, _) = fix.insert_media_and_ledger("PublishFailure.mkv");
+    let state = fix.state.clone().with_projection_service(Arc::new(
+        ProjectionService::new().with_build_capacity(1),
+    ));
+    let library_db = fix.state.store().lock().data_dir().join("library.db");
+    rusqlite::Connection::open(library_db)
+        .unwrap()
+        .execute_batch("CREATE TRIGGER fail_projection_publish BEFORE INSERT ON browse_files BEGIN SELECT RAISE(ABORT, 'simulated projection publish failure'); END;")
+        .unwrap();
+
+    let result = state
+        .projection
+        .ensure(state.clone(), fix.library_id.clone())
+        .await;
+
+    assert!(matches!(result, Err(ProjectionError::Failed(_))), "Store publication failure must surface as Failed: {result:?}");
+    assert!(state.projection.has_visited(&fix.library_id));
+    assert!(!state.projection.has_media_dependency(&fix.library_id, media_id));
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn saturated_projection_build_capacity_returns_503() {
     let fix = PresenceFixture::new();
     fix.insert_media_and_ledger("Gated.mkv");

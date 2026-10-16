@@ -30,7 +30,7 @@ struct Owned {
 
 pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, ProjectionError> {
     let owned = collect_owned(state, library_id)?;
-    let media_map = load_media(state, &owned.media_ids);
+    let media_map = load_media(state, &owned.media_ids)?;
     let catalog_rows = load_catalog_rows(state, &media_map);
     let cache = CacheIndex::build(&catalog_rows);
     let files = state.browse_files.as_ref();
@@ -128,16 +128,16 @@ fn collect_owned(state: &ApiState, library_id: &str) -> Result<Owned, Projection
 }
 
 /// Media 行按 500 一批读取，避免超过 SQLite 变量上限。
-fn load_media(state: &ApiState, ids: &[MediaId]) -> HashMap<MediaId, Media> {
+fn load_media(state: &ApiState, ids: &[MediaId]) -> Result<HashMap<MediaId, Media>, ProjectionError> {
     let store = state.store.lock();
     let mut map = HashMap::new();
     for chunk in ids.chunks(500) {
-        match store.media_batch(chunk) {
-            Ok(batch) => map.extend(batch),
-            Err(error) => tracing::warn!(%error, "投影构建读取 Media 批次失败"),
-        }
+        let batch = store
+            .media_batch(chunk)
+            .map_err(|error| ProjectionError::Failed(error.to_string()))?;
+        map.extend(batch);
     }
-    map
+    Ok(map)
 }
 
 /// 只查目标 Media 的详情键前缀：不再全量读取 catalog body。

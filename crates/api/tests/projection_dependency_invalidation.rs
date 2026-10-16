@@ -288,15 +288,30 @@ fn acknowledged_coalescing_sentinel_is_pruned_after_interrupted_acknowledgement(
         .browse_changes(BrowseChangeSource::Catalog, store.browse_change_cursor(BrowseChangeSource::Catalog).unwrap(), 10)
         .unwrap()
         .is_empty());
+    let mut replay_budget = api::browse_projection::changes::MAX_EVENTS_PER_ROUND;
     let replay = consumer
-        .poll_source(&store, &ownership, BrowseChangeSource::Catalog)
+        .poll_source_budgeted(
+            &store,
+            &ownership,
+            BrowseChangeSource::Catalog,
+            &mut replay_budget,
+        )
         .unwrap();
     assert_eq!(replay, (1, true), "replay must consume exactly one budget unit");
+    assert_eq!(
+        replay_budget,
+        api::browse_projection::changes::MAX_EVENTS_PER_ROUND - 1,
+        "replay must decrement the caller-shared budget exactly once",
+    );
+    let after_replay = store.browse_projection_head(&library_id).unwrap().unwrap();
+    assert!(
+        after_replay.dirty_token > baseline.dirty_token,
+        "replayed sentinel must invalidate the affected library before any later event",
+    );
     assert!(store
         .browse_changes(BrowseChangeSource::Catalog, sentinel.seq - 1, 1)
         .unwrap()
         .is_empty(), "replay must prune the acknowledged coalescing sentinel");
-
     store
         .put_catalog_cache("tmdb", "/movie/1000", "{}", 10_001, None)
         .unwrap();

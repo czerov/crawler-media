@@ -24,7 +24,7 @@ async fn season_played_mark_updates_episode_rollup_and_next_up() {
     assert!(get_json(&app, "/Shows/NextUp").await["Items"].as_array().unwrap().is_empty());
 }
 #[tokio::test]
-async fn library_episode_expansion_excludes_nested_library_rows() {
+async fn library_episode_expansion_respects_nested_and_default_library_ownership() {
     let tmp = tempfile::tempdir().unwrap();
     let (app, _, _) = app(tmp.path());
     let store = Store::open(tmp.path().join("data")).unwrap();
@@ -32,17 +32,29 @@ async fn library_episode_expansion_excludes_nested_library_rows() {
     let child_root = parent_root.join("child");
     std::fs::create_dir_all(&child_root).unwrap();
     let parent = store.create_library(MediaKind::Tv, "Parent shows", &[parent_root.to_str().unwrap()], "everyone", true, &[]).unwrap();
-    store.create_library(MediaKind::Tv, "Child shows", &[child_root.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    let child = store.create_library(MediaKind::Tv, "Child shows", &[child_root.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    store.set_default_library(&parent.id).unwrap();
     let show = new_media(MediaKind::Tv, "Nested show");
     store.insert_media(&show).unwrap();
     let parent_episode = insert_episode(&store, &parent_root, show.id, 1, 1);
-    insert_episode(&store, &child_root, show.id, 1, 2);
+    let child_episode = insert_episode(&store, &child_root, show.id, 1, 2);
+    let outside_root = tmp.path().join("unowned-tv-path");
+    std::fs::create_dir_all(&outside_root).unwrap();
+    let outside_episode = insert_episode(&store, &outside_root, show.id, 1, 3);
     drop(store);
 
-    let listing = get_json(&app, &format!("/Items?ParentId={}&Recursive=true&IncludeItemTypes=Episode", parent.id)).await;
-    let episodes = listing["Items"].as_array().unwrap();
-    assert_eq!(episodes.len(), 1);
-    assert_eq!(episodes[0]["Id"], parent_episode.to_string().replace('-', ""));
+    let child_listing = get_json(&app, &format!("/Items?ParentId={}&Recursive=true&IncludeItemTypes=Episode", child.id)).await;
+    let child_episodes = child_listing["Items"].as_array().unwrap();
+    assert_eq!(child_episodes.len(), 1);
+    assert_eq!(child_episodes[0]["Id"], child_episode.to_string().replace('-', ""));
+
+    let parent_listing = get_json(&app, &format!("/Items?ParentId={}&Recursive=true&IncludeItemTypes=Episode", parent.id)).await;
+    let parent_episodes = parent_listing["Items"].as_array().unwrap();
+    let parent_episode_ids = parent_episodes.iter().map(|episode| episode["Id"].as_str().unwrap()).collect::<std::collections::HashSet<_>>();
+    assert_eq!(parent_episodes.len(), 2);
+    assert!(parent_episode_ids.contains(parent_episode.to_string().replace('-', "").as_str()));
+    assert!(parent_episode_ids.contains(outside_episode.to_string().replace('-', "").as_str()));
+    assert!(!parent_episode_ids.contains(child_episode.to_string().replace('-', "").as_str()));
 }
 
 #[tokio::test]
@@ -62,6 +74,33 @@ async fn newer_show_played_mark_supersedes_older_unplayed_season_everywhere() {
     drop(store);
     assert_eq!(get_json(&app, &format!("/Items/{}", episode.to_string().replace('-', ""))).await["UserData"]["Played"], true);
     assert!(get_json(&app, "/Shows/NextUp").await["Items"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_season_favorite_does_not_resurrect_explicitly_unplayed_episode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _, _) = app(tmp.path());
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("native-favorite");
+    std::fs::create_dir_all(&root).unwrap();
+    store.create_library(MediaKind::Tv, "Native favorite", &[root.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    let show = new_media(MediaKind::Tv, "Native favorite show");
+    store.insert_media(&show).unwrap();
+    let episode = insert_episode(&store, &root, show.id, 1, 1);
+    let user = store.admin_user_id().unwrap();
+    store.upsert_unit(user, show.id, 1, -1, 0, Some(true), None, None, None, None, false, 5).unwrap();
+    store.upsert_unit(user, show.id, 1, 1, 0, Some(false), None, None, None, None, false, 10).unwrap();
+    drop(store);
+
+    let response = app.clone().oneshot(Request::builder()
+        .method("POST")
+        .uri("/api/v1/playback/marks")
+        .header("authorization", "Bearer admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"media_item_id": show.id.to_string(), "season_number": 1, "favorite": true}).to_string()))
+        .unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(get_json(&app, &format!("/Items/{}", episode.to_string().replace('-', ""))).await["UserData"]["Played"], false);
 }
 
 

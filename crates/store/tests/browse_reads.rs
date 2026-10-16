@@ -127,6 +127,25 @@ fn favorite_only_update_preserves_played_activity_timestamp() {
 }
 
 #[test]
+fn whole_unit_unfavorite_preserves_other_units_activity_timestamps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let user = UserId::new();
+    let media = media(MediaKind::Tv, "Cascade favorite timestamp", None);
+    store.insert_media(&media).unwrap();
+    store.upsert_unit(user, media.id, -1, -1, 0, Some(false), Some(true), None, None, None, false, 5).unwrap();
+    store.upsert_unit(user, media.id, 1, -1, 0, Some(false), Some(true), None, None, None, false, 10).unwrap();
+    store.upsert_unit(user, media.id, 1, 1, 0, Some(false), Some(true), None, None, None, false, 15).unwrap();
+
+    store.set_unit_marks(user, media.id, -1, -1, None, Some(false), 99).unwrap();
+
+    assert_eq!(store.unit_state(user, media.id, -1, -1).unwrap().unwrap().updated_at, 5);
+    assert_eq!(store.unit_state(user, media.id, 1, -1).unwrap().unwrap().updated_at, 10);
+    assert_eq!(store.unit_state(user, media.id, 1, 1).unwrap().unwrap().updated_at, 15);
+    assert!(!store.unit_state(user, media.id, 1, 1).unwrap().unwrap().favorite);
+}
+
+#[test]
 fn playback_units_for_user_is_scoped_to_one_user() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path().join("data")).unwrap();

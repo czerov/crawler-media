@@ -304,6 +304,14 @@ impl ProjectionService {
     pub fn has_dependencies(&self, library_id: &str) -> bool {
         self.deps.lock().contains_library(library_id)
     }
+    pub fn has_visited(&self, library_id: &str) -> bool {
+        self.visited.lock().contains(library_id)
+    }
+    pub fn has_media_dependency(&self, library_id: &str, media_id: domain::MediaId) -> bool {
+        self.deps
+            .lock()
+            .has_media_dependency(library_id, media_id)
+    }
 
     pub fn available_build_permits(&self) -> usize {
         self.build_budget.available_permits()
@@ -373,11 +381,17 @@ impl ProjectionService {
         };
         let dirty_version_before = self.dirty_libraries.lock().get(&library_id).copied();
 
-        let lease = match state.acquire_library_work(&library_id) {
+        let lease = match state.acquire_library_work_for_projection(&library_id) {
             Ok(lease) => lease,
-            Err(error) => {
+            Err(crate::library_lifecycle::ProjectionLeaseError::Lifecycle(error)) => {
                 let outcome = BuildOutcome::Cancelled;
                 tracing::debug!(library_id = %library_id, %error, "拒绝已冻结 Library 的投影构建");
+                self.publish_terminal(&library_id, &entry, outcome.clone());
+                return outcome_result(outcome);
+            }
+            Err(crate::library_lifecycle::ProjectionLeaseError::Store(error)) => {
+                let outcome = BuildOutcome::Failed(error.to_string());
+                tracing::warn!(library_id = %library_id, %error, "获取投影构建租约时读取 Store 失败");
                 self.publish_terminal(&library_id, &entry, outcome.clone());
                 return outcome_result(outcome);
             }
@@ -731,15 +745,22 @@ fn publish_blocking(
             let kind = m
                 .facts
                 .get("media")
-                .and_then(|v| v.get("kind"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("movie");
             Some(format!("tmdb:/{kind}/{tmdb_id}"))
         })
         .collect();
+    let mut publication_outcome = None;
     let published = lease.publish(|| {
         let store = state.store.lock();
-        let current_epoch = ownership_signature(&store).map_err(|error| error.to_string())?;
+        let current_epoch = match ownership_signature(&store) {
+            Ok(signature) => signature,
+            Err(error) => {
+                let outcome = BuildOutcome::Failed(error.to_string());
+                publication_outcome = Some(outcome.clone());
+                return Ok(outcome);
+            }
+        };
         if current_epoch != ownership_epoch {
             return Ok(BuildOutcome::StaleScope);
         }
@@ -760,8 +781,16 @@ fn publish_blocking(
     match published {
         Ok(outcome) => outcome,
         Err(error) => {
-            tracing::debug!(library_id, %error, "Library 移除期间取消投影发布");
-            BuildOutcome::Cancelled
+            if let Some(outcome) = publication_outcome {
+                return outcome;
+            }
+            if lease.control().is_cancelled() {
+                tracing::debug!(library_id, %error, "Library 移除期间取消投影发布");
+                BuildOutcome::Cancelled
+            } else {
+                tracing::warn!(library_id, %error, "投影发布屏障失败");
+                BuildOutcome::Failed(error)
+            }
         }
     }
 }

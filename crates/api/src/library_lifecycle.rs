@@ -1,6 +1,13 @@
 //! Library-scoped work leases. Registry -> Store is the only permitted lock order.
 use crate::management::ApiState;
 
+#[derive(Debug)]
+pub(crate) enum ProjectionLeaseError {
+    Lifecycle(String),
+    Store(store::StoreError),
+}
+
+
 impl ApiState {
     pub(crate) fn acquire_path_work(&self, path: &std::path::Path, kind: domain::MediaKind)
         -> Result<Option<LibraryWorkLease>, String>
@@ -18,6 +25,14 @@ impl ApiState {
     pub fn acquire_library_work(&self, library_id: &str) -> Result<LibraryWorkLease, String> {
         self.library_work.acquire(&self.store, library_id)
     }
+    pub(crate) fn acquire_library_work_for_projection(
+        &self,
+        library_id: &str,
+    ) -> Result<LibraryWorkLease, ProjectionLeaseError> {
+        self.library_work
+            .acquire_for_projection(&self.store, library_id)
+    }
+
 
     /// 等该库当前在跑的后台工作全部结束（建库自动扫描、显式扫描、重导入共用同一
     /// registry；由 lease drop 的 `notify_waiters` 唤醒，不是定时轮询）。
@@ -178,6 +193,33 @@ impl LibraryWorkRegistry {
         entry.controls.insert(lease_id.clone(), control.clone());
         Ok(LibraryWorkLease { registry: self.clone(), library_id: library_id.into(), lease_id, control })
     }
+    pub(crate) fn acquire_for_projection(
+        self: &Arc<Self>,
+        store: &Mutex<store::Store>,
+        library_id: &str,
+    ) -> Result<LibraryWorkLease, ProjectionLeaseError> {
+        let mut entries = self.entries.lock();
+        let entry = entries.entry(library_id.to_string()).or_default();
+        let accepts_work = match store.lock().library_accepts_work(library_id) {
+            Ok(accepts_work) => accepts_work,
+            Err(error) => return Err(ProjectionLeaseError::Store(error)),
+        };
+        if entry.cancelled || !accepts_work {
+            return Err(ProjectionLeaseError::Lifecycle(
+                "Library 正在删除或已不存在".into(),
+            ));
+        }
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        let control = library::WorkControl::default();
+        entry.controls.insert(lease_id.clone(), control.clone());
+        Ok(LibraryWorkLease {
+            registry: self.clone(),
+            library_id: library_id.into(),
+            lease_id,
+            control,
+        })
+    }
+
 
     pub fn freeze(&self, store: &Mutex<store::Store>, library_id: &str)
         -> Result<store::LibraryRemoval, store::StoreError>

@@ -253,6 +253,14 @@ impl MediaServerProvider for ApiServerProvider {
     ) -> Result<Vec<MediaItemSnapshot>, String> {
         items::list_visible_items(self, user_id, parent_id).await
     }
+    async fn list_visible_items_in_library(
+        &self,
+        user_id: UserId,
+        parent_id: Option<&str>,
+        library_id: &str,
+    ) -> Result<Vec<MediaItemSnapshot>, String> {
+        items::list_visible_items_in_library(self, user_id, parent_id, library_id).await
+    }
 
     async fn list_resumable_items(
         &self,

@@ -96,37 +96,14 @@ pub(super) async fn items(
         for item in rows {
             if item.is_series {
                 let series_id = item.media.id.to_string().replace('-', "");
-                if let Ok(episodes) = state.provider.list_visible_items(user.id, Some(&series_id)).await {
-                    expanded.extend(episodes.into_iter().filter(|episode| {
-                        if !is_library_parent {
-                            return true;
-                        }
-                        let Some(target_library_id) = query.parent_id.as_deref() else {
-                            return false;
-                        };
-                        libraries
-                            .iter()
-                            .filter(|library| library.id == target_library_id)
-                            .flat_map(|library| &library.root_paths)
-                            .any(|root| {
-                                let target_folder_id = format!(
-                                    "folder_{}",
-                                    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, root.to_string_lossy().as_bytes()).simple()
-                                );
-                                folder_id_matches(&libraries, &target_folder_id, &episode.row.path)
-                            })
-                            && !libraries
-                                .iter()
-                                .filter(|library| library.id != target_library_id)
-                                .flat_map(|library| &library.root_paths)
-                                .any(|root| {
-                                    let other_folder_id = format!(
-                                        "folder_{}",
-                                        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, root.to_string_lossy().as_bytes()).simple()
-                                    );
-                                    folder_id_matches(&libraries, &other_folder_id, &episode.row.path)
-                                })
-                    }));
+                let episodes = if is_library_parent {
+                    let Some(library_id) = query.parent_id.as_deref() else { continue };
+                    state.provider.list_visible_items_in_library(user.id, Some(&series_id), library_id).await
+                } else {
+                    state.provider.list_visible_items(user.id, Some(&series_id)).await
+                };
+                if let Ok(episodes) = episodes {
+                    expanded.extend(episodes);
                 }
             } else {
                 expanded.push(item);

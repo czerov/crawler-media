@@ -99,7 +99,7 @@ fn direct_series_rollup(
     user_id: UserId,
     media_id: domain::MediaId,
 ) -> (bool, usize, (usize, usize)) {
-    let Ok(snapshot) = super::read_snapshot::collect_server_read(store, user_id, None) else {
+    let Ok(snapshot) = super::read_snapshot::collect_server_read(store, user_id, None, None) else {
         return (false, 0, (0, 0));
     };
     let mut episodes = HashSet::new();
@@ -130,12 +130,31 @@ pub(super) async fn list_visible_items(
     user_id: UserId,
     parent_id: Option<&str>,
 ) -> Result<Vec<MediaItemSnapshot>, String> {
+    list_visible_items_with_library_scope(provider, user_id, parent_id, None).await
+}
+
+pub(super) async fn list_visible_items_in_library(
+    provider: &ApiServerProvider,
+    user_id: UserId,
+    parent_id: Option<&str>,
+    library_id: &str,
+) -> Result<Vec<MediaItemSnapshot>, String> {
+    list_visible_items_with_library_scope(provider, user_id, parent_id, Some(library_id)).await
+}
+
+async fn list_visible_items_with_library_scope(
+    provider: &ApiServerProvider,
+    user_id: UserId,
+    parent_id: Option<&str>,
+    library_scope: Option<&str>,
+) -> Result<Vec<MediaItemSnapshot>, String> {
     let state = provider.state.clone();
     let budget = state.http_work.clone();
     let parent_id = parent_id.map(str::to_owned);
+    let library_scope = library_scope.map(str::to_owned);
     budget
         .run(std::time::Duration::from_secs(30), move || {
-            list_visible_items_blocking(&state, user_id, parent_id.as_deref())
+            list_visible_items_blocking(&state, user_id, parent_id.as_deref(), library_scope.as_deref())
         })
         .await
         .map_err(|error| {
@@ -148,9 +167,10 @@ fn list_visible_items_blocking(
     state: &ApiState,
     user_id: UserId,
     parent_id: Option<&str>,
+    library_scope: Option<&str>,
 ) -> Result<Vec<MediaItemSnapshot>, String> {
     let store_guard = state.store.lock();
-    let snapshot = collect_pending(&store_guard, user_id, parent_id)?;
+    let snapshot = collect_pending(&store_guard, user_id, parent_id, library_scope)?;
     drop(store_guard);
     let (pending, ingest_paths) = snapshot;
     let browse = state.browse_files.as_ref();
@@ -217,10 +237,13 @@ fn collect_pending(
     store: &crate::Store,
     user_id: UserId,
     parent_id: Option<&str>,
+    library_scope: Option<&str>,
 ) -> Result<(Vec<PendingSnapshot>, Vec<(domain::MediaId, String)>), String> {
-    let snapshot = super::read_snapshot::collect_server_read(store, user_id, parent_id)?;
+    let snapshot = super::read_snapshot::collect_server_read(store, user_id, parent_id, library_scope)?;
     let ServerReadSnapshot { ownership, is_admin, media, rows: ledger_rows, units, .. } = snapshot;
-    let requested_library = parent_id.and_then(|id| ownership.library(id)).map(|library| library.id.as_str());
+    let requested_library = library_scope.or_else(|| {
+        parent_id.and_then(|id| ownership.library(id)).map(|library| library.id.as_str())
+    });
     let mut show_episodes: HashMap<domain::MediaId, HashSet<(u32, u32)>> = HashMap::new();
     let mut show_seasons: HashMap<domain::MediaId, HashSet<u32>> = HashMap::new();
     let row_visible = |row: &domain::LedgerRow| -> bool {
