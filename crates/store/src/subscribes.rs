@@ -216,7 +216,9 @@ impl Store {
         let mut stmt = self.subscribe.prepare(
             "SELECT enclosure FROM pending_downloads WHERE subscribe_id = ?1 AND state IN ('rejected', 'stalled')",
         )?;
-        let rows = stmt.query_map(params![subscribe_id.to_string()], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![subscribe_id.to_string()], |row| {
+            row.get::<_, String>(0)
+        })?;
         let mut out = std::collections::HashSet::new();
         for row in rows {
             out.insert(row?);
@@ -370,6 +372,12 @@ impl Store {
             params![id.to_string()],
         )?;
         tx.commit()?;
+        // L4: per-subscription settings (`subscribe.<name>:<id>`, e.g. the
+        // completion notice marker) live in the app database; drop them too.
+        self.app.execute(
+            "DELETE FROM settings WHERE key LIKE 'subscribe.%:' || ?1",
+            params![id.to_string()],
+        )?;
         Ok(n > 0)
     }
 
@@ -662,8 +670,10 @@ impl Store {
             ])?;
         }
         drop(statement);
-        tx.execute("DELETE FROM subscribe_facts WHERE subscribe_id = ?1 AND path IS NULL",
-            [subscribe_id.to_string()])?;
+        tx.execute(
+            "DELETE FROM subscribe_facts WHERE subscribe_id = ?1 AND path IS NULL",
+            [subscribe_id.to_string()],
+        )?;
         tx.commit()?;
         Ok(())
     }

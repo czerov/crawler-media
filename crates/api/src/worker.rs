@@ -245,19 +245,15 @@ pub(crate) fn notify_subscription_complete(
     ) {
         return Ok(());
     }
+    // L4: a unit only counts while its file is still on disk.
+    let done = crate::completion::units_on_disk(state, subscribe);
     let store = state.store.lock();
-    let facts = store
-        .load_subscribe_facts(subscribe.id)
-        .map_err(|e| e.to_string())?;
-    let done = subscribe
-        .coverage
-        .units()
-        .iter()
-        .all(|(season, episode)| facts.get(*season, *episode).is_some());
+    let key = format!("subscribe.completed:{}", subscribe.id);
     if !done {
+        // L4: no longer complete → the next completion notifies again.
+        let _ = store.delete_setting(&key);
         return Ok(());
     }
-    let key = format!("subscribe.completed:{}", subscribe.id);
     if store.get_setting(&key).ok().flatten().is_some() {
         return Ok(()); // 已通知过
     }

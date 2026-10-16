@@ -22,6 +22,12 @@ pub(crate) fn library_complete(state: &ApiState, subscribe: &Subscribe) -> bool 
     {
         return false;
     }
+    units_on_disk(state, subscribe)
+}
+
+/// Every unit of the (bounded) coverage has a fact whose file exists.
+/// Unlike `library_complete`, wash-cut subscriptions are not excluded.
+pub(crate) fn units_on_disk(state: &ApiState, subscribe: &Subscribe) -> bool {
     let Ok(facts) = state.store.lock().load_subscribe_facts(subscribe.id) else {
         return false;
     };
