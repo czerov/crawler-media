@@ -52,11 +52,18 @@ impl JobLoopControl {
 pub struct JobLoopHandle {
     loop_task: JoinHandle<()>,
     control: Arc<JobLoopControl>,
+    read_only: bool,
 }
 
 impl JobLoopHandle {
     pub fn new(loop_task: JoinHandle<()>, control: Arc<JobLoopControl>) -> Self {
-        Self { loop_task, control }
+        Self { loop_task, control, read_only: false }
+    }
+
+    /// G-M5: true when another live instance owns the data directory, so this
+    /// instance runs no background jobs (HTTP stays available, read-only).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn abort(&self) {
@@ -93,9 +100,21 @@ pub fn spawn_job_loop_with_control(
     clock: impl Fn() -> i64 + Send + 'static,
     control: Arc<JobLoopControl>,
 ) -> JobLoopHandle {
+    // G-M5: only the instance holding the data-directory lease schedules
+    // searches / transfers; a second instance degrades to read-only.
+    let lease = match crate::instance_lease::acquire(&state.store) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::error!(%error, "实例锁冲突：本实例不运行后台任务（只读模式）");
+            let mut handle = JobLoopHandle::new(tokio::spawn(async {}), control);
+            handle.read_only = true;
+            return handle;
+        }
+    };
     let clock: Arc<Mutex<Box<dyn Fn() -> i64 + Send>>> = Arc::new(Mutex::new(Box::new(clock)));
     let loop_control = control.clone();
     let loop_task = tokio::spawn(async move {
+        let _lease = lease;
         loop {
             if loop_control.is_stopping() {
                 break;

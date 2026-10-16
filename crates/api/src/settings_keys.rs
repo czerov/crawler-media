@@ -45,3 +45,5 @@ pub const SUBSCRIBE_AIR_DATE_GATE: &str = "subscribe.air_date_gate";
 /// M1 overlap policy when a range pack and single episodes cover the same slots:
 /// `prefer_pack` (default) or `prefer_episode`.
 pub const SUBSCRIBE_OVERLAP_POLICY: &str = "subscribe.overlap_policy";
+/// G-M5: "1"/"true" allows several instances on one data directory (unsafe).
+pub const INSTANCE_ALLOW_MULTI: &str = "instance.allow_multi";

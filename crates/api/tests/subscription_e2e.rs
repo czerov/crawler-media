@@ -26,6 +26,8 @@ mod g_h1_air_date_gate;
 mod g_h2_season_inferred;
 #[path = "subscription_e2e/g_m2_existing_task_state.rs"]
 mod g_m2_existing_task_state;
+#[path = "subscription_e2e/g_m5_instance_lock.rs"]
+mod g_m5_instance_lock;
 #[path = "subscription_e2e/golden_path.rs"]
 mod golden_path;
 #[path = "subscription_e2e/h1_wash_in_flight.rs"]

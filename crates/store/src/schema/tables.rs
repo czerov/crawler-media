@@ -1,4 +1,9 @@
 pub(super) const APP_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS instance_lock (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    owner TEXT NOT NULL,
+    heartbeat_at INTEGER NOT NULL
+);
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
             login TEXT NOT NULL UNIQUE,

@@ -27,6 +27,12 @@ pub struct SearchFixture {
     pub requests: Mutex<Vec<String>>,
 }
 
+impl SearchFixture {
+    pub fn empty() -> Self {
+        Self { html: Mutex::new(String::new()), requests: Mutex::new(vec![]) }
+    }
+}
+
 impl indexer::Fetcher for SearchFixture {
     fn fetch(&self, request: &indexer::FetchRequest) -> Result<String, indexer::IndexerError> {
         self.requests.lock().push(request.key.clone());
