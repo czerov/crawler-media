@@ -35,6 +35,8 @@ pub mod facts;
 
 use changes::{ChangeConsumer, ProjectionDependencies};
 /// 投影构建与 follower 等待共用的等待预算。
+/// Maximum number of journal rounds consumed by one freshness check.
+const FRESHNESS_JOURNAL_ROUNDS: usize = 4;
 pub(crate) const PROJECTION_DEADLINE: Duration = Duration::from_secs(30);
 /// 共享构建容量：不同 Library 的 leader 并发重建不得超过该数，超出即 503。
 const PROJECTION_BUILD_CAPACITY: usize = 2;
@@ -553,8 +555,16 @@ impl ProjectionService {
         state: &ApiState,
         library_id: &str,
     ) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
-        if !*self.sources_complete.lock() {
-            // Incomplete source prevents generation from being accepted as fresh (D3-03)
+        // A ready projection is usable only after this request has consumed a bounded
+        // amount of pending journal work. Incomplete sources force the build path.
+        let mut sources_complete = false;
+        for _ in 0..FRESHNESS_JOURNAL_ROUNDS {
+            sources_complete = self.poll_changes(state)?;
+            if sources_complete {
+                break;
+            }
+        }
+        if !sources_complete {
             return Ok(None);
         }
         if self.dirty_libraries.lock().contains_key(library_id) {

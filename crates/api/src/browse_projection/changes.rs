@@ -118,12 +118,24 @@ impl ChangeConsumer {
             match c.source {
                 BrowseChangeSource::App => match c.entity_kind.as_str() {
                     "library" => {
-                        // Library settings changed: this library is affected
-                        affected.insert(c.entity_key.clone());
+                        // A new library has no persisted projection dependencies yet.
+                        if deps.media_by_library.contains_key(&c.entity_key)
+                            || deps.ledger_by_library.contains_key(&c.entity_key)
+                        {
+                            affected.insert(c.entity_key.clone());
+                        } else {
+                            tracing::debug!(library_id = %c.entity_key, "新 Library 不引用现有投影依赖");
+                        }
                     }
                     "library_root" => {
-                        // Library roots changed: affects the library or all libraries if unknown
-                        affected.extend(all_libs.iter().map(|l| l.id.clone()));
+                        affected.insert(c.entity_key.clone());
+                        for root in c.old_path.iter().chain(c.new_path.iter()) {
+                            for (lib_id, paths) in &deps.paths_by_library {
+                                if paths.iter().any(|path| Path::new(path).starts_with(root)) {
+                                    affected.insert(lib_id.clone());
+                                }
+                            }
+                        }
                     }
                     "media" => {
                         if let Ok(media_id) = c.entity_key.parse::<MediaId>() {
@@ -134,13 +146,9 @@ impl ChangeConsumer {
                                     found_any = true;
                                 }
                             }
-                            // Conservative invalidation if not found in cached deps
                             if !found_any {
-                                affected.extend(all_libs.iter().map(|l| l.id.clone()));
+                                tracing::debug!(media_id = %media_id, "浏览投影变更不引用已发布依赖");
                             }
-                        } else {
-                            // Unknown key conservatively dirties all
-                            affected.extend(all_libs.iter().map(|l| l.id.clone()));
                         }
                     }
                     _ => {
@@ -152,42 +160,56 @@ impl ChangeConsumer {
                     "ledger" => {
                         // A move or delete/insert dirties old owner and new owner
                         let mut resolved_any = false;
-                        if let Some(old) = &c.old_path {
-                            resolved_any = true;
-                            // Check old path in current ownership
-                            for lib in all_libs {
-                                if let Some(owner) = ownership.owner(Path::new(old), lib.kind) {
-                                    affected.insert(owner.id.clone());
+                        // Resolve the changed row against published dependencies first.
+                        if let Ok(lid) = c.entity_key.parse::<LedgerId>() {
+                            for (lib_id, ledgers) in &deps.ledger_by_library {
+                                if ledgers.contains(&lid) {
+                                    affected.insert(lib_id.clone());
+                                    resolved_any = true;
                                 }
                             }
-                            // Check old path in recorded deps
+                        }
+                        if let Some(old) = &c.old_path {
                             for (lib_id, paths) in &deps.paths_by_library {
                                 if paths.contains(old) {
                                     affected.insert(lib_id.clone());
+                                    resolved_any = true;
                                 }
                             }
                         }
                         if let Some(new_p) = &c.new_path {
-                            resolved_any = true;
-                            for lib in all_libs {
-                                if let Some(owner) = ownership.owner(Path::new(new_p), lib.kind) {
-                                    affected.insert(owner.id.clone());
-                                }
+                            if let Some(owner) = all_libs
+                                .iter()
+                                .filter_map(|lib| ownership.owner(Path::new(new_p), lib.kind))
+                                .find(|owner| {
+                                    ownership.owner(Path::new(new_p), owner.kind)
+                                        .is_some_and(|matched| matched.id == owner.id)
+                                        && owner.root_paths.iter().any(|root| Path::new(new_p).starts_with(root))
+                                })
+                            {
+                                affected.insert(owner.id.clone());
+                                resolved_any = true;
                             }
                         }
                         if !resolved_any {
-                            // If neither path was provided, check ledger_id in deps or conservative
-                            if let Ok(lid) = c.entity_key.parse::<LedgerId>() {
-                                for (lib_id, ledgers) in &deps.ledger_by_library {
-                                    if ledgers.contains(&lid) {
-                                        affected.insert(lib_id.clone());
-                                        resolved_any = true;
+                            if c.new_path.is_none() {
+                                if let Some(old) = &c.old_path {
+                                    let mut owner_found = false;
+                                    for lib in all_libs {
+                                        if let Some(owner) = ownership.owner(Path::new(old), lib.kind) {
+                                            affected.insert(owner.id.clone());
+                                            owner_found = true;
+                                        }
                                     }
+                                    if !owner_found {
+                                        affected.extend(all_libs.iter().map(|l| l.id.clone()));
+                                    }
+                                } else {
+                                    tracing::debug!(entity_key = %c.entity_key, "浏览投影 ledger 变更不引用已发布依赖");
                                 }
+                            } else {
+                                tracing::debug!(entity_key = %c.entity_key, "浏览投影 ledger 变更不引用已发布依赖");
                             }
-                        }
-                        if !resolved_any {
-                            affected.extend(all_libs.iter().map(|l| l.id.clone()));
                         }
                     }
                     "file_meta" => {
@@ -201,7 +223,7 @@ impl ChangeConsumer {
                             }
                         }
                         if !resolved {
-                            affected.extend(all_libs.iter().map(|l| l.id.clone()));
+                            tracing::debug!(entity_key = %c.entity_key, "浏览投影 file_meta 变更不引用已发布依赖");
                         }
                     }
                     "media_marker" => {
@@ -222,7 +244,7 @@ impl ChangeConsumer {
                             }
                         }
                         if !resolved {
-                            affected.extend(all_libs.iter().map(|l| l.id.clone()));
+                            tracing::debug!(entity_key = %c.entity_key, "浏览投影 marker 变更不引用已发布依赖");
                         }
                     }
                     _ => {
@@ -254,8 +276,15 @@ impl ChangeConsumer {
                                 resolved = true;
                             }
                         }
-                        // If it's a detail cache and not found in deps, conservatively dirty all
-                        if !resolved {
+                        // Known detail-cache paths that are not projected dependencies are
+                        // unrelated. Unknown key shapes remain conservatively invalidated.
+                        let known_detail_key = base_key
+                            .split_once(':')
+                            .is_some_and(|(_, path)| {
+                                path.starts_with('/')
+                                    && path.split('/').filter(|part| !part.is_empty()).count() == 2
+                            });
+                        if !resolved && !known_detail_key {
                             affected.extend(all_libs.iter().map(|l| l.id.clone()));
                         }
                     }
