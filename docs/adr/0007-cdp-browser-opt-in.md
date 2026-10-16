@@ -34,15 +34,17 @@
 - 站点 cookie 只经 `Network.setCookies` 按站点 host 注入（host-only，https 置 `secure`），**不得**使用 `Network.setExtraHTTPHeaders`（会发给第三方主机）。
 - **多标签并发**：所有 tab 共用 daemon 的 cookie jar。我们注入的 cookie 按 host 绑定，但服务器可能在会话中写入父域 cookie，因此另需下面的分组串行与精确清理。全局并发上限默认 3（1–8 可配）。
 - **精确清理**：会话结束时用 `Network.getAllCookies`（或 `Storage.getCookies`）取全部 cookie，筛出 domain 属于本站 host、其父域或本会话跳转访问过的 host 的条目，按每条 cookie **自身的** name+domain+path 调 `Network.deleteCookies` 删除（仅给 url 删不到 `path=/forum` 这类 cookie）；删除后复查，残留只 `warn!`。**不使用** `Network.clearBrowserCookies`（会清掉其它 tab 的 cookie）。不依赖 `Target.createBrowserContext`；每会话独立上下文是后续增强。
-- **按可注册域分组串行**：忽略 scheme 与端口（cookie 不按它们隔离）；host 相同、互为后缀，或都至少 3 个 label 且去掉首个 label 后相同（兄弟子域）的站点同组，同一时刻最多一个会话，避免父域 cookie 串号或被另一会话删除。不引入 PSL，`*.co.uk` 之类会被保守串行。
+- **host 规范化**：站点 host、cookie domain、会话访问过的 host 统一先小写、去尾点、IDNA 转 ASCII（punycode）、IPv6 去方括号，再比较。
+- **按可注册域分组串行**：忽略 scheme 与端口（cookie 不按它们隔离）；分组 key 为公共后缀表（`psl` crate，编译进二进制、不联网）给出的可注册域（eTLD+1）；IP、单段名用整个 host，`localhost` 与 `*.localhost` 归为一组。同组同一时刻最多一个会话，避免共同祖先域 cookie 串号或被另一会话删除（覆盖兄弟、堂兄弟、跨层级子域）。
+- **只清理主 frame 访问过的 host**：iframe（广告、质询等共享第三方）不纳入清理；主 frame 跳到其它分组的 host（如共享 SSO）只告警。跨分组共享的 SSO/质询主机不保证隔离，需要时把并发设为 1。
 - **有界 FIFO 排队**：拿不到全局名额或分组时按票号先来先服务排队，超过排队上限或剩余时间不足即返回 busy（导航前失败，可回退 HTTP）。登录与签到是后台 Job，排队可接受。
 - 前提以计划 Task 0 实测为准：`getAllCookies`/`Storage.getCookies` 至少一个可用，且带 domain+path 的 `deleteCookies` 能删除 path 级 cookie。不满足时并发上限**降为 1**（`deleteCookies` 缺失时先尝试过期覆盖删除）。
 
 ### 受管 Obscura 生命周期
 
-**启动条件**（全部满足）：开关开启、未配置 `cdp.url`、至少一个启用中、`maintenance_via = browser` 且没有自己 Site `cdp_url` 的 Site（`managed_browser_sites > 0`；设置页另显示含自带端点的 `browser_sites`）、二进制已安装（或安装策略允许下载）。默认所有 Site 为 `http`，因此只开开关不会启动浏览器进程。不满足时 `/settings/browser` 返回未启动原因（`switch_off` / `instance_endpoint_configured` / `no_browser_sites` / `not_installed` / `start_failed`）。Site 的 `maintenance_via`、`cdp_url`、启用状态变化后重新评估。
+**启动条件**（全部满足）：开关开启、未配置 `cdp.url`、至少一个启用中、`maintenance_via = browser` 且没有自己 Site `cdp_url` 的 Site（`managed_browser_sites > 0`；设置页另显示含自带端点的 `browser_sites`）、二进制已安装（或安装策略允许下载）。默认所有 Site 为 `http`，因此只开开关不会启动浏览器进程。不满足时 `/settings/browser` 返回未启动原因（`switch_off` / `instance_endpoint_configured` / `no_managed_browser_sites` / `not_installed` / `start_failed`）。Site 的 `maintenance_via`、`cdp_url`、启用状态变化后重新评估。
 
-- **浏览器会话不使用 Site 代理**（浏览器自己出网）。配置了 `proxy` 的 Site 不能选择浏览器方式（写入时 400），以免直连暴露真实出口或因 IP 不一致失败。
+- **浏览器会话不使用 Site 代理**（浏览器自己出网）。不变式：`maintenance_via = browser` 的 Site 不能有 `proxy`——无论先设哪一项，写入后违反即 400，以免直连暴露真实出口或因 IP 不一致失败。
 - **安装策略** `obscura.install`：默认 `preinstalled`（只用预置二进制，不联网）；Admin 显式改为 `download` 才会从发布地址下载。启动默认值可由 `CRAWLER_MEDIA_OBSCURA_INSTALL` 设置。
 - **端口与绑定**：每次启动选随机空闲端口，并以 `--host 127.0.0.1` 绑定回环（以 Task 0 实测为准；无法保证回环绑定则拒绝启用受管模式）。就绪与身份以 `/json/version` 加本进程子进程存活判定。端口竞争导致启动失败时换端口重试至多 2 次。
 - **进程身份**：pidfile `<data>/run/obscura.pid`（pid、端口、nonce）。启动时只回收 exe 指向 `<data>/bin/obscura` 的旧进程；其它进程只删 pidfile，不杀。应用正常退出时停止受管 daemon。
