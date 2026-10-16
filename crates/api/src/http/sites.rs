@@ -585,10 +585,7 @@ pub(crate) async fn site_login(State(state): State<ApiState>, Path(id): Path<Str
             })?;
             let bus = hooks::Bus::new();
             let creds = crate::check_in::store_sites(&state_for_work.store);
-            let http = crate::check_in::attendance_http();
-            hooks::LoginPlugin::http(&bus, &creds, &http)
-                .with_policy(&policy)
-                .login(site_id)
+            crate::site_maintenance::perform_login(&state_for_work, &site, &bus, &creds)
                 .map_err(|error| {
                     (
                         StatusCode::BAD_REQUEST,
@@ -629,10 +626,7 @@ pub(crate) async fn site_check_in(
             })?;
             let bus = hooks::Bus::new();
             let creds = crate::check_in::store_sites(&state_for_work.store);
-            let http = crate::check_in::attendance_http();
-            hooks::CheckInPlugin::http(&bus, &creds, &http)
-                .with_policy(&policy)
-                .check_in(site_id)
+            crate::site_maintenance::perform_check_in(&state_for_work, &site, &bus, &creds)
                 .map_err(|error| {
                     (
                         StatusCode::BAD_REQUEST,

@@ -51,6 +51,7 @@ mod poster_fetch;
 pub mod runtime_browser;
 mod runtime_downloader;
 pub mod settings_keys;
+pub mod site_maintenance;
 pub mod store;
 pub mod theintrodb;
 pub mod scan_operations;
