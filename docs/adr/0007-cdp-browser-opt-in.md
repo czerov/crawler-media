@@ -1,6 +1,6 @@
-# Browser 走 CDP：单一开关、受管 Obscura 兜底、失败回退 HTTP
+# Browser 走 CDP：单一开关、仅用于登录与签到、受管 Obscura 兜底、导航前失败回退 HTTP
 
-JS 渲染的搜索在 CDP 支撑的 **Browser** 抓取后（`render: true`）使用同一套 Indexer 选择器。登录与 **Check-in** 是该会话上的第一方插件。默认 Docker 镜像不打包 Chromium 或 Obscura；受管 Obscura 默认只用预置二进制，Admin 显式允许后才下载。这不是 Windows RDP。
+**Browser**（CDP 会话）只用于 Site 的登录与 **Check-in**，二者是该会话上的第一方插件。**搜索与 RSS 永远走 HTTP，不使用 CDP**（2026-10-16 r4 范围调整：删除 Profile `render` 搜索路径）。默认 Docker 镜像不打包 Chromium 或 Obscura；受管 Obscura 默认只用预置二进制，Admin 显式允许后才下载。这不是 Windows RDP。
 
 ## 决策（2026-10-16，r2 按计划修订同步）
 
@@ -10,8 +10,9 @@ JS 渲染的搜索在 CDP 支撑的 **Browser** 抓取后（`render: true`）使
 
 实例级只有一个 Browser/CDP 开关 `cdp.enabled`，取代原先并列的 `cdp.sync.enabled` 与 `obscura.enabled`。
 
-- **关闭**：完全不使用 CDP。所有抓取走 HTTP；登录与 **Check-in** 走 HTTP 插件。不探测端点、不下载、不启动任何浏览器进程。Site 上的 `cdp_url` 在开关关闭时**不生效**；`/settings/browser` 返回被忽略的数量 `ignored_site_endpoints`，UI 告警。
-- **开启**：启用浏览器链路，端点按下一节的顺序解析。
+- **关闭**：完全不使用 CDP。登录与 **Check-in** 走 HTTP 插件。不探测端点、不下载、不启动任何浏览器进程。Site 上的 `cdp_url` 在开关关闭时**不生效**；`/settings/browser` 返回被忽略的数量 `ignored_site_endpoints`，UI 告警。
+- **开启**：`maintenance_via = browser` 的 Site 用浏览器登录与签到，端点按下一节的顺序解析；`maintenance_via = http`（默认）的 Site 仍走 HTTP。
+- **搜索不受开关影响**：始终 HTTP。Profile 的 `render` 字段被忽略（加载时 `warn!`），下一个 minor 版本删除。
 - 开关读取失败（非法值）报错，**不得**静默当作关闭。
 
 ### 端点解析（开关开启时）
@@ -24,20 +25,22 @@ JS 渲染的搜索在 CDP 支撑的 **Browser** 抓取后（`render: true`）使
 
 ### 失败回退 HTTP（分阶段）
 
-- **render 搜索**：任何 CDP 环节失败（含并发已满 `BrowserBusy`、总时限超时）都回退 HTTP 并 `warn!`（Site、route、原因）。结果来源记为 `HttpFallback`；回退后解析得到 0 个候选时记为 `SiteFailure{kind: CdpFallbackEmpty}`，订阅与 UI 可见，不伪装为「站点没有资源」。
-- **登录 / Check-in**：只有**导航之前**的失败（端点解析、并发已满、target / WebSocket 建立、cookie 注入失败——服务端尚未收到请求）才回退 HTTP。**导航已发出之后**的失败不回退，直接报错，避免重复签到或重复登录请求。
+- **登录 / Check-in**：只有**导航之前**的失败（端点解析、排队超时 `BrowserBusy`、target / WebSocket 建立、cookie 注入失败——服务端尚未收到请求）才回退 HTTP，并 `warn!`（Site、route、原因）。**导航已发出之后**的失败不回退，直接报错，避免重复签到或重复登录请求。
 - 回退不等于成功；HTTP 遇到质询照常报错，不重试浏览器路径。
-- 单次 render 有总时限（默认 15s，可配置），各步骤共用剩余时间。
+- 单个浏览器会话有总时限（默认 30s，可配置，**含排队等待**），各步骤共用剩余时间；会话结束的 cookie 清理与 target 关闭另有独立上限（默认 2s），超时只 `warn!`，因此单会话最长占用为「总时限 + 2 × 清理上限」。
 
 ### 并发与 cookie 隔离
 
 - 站点 cookie 只经 `Network.setCookies` 按站点 host 注入（host-only，https 置 `secure`），**不得**使用 `Network.setExtraHTTPHeaders`（会发给第三方主机）。
-- 每会话使用独立浏览上下文（`Target.createBrowserContext`）时，并发上限默认 2。Obscura 不支持或未经验证支持时，会话结束只能 `Network.clearBrowserCookies` 清理共享 cookie jar，此时**代码强制并发上限为 1**，避免一个会话结束时清掉另一会话的 cookie。能力以计划 Task 0 的实测为准。
-- 拿不到并发许可立即失败（busy），不阻塞调用方。
+- **多标签并发**：所有 tab 共用 daemon 的 cookie jar，cookie 按 host 绑定，不同站点天然隔离。全局并发上限默认 3（1–8 可配）。
+- **按站点清理**：会话结束时只删除本会话站点 origin 下的 cookie（`Network.getCookies{urls:[origin]}` + 逐个 `Network.deleteCookies{name,url}`），**不使用** `Network.clearBrowserCookies`（会清掉其它 tab 的 cookie）。不依赖 `Target.createBrowserContext`；每会话独立上下文是后续增强。
+- **同站点串行**：同一站点（scheme+host+port）同一时刻最多一个会话，避免一方的注入或清理冲掉另一方的 cookie。
+- **有界等待**：拿不到全局名额或站点锁时排队，最多等到会话总时限；超时返回 busy（属于导航前失败，可回退 HTTP）。登录与签到是后台 Job，排队可接受。
+- `Network.deleteCookies` 的支持以计划 Task 0 实测为准；不支持时改用过期覆盖删除，仍不可行则并发上限降为 1。
 
 ### 受管 Obscura 生命周期
 
-**启动条件**（全部满足）：开关开启、未配置 `cdp.url`、至少一个启用中的 Site 使用 `render: true` 的 Profile（`render_sites > 0`）、二进制已安装（或安装策略允许下载）。内置 Profile 当前全部 `render: false`，因此只开开关不会启动浏览器进程。不满足时 `/settings/browser` 返回未启动原因（`switch_off` / `instance_endpoint_configured` / `no_render_sites` / `not_installed` / `start_failed`）。
+**启动条件**（全部满足）：开关开启、未配置 `cdp.url`、至少一个启用中、`maintenance_via = browser` 且没有自己 Site `cdp_url` 的 Site（`browser_sites > 0`）、二进制已安装（或安装策略允许下载）。默认所有 Site 为 `http`，因此只开开关不会启动浏览器进程。不满足时 `/settings/browser` 返回未启动原因（`switch_off` / `instance_endpoint_configured` / `no_browser_sites` / `not_installed` / `start_failed`）。Site 的 `maintenance_via`、`cdp_url`、启用状态变化后重新评估。
 
 - **安装策略** `obscura.install`：默认 `preinstalled`（只用预置二进制，不联网）；Admin 显式改为 `download` 才会从发布地址下载。启动默认值可由 `CRAWLER_MEDIA_OBSCURA_INSTALL` 设置。
 - **端口与绑定**：每次启动选随机空闲端口，并以 `--host 127.0.0.1` 绑定回环（以 Task 0 实测为准；无法保证回环绑定则拒绝启用受管模式）。就绪与身份以 `/json/version` 加本进程子进程存活判定。端口竞争导致启动失败时换端口重试至多 2 次。
@@ -59,14 +62,15 @@ JS 渲染的搜索在 CDP 支撑的 **Browser** 抓取后（`render: true`）使
 - 端点不接受内嵌凭据与 query string；空/非法端点写入时 400 拒绝，不静默 fallback。
 - 启动构造与每次真实请求共用同一配置入口：API 以 provider closure 从 Store 读取实时设置，Indexer 不依赖 API/Store。保存后立即生效。
 - 设置写失败返回非 200 并恢复先前配置。保存只表示配置成功，不做联网连通性检查。
-- `render` 只对内置与 Admin 本地 overlay Profile 开放；插件来源 Profile 禁止 `render: true`（浏览器网络栈不经过 net-guard）。
+- 浏览器只能由 Admin 在 Site 上选择 `maintenance_via = browser` 触发；Profile（含插件提供的 YAML）无法触发浏览器。浏览器网络栈不经过 net-guard，若插件将来能创建 Site，插件方案须禁止其设置 `maintenance_via`/`cdp_url`。
 
 ### 迁移规则（一次性，启动时）
 
 - `cdp.enabled` 已存在 → 不迁移。
 - 否则 `cdp.enabled = cdp.sync.enabled || obscura.enabled`；若两者都关但有 Site 配了非空 `cdp_url`（旧边界允许「全局关 + Site 端点」）→ 置 `cdp.enabled=1` 并记 `info!`，避免升级后静默失去渲染。
-- `cdp.url` 为空且 `obscura.url` 非空 → 写入 `cdp.url`。写入新 key 后删除三个旧 key；迁移代码在下一个 minor 版本删除。
-- 已保存的 `https://` 实例或 Site 端点在新规则下非法：**不自动改写**，记 `warn!`，并在 `/settings/browser` 的 `invalid_endpoints` 中列出，由 UI 提示用户修改；在修改前这些端点的 render 请求按失败回退 HTTP。
+- `cdp.url` 为空且 `obscura.url` 非空 → 写入 `cdp.url`。
+- Site 新增 `maintenance_via`（默认 `http`）；`cdp_url` 非空或 Profile 曾为 `render: true` 的 Site 迁移为 `browser`，保持旧版本下这些 Site 用浏览器登录/签到的行为。写入新 key 后删除三个旧 key；迁移代码在下一个 minor 版本删除。
+- 已保存的 `https://` 实例或 Site 端点在新规则下非法：**不自动改写**，记 `warn!`，并在 `/settings/browser` 的 `invalid_endpoints` 中列出，由 UI 提示用户修改；在修改前这些 Site 的浏览器会话在导航前失败并回退 HTTP。
 
 ### 凭据
 
@@ -95,6 +99,6 @@ JS 渲染的搜索在 CDP 支撑的 **Browser** 抓取后（`render: true`）使
 
 ## 理由与备选方案
 
-默认打包 Chromium 会让每个只需要 HTTP 的 NAS 部署膨胀；完全不支持 CDP 会丢掉需要 JS 渲染与人工认证的 tracker。受管 Obscura 兜底让「开关打开即可用」成立，而失败回退 HTTP 保证浏览器链路故障不会让抓取与签到整体失效。单一开关避免用户面对「开了全局 CDP 但没配 URL」这类无意义组合。
+默认打包 Chromium 会让每个只需要 HTTP 的 NAS 部署膨胀；完全不支持 CDP 会让需要浏览器才能通过的登录/签到无法自动化。在已预置（或允许下载）二进制、且确有 Site 选择浏览器登录/签到时，受管 Obscura 兜底让「开关打开即可用」成立；导航前失败回退 HTTP 保证浏览器链路故障不会让签到整体失效。搜索不走浏览器：内置 Profile 全部不需要渲染，渲染搜索带来的并发、降级可见性与资源成本不值得在 v1 承担。单一开关避免用户面对「开了全局 CDP 但没配 URL」这类无意义组合。
 
 **备选方案**：默认自动下载（被否决：开关一开就执行第三方程序，供应链风险由用户被动承担）；镜像始终带 Chromium；保留两个独立开关；失败即报错而不回退；端点失败后改用 Obscura 重试（被否决：会让故障表现为不可预期的第二跳延迟，且与「用户配置的连接优先」相矛盾）。
