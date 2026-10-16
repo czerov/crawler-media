@@ -48,7 +48,16 @@ pub fn transfer_file_controlled(
 
     // 第一阶段：生成暂存文件。Move 模式在暂存阶段先复制，保留原文件 src
     let stage_res = match mode {
-        TransferMode::Copy | TransferMode::Move => copy_controlled(src, &temp, control),
+        TransferMode::Copy => copy_controlled(src, &temp, control),
+        // D-M1: same device → link the very inode (no data copy); the source
+        // name is removed after publication, so Move is effectively a rename.
+        TransferMode::Move => {
+            if fs::hard_link(src, &temp).is_ok() {
+                Ok(())
+            } else {
+                copy_controlled(src, &temp, control)
+            }
+        }
         TransferMode::Hardlink => {
             if fs::hard_link(src, &temp).is_err() {
                 tracing::warn!(src = %src.display(), dest = %dest.display(), "硬链接失败（可能跨设备），回退为复制");
@@ -110,7 +119,9 @@ fn publish_no_clobber(temp: &Path, dest: &Path) -> std::io::Result<()> {
             let _ = fs::remove_file(temp);
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(already_exists(dest)),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(already_exists(dest))
+        }
         Err(_) => {
             if fs::symlink_metadata(dest).is_ok() {
                 return Err(already_exists(dest));
@@ -123,7 +134,10 @@ fn publish_no_clobber(temp: &Path, dest: &Path) -> std::io::Result<()> {
 fn already_exists(dest: &Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
-        format!("destination already exists, refusing to overwrite: {}", dest.display()),
+        format!(
+            "destination already exists, refusing to overwrite: {}",
+            dest.display()
+        ),
     )
 }
 

@@ -125,3 +125,19 @@ fn move_failure_preserves_source_file_without_data_loss() {
     assert!(source.exists(), "转移发布失败时源文件必须被安全保留在原位");
     assert_eq!(fs::read(&source).unwrap(), b"precious media content");
 }
+
+#[cfg(unix)]
+#[test]
+fn same_device_move_is_a_rename_without_copy() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("dl/a.mkv");
+    let dest = dir.path().join("lib/a.mkv");
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    fs::write(&src, b"video").unwrap();
+    let inode = fs::metadata(&src).unwrap().ino();
+    transfer_file(&src, &dest, TransferMode::Move).unwrap();
+    assert!(!src.exists(), "source moved away");
+    assert_eq!(fs::metadata(&dest).unwrap().ino(), inode, "same inode: no copy");
+    assert_eq!(fs::read(&dest).unwrap(), b"video");
+}
