@@ -39,7 +39,22 @@ docker compose up --build
 
 镜像内单进程（`crawler-media`）监听 18765：静态 UI（`web/dist` 拷入
 `/usr/share/crawler-media/ui`）+ API + Jellyfin 兼容，浏览器和播放器都打这一个端口。
-镜像内默认 **无 Chromium**。实例级 Browser 开关决定是否使用 CDP：**关闭**时所有请求走 HTTP，不探测端点、不下载、不启动任何浏览器进程，Site 的 `cdp_url` 也不生效；**开启**时端点按 Site `cdp_url` → 实例 `cdp.url` → 受管 Obscura 解析，任一 CDP 环节失败都回退到不用 CDP 的 HTTP 流程并记 warn 日志（回退覆盖 render 搜索、登录与签到，且不等于成功）。未配置 `cdp.url` 时由应用按需下载并启动受管 Obscura（默认本地 `127.0.0.1:9223`，首次使用需能访问其发布地址；离线部署请预置二进制或改为配置外部端点）。也可自行运行外部 Browser 并在设置中填端点；受管进程只管理本进程拉起的 daemon，关闭开关不会杀掉外部服务。保存配置即时生效，但不等于连通性验证。
+镜像内默认 **无 Chromium**。实例级 Browser 开关决定是否使用 CDP：**关闭**时所有请求走 HTTP，不探测端点、不下载、不启动任何浏览器进程，Site 的 `cdp_url` 也不生效；**开启**时端点按 Site `cdp_url` → 实例 `cdp.url` → 受管 Obscura 解析，任一 CDP 环节失败都回退到不用 CDP 的 HTTP 流程并记 warn 日志（回退覆盖 render 搜索、登录与签到，且不等于成功）。端点只接受 `http` CDP discovery URL（不接受 `https`/`ws`/`wss`、内嵌凭据或 query）。
+
+回退分阶段：render 搜索任一 CDP 环节失败都回退 HTTP 并 warn，回退后 0 结果会作为站点失败（`CdpFallbackEmpty`）显示；登录与签到只在**导航之前**失败时回退 HTTP，导航之后失败直接报错，不会再发一次 HTTP 签到。
+
+**受管 Obscura 启动条件**：开关开启、未配置 `cdp.url`、至少有一个启用的 Site 使用 `render: true` 的 Profile（内置 Profile 当前全部 `render: false`，需 Admin overlay Profile）、二进制可用。不满足时设置页显示未启动原因（`no_render_sites`、`not_installed` 等）。受管 daemon 每次启动使用随机空闲端口并只绑定 `127.0.0.1`；只管理本进程拉起的 daemon，关闭开关或应用退出会停止它，外部服务不受影响。
+
+**安装策略**（`obscura.install`，启动默认值 `CRAWLER_MEDIA_OBSCURA_INSTALL`）：
+
+- `preinstalled`（默认）：不联网。把 v0.2.3 对应平台的 `obscura`、`obscura-worker` 放到 `<data>/bin/`，并放置原始发布归档 `<data>/bin/obscura.tar.gz`（应用解出前会核对写死的 SHA-256；不符拒绝安装）。
+- `download`：首次需要时从 GitHub Releases 下载对应平台归档，按写死的 SHA-256 与大小校验，上限 200 MiB，通过后原子落盘。
+
+信任根是代码中写死的哈希，不是发布仓库本身（详见 ADR-0007「信任模型」）。
+
+**`network_mode: host` 风险**：受管 daemon 虽只绑定回环，但同宿主的任何进程都能访问该无鉴权 CDP 端口并读取站点 cookie；在共享宿主上请使用 bridge 网络或改用独立容器中的外部端点。
+
+也可自行运行外部 Browser 并在设置中填 `cdp.url`。升级后旧的 `https://` 端点不会被自动改写，会在设置页 `invalid_endpoints` 中提示修改。保存配置即时生效，但不等于连通性验证。
 
 ## 下载器
 
@@ -59,7 +74,8 @@ qBittorrent / Transmission 通过 `/api/v1/downloaders` 配置（持久化到 SQ
 | `CRAWLER_MEDIA_LISTEN` | `127.0.0.1:18765` | 监听地址 |
 | `CRAWLER_MEDIA_UI` | 空 | 前端静态产物目录 |
 | `CRAWLER_MEDIA_CORS_ORIGINS` | 空 | CORS 白名单（逗号分隔） |
-| `CRAWLER_MEDIA_BROWSER` | 关 | 启动期 Browser 开关默认值（`1`/`true`/`yes`/`on`）；置位不再导致启动失败，行为等同在设置中打开开关 |
+| `CRAWLER_MEDIA_BROWSER` | 关 | 启动期 Browser 开关默认值（`1`/`true`/`yes`/`on`），仅在未保存过开关时生效。**只控制开关**：受管浏览器还需预置二进制或 `CRAWLER_MEDIA_OBSCURA_INSTALL=download`，且至少一个 render 站点，否则不会启动（设置页显示原因） |
+| `CRAWLER_MEDIA_OBSCURA_INSTALL` | `preinstalled` | 受管 Obscura 安装策略启动默认值：`preinstalled`（不联网）或 `download`（按写死哈希校验后下载） |
 | `CRAWLER_MEDIA_TMDB_KEY` | 空 | 非空 env／_FILE 固定 TMDB API Key 时，UI PUT 返回409；清除env pin后才可由UI修改 |
 | `CRAWLER_MEDIA_TVDB_KEY` | 空 | TVDB API Key |
 | `CRAWLER_MEDIA_QB_URL` / `_USER` / `_PASS` / `_CATEGORY` | 空 | qBittorrent 覆盖 |

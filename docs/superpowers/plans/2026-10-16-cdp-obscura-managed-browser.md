@@ -14,11 +14,26 @@
 
 - 2026-10-16 r2：按审核报告（B1–B2、H1–H5、M1–M7、L1–L8）修订。主要变化：新增 Task 0 兼容性 spike；Task 1 改为自足的完整实现步骤（不再依赖本机补丁）；cookie 注入改为 `Network.setCookies` 并按 host 绑定；受管 Obscura 改为哈希校验安装、随机端口 + 身份确认、按需启动、Job 化 reconcile；回退语义在数据层可见。
 
+- 2026-10-16 r3：按复审（R2-H1、R2-M1–M4、R2-L1–L4）修订。新增 Task −1（本提交已完成）同步 ADR/deploy/CONTEXT；并发上限与 T0 隔离能力联动；https 存量端点迁移提示；`CRAWLER_MEDIA_BROWSER` 未启动原因；v1 内实现 render 总时限。
+
 ## 起点
 
 分支 `feat/cdp-obscura` 自 `d201fcf` 起，代码与 `main` 相同。**不存在、也不依赖任何本机补丁**；Task 1 从现有代码（`crates/indexer/src/browser.rs` 中 `PageSession::cookie_header` 默认返回 `Ok("session=browser")`、`cdp_page.rs` 未实现 `cookie_header`、`set_cookie_header` 走 `Network.setExtraHTTPHeaders`）直接改起。
 
-依赖链：T0 → T1 → T2 → T3；T4 → T5 → T6；T1 → T7 → T8（依赖 T6 的 `ApiState.browser`）；T9 依赖 T2、T4；T10 依赖 T2、T5。T0 的结论若否定某个 CDP 方法，先改 T1 的降级方式再开工。
+依赖链：T−1（已完成）→ T0 → T1 → T2 → T3；T4 → T5 → T6；T1 → T7 → T8（依赖 T6 的 `ApiState.browser`）；T9 依赖 T2、T4；T10 依赖 T2、T5。T0 的结论若否定某个 CDP 方法，先改 T1 的降级方式再开工。
+
+### Task −1: 同步规格文档（ADR-0007 / deploy / CONTEXT）——**已在 r3 提交中完成**
+
+执行者开工前要读的三份规格必须与本计划一致。r3 提交已改写：
+
+- `docs/adr/0007-cdp-browser-opt-in.md`：默认 `preinstalled`、显式 `download`；随机端口 + 回环绑定 + 身份确认；端点只接受 `http`；登录/签到导航后失败不回退；受管 daemon 仅在 `render_sites > 0` 时启动；新增「并发与 cookie 隔离」「信任模型」「迁移规则」（含 https 存量端点）；「验证边界」留出 Task 0 实测表。
+- `docs/deploy.md`：Browser 段落与环境变量表（`CRAWLER_MEDIA_BROWSER` 只控制开关、新增 `CRAWLER_MEDIA_OBSCURA_INSTALL`）、预置规则、`network_mode: host` 风险。
+- `CONTEXT.md` 的 **Browser** 词条。
+
+- [x] **Step 1: 改写三份文档**（r3 提交）
+- [ ] **Step 2: 后续 task 若改变行为，同一提交内同步改这三份文档**；Task 0 只向 ADR「验证边界」追加实测结果。
+
+---
 
 ### Task 0: Obscura CDP 兼容性 spike（手动 / `#[ignore]`，不进 CI）
 
@@ -74,7 +89,7 @@ git commit -m "test(indexer): add ignored Obscura CDP compatibility probe and re
 **Files:**
 - Modify: `crates/indexer/src/browser.rs`
 - Modify: `crates/indexer/src/cdp_page.rs`
-- Modify: `crates/indexer/src/cdp_page_transport.rs`（`Transport::connect` 的 scheme 校验）
+- Modify: `crates/indexer/src/cdp_page_transport.rs`（`Transport::connect` 的 scheme 校验；`TIMEOUT` 单步上限保留，新增接受外部 deadline 的入口）
 - Modify: `crates/indexer/src/lib.rs:9`
 - Test: `crates/indexer/tests/cdp_page.rs`, `crates/indexer/tests/browser_capabilities.rs`, `crates/indexer/tests/browser.rs`
 
@@ -100,7 +115,9 @@ git commit -m "test(indexer): add ignored Obscura CDP compatibility probe and re
   - `#[derive(Clone)] pub struct Browser`（`config`、`provider`、`opener` 已是 `Arc`/`Clone`，另加 `permits: Arc<Semaphore>`）
   - `Browser::render(&self, request: &FetchRequest) -> Result<RenderedPage, IndexerError>`
   - `Browser::fetch_html` 签名不变，内部 `self.render(request).map(|page| page.html)`
-  - `Browser::with_max_sessions(self, n: usize) -> Self`（默认 2）；拿不到 permit → 立即 `Err(IndexerError::BrowserBusy)`，不阻塞（M3）
+  - `pub enum CookieIsolation { SharedJar, PerSessionContext }`；`Browser::with_cookie_isolation(self, CookieIsolation) -> Self`，**默认 `SharedJar`**
+  - `Browser::with_max_sessions(self, n: usize) -> Self`：有效上限 = `match isolation { SharedJar => 1, PerSessionContext => n }`（默认 n=2）。即：未经 Task 0 证明支持 `Target.createBrowserContext` 并实现每会话独立上下文之前，代码强制并发 1，避免会话 A 结束时的 `clearBrowserCookies` 清掉会话 B 的 cookie（R2-M1）。拿不到 permit → 立即 `Err(IndexerError::BrowserBusy)`，不阻塞
+  - `Browser::with_render_deadline(self, Duration) -> Self`（默认 15s，R2-M4）
   - `IndexerError::BrowserBusy` 与 `IndexerError::BrowserSetup(String)` 变体：`open`、`set_site_cookies`、`BrowserBusy` 等**导航前**失败统一映射为 `BrowserSetup`（Task 7/8 据此决定是否允许回退）
 
 - [ ] **Step 1: 写失败测试（cookie 注入方式）**
@@ -158,7 +175,15 @@ fn default_page_session_cookie_header_is_an_error_not_a_fake_session() {
     // /json/new 返回 webSocketDebuggerUrl = ws://10.0.0.9:9/devtools/page/x → Err，且仍 close target
 }
 #[test] fn third_concurrent_render_is_busy_not_blocked() {
-    // with_max_sessions(2)；opener 在 barrier 上阻塞两个会话；第三个立即 Err(BrowserBusy)
+    // with_cookie_isolation(PerSessionContext).with_max_sessions(2)；两个会话阻塞在 barrier；第三个立即 Err(BrowserBusy)
+}
+#[test] fn shared_jar_forces_a_single_session() {
+    // 默认 SharedJar + with_max_sessions(4)：第二个并发 render 立即 BrowserBusy，
+    // 因此第一个会话结束时的 clearBrowserCookies 不可能影响另一会话
+}
+#[test] fn render_respects_the_total_deadline() {
+    // with_render_deadline(200ms)；假 CDP 每步延迟 80ms（open/setCookies/goto/content/getCookies）
+    // 断言总耗时 < 400ms 且返回超时错误；target 仍被 close
 }
 ```
 
@@ -170,7 +195,7 @@ Expected: 编译失败（无 `render`/`RenderedPage`/`set_site_cookies`/`Browser
 - [ ] **Step 4: 实现 `cdp_page.rs`**
 
 1. `set_site_cookies(page_url, header)`：
-   - 用 `url` 解析 `page_url`，取 `origin = scheme://host[:port]/`；scheme 非 http/https 报错。
+   - 用 `tungstenite::http::Uri` 解析 `page_url`（indexer 没有 `url` 依赖，`validate_endpoint` 已在用 `Uri`；不新增依赖），取 `origin = scheme://authority/`；scheme 非 http/https 或无 host 报错。
    - `header.split(';')` → `trim` → `split_once('=')`，跳过空 name；值原样保留（不解码）。
    - 发送 `Network.setCookies`，`params = {"cookies":[{"name","value","url":origin,"secure": scheme=="https","path":"/"}]}`。用 `url` 而不是 `domain`，让浏览器按 host-only 绑定，第三方主机拿不到。
    - 日志只记 `cookie_count`，**不记值**。
@@ -216,6 +241,8 @@ pub fn render(&self, request: &FetchRequest) -> Result<RenderedPage, IndexerErro
     result.inspect_err(|error| tracing::error!(%error, request_key = %request.key, "Browser render failed"))
 }
 ```
+总时限（R2-M4）：`render` 开头计算 `deadline = Instant::now() + self.render_deadline`，经 `open_cdp_session_until(endpoint, deadline)` 与 `CdpPageSession::with_deadline(deadline)` 传入；`with_transport` 取 `min(Instant::now() + TIMEOUT, deadline)`，HTTP discovery 的 `http_agent` 超时取剩余时间。超时错误是导航前还是导航后，由失败发生的步骤决定（`goto` 之前 → `BrowserSetup`）。`PageSession` trait 增加 `fn set_deadline(&self, deadline: Instant) {}` 默认空实现，假 session 不受影响。
+
 信号量用 `std::sync` 自写的 `try_acquire`（`Mutex<usize>` + RAII guard，约 20 行，放 `browser.rs` 底部），不引入 tokio。删除 `PageSession::set_cookie_header` 的所有实现与调用；`Browser` 加 `#[derive(Clone)]`。
 
 - [ ] **Step 7: 导出**
@@ -246,7 +273,8 @@ git commit -m "feat(indexer): bind site cookies per host, read real cookies back
 本 task 同时改 `indexer` 与 `api`，因为 `BrowserConfig` 换形后 `crates/api` 立刻编译失败；分两个提交会让中间提交处于红状态。
 
 **Files:**
-- Modify: `crates/indexer/src/browser.rs`, `crates/indexer/src/lib.rs`, `crates/indexer/src/engine.rs`（`SiteFailure.kind`）
+- Modify: `crates/indexer/src/browser.rs`, `crates/indexer/src/lib.rs`, `crates/indexer/src/engine.rs`（`SiteFailure.kind`）, `crates/indexer/src/profile.rs`（来源参数，拒绝插件 Profile 的 `render`）
+- Modify（`SiteFailure` 其它构造点）: `crates/api/src/http/search/fanout.rs:136`, `crates/api/src/worker.rs:459`, `crates/api/src/worker.rs:477`（补 `kind: SiteFailureKind::Fetch`）；搜索/订阅响应 DTO 中输出 `failures[].kind`（`"fetch"` / `"cdp_fallback_empty"`），在序列化 `SiteFailure` 的位置一并加字段
 - Modify: `crates/api/src/settings_keys.rs`, `crates/api/src/runtime_browser.rs`, `crates/api/src/http/settings.rs`（仅编译适配）
 - Test: `crates/indexer/tests/browser_capabilities.rs`, `crates/indexer/tests/browser.rs`, `crates/api/tests/browser_runtime.rs`, `crates/api/tests/config_parsing.rs`, `crates/api/tests/management/browser_settings.rs`
 
@@ -285,6 +313,7 @@ git commit -m "feat(indexer): bind site cookies per host, read real cookies back
   - 写入新 key 后删除 `cdp.sync.enabled`、`obscura.enabled`、`obscura.url`。
 - `load()` 只读新 key；旧读取逻辑只存在于 `migrate_legacy`，计划在下一个 minor 版本删除 `migrate_legacy`（在 `CHANGELOG`/ADR 记录这个时间点）。
 - `response()` 增加 `"ignored_site_endpoints": n`：开关关闭时有多少 Site 配置了 `cdp_url` 而被忽略，UI 显示告警。
+- **存量 https 端点（R2-M2）**：Task 1 起只接受 `http`。`migrate_legacy` 与每次 `response()` 都扫描实例 `cdp.url` 与所有 Site `cdp_url`，非法者（含 `https://`）**不自动改写**；迁移时 `warn!(count, "stored CDP endpoints are no longer valid")`（不记 URL 中可能的敏感部分，只记 Site id），`response()` 返回 `"invalid_endpoints": [{"scope":"instance"} | {"scope":"site","site_id":n,"reason":"https_unsupported"}]`，UI 提示修改。修改前这些端点的 render 请求按 resolve 报错 → 回退 HTTP。
 
 **`response()` 形状：**
 ```json
@@ -321,6 +350,7 @@ git commit -m "feat(indexer): bind site cookies per host, read real cookies back
     // render profile + 假 opener 失败 + HTTP 返回 JS 外壳 → outcome.failures[0].kind == CdpFallbackEmpty
 }
 #[test] fn fallback_with_results_reports_http_fallback_source() {}
+#[test] fn plugin_profile_cannot_enable_render() {}
 ```
 
 - [ ] **Step 2: 运行并确认失败**
@@ -357,6 +387,8 @@ fn legacy_obscura_url_is_adopted_as_the_instance_endpoint() {
 }
 #[test]
 fn migration_never_overrides_an_explicit_switch() {}
+#[test]
+fn stored_https_endpoints_are_reported_not_rewritten() {}
 ```
 
 `crates/api/tests/browser_runtime.rs` 更新为断言 `response()["capabilities"]["route_precedence"] == ["site","instance","managed"]` 与 `fallback == "http"`。
@@ -442,7 +474,7 @@ git commit -m "feat(api): reject invalid CDP endpoints at write time"
   - `pub enum InstallPolicy { Download, PreinstalledOnly }`：设置 key `obscura.install = "download" | "preinstalled"`，env `CRAWLER_MEDIA_OBSCURA_INSTALL` 作启动默认；**默认 `preinstalled`**，需要 Admin 显式改为 `download` 才会联网下载
   - `ObscuraManager::{new, with_installer, with_launcher, with_ready_timeout, with_port_picker, binary_path, is_installed, is_downloading, owns_live_daemon, cdp_url, start, stop, shutdown, status}`
   - `cdp_url(&self) -> Option<String>`：**仅当本 manager 持有存活子进程且身份已确认时返回 `Some`**（H3）
-  - `pub struct ObscuraStatus { installed, running, downloading, port, cdp_url, expected_version, reported_version, binary_path, install_policy, last_error }`（`Serialize`）
+  - `pub struct ObscuraStatus { installed, running, downloading, port, cdp_url, expected_version, reported_version, binary_path, install_policy, last_error, not_started_reason }`（`Serialize`）；`not_started_reason: Option<&'static str>` ∈ `switch_off` / `instance_endpoint_configured` / `no_render_sites` / `not_installed` / `start_failed`，由 Task 5 的 reconcile 写入（R2-M3）
   - `obscura_install::{ReleaseInstaller, ProcessLauncher, OBSCURA_ASSETS, MAX_ARCHIVE_BYTES}`
 
 **信任根（写进 ADR）：** 受管 Obscura 的信任根是代码中写死的 SHA-256，随 `OBSCURA_VERSION` 一起更新；我们信任的是「v0.2.3 这几个具体文件」，不是 `h4ckf0r0day/obscura` 仓库本身（该仓库自述为防检测浏览器，第三方维护，无上游签名）。升级版本必须人工下载、核对、改表、过 Task 0 spike。
@@ -466,7 +498,7 @@ pub const EXPECTED_ENTRIES: &[&str] = &["obscura", "obscura-worker"];
 ```
 
 **`ReleaseInstaller::ensure_installed` 步骤（B1）：**
-1. 已安装判定：`<data>/bin/obscura` 与 `obscura-worker` 存在，且 `<data>/bin/.obscura.sha256` 记录的归档哈希等于表中值 → 直接返回；预置二进制（`PreinstalledOnly`）则要求 `<data>/bin/obscura.tar.gz` 原始归档存在并过同样的哈希校验后解出，或二进制旁有与表一致的 `.obscura.sha256`（运维按 deploy 文档放置）。否则 `PreinstalledOnly` 返回 `InstallError::NotInstalled`，**不联网**。
+1. 已安装判定：`<data>/bin/obscura` 与 `obscura-worker` 存在，且 `<data>/bin/.obscura.sha256` 记录的归档哈希等于表中值 → 直接返回；预置（`PreinstalledOnly`）要求 `<data>/bin/obscura.tar.gz` 原始发布归档存在，过同样的哈希/大小校验后按步骤 5–6 解出（与 deploy 文档一致；不接受只放二进制加手写哈希文件）。否则 `PreinstalledOnly` 返回 `InstallError::NotInstalled`，**不联网**。
 2. `Download`：`ureq` agent 设置 `timeout_connect=10s`、`timeout_global=300s`；若响应 `Content-Length` > `MAX_ARCHIVE_BYTES` 或 != 表中 size → 拒绝。
 3. 流式写入 `<data>/bin/.obscura-<nonce>.tar.gz.part`（`create_new`），边写边 `Sha256::update`，`Read::take(MAX_ARCHIVE_BYTES + 1)` 超限即拒绝。
 4. 哈希或长度不符 → 删除 `.part`、`error!(expected, actual, asset)`、返回 `InstallError::HashMismatch`。
@@ -475,7 +507,7 @@ pub const EXPECTED_ENTRIES: &[&str] = &["obscura", "obscura-worker"];
 7. 修复 L3：`is_running` 中的 `.parse().unwrap()` 改为 `SocketAddr::from((Ipv4Addr::LOCALHOST, port))`。
 
 **`start()` / 身份确认（H3 + M4）：**
-- 端口：每次启动由 `with_port_picker`（默认：绑定 `127.0.0.1:0` 取空闲端口后释放）选择，不再固定 9223。
+- 端口：若 Task 0 证明 `--port 0` 可用且能读到实际端口（stdout 的 `CDP server: ws://127.0.0.1:<port>` 行），优先用它；否则由 `with_port_picker`（默认：绑定 `127.0.0.1:0` 取空闲端口后释放）选择。释放到 Obscura 绑定之间有竞态：就绪失败且子进程已退出时，换新端口重试至多 2 次（R2-L3），仍失败才报 `start_failed`。不再固定 9223。
 - 启动参数：`serve --host 127.0.0.1 --port <port>`（`--host` 以 Task 0 结论为准；若不支持，ADR 记录默认绑定实测结果，非回环则拒绝启用受管模式）。
 - 就绪：轮询 `GET http://127.0.0.1:<port>/json/version`（200ms 间隔，默认 10s 上限），且 `handle.try_alive()` 为真；`Browser` 字段写入 `reported_version`（L2：以 `/json/version` 为准，`OBSCURA_VERSION` 只是期望值，不一致 `warn!`）。
 - 已有 `self.child` 且存活 → no-op；**端口上有服务但不是我们的子进程，绝不当作受管端点**。
@@ -502,6 +534,7 @@ pub const EXPECTED_ENTRIES: &[&str] = &["obscura", "obscura-worker"];
 #[test] fn exited_child_reports_not_running_and_no_cdp_url() {}
 #[test] fn stale_pidfile_for_a_foreign_process_is_removed_without_killing() {}
 #[test] fn install_failure_is_reported_without_recording_a_child() {}
+#[test] fn port_race_retries_with_a_new_port() {}
 ```
 假 installer 返回临时文件路径；假 launcher 在 `spawn` 里起一个回答 `/json/version` 的 localhost 线程并由 handle 持有，或故意不回答以触发超时。测试用 `with_ready_timeout(Duration::from_millis(100))`，安装测试把 `MAX_ARCHIVE_BYTES`/资产表作为 `ReleaseInstaller` 的构造参数注入（生产用常量）。
 
@@ -538,7 +571,7 @@ git commit -m "feat(api): verify Obscura releases by pinned SHA-256 and own the 
 **Interfaces:**
 - Consumes: Task 4 的 manager/status；既有 Job 体系（`JobKind`）。
 - Produces:
-  - `GET /api/v1/settings/browser/obscura` → `{installed, running, downloading, port, cdp_url, version, binary_path}`
+  - `GET /api/v1/settings/browser/obscura` → Task 4 `ObscuraStatus` 的完整序列化（`installed, running, downloading, port, cdp_url, expected_version, reported_version, binary_path, install_policy, last_error, not_started_reason`），不另造字段集（R2-L4）
   - `POST /api/v1/settings/browser/obscura/start` → 202 `{queued:true}`（结果经状态轮询）
   - `POST /api/v1/settings/browser/obscura/stop` → `{ok:true}`
   - `GET/PUT /settings/browser` 的响应新增 `"obscura"` 字段（进程事实，来自 manager），`cdp` 段保持 Task 2 形状
@@ -558,7 +591,11 @@ git commit -m "feat(api): verify Obscura releases by pinned SHA-256 and own the 
 #[tokio::test] async fn saving_the_switch_on_without_an_endpoint_starts_the_managed_daemon() {}
 #[tokio::test] async fn saving_the_switch_off_stops_the_managed_daemon() {}
 #[tokio::test] async fn configuring_an_instance_endpoint_stops_the_managed_daemon() {}
-#[tokio::test] async fn switch_on_without_any_render_site_does_not_start_the_daemon() {}
+#[tokio::test] async fn switch_on_without_any_render_site_does_not_start_the_daemon() {
+    // 且 status.not_started_reason == "no_render_sites"
+}
+#[tokio::test] async fn preinstalled_policy_without_binary_reports_not_installed() {}
+#[tokio::test] async fn obscura_status_route_matches_the_obscura_status_struct() {}
 #[tokio::test] async fn saving_returns_before_the_install_finishes() {
     // 假 installer 阻塞在 barrier 上；PUT 立即 200，GET obscura → downloading=true
 }
@@ -605,7 +642,7 @@ git commit -m "feat(api): expose managed Obscura status/start/stop and reconcile
   - provider closure 每次读取设置后返回：`enabled = cdp.enabled`；`endpoint = cdp.url` 非空时 `Some`；`managed_endpoint = if enabled && url 为空 { manager.cdp_url() } else { None }`——`cdp_url()` 只在本 manager 持有存活且身份已确认的子进程时为 `Some`（读内存状态 + `try_wait`，无 TCP 探测）
 
 **行为约束：**
-- `CRAWLER_MEDIA_BROWSER=1` 不再拒绝启动，行为等同打开开关（经 `seed_switch_default` 落成显式设置）。用户已显式设置过 `cdp.enabled` 时，env 不得覆盖。
+- `CRAWLER_MEDIA_BROWSER=1` 不再拒绝启动，**只**设置开关默认值（经 `seed_switch_default` 落成显式设置），用户已显式设置过 `cdp.enabled` 时 env 不得覆盖。它不决定安装策略，也不保证启动：在默认 `preinstalled` 且无预置二进制、或 `render_sites == 0` 时不启动，启动日志 `info!(reason = not_started_reason)` 一次，设置页显示原因（R2-M3）。`CRAWLER_MEDIA_OBSCURA_INSTALL` 同理只在 `obscura.install` 未设置时写入默认值，并在 `crates/api/src/config.rs` 注册该变量。
 - 受管端点**不做**每请求 TCP 探活；只读 manager 的内存状态（H3）。端口被外部进程占用时 `cdp_url()` 为 `None`，按 Task 2 的「无可用端点」回退 HTTP 并 warn。
 - `boot_reconcile` 只投递 `JobKind::BrowserReconcile`，不在启动路径上下载。
 - `main.rs` shutdown 时调用 `manager.shutdown()`（M4）。
@@ -617,6 +654,7 @@ git commit -m "feat(api): expose managed Obscura status/start/stop and reconcile
 ```rust
 #[test] fn env_flag_seeds_the_switch_only_when_it_is_unset() {}
 #[test] fn env_flag_never_overrides_an_explicit_switch_value() {}
+#[test] fn install_env_seeds_the_policy_only_when_unset() {}
 #[test] fn production_browser_no_longer_rejects_the_legacy_managed_flag() {}
 #[tokio::test] async fn switch_on_without_an_instance_endpoint_passes_the_managed_endpoint() {}
 #[tokio::test] async fn managed_endpoint_is_absent_when_the_manager_owns_no_live_daemon() {}
@@ -825,7 +863,8 @@ test("body carries one switch and no legacy obscura toggle", () => {
 });
 test("status text reflects process facts, render site count and ignored endpoints", () => {
   assert.match(describeObscuraStatus({ running: false, downloading: true, render_sites: 2 }), /下载中/);
-  assert.match(describeObscuraStatus({ running: false, render_sites: 0 }), /没有站点需要浏览器/);
+  assert.match(describeObscuraStatus({ running: false, not_started_reason: "no_render_sites", render_sites: 0 }), /没有站点需要浏览器/);
+  assert.match(describeObscuraStatus({ running: false, not_started_reason: "not_installed" }), /预置|下载/);
 });
 ```
 
@@ -836,7 +875,7 @@ Expected: FAIL。
 
 - [ ] **Step 3: 改造面板**
 
-删除独立的 Obscura 开关与 URL 输入；`cdp.url` 留空即表示使用受管 Obscura，UI 必须显式提示这一点。新增安装策略选择（仅预置 / 允许自动下载，默认仅预置）、`render_sites`、`ignored_site_endpoints` 告警与 `last_error` 显示；start 返回 202 后轮询状态。
+删除独立的 Obscura 开关与 URL 输入；`cdp.url` 留空即表示使用受管 Obscura，UI 必须显式提示这一点。新增安装策略选择（仅预置 / 允许自动下载，默认仅预置）、`render_sites`、`ignored_site_endpoints` 与 `invalid_endpoints` 告警、`not_started_reason` 与 `last_error` 显示；搜索结果的站点失败列表按 `failures[].kind == "cdp_fallback_empty"` 显示「CDP 回退后无结果」（R2-L2）；start 返回 202 后轮询状态。
 
 - [ ] **Step 4: 运行并确认通过**
 
@@ -856,7 +895,8 @@ git commit -m "feat(web): one CDP switch with managed Obscura status and control
 
 - CDP discovery / close（`cdp_page.rs` 的 `http_agent`）与 `connect_tcp` 将来改走 net-guard 的「浏览器实例策略」（与下载器实例同级，由宿主配置允许的 host:port）；在此之前，Task 1 的 `webSocketDebuggerUrl` host:port 一致性校验与「端点只接受 http」是最低防线。
 - 浏览器自身的网络栈（页面 JS、子资源、跳转）不经过 net-guard，因此 **render 只对内置与 Admin 本地 overlay Profile 开放**；插件来源 Profile 设置 `render: true` 在加载时被拒绝（`crates/indexer/src/profile.rs` 加载入口加来源参数，Task 2 内实现并测试 `plugin_profile_cannot_enable_render`）。
-- exec-ctx 在插件方案 M0a 落地后，`Browser::render` 入口加 `debug_assert!(exec_ctx::is_blocking_ok())`；Task 1 的 Browser 信号量纳入插件方案的并发预算体系。单次 render 总时限对齐 `blocking_budget`（由调用方传入 deadline，后续工作）。
+- exec-ctx 在插件方案 M0a 落地后，`Browser::render` 入口加 `debug_assert!(exec_ctx::is_blocking_ok())`；Task 1 的 Browser 信号量纳入插件方案的并发预算体系。v1 已有 render 总时限（Task 1，默认 15s）；改为由调用方按 `blocking_budget` 传入 deadline 是后续工作。
+- **插件方案的待办（登记，不在本计划改）**：插件设计 §5/§13C 加一条「插件 YAML 禁止 `render: true`」，必须在插件方案 M1b 之前落地。本计划 Task 2 已在 Profile 加载入口实现该拒绝，插件方案只需引用。
 - 把受管 Obscura 放进受限网络（容器 / netns）列为后续工作。
 
 ## 收尾
@@ -865,6 +905,6 @@ git commit -m "feat(web): one CDP switch with managed Obscura status and control
 - [ ] `cd web && node --test && pnpm typecheck` 全绿。
 - [ ] **手动验收（有网络的机器，结果写进 ADR）**：设 `obscura.install=download` → 开关开启 → 下载并哈希校验 → 启动（确认仅监听 127.0.0.1、端口随机）→ 配一个 `render: true` 的 overlay Profile 指向本地 JS 渲染页 → 搜索得到结果 → 浏览器签到 → cookie 回读并合并 → 关闭开关后进程退出、pidfile 删除。
 - [ ] 按 Review Focus 九条逐条确认对应测试存在且真的在断言该行为。
-- [ ] ADR-0007 与 `docs/deploy.md` 补充：信任根是写死的 SHA-256（Task 4）；离线部署的预置路径 `<data>/bin/obscura`、`<data>/bin/obscura-worker` 与 `<data>/bin/.obscura.sha256`（或放原始归档 `<data>/bin/obscura.tar.gz`），预置同样过哈希校验（L6）；`obscura.install` 默认 `preinstalled`；`network_mode: host` 风险；端点仅 `http`。
+- [x] （已在 Task −1 完成，收尾只复核）ADR-0007 与 `docs/deploy.md` 补充：信任根是写死的 SHA-256（Task 4）；离线部署的预置路径 `<data>/bin/obscura`、`<data>/bin/obscura-worker` 与 `<data>/bin/.obscura.sha256`（或放原始归档 `<data>/bin/obscura.tar.gz`），预置同样过哈希校验（L6）；`obscura.install` 默认 `preinstalled`；`network_mode: host` 风险；端点仅 `http`。
 - [ ] 确认 `docs/adr/0007-cdp-browser-opt-in.md`、`CONTEXT.md`、`docs/deploy.md` 的描述与最终实现一致；如有偏差，改代码或改文档，不允许两边不一致。
 - [ ] 在 worktree 提交完整分支，`main` 保持干净。
