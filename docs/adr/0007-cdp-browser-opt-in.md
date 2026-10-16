@@ -91,7 +91,19 @@
 - **数据升级**：不要求空数据目录。v7 库增量补 `sites.maintenance_via`（默认 `http`），已有数据全部保留。
 - **会话隔离**：每个 Browser 会话使用独立的 BrowserContext（`Target.createBrowserContext` → `createTarget{browserContextId}` → `disposeBrowserContext`）。本应用不调用任何 cookie 删除命令，也不会碰到其他上下文里的 cookie；会话结束后，该会话的 cookie 随上下文一起销毁，因此不会串号，也不会残留凭据。不支持 BrowserContext 的端点标记为不兼容，登录/签到在导航前回退 HTTP。
 - **回退边界**：只有导航前失败（BrowserSetup/BrowserBusy）才回退 HTTP，且回退时不重复发 Hook 事件；导航后的失败原样报告。
-- **T0 验证表（待补）**：Obscura v0.2.3 对 `Target.createBrowserContext`、`getCookies{urls}`、拒收公共后缀 cookie 的支持情况，用 `cargo test -p indexer --test obscura_t0 -- --ignored`（设置 `OBSCURA_CDP_URL`）验证后填入。
+- **T0 验证表**：2026-10-16 在 box 上用 Obscura v0.2.3（x86_64-linux，sha256 `1534d1e6…eec` 校验通过）实测。前 6 项结果出自本仓库测试（`crates/indexer/tests/obscura_t0.rs`、`crates/api/tests/management/obscura_lifecycle.rs`，均为 `#[ignore]`），其余出自复审 r2 的 Node 探针：
+
+| 能力 | 结果 |
+|---|---|
+| `/json/version` | 支持；`Browser` 字段报 `Chrome/145.0.0.0`，所以版本改用 `obscura --version` 核对（输出 `obscura 0.2.3`） |
+| `/json/new`、`/json/close` | **不支持**，已改为 `Target.createTarget` / `Target.closeTarget` |
+| `createBrowserContext` / `createTarget{browserContextId}` / `disposeBrowserContext` | 支持；第二个会话读不到上一个会话的 cookie |
+| 直连 `/devtools/page/{id}` 后发 `Page.navigate` | `-32601 No page for session`，已改为 `Target.attachToTarget{flatten:true}` 加 sessionId |
+| 端到端 render（注入 cookie、goto、读取 content、回读 `getCookies{urls}`） | **通过**（`render_end_to_end_navigates_injects_and_reads_back_cookies`） |
+| 受管 start：spawn 线程退出后 daemon 仍存活，stop 后进程退出 | **通过**（`real_obscura_managed_start_survives_spawn_thread_and_stops`） |
+| `getCookies{urls}` 是否按 path 过滤 | **不过滤**，所以回读只取 path=`/` 的 cookie |
+| 访问私网目标 | 默认禁止；需要的话设置 `CRAWLER_MEDIA_OBSCURA_ALLOW_PRIVATE_NETWORK=1`，启动时会加上 `--allow-private-network` |
+| 拒收公共后缀 cookie | 未测 |
 
 ## 历史边界（2026-10-10，已被上一节取代）
 

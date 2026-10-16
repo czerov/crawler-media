@@ -116,3 +116,13 @@ Site 凭证（cookie / API key / RSS URL）按 [ADR-0003](<adr/0003-plaintext-si
 **当前控制缺陷必须了解：** 禁用running清理尚不能阻止下一批，修改更安全策略尚不刷新已queued的下一次快照；预览／报告存在计数截断与扫描预算缺口。不能把UI关闭当作已经停止，也不能把保存dry_run当作下一次一定只读。见 [总复核F01–F06](<audits/2026-10-13-database-api-review.md>) 与 [DB8合同](<superpowers/plans/2026-10-12-db8-maintenance-retention.md>)。
 
 不要在运行时复制单个主体文件忽略WAL当备份；采用SQLite online backup或停机后对有关文件的一致备份。不要手工删除DB/WAL/SHM来缩空间。
+
+
+### Obscura 受管浏览器补充（r9）
+- **预置方式**（`OBSCURA_INSTALL=preinstalled`，默认值），以下两种任选其一：
+  - 把官方发布包放到 `<data>/bin/obscura.tar.gz`，程序会按写死的 sha256 校验后解包；
+  - 把 `obscura` 和 `obscura-worker` 两个二进制放进 `<data>/bin/`，并在同目录放一份 `obscura.sha256sums`（`sha256sum` 格式，每行一项）。两种方式下，每次启动都会重新校验二进制的 hash。
+- **局域网或内网站点**：Obscura 默认禁止访问私网地址。如果确实需要，设置 `CRAWLER_MEDIA_OBSCURA_ALLOW_PRIVATE_NETWORK=1`（默认关闭，注意 SSRF 风险）。
+- **版本核对**用 `obscura --version`；不符时显示在状态的 `last_error` 里。
+- **进程回收**：daemon 以独立进程组运行，停止时整组回收。应用崩溃后，由下次启动时的 pidfile 回收。
+- **权限**：Browser 设置和 Obscura 状态接口仅管理员可读，因为里面有 CDP 端口和二进制路径。
