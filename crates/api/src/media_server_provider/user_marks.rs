@@ -119,15 +119,10 @@ pub(super) fn write_favorite_mark(
     season: i32,
     episode: i32,
     favorite: bool,
-    _now: i64,
+    now: i64,
 ) -> Result<(), String> {
-    let played = store
-        .unit_state(user_id, media_id, season, episode)
-        .map_err(|error| error.to_string())?
-        .map(|state| state.played)
-        .unwrap_or_else(|| unit_played(store, user_id, media_id, season, episode));
     store
-        .set_unit_favorite(user_id, media_id, season, episode, favorite, played)
+        .set_unit_favorite(user_id, media_id, season, episode, favorite, now)
         .map_err(|error| {
             tracing::error!(%error, %user_id, %media_id, season, episode, "failed to update Jellyfin favorite mark");
             error.to_string()

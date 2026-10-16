@@ -22,6 +22,9 @@ pub struct UnitState {
     pub subtitle_track: Option<String>,
     pub play_count: i64,
     pub updated_at: i64,
+    /// When this unit was last favourited. Zero means never favourited, or
+    /// favourited before this clock existed (those rows keep `updated_at`).
+    pub favorite_at: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +34,7 @@ pub struct UnitRow {
     pub played: bool,
     pub favorite: bool,
     pub updated_at: i64,
+    pub favorite_at: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

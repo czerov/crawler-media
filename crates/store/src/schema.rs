@@ -16,7 +16,7 @@ mod scan_operations;
 pub const APP_SCHEMA_VERSION: i64 = 7;
 pub const CATALOG_SCHEMA_VERSION: i64 = 2;
 pub const LIBRARY_SCHEMA_VERSION: i64 = 14;
-pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 5;
+pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 6;
 
 /// Read the current schema version from a database file.
 ///
@@ -387,6 +387,18 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     )?;
     read_revisions::migrate_read_revisions("subscribe", conn)?;
     read_revisions::create_revision_trigger(conn, "playback_units", "sub_units")?;
+    // subscribe schema 6: favourite activity has its own clock so a favourite
+    // write cannot reorder played marks or invent a viewing timestamp.
+    ensure_column(
+        conn,
+        "playback_units",
+        "favorite_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    conn.execute_batch(
+        "UPDATE playback_units SET favorite_at = updated_at
+         WHERE favorite != 0 AND favorite_at = 0 AND updated_at != 0;",
+    )?;
     set_schema_version(conn, SUBSCRIBE_SCHEMA_VERSION)?;
     Ok(())
 }

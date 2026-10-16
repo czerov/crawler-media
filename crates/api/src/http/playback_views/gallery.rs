@@ -55,7 +55,11 @@ pub(crate) async fn favorites_gallery(
         for media_id in media_ids {
             for row in store.unit_rows(user_id, media_id).unwrap_or_default() {
                 if row.favorite {
-                    by_media.insert(media_id, row.updated_at);
+                    let favorited_at = if row.favorite_at != 0 { row.favorite_at } else { row.updated_at };
+                    let entry = by_media.entry(media_id).or_insert(0);
+                    if favorited_at > *entry {
+                        *entry = favorited_at;
+                    }
                 }
             }
         }

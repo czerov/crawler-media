@@ -16,7 +16,7 @@ impl Store {
         self.subscribe
             .query_row(
                 "SELECT position_ms, played, favorite, duration_ms, audio_track,
-                        subtitle_track, play_count, updated_at
+                        subtitle_track, play_count, updated_at, favorite_at
                  FROM playback_units
                  WHERE user_id = ?1 AND media_id = ?2 AND season = ?3 AND episode = ?4",
                 params![user_id.to_string(), media_id.to_string(), season, episode],
@@ -30,6 +30,7 @@ impl Store {
                         subtitle_track: row.get(5)?,
                         play_count: row.get(6)?,
                         updated_at: row.get(7)?,
+                        favorite_at: row.get(8)?,
                     })
                 },
             )
@@ -44,16 +45,25 @@ impl Store {
         season: i32,
         episode: i32,
         favorite: bool,
-        played: bool,
+        now: i64,
     ) -> Result<(), StoreError> {
+        let favorite_at = if favorite { now } else { 0 };
         self.subscribe.execute(
             "INSERT INTO playback_units
                 (user_id, media_id, season, episode, position_ms, played, favorite,
-                 duration_ms, audio_track, subtitle_track, play_count, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, NULL, NULL, NULL, 0, 0)
+                 duration_ms, audio_track, subtitle_track, play_count, updated_at, favorite_at)
+             VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, NULL, NULL, NULL, 0, 0, ?6)
              ON CONFLICT(user_id, media_id, season, episode) DO UPDATE SET
-                favorite = excluded.favorite",
-            params![user_id.to_string(), media_id.to_string(), season, episode, played as i64, favorite as i64],
+                favorite = excluded.favorite,
+                favorite_at = excluded.favorite_at",
+            params![
+                user_id.to_string(),
+                media_id.to_string(),
+                season,
+                episode,
+                favorite as i64,
+                favorite_at,
+            ],
         )?;
         Ok(())
     }
@@ -76,6 +86,11 @@ impl Store {
     ) -> Result<UnitState, StoreError> {
         let existing = self.unit_state(user_id, media_id, season, episode)?;
         let played = played.unwrap_or(existing.as_ref().map(|u| u.played).unwrap_or(false));
+        let favorite_at = match favorite {
+            Some(true) => now,
+            Some(false) => 0,
+            None => existing.as_ref().map(|unit| unit.favorite_at).unwrap_or(0),
+        };
         let favorite = favorite.unwrap_or(existing.as_ref().map(|u| u.favorite).unwrap_or(false));
         let duration_ms = duration_ms.or(existing.as_ref().and_then(|u| u.duration_ms));
         let play_count = existing.as_ref().map(|u| u.play_count).unwrap_or(0)
@@ -89,8 +104,8 @@ impl Store {
         self.subscribe.execute(
             "INSERT INTO playback_units
                 (user_id, media_id, season, episode, position_ms, played, favorite,
-                 duration_ms, audio_track, subtitle_track, play_count, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 duration_ms, audio_track, subtitle_track, play_count, updated_at, favorite_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(user_id, media_id, season, episode) DO UPDATE SET
                 position_ms = excluded.position_ms,
                 played = excluded.played,
@@ -99,7 +114,8 @@ impl Store {
                 audio_track = excluded.audio_track,
                 subtitle_track = excluded.subtitle_track,
                 play_count = excluded.play_count,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                favorite_at = excluded.favorite_at",
             params![
                 user_id.to_string(),
                 media_id.to_string(),
@@ -113,6 +129,7 @@ impl Store {
                 subtitle_track,
                 play_count,
                 now,
+                favorite_at,
             ],
         )?;
         self.unit_state(user_id, media_id, season, episode)?
@@ -133,9 +150,9 @@ impl Store {
         self.subscribe.execute(
             "INSERT OR IGNORE INTO playback_units
                 (user_id, media_id, season, episode, position_ms, played, favorite,
-                 duration_ms, audio_track, subtitle_track, play_count, updated_at)
+                 duration_ms, audio_track, subtitle_track, play_count, updated_at, favorite_at)
              SELECT user_id, media_id, -1, -1, position_ms, played, favorite,
-                    duration_ms, audio_track, subtitle_track, play_count, updated_at
+                    duration_ms, audio_track, subtitle_track, play_count, updated_at, favorite_at
              FROM playback_units
              WHERE user_id = ?1 AND media_id = ?2 AND season = 0 AND episode = 0",
             params![user_id.to_string(), media_id.to_string()],
@@ -200,6 +217,31 @@ impl Store {
         }
         Ok(list)
     }
+
+    /// Favourited units ordered by favourite activity, newest first.
+    /// A pre-migration favourite (`favorite_at = 0`) keeps its playback
+    /// timestamp as the ordering key.
+    pub fn favorite_rows(&self, user_id: UserId) -> Result<Vec<(MediaId, i64, i32, i32)>, StoreError> {
+        let mut stmt = self.subscribe.prepare(
+            "SELECT media_id, season, episode,
+                    CASE WHEN favorite_at != 0 THEN favorite_at ELSE updated_at END AS favorited
+             FROM playback_units
+             WHERE user_id = ?1 AND favorite != 0
+             ORDER BY favorited DESC, media_id, season, episode",
+        )?;
+        let rows = stmt.query_map(params![user_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        let mut list = Vec::new();
+        for row in rows {
+            let (media, season, episode, favorited) = row?;
+            if let Ok(media_id) = MediaId::from_str(&media) {
+                list.push((media_id, favorited, season, episode));
+            }
+        }
+        Ok(list)
+    }
+
     /// All unit rows of a media (for marks aggregation / cascade).
     pub fn unit_rows(
         &self,
@@ -207,7 +249,7 @@ impl Store {
         media_id: MediaId,
     ) -> Result<Vec<UnitRow>, StoreError> {
         let mut stmt = self.subscribe.prepare(
-            "SELECT season, episode, played, favorite, updated_at
+            "SELECT season, episode, played, favorite, updated_at, favorite_at
              FROM playback_units WHERE user_id = ?1 AND media_id = ?2",
         )?;
         let rows = stmt.query_map(params![user_id.to_string(), media_id.to_string()], |row| {
@@ -217,6 +259,7 @@ impl Store {
                 played: row.get::<_, i64>(2)? != 0,
                 favorite: row.get::<_, i64>(3)? != 0,
                 updated_at: row.get(4)?,
+                favorite_at: row.get(5)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -256,17 +299,10 @@ impl Store {
         now: i64,
     ) -> Result<(), StoreError> {
         if let Some(favorite) = favorite {
-            // Favorite-only changes preserve the existing played value and activity time.
+            // Favourite activity is its own clock. Playback fields stay on the
+            // row that already owns them; a missing unit is favourite-only.
             if played.is_none() {
-                let existing = self.unit_state(user_id, media_id, season, episode)?;
-                self.set_unit_favorite(
-                    user_id,
-                    media_id,
-                    season,
-                    episode,
-                    favorite,
-                    existing.as_ref().is_some_and(|unit| unit.played),
-                )?;
+                self.set_unit_favorite(user_id, media_id, season, episode, favorite, now)?;
             } else {
                 let existing = self.unit_state(user_id, media_id, season, episode)?;
                 self.upsert_unit(
@@ -284,10 +320,9 @@ impl Store {
                     now,
                 )?;
             }
-            // Cascaded favorite changes must not reorder playback activity.
             if !favorite && season == UNIT_WHOLE && episode == UNIT_WHOLE {
                 self.subscribe.execute(
-                    "UPDATE playback_units SET favorite = 0
+                    "UPDATE playback_units SET favorite = 0, favorite_at = 0
                      WHERE user_id = ?1 AND media_id = ?2",
                     params![user_id.to_string(), media_id.to_string()],
                 )?;

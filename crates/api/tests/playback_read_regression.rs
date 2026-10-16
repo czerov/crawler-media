@@ -272,6 +272,48 @@ async fn favorites_sort_matches_existing_keys() {
 }
 
 #[tokio::test]
+async fn newest_favorite_leads_without_reordering_played_marks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = make_state(tmp.path());
+    let app = router(state.clone());
+    let store = state.store();
+    let library = seed_library(&store.lock(), tmp.path(), "recent-favorites");
+    let (member, token) = seed_member(&store.lock(), "dana");
+    let (older, newer) = {
+        let guard = store.lock();
+        let older = seed_media(&guard, "Older favorite", Some(2020));
+        let newer = seed_media(&guard, "Newer favorite", Some(2021));
+        add_ledger(&guard, older, &library, "older");
+        add_ledger(&guard, newer, &library, "newer");
+        guard
+            .upsert_unit(member, older, -1, -1, 0, Some(true), Some(true), None, None, None, false, 10)
+            .unwrap();
+        guard
+            .upsert_unit(member, newer, -1, -1, 0, Some(true), Some(false), None, None, None, false, 50)
+            .unwrap();
+        guard
+            .set_unit_marks(member, newer, -1, -1, None, Some(true), 80)
+            .unwrap();
+        (older, newer)
+    };
+
+    let favorites = get(&app, "/api/v1/playback/favorites?limit=10", &token).await;
+    let ids: Vec<&str> = favorites["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["media_item_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids[0], newer.to_string(), "new favourite must lead: {favorites}");
+    let gallery = get(&app, "/api/v1/playback/favorites/gallery?limit=10", &token).await;
+    assert_eq!(gallery[0]["media_item_id"], newer.to_string(), "{gallery}");
+    let played = store.lock().user_active_media_ids(member).unwrap();
+    assert_eq!(played[0].0, newer);
+    assert_eq!(played[0].1, 50, "favourite activity must not reorder played marks");
+    let _ = older;
+}
+
+#[tokio::test]
 async fn activity_media_target_fields_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());

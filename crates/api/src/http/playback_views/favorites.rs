@@ -180,17 +180,18 @@ fn favorite_entries(
                 .then_some(row.media_id)
         })
         .collect();
-    let mut by_media: HashMap<domain::MediaId, (i64, i32, i32)> = HashMap::new(); // updated_at, season, episode
+    let mut by_media: HashMap<domain::MediaId, (i64, i32, i32)> = HashMap::new();
     for media_id in media_ids {
         for row in store.unit_rows(user_id, media_id).unwrap_or_default() {
             if !row.favorite {
                 continue;
             }
+            let favorited_at = if row.favorite_at != 0 { row.favorite_at } else { row.updated_at };
             let entry = by_media
                 .entry(media_id)
                 .or_insert((0, row.season, row.episode));
-            if row.updated_at > entry.0 {
-                *entry = (row.updated_at, row.season, row.episode);
+            if favorited_at > entry.0 {
+                *entry = (favorited_at, row.season, row.episode);
             }
         }
     }

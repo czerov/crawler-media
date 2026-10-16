@@ -350,6 +350,7 @@ pub(super) const SUBSCRIBE_TABLES: &str = r#"
             subtitle_track TEXT,
             play_count INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0,
+            favorite_at INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (user_id, media_id, season, episode)
         );
         CREATE INDEX IF NOT EXISTS subscribes_user_idx ON subscribes(user_id);

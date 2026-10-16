@@ -462,6 +462,7 @@ mod tests {
                 position_ms: 0,
                 played,
                 favorite: false,
+                favorite_at: 0,
                 duration_ms: None,
                 audio_track: None,
                 subtitle_track: None,

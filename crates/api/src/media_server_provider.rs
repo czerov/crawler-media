@@ -269,7 +269,9 @@ impl MediaServerProvider for ApiServerProvider {
     ) -> Result<Vec<MediaItemSnapshot>, String> {
         let targets = {
             let store = self.state.store.lock();
-            store.user_resumable_units(user_id, limit).unwrap_or_default()
+            store
+                .user_resumable_units(user_id, limit)
+                .unwrap_or_default()
         };
         let mut results = Vec::new();
         let mut seen_media = std::collections::HashSet::new();

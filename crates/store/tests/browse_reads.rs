@@ -119,7 +119,7 @@ fn favorite_only_update_preserves_played_activity_timestamp() {
     let media = media(MediaKind::Tv, "Favorite timestamp", None);
     store.insert_media(&media).unwrap();
     store.upsert_unit(user, media.id, 1, -1, 0, Some(true), Some(false), None, None, None, false, 10).unwrap();
-    store.set_unit_favorite(user, media.id, 1, -1, true, true).unwrap();
+    store.set_unit_favorite(user, media.id, 1, -1, true, 99).unwrap();
     let state = store.unit_state(user, media.id, 1, -1).unwrap().unwrap();
     assert!(state.played);
     assert!(state.favorite);
@@ -143,6 +143,97 @@ fn whole_unit_unfavorite_preserves_other_units_activity_timestamps() {
     assert_eq!(store.unit_state(user, media.id, 1, -1).unwrap().unwrap().updated_at, 10);
     assert_eq!(store.unit_state(user, media.id, 1, 1).unwrap().unwrap().updated_at, 15);
     assert!(!store.unit_state(user, media.id, 1, 1).unwrap().unwrap().favorite);
+}
+
+#[test]
+fn first_movie_favorite_copies_legacy_whole_file_playback_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let user = UserId::new();
+    let movie = media(MediaKind::Movie, "Legacy favorite", None);
+    store.insert_media(&movie).unwrap();
+    store
+        .upsert_unit(
+            user,
+            movie.id,
+            0,
+            0,
+            600_000,
+            Some(true),
+            Some(false),
+            Some(7_200_000),
+            Some("audio-old"),
+            Some("subtitle-old"),
+            true,
+            42,
+        )
+        .unwrap();
+
+    store
+        .set_unit_marks(user, movie.id, -1, -1, None, Some(true), 99)
+        .unwrap();
+
+    let canonical = store.unit_state(user, movie.id, -1, -1).unwrap().unwrap();
+    assert!(canonical.favorite);
+    assert_eq!(canonical.position_ms, 600_000);
+    assert!(canonical.played);
+    assert_eq!(canonical.play_count, 1);
+    assert_eq!(canonical.duration_ms, Some(7_200_000));
+    assert_eq!(canonical.audio_track.as_deref(), Some("audio-old"));
+    assert_eq!(canonical.subtitle_track.as_deref(), Some("subtitle-old"));
+    assert_eq!(canonical.updated_at, 42, "legacy activity must move with the state");
+    assert_eq!(canonical.favorite_at, 99);
+}
+
+#[test]
+fn favorite_activity_orders_independently_of_played_activity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let user = UserId::new();
+    let older = media(MediaKind::Movie, "Older favorite", None);
+    let newer = media(MediaKind::Movie, "Newer favorite", None);
+    store.insert_media(&older).unwrap();
+    store.insert_media(&newer).unwrap();
+    store
+        .upsert_unit(user, older.id, -1, -1, 0, Some(true), Some(true), None, None, None, false, 10)
+        .unwrap();
+    store
+        .upsert_unit(user, newer.id, -1, -1, 0, Some(true), Some(false), None, None, None, false, 50)
+        .unwrap();
+
+    store
+        .set_unit_marks(user, newer.id, -1, -1, None, Some(true), 80)
+        .unwrap();
+
+    let rows = store.favorite_rows(user).unwrap();
+    assert_eq!(rows[0].0, newer.id, "a new favourite must lead recent favourites");
+    assert_eq!(rows[0].1, 80);
+    let played = store.user_active_media_ids(user).unwrap();
+    assert_eq!(played[0].0, newer.id);
+    assert_eq!(played[0].1, 50, "favouriting must not refresh the played clock");
+    assert_eq!(store.unit_state(user, newer.id, -1, -1).unwrap().unwrap().updated_at, 50);
+}
+
+#[test]
+fn favorite_only_insert_does_not_materialize_inherited_played() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let user = UserId::new();
+    let show = media(MediaKind::Tv, "Inherited played", None);
+    store.insert_media(&show).unwrap();
+    store
+        .upsert_unit(user, show.id, 1, -1, 0, Some(true), None, None, None, None, false, 10)
+        .unwrap();
+
+    store
+        .set_unit_favorite(user, show.id, 1, 1, true, 20)
+        .unwrap();
+    store.clear_units(user, None, Some(1)).unwrap();
+
+    let episode = store.unit_state(user, show.id, 1, 1).unwrap().unwrap();
+    assert!(episode.favorite);
+    assert!(!episode.played, "inherited played must not survive as an explicit fact");
+    assert_eq!(episode.updated_at, 0);
 }
 
 #[test]

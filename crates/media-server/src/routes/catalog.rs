@@ -110,6 +110,9 @@ pub(super) async fn items(
             }
         }
         rows = expanded;
+        if let ParentScope::Folder(root) = &scope {
+            rows.retain(|item| std::path::Path::new(&item.row.path).starts_with(root));
+        }
     }
     // genre/studio 判定保持既有位置（folder 过滤与分集展开之后）。认不出 genre/studio
     // 的 parent 一律返回空集合，绝不退化成整库。

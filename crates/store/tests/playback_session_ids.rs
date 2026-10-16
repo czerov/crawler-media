@@ -172,8 +172,8 @@ fn old_schema_migrates_without_resetting_user_facts() {
 
         // Insert legacy unit and session
         conn.execute(
-            "INSERT INTO playback_units (user_id, media_id, season, episode, position_ms, played, favorite)
-             VALUES ('u1', 'm1', -1, -1, 750000, 0, 1)",
+            "INSERT INTO playback_units (user_id, media_id, season, episode, position_ms, played, favorite, updated_at)
+             VALUES ('u1', 'm1', -1, -1, 750000, 0, 1, 42)",
             [],
         )
         .unwrap();
@@ -193,7 +193,7 @@ fn old_schema_migrates_without_resetting_user_facts() {
     let version: i64 = sub_conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 5, "subscribe.db schema version must be 5");
+    assert_eq!(version, 6, "subscribe.db schema version must be 6");
 
     // Check session backfilled last_report_at_ms = 1234 * 1000
     let (last_report_at_ms, play_session_id): (i64, Option<String>) = sub_conn
@@ -205,6 +205,14 @@ fn old_schema_migrates_without_resetting_user_facts() {
         .unwrap();
     assert_eq!(last_report_at_ms, 1234 * 1000);
     assert_eq!(play_session_id, None);
+    let favorite_at: i64 = sub_conn
+        .query_row(
+            "SELECT favorite_at FROM playback_units WHERE user_id = 'u1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(favorite_at, 42, "an old favourite keeps its activity as favorite_at");
 }
 
 #[test]

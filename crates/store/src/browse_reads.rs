@@ -54,7 +54,7 @@ impl Store {
         let mut stmt = self.subscribe.prepare(
             "SELECT media_id, season, episode,
                     position_ms, played, favorite, duration_ms, audio_track,
-                    subtitle_track, play_count, updated_at
+                    subtitle_track, play_count, updated_at, favorite_at
              FROM playback_units WHERE user_id = ?1
              ORDER BY media_id, season, episode",
         )?;
@@ -72,6 +72,7 @@ impl Store {
                     subtitle_track: row.get(8)?,
                     play_count: row.get(9)?,
                     updated_at: row.get(10)?,
+                    favorite_at: row.get(11)?,
                 },
             })
         })?;
@@ -97,7 +98,7 @@ impl Store {
             let sql = format!(
                 "SELECT media_id, season, episode,
                         position_ms, played, favorite, duration_ms, audio_track,
-                        subtitle_track, play_count, updated_at
+                        subtitle_track, play_count, updated_at, favorite_at
                  FROM playback_units
                  WHERE user_id = ?1 AND media_id IN ({placeholders})
                  ORDER BY media_id, season, episode"
@@ -122,6 +123,7 @@ impl Store {
                         subtitle_track: row.get(8)?,
                         play_count: row.get(9)?,
                         updated_at: row.get(10)?,
+                        favorite_at: row.get(11)?,
                     },
                 })
             })?;
