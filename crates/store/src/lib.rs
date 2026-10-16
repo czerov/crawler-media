@@ -9,6 +9,8 @@ mod browse_projection;
 pub use browse_projection::{
     BrowseFileFacts, BrowseMediaFacts, ProjectionBuild, ProjectionSnapshot, ReadRevisions,
 };
+mod browse_changes;
+pub use browse_changes::{BrowseChange, BrowseChangeSource, ProjectionHead};
 mod browse_reads;
 mod catalog;
 mod collections;
@@ -34,7 +36,11 @@ pub mod library_defaults;
 mod library_ownership;
 mod library_paths;
 mod library_scope;
-pub use library_scope::{LibraryPathScope, StrictOwner};
+pub use library_scope::{LibraryPathResolver, LibraryPathScope, StrictOwner};
+mod subscribe_library_snapshot;
+pub use subscribe_library_snapshot::SubscribeLibrarySnapshot;
+mod subscribe_library;
+pub use subscribe_library::evaluate_subscribe_facts_pure;
 mod maps;
 mod media;
 mod open;
@@ -53,7 +59,6 @@ mod search_history;
 pub use search_history::{HistoryDeleteOutcome, HistoryDeletePlan};
 mod sites;
 mod subscribe_wanted;
-mod subscribe_library;
 mod subscribes;
 mod users;
 

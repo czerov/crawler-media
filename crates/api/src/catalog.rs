@@ -163,6 +163,14 @@ pub trait Catalog: Send + Sync {
     ) -> Result<Vec<media::EpisodeMeta>, String> {
         Ok(Vec::new())
     }
+    /// Read fresh or stale season details without making a network request.
+    fn cached_season_details(
+        &self,
+        _tmdb_id: &str,
+        _season: u32,
+    ) -> Result<Option<Vec<media::EpisodeMeta>>, String> {
+        Ok(None)
+    }
     /// Season details with an explicit language (季级语言回落). Default: none.
     fn season_details_lang(
         &self,
@@ -372,6 +380,15 @@ impl<H: media::CatalogGet + Send + Sync> Catalog for TmdbCatalog<H> {
     ) -> Result<Vec<media::EpisodeMeta>, String> {
         self.inner
             .season_details(tmdb_id, season)
+            .map_err(|err| err.to_string())
+    }
+    fn cached_season_details(
+        &self,
+        tmdb_id: &str,
+        season: u32,
+    ) -> Result<Option<Vec<media::EpisodeMeta>>, String> {
+        self.inner
+            .cached_season_details(tmdb_id, season)
             .map_err(|err| err.to_string())
     }
     fn season_details_lang(

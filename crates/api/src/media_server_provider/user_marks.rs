@@ -7,25 +7,41 @@ pub(super) fn unit_played(
     season: i32,
     episode: i32,
 ) -> bool {
-    let mut units = vec![(season, episode)];
-    if season >= 0 && episode >= 0 {
-        units.push((season, crate::store::UNIT_WHOLE));
-    }
-    if season >= 0 || episode >= 0 {
-        units.push((crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE));
-    }
-    for (unit_season, unit_episode) in units {
+    let mut units: [Option<crate::store::UnitState>; 3] = [None, None, None];
+    let keys = [
+        (season, episode),
+        (season, crate::store::UNIT_WHOLE),
+        (crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE),
+    ];
+    for (index, (unit_season, unit_episode)) in keys.into_iter().enumerate() {
+        if index > 0 && (season < 0 || episode < 0) {
+            continue;
+        }
         match store.unit_state(user_id, media_id, unit_season, unit_episode) {
-            Ok(Some(state)) => return state.played,
+            Ok(Some(state)) => units[index] = Some(state),
             Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(%error, %user_id, %media_id, season = unit_season, episode = unit_episode, "failed to read Jellyfin played mark")
-            }
+            Err(error) => tracing::warn!(%error, %user_id, %media_id, season = unit_season, episode = unit_episode, "failed to read Jellyfin played mark"),
         }
     }
-    false
+    resolve_effective_played(
+        units[0].as_ref().map(|unit| (unit, unit.updated_at)),
+        units[1].as_ref().map(|unit| (unit, unit.updated_at)),
+        units[2].as_ref().map(|unit| (unit, unit.updated_at)),
+    )
 }
 
+pub(super) fn resolve_effective_played(
+    episode_unit: Option<(&crate::store::UnitState, i64)>,
+    season_unit: Option<(&crate::store::UnitState, i64)>,
+    show_unit: Option<(&crate::store::UnitState, i64)>,
+) -> bool {
+    [episode_unit, season_unit, show_unit]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(specificity, unit)| unit.map(|(state, updated_at)| (updated_at, 2 - specificity, state.played)))
+        .max_by_key(|(updated_at, specificity, _)| (*updated_at, *specificity))
+        .is_some_and(|(_, _, played)| played)
+}
 pub(super) fn item_is_played(
     store: &crate::Store,
     user_id: UserId,
@@ -103,40 +119,19 @@ pub(super) fn write_favorite_mark(
     season: i32,
     episode: i32,
     favorite: bool,
-    now: i64,
+    _now: i64,
 ) -> Result<(), String> {
-    let existing = store
+    let played = store
         .unit_state(user_id, media_id, season, episode)
-        .map_err(|error| {
-            tracing::error!(%error, %user_id, %media_id, season, episode, "failed to read Jellyfin favorite target");
-            error.to_string()
-        })?;
-    let played = existing
-        .as_ref()
+        .map_err(|error| error.to_string())?
         .map(|state| state.played)
         .unwrap_or_else(|| unit_played(store, user_id, media_id, season, episode));
     store
-        .upsert_unit(
-            user_id,
-            media_id,
-            season,
-            episode,
-            existing.as_ref().map(|state| state.position_ms).unwrap_or(0),
-            Some(played),
-            Some(favorite),
-            existing.as_ref().and_then(|state| state.duration_ms),
-            existing.as_ref().and_then(|state| state.audio_track.as_deref()),
-            existing
-                .as_ref()
-                .and_then(|state| state.subtitle_track.as_deref()),
-            false,
-            now,
-        )
+        .set_unit_favorite(user_id, media_id, season, episode, favorite, played)
         .map_err(|error| {
             tracing::error!(%error, %user_id, %media_id, season, episode, "failed to update Jellyfin favorite mark");
             error.to_string()
         })
-        .map(|_| ())
 }
 
 pub(super) fn persist_unplayed_override(

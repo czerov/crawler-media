@@ -16,6 +16,20 @@ use crate::library_ownership::LibraryOwnership;
 use crate::library_paths::resolved_path;
 use crate::{Library, StoreError};
 
+/// Pluggable path resolver interface for strict Library path scope.
+pub trait LibraryPathResolver {
+    fn resolve_path(&self, path: &Path) -> Result<PathBuf, StoreError>;
+}
+
+/// Default filesystem resolver using `resolved_path`.
+struct StandardFsResolver;
+
+impl LibraryPathResolver for StandardFsResolver {
+    fn resolve_path(&self, path: &Path) -> Result<PathBuf, StoreError> {
+        Ok(resolved_path(path)?)
+    }
+}
+
 /// The outcome of matching a path strictly against library roots.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StrictOwner<'a> {
@@ -38,17 +52,28 @@ pub struct LibraryPathScope {
 }
 
 impl LibraryPathScope {
-    /// Resolve and normalize all root paths in the given snapshot.
+    /// Resolve and normalize all root paths in the given snapshot using the default filesystem resolver.
     ///
     /// MUST be called outside Store locks because filesystem canonicalization
     /// is performed for existing root paths.
     pub fn resolve(snapshot: LibraryOwnership) -> Result<Self, StoreError> {
+        Self::resolve_with(snapshot, &StandardFsResolver)
+    }
+
+    /// Resolve and normalize all root paths in the given snapshot using a supplied resolver.
+    ///
+    /// Non-NotFound errors are propagated and do not silently skip failing roots.
+    pub fn resolve_with(
+        snapshot: LibraryOwnership,
+        resolver: &dyn LibraryPathResolver,
+    ) -> Result<Self, StoreError> {
         let mut libraries = Vec::with_capacity(snapshot.libraries().len());
         for lib in snapshot.libraries() {
             let mut resolved_roots = Vec::with_capacity(lib.root_paths.len());
             for root in &lib.root_paths {
-                if let Ok(r) = resolved_path(root) {
-                    resolved_roots.push(r);
+                match resolver.resolve_path(root) {
+                    Ok(r) => resolved_roots.push(r),
+                    Err(e) => return Err(e),
                 }
             }
             libraries.push(ResolvedLibrary {

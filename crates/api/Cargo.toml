@@ -62,3 +62,6 @@ path = "src/bin/live_loop/main.rs"
 [[test]]
 name = "adaptive_review9_regression"
 path = "tests/adaptive_review9_regression.rs"
+[[test]]
+name = "jellyfin_read_scale"
+path = "tests/jellyfin_read_scale.rs"

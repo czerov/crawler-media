@@ -9,6 +9,7 @@ use super::{PosterBytes, PosterError};
 pub const POSITIVE_TTL: Duration = Duration::from_secs(24 * 3600);
 pub const NEGATIVE_TTL: Duration = Duration::from_secs(30);
 pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_META_BYTES: usize = 1024;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -42,12 +43,16 @@ impl DiskPosterCache {
     pub fn get(&self, media_id: MediaId) -> Option<PosterBytes> {
         let path = self.file_path(media_id);
         let bytes = std::fs::read(&path).ok()?;
-        if bytes.len() > MAX_IMAGE_BYTES {
+        if bytes.len() > MAX_IMAGE_BYTES + MAX_META_BYTES + 2 {
             let _ = std::fs::remove_file(&path);
             return None;
         }
 
         let (meta, img) = split_cache_payload(&bytes)?;
+        if img.len() > MAX_IMAGE_BYTES || meta.len() > MAX_META_BYTES {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
         let mut lines = meta.lines();
         let fetched_at = lines.next()?.parse::<u64>().ok()?;
         let content_type = lines.next()?.to_string();
@@ -68,6 +73,10 @@ impl DiskPosterCache {
         if img.len() > MAX_IMAGE_BYTES {
             return Err(PosterError::InvalidImage);
         }
+        let meta_prefix = format!("{}\n{}\n", now_secs(), content_type);
+        if meta_prefix.len() > MAX_META_BYTES {
+            return Err(PosterError::InvalidImage);
+        }
         if let Err(e) = std::fs::create_dir_all(&self.root) {
             return Err(PosterError::Io(format!("create cache dir: {e}")));
         }
@@ -75,7 +84,7 @@ impl DiskPosterCache {
         let target = self.file_path(media_id);
         let tmp = self.root.join(format!("{media_id}.tmp.{}.{:?}", std::process::id(), std::thread::current().id()));
 
-        let meta = format!("{}\n{}\n\n", now_secs(), content_type);
+        let meta = format!("{meta_prefix}\n");
         let mut file = std::fs::File::create(&tmp).map_err(|e| PosterError::Io(e.to_string()))?;
         file.write_all(meta.as_bytes()).map_err(|e| PosterError::Io(e.to_string()))?;
         file.write_all(img).map_err(|e| PosterError::Io(e.to_string()))?;

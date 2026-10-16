@@ -30,7 +30,7 @@ struct Owned {
 
 pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, ProjectionError> {
     let owned = collect_owned(state, library_id)?;
-    let media_map = load_media(state, &owned.media_ids);
+    let media_map = load_media(state, &owned.media_ids)?;
     let catalog_rows = load_catalog_rows(state, &media_map);
     let cache = CacheIndex::build(&catalog_rows);
     let files = state.browse_files.as_ref();
@@ -41,14 +41,27 @@ pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, Proj
             .entry(row.media_id)
             .or_default()
             .push(row.clone());
-        file_facts.push(file_facts_for(files, row, owned.missing.contains(&row.path)));
+        if let Some(media) = media_map.get(&row.media_id) {
+            file_facts.push(file_facts_for(files, row, media, owned.missing.contains(&row.path)));
+        }
     }
     let media_facts = media_facts_for(&owned.media_ids, &media_map, &rows_by_media, &cache, files);
+    let (expected_dirty_token, next_generation) = {
+        let store = state.store.lock();
+        let head = store
+            .browse_projection_head(library_id)
+            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
+        match head {
+            Some(h) => (Some(h.dirty_token), h.generation + 1),
+            None => (None, 1),
+        }
+    };
     Ok(ProjectionBuild {
         library_id: library_id.to_string(),
-        generation: 1,
+        generation: next_generation,
         scope_signature: scope_signature(&owned.library),
         revisions: owned.revisions,
+        expected_dirty_token,
         files: file_facts,
         media: media_facts,
     })
@@ -115,16 +128,16 @@ fn collect_owned(state: &ApiState, library_id: &str) -> Result<Owned, Projection
 }
 
 /// Media 行按 500 一批读取，避免超过 SQLite 变量上限。
-fn load_media(state: &ApiState, ids: &[MediaId]) -> HashMap<MediaId, Media> {
+fn load_media(state: &ApiState, ids: &[MediaId]) -> Result<HashMap<MediaId, Media>, ProjectionError> {
     let store = state.store.lock();
     let mut map = HashMap::new();
     for chunk in ids.chunks(500) {
-        match store.media_batch(chunk) {
-            Ok(batch) => map.extend(batch),
-            Err(error) => tracing::warn!(%error, "投影构建读取 Media 批次失败"),
-        }
+        let batch = store
+            .media_batch(chunk)
+            .map_err(|error| ProjectionError::Failed(error.to_string()))?;
+        map.extend(batch);
     }
-    map
+    Ok(map)
 }
 
 /// 只查目标 Media 的详情键前缀：不再全量读取 catalog body。
@@ -149,9 +162,21 @@ fn load_catalog_rows(state: &ApiState, media_map: &HashMap<MediaId, Media>) -> V
         })
 }
 
-fn file_facts_for(files: &dyn BrowseFileRead, row: &LedgerRow, missing: bool) -> BrowseFileFacts {
+fn file_facts_for(
+    files: &dyn BrowseFileRead,
+    row: &LedgerRow,
+    media: &Media,
+    missing: bool,
+) -> BrowseFileFacts {
     let path = Path::new(&row.path);
     let (size, has_stat, created_ns, modified_ns) = observe(files, path);
+    let mut sidecars = serde_json::Map::new();
+    for candidate in crate::scrape_metadata::nfo_candidates(path, row, media.kind) {
+        sidecars.insert(candidate.display().to_string(), observe_version(files, &candidate));
+    }
+    for candidate in artwork_candidates(path) {
+        sidecars.insert(candidate.display().to_string(), observe_version(files, &candidate));
+    }
     let facts = FileFacts {
         row: row.clone(),
         size,
@@ -160,12 +185,42 @@ fn file_facts_for(files: &dyn BrowseFileRead, row: &LedgerRow, missing: bool) ->
         modified_ns,
         missing,
         has_still: crate::episode_still::existing_with(path, files).is_some(),
+        sidecars,
     };
     BrowseFileFacts {
         ledger_id: row.id,
         media_id: row.media_id,
         facts: facts.to_json(),
     }
+}
+
+fn observe_version(files: &dyn BrowseFileRead, path: &Path) -> serde_json::Value {
+    match files.metadata(path) {
+        Ok(meta) if meta.is_file() => serde_json::json!({
+            "size": meta.len(),
+            "modified_ns": meta.modified().ok().and_then(to_ns),
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn artwork_candidates(video: &Path) -> Vec<std::path::PathBuf> {
+    let Some(parent) = video.parent() else {
+        return Vec::new();
+    };
+    let stem = video.file_stem().and_then(|value| value.to_str()).unwrap_or_default();
+    let mut candidates = vec![parent.join("poster.jpg"), parent.join("fanart.jpg")];
+    if let Some(up) = parent.parent() {
+        candidates.push(up.join("poster.jpg"));
+        candidates.push(up.join("fanart.jpg"));
+    }
+    candidates.extend([
+        crate::episode_still::path(video),
+        parent.join(format!("{stem}-still.jpg")),
+        parent.join(format!("{stem}.jpg")),
+        parent.join("still.jpg"),
+    ]);
+    candidates
 }
 
 /// 与 `file_stats` 同一口径：只有普通文件计入 size/added_at，缺失或错误留空。

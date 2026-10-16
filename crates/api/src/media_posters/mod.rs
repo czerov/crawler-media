@@ -3,7 +3,18 @@ use domain::MediaId;
 
 pub mod cache;
 pub mod http;
+pub mod inflight;
+pub mod negative_cache;
 pub mod service;
+
+pub use negative_cache::{PosterClock, SystemPosterClock};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PosterResourceCounts {
+    pub negative_entries: usize,
+    pub registry_entries: usize,
+    pub active_workers: usize,
+}
 
 #[derive(Clone, Debug)]
 pub struct PosterBytes {
@@ -23,6 +34,8 @@ pub enum PosterError {
     Upstream(String),
     #[error("poster IO failed: {0}")]
     Io(String),
+    #[error("poster service busy")]
+    Busy,
 }
 
 #[async_trait::async_trait]

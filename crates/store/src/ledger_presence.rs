@@ -64,15 +64,15 @@ impl crate::Store {
         let mut result = LedgerPresenceResult::default();
 
         for obs in observations {
-            let current: Option<(String, String, Option<i64>)> = tx
+            let current: Option<(String, String, Option<i64>, bool)> = tx
                 .query_row(
-                    "SELECT path, media_id, missing_at FROM ledger WHERE id = ?1",
+                    "SELECT path, media_id, missing_at, transfer_pending FROM ledger WHERE id = ?1",
                     [&obs.row.id.to_string()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .rusqlite_optional()?;
 
-            let Some((cur_path, cur_media_id, cur_missing_at)) = current else {
+            let Some((cur_path, cur_media_id, cur_missing_at, pending)) = current else {
                 result.skipped += 1;
                 continue;
             };
@@ -84,6 +84,16 @@ impl crate::Store {
             {
                 result.skipped += 1;
                 continue;
+            }
+            if pending {
+                if obs.presence != FilePresence::Present {
+                    result.skipped += 1;
+                    continue;
+                }
+                tx.execute("UPDATE ledger SET transfer_pending = 0 WHERE id = ?1",
+                    [obs.row.id.to_string()])?;
+                tracing::info!(ledger_id = %obs.row.id, path = %obs.row.path,
+                    "Recovered completed Transfer publication");
             }
 
             match mode {

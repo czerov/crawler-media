@@ -2,7 +2,7 @@ use rusqlite::params;
 
 use super::{Store, StoreError};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogCacheRow {
     pub source: String,
     pub cache_key: String,

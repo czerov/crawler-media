@@ -13,7 +13,8 @@ pub fn migrate_browse_projection(conn: &Connection) -> Result<(), StoreError> {
              app_revision INTEGER NOT NULL,
              library_revision INTEGER NOT NULL,
              catalog_revision INTEGER NOT NULL,
-             subscribe_revision INTEGER NOT NULL
+             subscribe_revision INTEGER NOT NULL,
+             dirty_token INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS browse_files(
              library_id TEXT NOT NULL,

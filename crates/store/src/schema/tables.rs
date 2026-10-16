@@ -197,6 +197,7 @@ CREATE TABLE IF NOT EXISTS pending_file_deletions (
             completed INTEGER NOT NULL DEFAULT 0,
             succeeded INTEGER NOT NULL DEFAULT 0,
             failed INTEGER NOT NULL DEFAULT 0,
+            partial INTEGER NOT NULL DEFAULT 0,
             error TEXT,
             created_at_ms INTEGER NOT NULL,
             started_at_ms INTEGER,
@@ -227,6 +228,8 @@ CREATE TABLE IF NOT EXISTS pending_file_deletions (
             created_at_ms INTEGER NOT NULL,
             reason TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS ledger_probe_obligations_created_ledger_idx
+            ON ledger_probe_obligations(created_at_ms, ledger_id);
         "#;
 
 pub(super) const SUBSCRIBE_TABLES: &str = r#"

@@ -96,7 +96,13 @@ pub(super) async fn items(
         for item in rows {
             if item.is_series {
                 let series_id = item.media.id.to_string().replace('-', "");
-                if let Ok(episodes) = state.provider.list_visible_items(user.id, Some(&series_id)).await {
+                let episodes = if is_library_parent {
+                    let Some(library_id) = query.parent_id.as_deref() else { continue };
+                    state.provider.list_visible_items_in_library(user.id, Some(&series_id), library_id).await
+                } else {
+                    state.provider.list_visible_items(user.id, Some(&series_id)).await
+                };
+                if let Ok(episodes) = episodes {
                     expanded.extend(episodes);
                 }
             } else {

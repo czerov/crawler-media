@@ -1,3 +1,5 @@
+mod counters;
+
 use rusqlite::{OptionalExtension, params};
 
 use super::{Store, StoreError};
@@ -13,6 +15,7 @@ pub struct ProbeJob {
     pub completed: usize,
     pub succeeded: usize,
     pub failed: usize,
+    pub partial: usize,
     pub error: Option<String>,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
@@ -115,7 +118,6 @@ impl Store {
         tx.commit()?;
         Ok(true)
     }
-
     pub fn recover_probe_jobs(&self) -> Result<Vec<(ProbeJob, Vec<ProbeJobUnit>)>, StoreError> {
         let tx = self.library.unchecked_transaction()?;
         tx.execute(
@@ -133,23 +135,25 @@ impl Store {
              )",
             [],
         )?;
+        let mut statement = tx.prepare("SELECT id FROM probe_jobs WHERE status IN ('queued','running')")?;
+        let ids = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for id in &ids {
+            counters::reconcile_counts_in_transaction(&tx, id)?;
+        }
         tx.commit()?;
 
         let mut statement = self.library.prepare(
             "SELECT id, kind, media_id, season, status, total, completed, succeeded,
-                    failed, error, created_at_ms, started_at_ms, finished_at_ms
+                    failed, partial, error, created_at_ms, started_at_ms, finished_at_ms
              FROM probe_jobs WHERE status IN ('queued', 'running')
              ORDER BY created_at_ms, id",
         )?;
-        let jobs = statement
-            .query_map([], map_probe_job)?
-            .collect::<Result<Vec<_>, _>>()?;
-        jobs.into_iter()
-            .map(|job| {
-                let units = self.probe_job_units(&job.id)?;
-                Ok((job, units))
-            })
-            .collect()
+        let jobs = statement.query_map([], map_probe_job)?.collect::<Result<Vec<_>, _>>()?;
+        jobs.into_iter().map(|job| {
+            let units = self.probe_job_units(&job.id)?;
+            Ok((job, units))
+        }).collect()
     }
 
     pub fn probe_job_units(&self, job_id: &str) -> Result<Vec<ProbeJobUnit>, StoreError> {
@@ -255,13 +259,11 @@ impl Store {
             params![job_id, reason],
         )?;
         tx.execute(
-            "UPDATE probe_jobs SET status = 'cancelled', error = ?2, finished_at_ms = ?3,
-               completed = (SELECT COUNT(*) FROM probe_job_units WHERE job_id = ?1 AND status IN ('succeeded', 'failed', 'cancelled')),
-               succeeded = (SELECT COUNT(*) FROM probe_job_units WHERE job_id = ?1 AND status = 'succeeded'),
-               failed = (SELECT COUNT(*) FROM probe_job_units WHERE job_id = ?1 AND status = 'failed')
+            "UPDATE probe_jobs SET status = 'cancelled', error = ?2, finished_at_ms = ?3
              WHERE id = ?1 AND status IN ('queued', 'running')",
             params![job_id, reason, now_ms()],
         )?;
+        counters::reconcile_counts_in_transaction(&tx, job_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -274,72 +276,24 @@ impl Store {
         _error_kind: Option<&str>,
         error: Option<&str>,
     ) -> Result<(ProbeJob, bool, bool), StoreError> {
-        let tx = self.library.unchecked_transaction()?;
-        let changed = tx.execute(
-            "UPDATE probe_job_units SET status = ?3, error = ?4
-             WHERE job_id = ?1 AND ledger_id = ?2 AND status IN ('queued', 'running')",
-            params![job_id, ledger_id, status, error],
-        )?;
-        let total: usize = tx.query_row(
-            "SELECT total FROM probe_jobs WHERE id = ?1",
-            [job_id],
-            |r| r.get(0),
-        )?;
-        let completed: usize = tx.query_row(
-            "SELECT COUNT(*) FROM probe_job_units
-             WHERE job_id = ?1 AND status IN ('succeeded', 'failed', 'cancelled', 'partial')",
-            [job_id],
-            |r| r.get(0),
-        )?;
-        let succeeded: usize = tx.query_row(
-            "SELECT COUNT(*) FROM probe_job_units WHERE job_id = ?1 AND status = 'succeeded'",
-            [job_id],
-            |r| r.get(0),
-        )?;
-        let failed: usize = tx.query_row(
-            "SELECT COUNT(*) FROM probe_job_units WHERE job_id = ?1 AND status = 'failed'",
-            [job_id],
-            |r| r.get(0),
-        )?;
-        let partial: usize = tx.query_row(
-            "SELECT COUNT(*) FROM probe_job_units WHERE job_id = ?1 AND status = 'partial'",
-            [job_id],
-            |r| r.get(0),
-        )?;
+        let (job, changed, all_done, _) = self.finish_probe_transition(job_id, ledger_id, status, error)?;
+        Ok((job, changed, all_done))
+    }
 
-        let kind: String = tx.query_row(
-            "SELECT kind FROM probe_jobs WHERE id = ?1",
-            [job_id],
-            |r| r.get(0),
-        )?;
+    pub fn finish_probe_unit_with_status_and_vm_steps(
+        &self,
+        job_id: &str,
+        ledger_id: &str,
+        status: &str,
+        error_kind: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(ProbeJob, bool, bool, i64), StoreError> {
+        let _ = error_kind;
+        self.finish_probe_transition(job_id, ledger_id, status, error)
+    }
 
-        // marker_refresh remains "running" until complete_marker_refresh atomically finishes it
-        let all_done = completed >= total;
-        let terminal = probe_job_terminal_status(&kind, total, completed, failed, partial);
-        let job_status = terminal.unwrap_or("running");
-        let finished_at = terminal.map(|_| now_ms());
-
-        // Only an active job may be driven to a new terminal state by a unit
-        // finishing: a unit that completes after the job was cancelled (Library
-        // removed, file deleted) must not resurrect it — a marker_refresh job
-        // would otherwise flip back to `running` with no work items left.
-        tx.execute(
-            "UPDATE probe_jobs SET
-                 completed = ?2,
-                 succeeded = ?3,
-                 failed = ?4,
-                 status = ?5,
-                 finished_at_ms = COALESCE(?6, finished_at_ms),
-                 error = COALESCE((SELECT error FROM probe_job_units
-                                   WHERE job_id = ?1 AND error IS NOT NULL LIMIT 1), error)
-             WHERE id = ?1 AND status IN ('queued', 'running')",
-            params![job_id, completed, succeeded, failed, job_status, finished_at],
-        )?;
-        tx.commit()?;
-        let job = self
-            .get_probe_job(job_id)?
-            .ok_or_else(|| StoreError::Missing(format!("probe job {job_id}")))?;
-        Ok((job.clone(), changed > 0, all_done))
+    pub fn reconcile_probe_job_counts(&self, job_id: &str) -> Result<ProbeJob, StoreError> {
+        self.reconcile_job_counts(job_id)
     }
 
     pub fn finish_probe_job(
@@ -377,7 +331,7 @@ impl Store {
         self.library
             .query_row(
                 "SELECT id, kind, media_id, season, status, total, completed, succeeded,
-                        failed, error, created_at_ms, started_at_ms, finished_at_ms
+                        failed, partial, error, created_at_ms, started_at_ms, finished_at_ms
                  FROM probe_jobs WHERE id = ?1",
                 [id],
                 map_probe_job,
@@ -393,7 +347,7 @@ impl Store {
         self.library
             .query_row(
                 "SELECT id, kind, media_id, season, status, total, completed, succeeded,
-                        failed, error, created_at_ms, started_at_ms, finished_at_ms
+                        failed, partial, error, created_at_ms, started_at_ms, finished_at_ms
                  FROM probe_jobs WHERE scope_key = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
                 [scope_key],
                 map_probe_job,
@@ -410,7 +364,7 @@ impl Store {
         self.library
             .query_row(
                 "SELECT id, kind, media_id, season, status, total, completed, succeeded,
-                        failed, error, created_at_ms, started_at_ms, finished_at_ms
+                        failed, partial, error, created_at_ms, started_at_ms, finished_at_ms
                  FROM probe_jobs
                  WHERE kind = 'marker_refresh' AND media_id = ?1
                    AND (season = ?2 OR season IS NULL)
@@ -500,10 +454,11 @@ fn map_probe_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProbeJob> {
         completed: row.get::<_, i64>(6)? as usize,
         succeeded: row.get::<_, i64>(7)? as usize,
         failed: row.get::<_, i64>(8)? as usize,
-        error: row.get(9)?,
-        created_at_ms: row.get(10)?,
-        started_at_ms: row.get(11)?,
-        finished_at_ms: row.get(12)?,
+        partial: row.get::<_, i64>(9)? as usize,
+        error: row.get(10)?,
+        created_at_ms: row.get(11)?,
+        started_at_ms: row.get(12)?,
+        finished_at_ms: row.get(13)?,
     })
 }
 
@@ -530,6 +485,7 @@ pub(crate) fn probe_job_terminal_status(
     completed: usize,
     failed: usize,
     partial: usize,
+    cancelled: usize,
 ) -> Option<&'static str> {
     if completed < total {
         return None;
@@ -539,6 +495,7 @@ pub(crate) fn probe_job_terminal_status(
     }
     match kind {
         "marker_refresh" => None,
+        _ if cancelled > 0 => Some("cancelled"),
         _ if partial > 0 => Some("partial"),
         _ => Some("succeeded"),
     }

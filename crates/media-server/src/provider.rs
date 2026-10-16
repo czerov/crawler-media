@@ -241,6 +241,16 @@ pub trait MediaServerProvider: Send + Sync + 'static {
         user_id: UserId,
         parent_id: Option<&str>,
     ) -> Result<Vec<MediaItemSnapshot>, String>;
+    /// Lists items visible to the user and owned by the requested library.
+    /// Providers without library-aware filtering retain their existing listing behavior.
+    async fn list_visible_items_in_library(
+        &self,
+        user_id: UserId,
+        parent_id: Option<&str>,
+        _library_id: &str,
+    ) -> Result<Vec<MediaItemSnapshot>, String> {
+        self.list_visible_items(user_id, parent_id).await
+    }
 
     async fn list_resumable_items(
         &self,

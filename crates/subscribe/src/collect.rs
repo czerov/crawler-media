@@ -12,6 +12,14 @@ use crate::choose::{covered_slots, is_complete};
 use crate::facts::{QualityFact, SubscribeFacts};
 use crate::{LedgerSource, RunOutcome, SubscribeError};
 
+/// Durable final-path reservation around filesystem publication. Implementations
+/// must not perform filesystem work while recording or completing a row.
+pub trait TransferRecorder {
+    fn prepare(&self, row: &LedgerRow, source: &Path, mode: library::TransferMode)
+        -> Result<LedgerRow, SubscribeError>;
+    fn published(&self, row: &LedgerRow) -> Result<(), SubscribeError>;
+}
+
 pub fn collect_completed<D: Downloader + ?Sized>(
     added: Added<'_, D>,
     probe: &dyn MediaProbe,
@@ -28,10 +36,20 @@ pub fn collect_completed_with_destinations<D: Downloader + ?Sized>(
 }
 
 pub fn collect_completed_controlled<D: Downloader + ?Sized>(
+    added: Added<'_, D>,
+    probe: &dyn MediaProbe,
+    existing: &[crate::collection_destinations::DestinationMapping],
+    control: &library::WorkControl,
+) -> Result<RunOutcome, SubscribeError> {
+    collect_completed_recorded(added, probe, existing, control, None)
+}
+
+pub fn collect_completed_recorded<D: Downloader + ?Sized>(
     mut added: Added<'_, D>,
     probe: &dyn MediaProbe,
     existing: &[crate::collection_destinations::DestinationMapping],
     control: &library::WorkControl,
+    recorder: Option<&dyn TransferRecorder>,
 ) -> Result<RunOutcome, SubscribeError> {
     control.check()?;
     let mut ledger = Vec::new();
@@ -44,7 +62,7 @@ pub fn collect_completed_controlled<D: Downloader + ?Sized>(
     // 先依据现有已确认的目标映射刷新/协调 facts，确保即便 Downloader 在 Move 模式下不再列出视频，
     // 本地持久化的映射依然能驱动并修复 facts
     for mapping in existing {
-        if mapping.destination_path.is_file() {
+        if !mapping.transfer_pending && mapping.destination_path.is_file() {
             reconcile_mapping_facts(&mut added.input.facts, added.input.subscribe, mapping, 0);
         }
     }
@@ -64,6 +82,7 @@ pub fn collect_completed_controlled<D: Downloader + ?Sized>(
             &mut rejected_enclosures,
             &mut collection_errors,
             control,
+            recorder,
         );
     }
     control.check()?;
@@ -93,6 +112,7 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
     rejected_enclosures: &mut Vec<String>,
     collection_errors: &mut Vec<String>,
     control: &library::WorkControl,
+    recorder: Option<&dyn TransferRecorder>,
 ) {
     let mut vetoed = false;
     // M2: video files skipped because their slots were already owned.
@@ -132,7 +152,8 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
             return;
         }
         let source_path = src.display().to_string();
-        if let Some(mapping) = existing.iter().find(|m| m.source_path == source_path) {
+        let mapping = existing.iter().find(|m| m.source_path == source_path);
+        if let Some(mapping) = mapping.filter(|mapping| !mapping.transfer_pending) {
             if mapping.destination_path.is_file() {
                 torrent_destinations.push(mapping.clone());
                 reconcile_mapping_facts(
@@ -162,6 +183,8 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
             &mut vetoed,
             &mut duplicate,
             control,
+            recorder,
+            mapping.filter(|mapping| mapping.transfer_pending),
         ) {
             Ok(Some(dest)) => torrent_destinations.push(
                 crate::collection_destinations::DestinationMapping::new(source_path, dest),
@@ -285,6 +308,8 @@ fn collect_one<D: Downloader + ?Sized>(
     vetoed: &mut bool,
     duplicate: &mut bool,
     control: &library::WorkControl,
+    recorder: Option<&dyn TransferRecorder>,
+    pending: Option<&crate::collection_destinations::DestinationMapping>,
 ) -> Result<Option<PathBuf>, SubscribeError> {
     let file_release = release::parse(
         src.file_name()
@@ -346,35 +371,46 @@ fn collect_one<D: Downloader + ?Sized>(
         *duplicate = true;
         return Ok(None);
     }
-    // A name can be taken between choosing it and publishing it (another
-    // worker, the user): publication never overwrites (D-H3), so pick the next
-    // free name and retry a few times (M8).
-    let mut attempts = 0;
-    let dest = loop {
-        let dest = dest_path(
-            added.input.library_root,
-            added.input.media,
-            &release,
-            &src,
-            added.input.naming,
-        )?;
-        if added.input.facts.entries().any(|(_, f)| {
-            f.path
-                .as_deref()
-                .is_some_and(|p| p == dest.to_string_lossy())
-        }) {
-            return Ok(None);
+    // Main's reservation: a retried transfer reuses its reserved destination.
+    // Otherwise a name can be taken between choosing it and publishing it
+    // (another worker, the user): publication never overwrites (D-H3), so pick
+    // the next free name and retry a few times (M8).
+    let (dest, mut row) = match pending {
+        Some(mapping) => {
+            let dest = mapping.destination_path.clone();
+            let row = reserve_and_publish(
+                added, scored, &release, &src, &dest, true, control, recorder,
+            )?;
+            (dest, row)
         }
-        match publish_video(added, &src, &dest, control) {
-            Err(SubscribeError::Library(library::LibraryError::Io(error)))
-                if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 3 =>
-            {
-                attempts += 1;
-                tracing::warn!(dest = %dest.display(), "目标文件在发布前出现，改用下一个可用文件名");
-            }
-            result => {
-                result?;
-                break dest;
+        None => {
+            let mut attempts = 0;
+            loop {
+                let dest = dest_path(
+                    added.input.library_root,
+                    added.input.media,
+                    &release,
+                    &src,
+                    added.input.naming,
+                )?;
+                if added.input.facts.entries().any(|(_, f)| {
+                    f.path
+                        .as_deref()
+                        .is_some_and(|p| p == dest.to_string_lossy())
+                }) {
+                    return Ok(None);
+                }
+                match reserve_and_publish(
+                    added, scored, &release, &src, &dest, false, control, recorder,
+                ) {
+                    Err(SubscribeError::Library(library::LibraryError::Io(error)))
+                        if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 3 =>
+                    {
+                        attempts += 1;
+                        tracing::warn!(dest = %dest.display(), "目标文件在发布前出现，改用下一个可用文件名");
+                    }
+                    result => break (dest, result?),
+                }
             }
         }
     };
@@ -438,20 +474,39 @@ fn collect_one<D: Downloader + ?Sized>(
         ledger_path: ledger_path.clone(),
         source_path: src.display().to_string(),
     });
-    ledger.push(LedgerRow {
-        id: LedgerId::new(),
-        media_id: added.input.media.id,
-        path: ledger_path,
-        season: release.season,
-        episode: release.episode,
-        resolution: quality.resolution,
-        codec: quality.codec,
-        hdr: quality.hdr,
-        quality_source: source,
-        confidence,
-        filter_score: Some(actual_score),
-    });
+    row.resolution = quality.resolution;
+    row.codec = quality.codec;
+    row.hdr = quality.hdr;
+    row.quality_source = source;
+    row.confidence = confidence;
+    row.filter_score = Some(actual_score);
+    ledger.push(row);
     Ok(Some(dest))
+}
+
+fn reserve_and_publish<D: Downloader + ?Sized>(
+    added: &Added<'_, D>, scored: &ScoredTorrent, release: &Release,
+    src: &Path, dest: &Path, pending: bool, control: &library::WorkControl,
+    recorder: Option<&dyn TransferRecorder>,
+) -> Result<LedgerRow, SubscribeError> {
+    let mut row = LedgerRow {
+        id: LedgerId::new(), media_id: added.input.media.id,
+        path: dest.display().to_string(), season: release.season, episode: release.episode,
+        resolution: release.resolution.clone(), codec: release.codec.clone(), hdr: release.hdr.clone(),
+        quality_source: QualitySource::Release, confidence: release.confidence,
+        filter_score: Some(scored.score),
+    };
+    if let Some(recorder) = recorder {
+        row = recorder.prepare(&row, src,
+            resolve_mode(src, added.input.library_root, added.input.transfer_mode))?;
+    }
+    if !pending || !dest.is_file() {
+        publish_video(added, src, dest, control)?;
+    }
+    if let Some(recorder) = recorder {
+        recorder.published(&row)?;
+    }
+    Ok(row)
 }
 
 fn publish_video<D: Downloader + ?Sized>(

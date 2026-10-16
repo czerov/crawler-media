@@ -30,9 +30,13 @@ use crate::blocking_budget::{BlockingBudget, BlockingError};
 use crate::management::ApiState;
 
 pub mod builder;
+pub mod changes;
 pub mod facts;
 
+use changes::{ChangeConsumer, ProjectionDependencies};
 /// 投影构建与 follower 等待共用的等待预算。
+/// Maximum number of journal rounds consumed by one freshness check.
+const FRESHNESS_JOURNAL_ROUNDS: usize = 4;
 pub(crate) const PROJECTION_DEADLINE: Duration = Duration::from_secs(30);
 /// 共享构建容量：不同 Library 的 leader 并发重建不得超过该数，超出即 503。
 const PROJECTION_BUILD_CAPACITY: usize = 2;
@@ -206,7 +210,6 @@ pub struct ProjectionService {
     dirty_libraries: Arc<Mutex<HashMap<String, u64>>>,
     /// 至少被浏览过一次的 Library；周期刷新只覆盖这些库。
     visited: Mutex<HashSet<String>>,
-    /// 每个 Library 至多一个进行中的构建；条目由 blocking 闭包在结束时移除。
     inflight: Arc<Mutex<InflightMap>>,
     /// 有界构建容量：permit 由 blocking 构建闭包持有到真正结束。
     build_budget: Arc<BlockingBudget>,
@@ -216,6 +219,8 @@ pub struct ProjectionService {
     disabled: bool,
     /// 测试 seam：终态发布后、条目移除前的屏障（生产为 `None`）。
     publish_barrier: Option<PublishBarrier>,
+    deps: Arc<Mutex<ProjectionDependencies>>,
+    consumer: Arc<ChangeConsumer>,
 }
 
 /// 锁内取得的当前状态：revision、scope 指纹与已发布投影。
@@ -227,6 +232,8 @@ struct Current {
 
 impl ProjectionService {
     pub fn new() -> Self {
+        let deps = Arc::new(Mutex::new(ProjectionDependencies::new()));
+        let consumer = Arc::new(ChangeConsumer::new(deps.clone()));
         Self {
             dirty_libraries: Arc::new(Mutex::new(HashMap::new())),
             visited: Mutex::new(HashSet::new()),
@@ -235,6 +242,8 @@ impl ProjectionService {
             deadline: PROJECTION_DEADLINE,
             disabled: false,
             publish_barrier: None,
+            deps,
+            consumer,
         }
     }
 
@@ -286,6 +295,27 @@ impl ProjectionService {
         self.dirty_libraries.lock().contains_key(library_id)
     }
 
+    /// Forget all in-memory state for a library after its removal is committed.
+    pub(crate) fn remove_library(&self, library_id: &str) {
+        self.deps.lock().remove_library(library_id);
+        self.dirty_libraries.lock().remove(library_id);
+        self.visited.lock().remove(library_id);
+    }
+    pub fn has_dependencies(&self, library_id: &str) -> bool {
+        self.deps.lock().contains_library(library_id)
+    }
+    pub fn has_visited(&self, library_id: &str) -> bool {
+        self.visited.lock().contains(library_id)
+    }
+    pub fn has_media_dependency(&self, library_id: &str, media_id: domain::MediaId) -> bool {
+        self.deps
+            .lock()
+            .has_media_dependency(library_id, media_id)
+    }
+
+    pub fn available_build_permits(&self) -> usize {
+        self.build_budget.available_permits()
+    }
     /// Ensure a valid projection snapshot is available for `library_id`.
     ///
     /// If the snapshot is missing, dirty, or built for a different revision/scope,
@@ -349,10 +379,25 @@ impl ProjectionService {
                 };
             }
         };
-
         let dirty_version_before = self.dirty_libraries.lock().get(&library_id).copied();
+
+        let lease = match state.acquire_library_work_for_projection(&library_id) {
+            Ok(lease) => lease,
+            Err(crate::library_lifecycle::ProjectionLeaseError::Lifecycle(error)) => {
+                let outcome = BuildOutcome::Cancelled;
+                tracing::debug!(library_id = %library_id, %error, "拒绝已冻结 Library 的投影构建");
+                self.publish_terminal(&library_id, &entry, outcome.clone());
+                return outcome_result(outcome);
+            }
+            Err(crate::library_lifecycle::ProjectionLeaseError::Store(error)) => {
+                let outcome = BuildOutcome::Failed(error.to_string());
+                tracing::warn!(library_id = %library_id, %error, "获取投影构建租约时读取 Store 失败");
+                self.publish_terminal(&library_id, &entry, outcome.clone());
+                return outcome_result(outcome);
+            }
+        };
         let outcome = self
-            .build_and_publish(state, library_id.clone(), entry, dirty_version_before)
+            .build_and_publish(state, library_id.clone(), entry, dirty_version_before, lease)
             .await;
 
         outcome_result(outcome)
@@ -370,6 +415,7 @@ impl ProjectionService {
         library_id: String,
         entry: Arc<Inflight>,
         dirty_version_before: Option<u64>,
+        lease: crate::library_lifecycle::LibraryWorkLease,
     ) -> BuildOutcome {
         let budget = self.build_budget.clone();
         let deadline = self.deadline;
@@ -378,6 +424,7 @@ impl ProjectionService {
         let barrier = self.publish_barrier.clone();
         let job_library = library_id.clone();
         let job_entry = entry.clone();
+        let deps = self.deps.clone();
         let result = budget
             .run(deadline, move || {
                 // 守卫在闭包内创建：Busy（未取得 permit、闭包未运行）时不存在守卫，
@@ -389,7 +436,7 @@ impl ProjectionService {
                     barrier,
                     outcome: None,
                 };
-                let outcome = publish_blocking(&state, &job_library);
+                let outcome = publish_blocking(&deps, &state, &job_library, &lease);
                 if matches!(outcome, BuildOutcome::Ready(_)) {
                     let mut dirty = dirty_libraries.lock();
                     if dirty.get(&job_library).copied() == dirty_version_before {
@@ -438,15 +485,19 @@ impl ProjectionService {
         }
     }
 
-    /// Refresh dirty libraries in a background loop every 60 seconds.
+    /// Refresh dirty libraries and observe external files in a background loop every 60 seconds (D3-04).
+    /// Cadence is an upper bound (60s check period + work latency).
     pub fn start_periodic_refresh(self: Arc<Self>, state: ApiState) {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                // 已访问库的文件事实可能被外部修改（NFO/图片/STRM），revision 不会动，
-                // 因此周期标脏：稳态请求仍读投影，刷新在后台有界顺序执行。
-                self.mark_all_dirty();
+                // 周期检查：通过 poll_changes 增量消费源变化，而不是无条件全部标脏
+                let _ = self.poll_changes(&state);
                 let visited: Vec<String> = self.visited.lock().iter().cloned().collect();
+                for lib_id in &visited {
+                    // Bounded off-lock external file observation (D3-04)
+                    self.observe_external_files(&state, lib_id).await;
+                }
                 for lib_id in visited {
                     match self.ensure(state.clone(), lib_id.clone()).await {
                         Ok(_) => {}
@@ -463,12 +514,107 @@ impl ProjectionService {
         });
     }
 
+    /// Bounded off-lock external file observation (D3-04):
+    /// Reads current file facts off-lock, compares with stored projection facts,
+    /// and marks library dirty only if an external change (mtime/size/existence) was detected.
+    async fn observe_external_files(&self, state: &ApiState, library_id: &str) {
+        let files = state.browse_files.clone();
+        let state_clone = state.clone();
+        let lib_id = library_id.to_string();
+        let has_changes = state.http_work.run(
+            crate::http::library::selection::BROWSE_DEADLINE,
+            move || {
+                let store = state_clone.store.lock();
+                let snap = match store.browse_projection(&lib_id) {
+                    Ok(Some(s)) => s,
+                    _ => return false,
+                };
+                drop(store);
+                for file in snap.files {
+                    let Some(previous) = facts::FileFacts::from_json(&file.facts) else {
+                        return true;
+                    };
+                    let path = std::path::Path::new(&previous.row.path);
+                    let meta = files.metadata(path);
+                    let (cur_size, cur_mtime) = match meta {
+                        Ok(meta) if meta.is_file() => (
+                            meta.len(),
+                            meta.modified().ok().and_then(|time| {
+                                time.duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|duration| duration.as_nanos() as i64)
+                            }),
+                        ),
+                        _ => (0, None),
+                    };
+                    if cur_size != previous.size || cur_mtime != previous.modified_ns {
+                        return true;
+                    }
+                    for (candidate, old_version) in &previous.sidecars {
+                        let old_version = old_version.as_object();
+                        let current = files.metadata(std::path::Path::new(candidate)).ok().filter(|m| m.is_file());
+                        let current_version = current.map(|meta| serde_json::json!({
+                            "size": meta.len(),
+                            "modified_ns": meta.modified().ok().and_then(|time| {
+                                time.duration_since(std::time::UNIX_EPOCH).ok()
+                                    .map(|duration| duration.as_nanos() as i64)
+                            }),
+                        }));
+                        if old_version.is_some() != current_version.is_some()
+                            || old_version.zip(current_version.as_ref().and_then(serde_json::Value::as_object))
+                                .is_some_and(|(old, new)| old != new)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                false
+            },
+        ).await.unwrap_or(false);
+
+        if has_changes {
+            self.mark_dirty(library_id);
+        }
+    }
+
+    /// Poll all three sources for changes sharing ONE per-round event budget (D3-03).
+    pub fn poll_changes(&self, state: &ApiState) -> Result<bool, ProjectionError> {
+        poll_changes_inner(&self.consumer, state)
+    }
+
     /// 新鲜度检查的 DB 读也在 blocking 预算里执行，不在 async worker 上持 Store 锁。
     async fn fresh_snapshot(
         &self,
         state: &ApiState,
         library_id: &str,
     ) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
+        // A ready projection is usable only after this request has consumed a bounded
+        // amount of pending journal work. Incomplete sources force the build path.
+        let budget = state.http_work.clone();
+        let consumer = self.consumer.clone();
+        let state_for_poll = state.clone();
+        let sources_complete = budget
+            .run(
+                crate::http::library::selection::BROWSE_DEADLINE,
+                move || {
+                    for _ in 0..FRESHNESS_JOURNAL_ROUNDS {
+                        if poll_changes_inner(&consumer, &state_for_poll)? {
+                            return Ok::<bool, ProjectionError>(true);
+                        }
+                    }
+                    Ok(false)
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                BlockingError::Busy => ProjectionError::Busy,
+                BlockingError::Timeout => ProjectionError::Timeout,
+                BlockingError::Worker(message) => ProjectionError::Failed(message),
+            })??;
+        if !sources_complete {
+            tracing::debug!(library_id = %library_id, "浏览投影等待 journal 完整消费");
+            return Err(ProjectionError::Busy);
+        }
         if self.dirty_libraries.lock().contains_key(library_id) {
             return Ok(None);
         }
@@ -490,50 +636,162 @@ impl ProjectionService {
     }
 }
 
-/// 锁内读当前 revision / scope 指纹 / 投影，公共事实全部一致才返回 ready 快照。
+/// 锁内读当前 scope 指纹 / 投影状态，仅依据 per-library dirty_token 与 state='ready'
+/// 判定普通新鲜度（D3-01 / D3-02），全局 revisions 仅保留在发布时的回退检查中。
 fn fresh_snapshot_inner(
     state: &ApiState,
     library_id: &str,
 ) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
     let current = {
         let store = state.store.lock();
-        let revisions = store
-            .read_revisions()
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
         let scope_signature = store
             .get_library(library_id)
             .map_err(|e| ProjectionError::Failed(e.to_string()))?
             .map(|library| builder::scope_signature(&library));
-        let snapshot = store
-            .browse_projection(library_id)
+        let head = store
+            .browse_projection_head(library_id)
             .map_err(|e| ProjectionError::Failed(e.to_string()))?;
-        Current {
-            revisions,
-            scope_signature,
-            snapshot,
-        }
+        let snapshot = match head {
+            Some(h) if h.ready && Some(h.scope_signature.as_str()) == scope_signature.as_deref() => {
+                store
+                    .browse_projection(library_id)
+                    .map_err(|e| ProjectionError::Failed(e.to_string()))?
+            }
+            _ => None,
+        };
+        snapshot
     };
-    Ok(current.snapshot.filter(|snap| {
-        snap.revisions.public_matches(&current.revisions)
-            && Some(snap.scope_signature.as_str()) == current.scope_signature.as_deref()
-    }))
+    Ok(current)
+}
+
+fn poll_changes_inner(
+    consumer: &ChangeConsumer,
+    state: &ApiState,
+) -> Result<bool, ProjectionError> {
+    let store = state.store.lock();
+    consumer
+        .hydrate_ready_dependencies(&store)
+        .map_err(|error| ProjectionError::Failed(error.to_string()))?;
+    let ownership = store
+        .library_ownership()
+        .map_err(|error| ProjectionError::Failed(error.to_string()))?;
+    let mut all_complete = true;
+    let mut shared_budget = changes::MAX_EVENTS_PER_ROUND;
+    for source in [
+        store::BrowseChangeSource::App,
+        store::BrowseChangeSource::Library,
+        store::BrowseChangeSource::Catalog,
+    ] {
+        let (_, complete) = consumer
+            .poll_source_budgeted(&store, &ownership, source, &mut shared_budget)
+            .map_err(|error| ProjectionError::Failed(error.to_string()))?;
+        all_complete &= complete;
+    }
+    Ok(all_complete)
 }
 
 /// blocking 线程上的构建 → 发布 → 回读；Store 锁只包住短 DB 读写。
-fn publish_blocking(state: &ApiState, library_id: &str) -> BuildOutcome {
+fn ownership_signature(store: &store::Store) -> Result<String, store::StoreError> {
+    let mut libraries: Vec<_> = store
+        .library_ownership()?
+        .libraries()
+        .iter()
+        .map(|library| {
+            let mut roots: Vec<_> = library.root_paths.iter().map(|root| root.display().to_string()).collect();
+            roots.sort_unstable();
+            format!("{}:{}:{}", library.id, library.kind.as_str(), roots.join("\u{1f}"))
+        })
+        .collect();
+    libraries.sort_unstable();
+    Ok(libraries.join("\u{1e}"))
+}
+
+fn publish_blocking(
+    deps: &Arc<Mutex<ProjectionDependencies>>,
+    state: &ApiState,
+    library_id: &str,
+    lease: &crate::library_lifecycle::LibraryWorkLease,
+) -> BuildOutcome {
+    let ownership_epoch = {
+        let store = state.store.lock();
+        match ownership_signature(&store) {
+            Ok(signature) => signature,
+            Err(error) => return BuildOutcome::Failed(error.to_string()),
+        }
+    };
     let build = match builder::build(state, library_id) {
         Ok(build) => build,
         Err(error) => return BuildOutcome::from_error(error),
     };
-    let store = state.store.lock();
-    match store.publish_browse_projection(&build) {
-        Ok(true) => match store.browse_projection(library_id) {
-            Ok(Some(snapshot)) => BuildOutcome::Ready(snapshot),
-            Ok(None) => BuildOutcome::Failed("Projection missing after publish".into()),
+    let media_ids: Vec<_> = build.media.iter().map(|m| m.media_id).collect();
+    let ledger_ids: Vec<_> = build.files.iter().map(|f| f.ledger_id).collect();
+    let paths: Vec<String> = {
+        let store = state.store.lock();
+        build
+            .files
+            .iter()
+            .filter_map(|f| store.get_ledger(&f.ledger_id.to_string()).ok().flatten().map(|r| r.path))
+            .collect()
+    };
+    let catalog_keys: Vec<String> = build
+        .media
+        .iter()
+        .filter_map(|m| {
+            let tmdb_id = m
+                .facts
+                .get("media")
+                .and_then(|v| v.get("tmdb_id"))
+                .and_then(|v| v.as_str())?;
+            let kind = m
+                .facts
+                .get("media")
+                .and_then(|v| v.as_str())
+                .unwrap_or("movie");
+            Some(format!("tmdb:/{kind}/{tmdb_id}"))
+        })
+        .collect();
+    let mut publication_outcome = None;
+    let published = lease.publish(|| {
+        let store = state.store.lock();
+        let current_epoch = match ownership_signature(&store) {
+            Ok(signature) => signature,
+            Err(error) => {
+                let outcome = BuildOutcome::Failed(error.to_string());
+                publication_outcome = Some(outcome.clone());
+                return Ok(outcome);
+            }
+        };
+        if current_epoch != ownership_epoch {
+            return Ok(BuildOutcome::StaleScope);
+        }
+        let outcome = match store.publish_browse_projection(&build) {
+            Ok(true) => match store.browse_projection(library_id) {
+                Ok(Some(snapshot)) => BuildOutcome::Ready(snapshot),
+                Ok(None) => BuildOutcome::Failed("Projection missing after publish".into()),
+                Err(error) => BuildOutcome::Failed(error.to_string()),
+            },
+            Ok(false) => BuildOutcome::StaleScope,
             Err(error) => BuildOutcome::Failed(error.to_string()),
-        },
-        Ok(false) => BuildOutcome::StaleScope,
-        Err(error) => BuildOutcome::Failed(error.to_string()),
+        };
+        if matches!(outcome, BuildOutcome::Ready(_)) {
+            deps.lock().record_library(library_id, media_ids, ledger_ids, paths, catalog_keys);
+        }
+        Ok(outcome)
+    });
+    match published {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Some(outcome) = publication_outcome {
+                return outcome;
+            }
+            if lease.control().is_cancelled() {
+                tracing::debug!(library_id, %error, "Library 移除期间取消投影发布");
+                BuildOutcome::Cancelled
+            } else {
+                tracing::warn!(library_id, %error, "投影发布屏障失败");
+                BuildOutcome::Failed(error)
+            }
+        }
     }
 }
 

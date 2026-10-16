@@ -60,6 +60,53 @@ pub fn aggregate_visible_episodes(
     user_id: Option<UserId>,
     season_metas: &HashMap<u32, HashMap<u32, media::EpisodeMeta>>,
 ) -> Vec<EpisodeRow> {
+    aggregate_visible_episodes_with(
+        store,
+        media,
+        rows,
+        target_season,
+        user_id,
+        season_metas,
+        &crate::browse_file_read::LocalBrowseFileRead,
+    )
+}
+
+pub fn aggregate_visible_episodes_with(
+    store: &Store,
+    media: &Media,
+    rows: &[LedgerRow],
+    target_season: Option<u32>,
+    user_id: Option<UserId>,
+    season_metas: &HashMap<u32, HashMap<u32, media::EpisodeMeta>>,
+    files: &dyn crate::browse_file_read::BrowseFileRead,
+) -> Vec<EpisodeRow> {
+    let mut unit_states = HashMap::new();
+    if let Some(uid) = user_id {
+        for row in rows {
+            let Some(e) = row.episode else { continue };
+            let s = row.season.unwrap_or(1);
+            if let Ok(st) = store.unit_state(uid, media.id, s as i32, e as i32) {
+                unit_states.insert((s, e), st);
+            }
+        }
+    }
+    aggregate_visible_episodes_owned(
+        rows,
+        target_season,
+        &unit_states,
+        season_metas,
+        files,
+    )
+}
+
+/// Bounded out-of-lock aggregation: takes owned rows, pre-loaded unit states and file seam.
+pub fn aggregate_visible_episodes_owned(
+    rows: &[LedgerRow],
+    target_season: Option<u32>,
+    unit_states: &HashMap<(u32, u32), Option<crate::store::UnitState>>,
+    season_metas: &HashMap<u32, HashMap<u32, media::EpisodeMeta>>,
+    files: &dyn crate::browse_file_read::BrowseFileRead,
+) -> Vec<EpisodeRow> {
     let mut grouped: HashMap<(u32, u32), (Vec<String>, String, Option<String>, Option<String>)> =
         HashMap::new();
 
@@ -82,11 +129,11 @@ pub fn aggregate_visible_episodes(
             .to_string();
 
         let local_still =
-            crate::episode_still::existing(file_path).map(|_| artwork_url("stills", row.id));
+            crate::episode_still::existing_with(file_path, files).map(|_| artwork_url("stills", row.id));
         // 只有磁盘上真有 fanart 才给地址。没有剧照时卡片用集号占位，
         // 不再对每一集打出必定 404 的 /fanart/{id}。
         let backdrop = if row.season.is_some()
-            && crate::http::library::backdrop_path(row).is_some()
+            && crate::http::library::backdrop_path_with(row, files).is_some()
         {
             Some(artwork_url("fanart", row.id))
         } else {
@@ -118,27 +165,15 @@ pub fn aggregate_visible_episodes(
                 None => (None, None, None),
             };
 
-            let (position_ms, played, progress_percent) = match user_id {
-                Some(uid) => {
-                    let state = match store.unit_state(uid, media.id, season as i32, episode as i32) {
-                        Ok(st) => st,
-                        Err(e) => {
-                            tracing::error!(user_id = %uid, media_id = %media.id, season = season, episode = episode, error = %e, "读取用户观看状态失败");
-                            None
-                        }
+            let (position_ms, played, progress_percent) = match unit_states.get(&(season, episode)).and_then(|state| state.as_ref()) {
+                Some(ps) => {
+                    let percent = if !ps.played {
+                        ps.duration_ms
+                            .and_then(|d| if d > 0 { Some(((ps.position_ms * 100) / d).clamp(0, 100)) } else { None })
+                    } else {
+                        None
                     };
-                    match state {
-                        Some(ps) => {
-                            let percent = if !ps.played {
-                                ps.duration_ms
-                                    .and_then(|d| if d > 0 { Some(((ps.position_ms * 100) / d).clamp(0, 100)) } else { None })
-                            } else {
-                                None
-                            };
-                            (ps.position_ms, ps.played, percent)
-                        }
-                        None => (0, false, None),
-                    }
+                    (ps.position_ms, ps.played, percent)
                 }
                 None => (0, false, None),
             };

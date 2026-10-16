@@ -51,7 +51,9 @@ pub(crate) fn resync_probe_job(conn: &Connection, job_id: &str) -> Result<(), St
              succeeded = (SELECT COUNT(*) FROM probe_job_units
                           WHERE job_id = ?1 AND status = 'succeeded'),
              failed = (SELECT COUNT(*) FROM probe_job_units
-                       WHERE job_id = ?1 AND status = 'failed')
+                       WHERE job_id = ?1 AND status = 'failed'),
+             partial = (SELECT COUNT(*) FROM probe_job_units
+                        WHERE job_id = ?1 AND status = 'partial')
          WHERE id = ?1",
         [job_id],
     )?;
@@ -90,12 +92,18 @@ pub(crate) fn resync_probe_job(conn: &Connection, job_id: &str) -> Result<(), St
         )?;
         return Ok(());
     }
+    let cancelled: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM probe_job_units WHERE job_id = ?1 AND status = 'cancelled'",
+        [job_id],
+        |row| row.get(0),
+    )?;
     let Some(terminal) = crate::probe_tasks::probe_job_terminal_status(
         &kind,
         total as usize,
         completed as usize,
         failed as usize,
         partial as usize,
+        cancelled as usize,
     ) else {
         return Ok(());
     };

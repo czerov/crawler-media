@@ -195,3 +195,30 @@ async fn list_visible_items_reads_metadata_io_outside_the_store_lock() {
         "NFO metadata must still be read"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jellyfin_metadata_gate_does_not_block_async_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Gate::new());
+    let state = make_state(tmp.path(), gate.clone());
+    let user_id = seed(&state, tmp.path());
+    let provider = api::media_server_provider::ApiServerProvider::new(state.clone());
+    let listing = tokio::spawn(async move { provider.list_visible_items(user_id, None).await });
+
+    let entered = tokio::time::timeout(Duration::from_secs(2), async {
+        while !gate.entered() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(entered.is_ok(), "metadata gate was not reached");
+    let _release = ReleaseOnDrop(gate.clone());
+
+    let user_provider = api::media_server_provider::ApiServerProvider::new(state);
+    let unrelated = tokio::time::timeout(Duration::from_secs(1), user_provider.get_user(user_id)).await;
+    assert!(unrelated.is_ok(), "unrelated provider request stalled behind metadata IO");
+    assert!(unrelated.unwrap().unwrap().is_some());
+    gate.release();
+    assert_eq!(listing.await.unwrap().unwrap().len(), 1);
+}
+

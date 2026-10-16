@@ -33,11 +33,18 @@ impl Store {
         self.insert_ledger_with_optional_source(row, source.to_str())
     }
 
-    fn insert_ledger_with_optional_source(
+    /// Insert ledger row with caller-observed transfer mode and optional source path,
+    /// avoiding filesystem metadata inspection under the Store lock.
+    pub fn insert_ledger_with_mode_and_source(
         &self,
         row: &LedgerRow,
+        transfer_mode: Option<&str>,
         source_path: Option<&str>,
     ) -> Result<(), StoreError> {
+        let mode = match transfer_mode {
+            Some(m) => m.to_string(),
+            None => self.transfer_mode_for_path(&row.path),
+        };
         self.library.execute(
             "INSERT INTO ledger (
                 id, media_id, path, season, episode, resolution, codec, hdr,
@@ -67,11 +74,100 @@ impl Store {
                 row.quality_source.as_str(),
                 row.confidence.as_str(),
                 row.filter_score,
-                self.transfer_mode_for_path(&row.path),
+                mode,
                 source_path,
             ],
         )?;
         Ok(())
+    }
+
+    /// Finalize a previously reserved Transfer row without recreating it if detached.
+    pub fn finalize_transfer(
+        &self,
+        row: &LedgerRow,
+        transfer_mode: &str,
+        source_path: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let changed = self.library.execute(
+            "UPDATE ledger SET season = ?4, episode = ?5, resolution = ?6, codec = ?7,
+                hdr = ?8, quality_source = ?9, confidence = ?10, filter_score = ?11,
+                transfer_mode = COALESCE(?12, transfer_mode)
+             WHERE id = ?1 AND media_id = ?2 AND path = ?3 AND source_path IS ?13",
+            params![
+                row.id.to_string(), row.media_id.to_string(), row.path,
+                row.season.map(i64::from), row.episode.map(i64::from), row.resolution,
+                row.codec, row.hdr, row.quality_source.as_str(), row.confidence.as_str(),
+                row.filter_score, transfer_mode, source_path,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Protected("Transfer reservation changed or was detached".into()));
+        }
+        Ok(())
+    }
+
+    pub fn ledger_source_path_matches(
+        &self,
+        path: &str,
+        expected: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let actual: Option<Option<String>> = self.library.query_row(
+            "SELECT source_path FROM ledger WHERE path = ?1",
+            [path],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(actual.flatten().as_deref() == expected)
+    }
+
+    /// Reserve a final path before filesystem publication. Existing identity is
+    /// never overwritten; only the same in-flight source can resume publication.
+    pub fn prepare_transfer(&self, row: &LedgerRow, mode: &str, source: &str)
+        -> Result<LedgerRow, StoreError>
+    {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.library, rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if let Some(existing) = self.ledger_by_path(&row.path)? {
+            let owned: bool = tx.query_row(
+                "SELECT transfer_pending = 1 AND COALESCE(source_path = ?2, 0) FROM ledger WHERE path = ?1",
+                params![row.path, source], |r| r.get(0),
+            )?;
+            if existing.media_id != row.media_id || !owned {
+                return Err(StoreError::Protected("Transfer destination already owned".into()));
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+        self.insert_ledger_with_mode_and_source(row, Some(mode), Some(source))?;
+        tx.execute("UPDATE ledger SET transfer_pending = 1 WHERE id = ?1", [row.id.to_string()])?;
+        tx.commit()?;
+        tracing::info!(ledger_id = %row.id, path = %row.path, "Reserved Transfer destination");
+        Ok(row.clone())
+    }
+
+    pub fn transfer_pending(&self, path: &str) -> Result<bool, StoreError> {
+        Ok(self.library.query_row("SELECT transfer_pending FROM ledger WHERE path = ?1",
+            [path], |r| r.get(0)).optional()?.unwrap_or(false))
+    }
+
+    pub fn complete_transfer_publication(&self, row: &LedgerRow) -> Result<(), StoreError> {
+        let changed = self.library.execute(
+            "UPDATE ledger SET transfer_pending = 0 WHERE id = ?1 AND media_id = ?2 AND path = ?3",
+            params![row.id.to_string(), row.media_id.to_string(), row.path],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Protected("Transfer reservation changed".into()));
+        }
+        tracing::info!(ledger_id = %row.id, path = %row.path, "Completed Transfer publication");
+        Ok(())
+    }
+
+    fn insert_ledger_with_optional_source(
+        &self,
+        row: &LedgerRow,
+        source_path: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.insert_ledger_with_mode_and_source(row, None, source_path)
     }
 
     fn transfer_mode_for_path(&self, path: &str) -> String {

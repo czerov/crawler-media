@@ -350,6 +350,25 @@ impl<H: CatalogGet> Tmdb<H> {
             parse::season_details(body)
         })
     }
+    /// Return cached season details (fresh or stale) without fetching.
+    pub fn cached_season_details(
+        &self,
+        tmdb_id: &str,
+        season: u32,
+    ) -> Result<Option<Vec<parse::EpisodeMeta>>, TmdbError> {
+        let path = format!("/tv/{tmdb_id}/season/{season}");
+        let join = if path.contains('?') { '&' } else { '?' };
+        let key = format!("{path}{join}language={}", self.language);
+        let body = match self.cache.get_fresh(&key)? {
+            Some(body) => body,
+            None => match self.cache.get_stale(&key)? {
+                Some(body) => body,
+                None => return Ok(None),
+            },
+        };
+        crate::contracts::object(&body, &["episodes", "id", "name", "season_number"])?;
+        parse::season_details(&body).map(Some)
+    }
 
     /// TMDB episode still file paths (`/tv/{id}/season/{s}/episode/{e}/images`).
     pub fn episode_images(

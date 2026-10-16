@@ -11,7 +11,7 @@ use std::str::FromStr;
 use crate::http::library::selection::metadata::BrowseMetadata;
 
 /// 当前 facts JSON 版本。读路径只接受这一版。
-pub(crate) const FACTS_VERSION: u64 = 2;
+pub(crate) const FACTS_VERSION: u64 = 3;
 
 /// 单个 ledger 文件的投影事实。
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +25,7 @@ pub(crate) struct FileFacts {
     pub modified_ns: Option<i64>,
     pub missing: bool,
     pub has_still: bool,
+    pub sidecars: serde_json::Map<String, Value>,
 }
 
 impl FileFacts {
@@ -54,6 +55,7 @@ impl FileFacts {
             "modified_ns": self.modified_ns,
             "missing": self.missing,
             "has_still": self.has_still,
+            "sidecars": self.sidecars,
         })
     }
 
@@ -85,6 +87,7 @@ impl FileFacts {
             modified_ns: value.get("modified_ns").and_then(Value::as_i64),
             missing: value.get("missing")?.as_bool()?,
             has_still: value.get("has_still")?.as_bool()?,
+            sidecars: value.get("sidecars")?.as_object()?.clone(),
         })
     }
 }

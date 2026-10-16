@@ -254,9 +254,11 @@ impl<'a> RoutedDownloader<'a> {
                     if slots.is_empty() {
                         slots.push((row.season, row.episode));
                     }
-                    sources.push(subscribe::collection_destinations::DestinationMapping::with_slots_and_quality(
+                    let mut mapping = subscribe::collection_destinations::DestinationMapping::with_slots_and_quality(
                         source, path, slots, Some(file_quality),
-                    ));
+                    );
+                    mapping.transfer_pending = store.transfer_pending(&row.path).map_err(error)?;
+                    sources.push(mapping);
                 }
             }
         }
