@@ -90,11 +90,16 @@ pub(crate) fn err(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
-pub(crate) async fn health() -> Response {
+pub(crate) async fn health(
+    axum::extract::State(state): axum::extract::State<ApiState>,
+) -> Response {
+    // Review N-2: `read_only` is true while another instance holds the
+    // data-directory lease (background jobs and write endpoints paused).
     ok(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "commit": env!("GIT_HASH"),
+        "read_only": !state.instance_writable(),
     }))
     .into_response()
 }

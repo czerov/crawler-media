@@ -29,7 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 subscribe.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "io-util", "time", "sync", "signal"] }
 futures-core = "0.3"
 flate2.workspace = true
 tar.workspace = true
