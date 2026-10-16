@@ -116,6 +116,13 @@ pub(super) const APP_TABLES: &str = r#"
         "#;
 
 pub(super) const LIBRARY_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS pending_file_deletions (
+    path TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
         CREATE TABLE IF NOT EXISTS ledger (
             id TEXT PRIMARY KEY,
             media_id TEXT NOT NULL,

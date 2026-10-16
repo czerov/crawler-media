@@ -481,11 +481,12 @@ fn persist(
     store.mark_pending_imported(id, &transferred)?;
     store.mark_pending_rejected(id, &rejected)?;
     store.save_subscribe_facts(id, &outcome.facts)?;
+    // M6: same queue as the Transfer job; deletion failures are retried later.
     for path in &outcome.removed_paths {
-        crate::http::file_delete::remove_file_and_ledger(&store, path)
-            .map_err(ApiError::internal)?;
+        store.enqueue_file_deletion(path, "wash_replaced")?;
     }
     drop(store);
+    crate::http::file_delete::retry_queued_deletions(&state.store);
     crate::http::library::enqueue_probes_for_rows(state, &outcome.ledger);
     Ok(())
 }

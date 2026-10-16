@@ -2,6 +2,7 @@
 //! Backed by 4 SQLite files in the data directory.
 
 mod app_write;
+mod pending_file_deletions;
 mod browse_projection;
 pub use browse_projection::{
     BrowseFileFacts, BrowseMediaFacts, ProjectionBuild, ProjectionSnapshot, ReadRevisions,

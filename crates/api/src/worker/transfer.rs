@@ -49,8 +49,12 @@ fn commit_transfer_outcome(
         .save_subscribe_facts(subscribe.id, &outcome.facts)
         .map_err(|e| e.to_string())?;
 
+    // M6: queue replaced files instead of deleting inline; a failed delete
+    // must not abort the commit (pending/wanted below) and is retried later.
     for path in &outcome.removed_paths {
-        crate::http::file_delete::remove_file_and_ledger(&store, path)?;
+        store
+            .enqueue_file_deletion(path, "wash_replaced")
+            .map_err(|e| e.to_string())?;
     }
     let now = crate::job_loop::unix_now();
     for row in &outcome.ledger {
@@ -72,6 +76,7 @@ fn commit_transfer_outcome(
     }
     let library_id = lease.library_id().to_string();
     drop(store);
+    crate::http::file_delete::retry_queued_deletions(&state.store);
     // Transfer 写入新 ledger 行并可能删除旧文件：该 Library 的投影必须重建。
     state.projection.mark_dirty(&library_id);
     Ok(())
@@ -220,6 +225,7 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
         tracing::info!(subscribe_id = %subscribe_id, "订阅正在删除中，跳过 Transfer");
         return Ok(());
     }
+    crate::http::file_delete::retry_queued_deletions(&state.store);
 
     let subscribe = match state.store.lock().get_subscribe(subscribe_id) {
         Ok(Some(s)) => s,

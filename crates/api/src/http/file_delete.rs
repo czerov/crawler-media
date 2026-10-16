@@ -10,6 +10,33 @@ fn remove_physical_file(path: &str) -> Result<(), String> {
     }
 }
 
+/// M6: retry every queued Library file deletion. Filesystem work happens
+/// outside the Store lock; the queue and ledger rows are only cleared once
+/// the file is really gone.
+pub(crate) fn retry_queued_deletions(store: &parking_lot::Mutex<Store>) {
+    let queued = match store.lock().list_pending_file_deletions() {
+        Ok(queued) => queued,
+        Err(error) => {
+            tracing::error!(%error, "读取待删除文件队列失败");
+            return;
+        }
+    };
+    for path in queued {
+        let result = remove_physical_file(&path);
+        let store = store.lock();
+        let recorded = match &result {
+            Ok(()) => store.complete_file_deletion(&path),
+            Err(error) => {
+                tracing::warn!(path = %path, %error, "删除被替换文件失败，保留在待删除队列稍后重试");
+                store.record_file_deletion_failure(&path, crate::job_loop::unix_now(), error)
+            }
+        };
+        if let Err(error) = recorded {
+            tracing::error!(path = %path, %error, "更新待删除文件队列失败");
+        }
+    }
+}
+
 /// Remove a library file, then remove its ledger row. A missing file is an
 /// already-completed deletion, while every other filesystem error leaves the
 /// ledger intact so callers can report and retry it.
