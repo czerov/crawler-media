@@ -88,6 +88,7 @@ impl TransmissionDownloader {
         for wanted in [
             crate::TASK_TAG.to_string(),
             crate::ownership_tag(&torrent.enclosure),
+            crate::CLAIMED_TAG.to_string(),
         ] {
             if !labels.contains(&wanted) {
                 labels.push(wanted);
@@ -96,6 +97,24 @@ impl TransmissionDownloader {
         self.rpc("torrent-set", json!({ "ids": [hash], "labels": labels }))?;
         tracing::info!(torrent = %torrent.title, %hash, "Transmission 已有同 hash 任务，补打标签认领");
         Ok(())
+    }
+
+    /// Review H-3: the task carries `CLAIMED_TAG` (unknown counts as claimed).
+    fn hash_claimed(&self, hash: &str) -> bool {
+        match self.rpc(
+            "torrent-get",
+            json!({ "ids": [hash], "fields": ["labels"] }),
+        ) {
+            Ok(got) => got["torrents"][0]["labels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|v| v.as_str() == Some(crate::CLAIMED_TAG)),
+            Err(error) => {
+                tracing::warn!(%hash, %error, "无法确认任务是否为认领的用户任务，按认领处理（不删文件）");
+                true
+            }
+        }
     }
 
     pub fn connect(config: TransmissionConfig) -> Result<Self, DownloaderError> {
@@ -387,6 +406,13 @@ impl Downloader for TransmissionDownloader {
         ))
     }
 
+    fn is_claimed(&self, torrent: &Torrent) -> Result<bool, DownloaderError> {
+        Ok(match self.owned_identity(torrent)? {
+            Some(hash) => self.hash_claimed(&hash),
+            None => false,
+        })
+    }
+
     fn remove_owned(&self, torrent: &Torrent, delete_files: bool) -> Result<(), DownloaderError> {
         let known = self.identities.lock().contains_key(&torrent.enclosure);
         let Some(hash) = crate::owned::owned_removal_target(
@@ -397,6 +423,7 @@ impl Downloader for TransmissionDownloader {
         else {
             return Ok(());
         };
+        let delete_files = delete_files && !self.hash_claimed(&hash);
         tracing::info!(torrent = %torrent.title, hash = %hash, delete_files, "从 Transmission 移除已证实归属的种子");
         self.rpc(
             "torrent-remove",
@@ -406,6 +433,7 @@ impl Downloader for TransmissionDownloader {
     }
 
     fn delete_task(&self, info_hash: &str, delete_files: bool) -> Result<(), DownloaderError> {
+        let delete_files = delete_files && !self.hash_claimed(info_hash);
         tracing::info!(hash = %info_hash, delete_files, "从 Transmission 按已证实哈希删除任务");
         self.rpc(
             "torrent-remove",

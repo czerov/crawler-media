@@ -114,6 +114,51 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
     control: &library::WorkControl,
     recorder: Option<&dyn TransferRecorder>,
 ) {
+    // Review H-3: a claimed user task's files are never moved away; Move
+    // degrades to Hardlink (copy fallback) for this torrent.
+    let saved_mode = added.input.transfer_mode;
+    if matches!(saved_mode, Some(library::TransferMode::Move))
+        && added
+            .input
+            .downloader
+            .is_claimed(&scored.torrent)
+            .unwrap_or(true)
+    {
+        tracing::info!(torrent = %scored.torrent.title, "认领的用户任务：Move 降级为硬链接，不移走用户文件");
+        added.input.transfer_mode = Some(library::TransferMode::Hardlink);
+    }
+    collect_scored_torrent_inner(
+        added,
+        probe,
+        existing,
+        scored,
+        ledger,
+        ledger_sources,
+        removed_paths,
+        transferred_enclosures,
+        rejected_enclosures,
+        collection_errors,
+        control,
+        recorder,
+    );
+    added.input.transfer_mode = saved_mode;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_scored_torrent_inner<D: Downloader + ?Sized>(
+    added: &mut Added<'_, D>,
+    probe: &dyn MediaProbe,
+    existing: &[crate::collection_destinations::DestinationMapping],
+    scored: &ScoredTorrent,
+    ledger: &mut Vec<LedgerRow>,
+    ledger_sources: &mut Vec<LedgerSource>,
+    removed_paths: &mut Vec<String>,
+    transferred_enclosures: &mut Vec<String>,
+    rejected_enclosures: &mut Vec<String>,
+    collection_errors: &mut Vec<String>,
+    control: &library::WorkControl,
+    recorder: Option<&dyn TransferRecorder>,
+) {
     let mut vetoed = false;
     // M2: video files skipped because their slots were already owned.
     let mut duplicate = false;

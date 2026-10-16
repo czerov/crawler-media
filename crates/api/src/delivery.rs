@@ -330,6 +330,10 @@ impl Downloader for RoutedDownloader<'_> {
         self.client_for(torrent)?.completed_files(torrent)
     }
 
+    fn is_claimed(&self, torrent: &Torrent) -> Result<bool, DownloaderError> {
+        self.client_for(torrent)?.is_claimed(torrent)
+    }
+
     fn collectable_files(
         &self,
         torrent: &Torrent,

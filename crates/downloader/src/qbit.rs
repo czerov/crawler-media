@@ -260,6 +260,13 @@ impl Downloader for QbitDownloader {
         self.remove_owned(torrent, delete_files)
     }
 
+    fn is_claimed(&self, torrent: &Torrent) -> Result<bool, DownloaderError> {
+        Ok(match self.exact_existing_hash(torrent)? {
+            Some(hash) => self.hash_claimed(&hash),
+            None => false,
+        })
+    }
+
     fn owned_identity(&self, torrent: &Torrent) -> Result<Option<String>, DownloaderError> {
         self.exact_existing_hash(torrent)
     }
@@ -280,6 +287,7 @@ impl Downloader for QbitDownloader {
         else {
             return Ok(());
         };
+        let delete_files = delete_files && !self.hash_claimed(&hash);
         tracing::info!(torrent = %torrent.title, hash = %hash, delete_files = %delete_files, "从 qBittorrent 移除已证实归属的种子");
         let url = join(&self.config.url, "/api/v2/torrents/delete");
         let body = format!("hashes={}&deleteFiles={}", form_enc(&hash), delete_files);
@@ -370,6 +378,7 @@ impl Downloader for QbitDownloader {
     }
 
     fn delete_task(&self, info_hash: &str, delete_files: bool) -> Result<(), DownloaderError> {
+        let delete_files = delete_files && !self.hash_claimed(info_hash);
         tracing::info!(hash = %info_hash, delete_files, "从 qBittorrent 删除任务");
         let url = join(&self.config.url, "/api/v2/torrents/delete");
         let body = format!(
@@ -472,6 +481,29 @@ impl Downloader for QbitDownloader {
 }
 
 impl QbitDownloader {
+    /// Review H-3: the task carries `CLAIMED_TAG`. Unknown (lookup failed)
+    /// counts as claimed so user data is never deleted on doubt.
+    fn hash_claimed(&self, hash: &str) -> bool {
+        let url = format!(
+            "{}?hashes={}",
+            join(&self.config.url, "/api/v2/torrents/info"),
+            form_enc(hash)
+        );
+        let infos: Result<Vec<TorrentInfo>, _> = self.get(&url).and_then(|body| {
+            serde_json::from_str(&body).map_err(|e| DownloaderError::Message(e.to_string()))
+        });
+        match infos {
+            Ok(infos) => infos.iter().any(|info| {
+                info.hash.eq_ignore_ascii_case(hash)
+                    && info.tags.split(',').any(|t| t.trim() == crate::CLAIMED_TAG)
+            }),
+            Err(error) => {
+                tracing::warn!(%hash, %error, "无法确认任务是否为认领的用户任务，按认领处理（不删文件）");
+                true
+            }
+        }
+    }
+
     /// Tag an existing task with `hash` as ours. Only tags are added; nothing
     /// destructive happens to a task the user created. Returns whether found.
     fn claim_existing(&self, hash: &str, tags: &str, title: &str) -> Result<bool, DownloaderError> {
@@ -489,7 +521,10 @@ impl QbitDownloader {
         }
         self.post_form(
             &join(&self.config.url, "/api/v2/torrents/addTags"),
-            &format!("hashes={hash}&tags={}", form_enc(tags)),
+            &format!(
+                "hashes={hash}&tags={}",
+                form_enc(&format!("{tags},{}", crate::CLAIMED_TAG))
+            ),
         )?;
         tracing::info!(torrent = %title, %hash, "qBittorrent 已有同 info hash 任务，补打标签认领");
         Ok(true)

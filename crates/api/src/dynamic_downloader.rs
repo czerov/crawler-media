@@ -112,6 +112,10 @@ impl Downloader for DynamicDownloader {
         delegate!(self, completed_files(torrent))
     }
 
+    fn is_claimed(&self, torrent: &Torrent) -> Result<bool, DownloaderError> {
+        delegate!(self, is_claimed(torrent))
+    }
+
     fn collectable_files(
         &self,
         torrent: &Torrent,

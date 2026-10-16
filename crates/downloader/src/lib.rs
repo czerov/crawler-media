@@ -73,6 +73,11 @@ pub trait Downloader: Send + Sync {
     }
     fn completed_files(&self, torrent: &Torrent) -> Result<Vec<PathBuf>, DownloaderError>;
 
+    /// Review H-3: whether the task for `torrent` is a claimed user task.
+    fn is_claimed(&self, _torrent: &Torrent) -> Result<bool, DownloaderError> {
+        Ok(false)
+    }
+
     /// D-L1: files finished so far (even while other files of the task are
     /// still downloading) and whether the task's wanted files are all done.
     /// The default keeps the whole-task behaviour of `completed_files`.
@@ -232,6 +237,11 @@ pub const OWNED_TAG_PREFIX: &str = "crawler-media-owned-";
 /// our Torrent and a client-side task is established by exact normalized title
 /// + size ([`normalize_name`] / [`names_match`] / [`size_matches`]).
 pub const TASK_TAG: &str = "crawler-media";
+
+/// Review H-3: extra tag/label on a user's existing task that we claimed
+/// (same info hash). Its data belongs to the user: never delete its files
+/// and never Move them out of the download directory.
+pub const CLAIMED_TAG: &str = "crawler-media-claimed";
 
 /// 归一化标题（保留字母数字及中文字符、小写），用于跨客户端匹配任务。
 pub fn normalize_name(value: &str) -> String {
