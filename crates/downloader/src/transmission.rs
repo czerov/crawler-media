@@ -317,6 +317,57 @@ impl Downloader for TransmissionDownloader {
         self.labeled_hash(torrent)
     }
 
+    fn select_files(
+        &self,
+        torrent: &Torrent,
+        keep: &dyn Fn(&str) -> bool,
+    ) -> Result<usize, DownloaderError> {
+        let Some(hash) = self.owned_identity(torrent)? else {
+            return Ok(0);
+        };
+        let arguments = self.rpc(
+            "torrent-get",
+            json!({ "ids": [hash.clone()], "fields": ["id", "hashString", "files"] }),
+        )?;
+        let Some(item) = arguments
+            .get("torrents")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("hashString")
+                        .and_then(Value::as_str)
+                        .is_some_and(|h| h.eq_ignore_ascii_case(&hash))
+                })
+            })
+        else {
+            return Ok(0);
+        };
+        let skipped: Vec<usize> = item
+            .get("files")
+            .and_then(Value::as_array)
+            .map(|files| {
+                files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, file)| {
+                        !keep(file.get("name").and_then(Value::as_str).unwrap_or(""))
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if skipped.is_empty() {
+            return Ok(0);
+        }
+        let id = item.get("id").cloned().unwrap_or(Value::Null);
+        tracing::info!(hash = %hash, count = skipped.len(), "Transmission 跳过不需要的文件");
+        self.rpc(
+            "torrent-set",
+            json!({ "ids": [id], "files-unwanted": skipped }),
+        )?;
+        Ok(skipped.len())
+    }
+
     fn endpoint(&self) -> Option<String> {
         Some(format!(
             "transmission|{}",

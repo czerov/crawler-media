@@ -44,6 +44,12 @@ pub struct MockQbit {
     /// Bytes served at `GET /download.php` (acts as the PT site's .torrent).
     pub torrent_file: Mutex<Option<String>>,
     pub add_tags: Mutex<Vec<String>>,
+    /// F-1: file names (metadata) given to the next added task, progress 0.
+    pub next_files: Mutex<Vec<String>>,
+    /// F-1: raw `torrents/filePrio` requests.
+    pub file_prios: Mutex<Vec<String>>,
+    /// (hash, file index) set to priority 0.
+    pub skipped: Mutex<Vec<(String, usize)>>,
     next: AtomicU64,
 }
 
@@ -65,6 +71,9 @@ impl MockQbit {
             torrent_file: Mutex::new(None),
             resumes: Mutex::new(Vec::new()),
             add_tags: Mutex::new(Vec::new()),
+            next_files: Mutex::new(Vec::new()),
+            file_prios: Mutex::new(Vec::new()),
+            skipped: Mutex::new(Vec::new()),
             next: AtomicU64::new(1),
         });
         let server = mock.clone();
@@ -172,7 +181,9 @@ impl MockQbit {
         {
             return ("403 Forbidden", "Forbidden".into(), "");
         }
-        if req.starts_with("POST /api/v2/torrents/add ") || req.starts_with("POST /api/v2/torrents/add?") {
+        if req.starts_with("POST /api/v2/torrents/add ")
+            || req.starts_with("POST /api/v2/torrents/add?")
+        {
             self.adds.lock().push(req.to_string());
             let tags = multipart_field(req, "tags").unwrap_or_default();
             let source = if req.contains("name=\"torrents\"") {
@@ -191,7 +202,10 @@ impl MockQbit {
                     .collect(),
                 progress: 0.0,
                 save_path: self.save_root.display().to_string(),
-                files: Vec::new(),
+                files: std::mem::take(&mut *self.next_files.lock())
+                    .into_iter()
+                    .map(|name| (name, 0.0))
+                    .collect(),
                 size: 0,
                 state: "downloading".into(),
                 source,
@@ -201,9 +215,14 @@ impl MockQbit {
         if req.contains("/api/v2/torrents/addTags") {
             self.add_tags.lock().push(req.to_string());
             let hashes = form_field(req, "hashes").unwrap_or_default();
-            let tags = form_field(req, "tags").unwrap_or_default().replace("%2C", ",");
+            let tags = form_field(req, "tags")
+                .unwrap_or_default()
+                .replace("%2C", ",");
             for task in self.tasks.lock().iter_mut() {
-                if hashes.split('|').any(|h| h.eq_ignore_ascii_case(&task.hash)) {
+                if hashes
+                    .split('|')
+                    .any(|h| h.eq_ignore_ascii_case(&task.hash))
+                {
                     for tag in tags.split(',').map(str::trim).filter(|t| !t.is_empty()) {
                         if !task.tags.iter().any(|t| t == tag) {
                             task.tags.push(tag.to_string());
@@ -232,22 +251,38 @@ impl MockQbit {
         if req.contains("/api/v2/torrents/files") {
             let hash = query_param(req, "hash").unwrap_or_default();
             let tasks = self.tasks.lock();
+            let skipped = self.skipped.lock();
             let body: Vec<_> = tasks
                 .iter()
                 .filter(|t| t.hash.eq_ignore_ascii_case(&hash))
                 .flat_map(|t| {
-                    t.files
-                        .iter()
-                        .map(|(name, p)| json!({"name": name, "progress": p}))
+                    t.files.iter().enumerate().map(|(i, (name, p))| {
+                        let off = skipped.iter().any(|(h, j)| h.eq_ignore_ascii_case(&t.hash) && *j == i);
+                        json!({"index": i, "name": name, "progress": p, "priority": if off { 0 } else { 1 }})
+                    })
                 })
                 .collect();
             return ("200 OK", serde_json::to_string(&body).unwrap(), "");
+        }
+        if req.contains("/api/v2/torrents/filePrio") {
+            self.file_prios.lock().push(req.to_string());
+            let hash = form_field(req, "hash").unwrap_or_default();
+            let ids = form_field(req, "id")
+                .unwrap_or_default()
+                .replace("%7C", "|");
+            for id in ids.split('|').filter_map(|i| i.parse::<usize>().ok()) {
+                self.skipped.lock().push((hash.to_lowercase(), id));
+            }
+            return ("200 OK", "".into(), "");
         }
         if req.contains("/api/v2/torrents/resume") || req.contains("/api/v2/torrents/start") {
             self.resumes.lock().push(req.to_string());
             if let Some(hashes) = form_field(req, "hashes") {
                 for task in self.tasks.lock().iter_mut() {
-                    if hashes.split('|').any(|h| h.eq_ignore_ascii_case(&task.hash)) {
+                    if hashes
+                        .split('|')
+                        .any(|h| h.eq_ignore_ascii_case(&task.hash))
+                    {
                         task.state = "downloading".into();
                     }
                 }

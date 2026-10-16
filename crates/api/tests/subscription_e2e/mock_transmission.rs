@@ -28,6 +28,8 @@ pub struct MockTransmission {
     pub rpc_version: u64,
     pub tasks: Mutex<Vec<TrTask>>,
     pub sets: Mutex<Vec<Value>>,
+    /// F-1: file names (metadata) given to the next added task.
+    pub next_files: Mutex<Vec<String>>,
     next: AtomicU64,
 }
 
@@ -41,6 +43,7 @@ impl MockTransmission {
             rpc_version,
             tasks: Mutex::new(Vec::new()),
             sets: Mutex::new(Vec::new()),
+            next_files: Mutex::new(Vec::new()),
             next: AtomicU64::new(1),
         });
         let server = mock.clone();
@@ -104,7 +107,10 @@ impl MockTransmission {
                     name: format!("task-{n}"),
                     filename: args["filename"].as_str().unwrap_or_default().into(),
                     percent: 0.0,
-                    files: Vec::new(),
+                    files: std::mem::take(&mut *self.next_files.lock())
+                        .into_iter()
+                        .map(|name| (name, 1, 0, true))
+                        .collect(),
                 });
                 json!({"result": "success", "arguments": {"torrent-added": {"hashString": hash, "id": n}}})
             }
@@ -116,10 +122,11 @@ impl MockTransmission {
                 let tasks = self.tasks.lock();
                 let rows: Vec<Value> = tasks
                     .iter()
-                    .map(|t| {
+                    .enumerate()
+                    .map(|(i, t)| {
                         let size: u64 = t.files.iter().map(|f| f.1).sum();
                         json!({
-                            "id": 1, "name": t.name, "hashString": t.hash,
+                            "id": i + 1, "name": t.name, "hashString": t.hash,
                             "totalSize": size, "sizeWhenDone": size, "percentDone": t.percent,
                             "downloadDir": self.download_dir.display().to_string(),
                             "rateDownload": 0, "rateUpload": 0, "status": 4, "error": 0,

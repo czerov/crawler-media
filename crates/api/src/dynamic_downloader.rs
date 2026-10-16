@@ -80,6 +80,14 @@ impl Downloader for DynamicDownloader {
         delegate!(self, remember_identity(torrent, hash))
     }
 
+    fn select_files(
+        &self,
+        torrent: &Torrent,
+        keep: &dyn Fn(&str) -> bool,
+    ) -> Result<usize, DownloaderError> {
+        delegate!(self, select_files(torrent, keep))
+    }
+
     fn add(&self, torrent: &Torrent) -> Result<(), DownloaderError> {
         delegate!(self, add(torrent))
     }

@@ -127,10 +127,7 @@ impl QbitDownloader {
 
     /// Run an authenticated request; on 403 re-login once and retry (D-H1).
     /// A second 403 is reported as an authentication error, never retried again.
-    fn authed<T>(
-        &self,
-        op: impl Fn(&str) -> Result<T, ureq::Error>,
-    ) -> Result<T, DownloaderError> {
+    fn authed<T>(&self, op: impl Fn(&str) -> Result<T, ureq::Error>) -> Result<T, DownloaderError> {
         let cookie = self.cookie();
         match op(&cookie) {
             Err(ureq::Error::StatusCode(403)) => {
@@ -283,23 +280,52 @@ impl Downloader for QbitDownloader {
         let Some(info) = self.owned_info(torrent)? else {
             return Ok(Vec::new());
         };
-        if info.progress < 1.0 {
+        let listed = self.torrent_files(&info.hash)?;
+        // F-1: skipped (priority 0) files never complete; the task is done once
+        // every wanted file is.
+        let wanted_done = listed.iter().any(|file| file.priority > 0)
+            && listed
+                .iter()
+                .filter(|file| file.priority > 0)
+                .all(|file| file.progress >= 1.0);
+        if info.progress < 1.0 && !wanted_done {
             return Ok(Vec::new());
         }
-        let files_url = format!(
-            "{}?hash={}",
-            join(&self.config.url, "/api/v2/torrents/files"),
-            form_enc(&info.hash)
-        );
-        let file_body = self.get(&files_url)?;
-        let listed: Vec<TorrentFile> = serde_json::from_str(&file_body)
-            .map_err(|err| DownloaderError::Message(err.to_string()))?;
         Ok(listed
             .into_iter()
-            .filter(|file| file.progress >= 1.0)
+            .filter(|file| file.priority > 0 && file.progress >= 1.0)
             .map(|file| Path::new(&info.save_path).join(file.name))
             .map(|path| apply_maps(&path, &self.config.path_maps))
             .collect())
+    }
+
+    fn select_files(
+        &self,
+        torrent: &Torrent,
+        keep: &dyn Fn(&str) -> bool,
+    ) -> Result<usize, DownloaderError> {
+        let Some(hash) = self.exact_existing_hash(torrent)? else {
+            return Ok(0);
+        };
+        let skipped: Vec<String> = self
+            .torrent_files(&hash)?
+            .into_iter()
+            .enumerate()
+            .filter(|(_, file)| !keep(&file.name))
+            .map(|(i, file)| file.index.unwrap_or(i).to_string())
+            .collect();
+        if skipped.is_empty() {
+            return Ok(0);
+        }
+        tracing::info!(hash = %hash, count = skipped.len(), "qBittorrent 跳过不需要的文件");
+        let url = join(&self.config.url, "/api/v2/torrents/filePrio");
+        let body = format!(
+            "hash={}&id={}&priority=0",
+            form_enc(&hash),
+            form_enc(&skipped.join("|"))
+        );
+        let _ = self.post_form(&url, &body)?;
+        Ok(skipped.len())
     }
 
     fn delete_task(&self, info_hash: &str, delete_files: bool) -> Result<(), DownloaderError> {
@@ -408,10 +434,16 @@ impl QbitDownloader {
     /// Tag an existing task with `hash` as ours. Only tags are added; nothing
     /// destructive happens to a task the user created. Returns whether found.
     fn claim_existing(&self, hash: &str, tags: &str, title: &str) -> Result<bool, DownloaderError> {
-        let url = format!("{}?hashes={hash}", join(&self.config.url, "/api/v2/torrents/info"));
+        let url = format!(
+            "{}?hashes={hash}",
+            join(&self.config.url, "/api/v2/torrents/info")
+        );
         let infos: Vec<TorrentInfo> = serde_json::from_str(&self.get(&url)?)
             .map_err(|e| DownloaderError::Message(e.to_string()))?;
-        if !infos.iter().any(|info| info.hash.eq_ignore_ascii_case(hash)) {
+        if !infos
+            .iter()
+            .any(|info| info.hash.eq_ignore_ascii_case(hash))
+        {
             return Ok(false);
         }
         self.post_form(
@@ -440,6 +472,16 @@ impl QbitDownloader {
             .map(|info| info.hash)
             .collect();
         crate::owned::proven_hashes(hashes)
+    }
+
+    fn torrent_files(&self, hash: &str) -> Result<Vec<TorrentFile>, DownloaderError> {
+        let files_url = format!(
+            "{}?hash={}",
+            join(&self.config.url, "/api/v2/torrents/files"),
+            form_enc(hash)
+        );
+        let file_body = self.get(&files_url)?;
+        serde_json::from_str(&file_body).map_err(|err| DownloaderError::Message(err.to_string()))
     }
 
     fn owned_info(&self, torrent: &Torrent) -> Result<Option<TorrentInfo>, DownloaderError> {
@@ -613,18 +655,42 @@ mod existing_health_tests {
     #[test]
     fn maps_qbit_states() {
         assert_eq!(existing_task_health("error", 0.2), ExistingHealth::Broken);
-        assert_eq!(existing_task_health("missingFiles", 1.0), ExistingHealth::Broken);
-        assert_eq!(existing_task_health("pausedDL", 0.5), ExistingHealth::Paused);
-        assert_eq!(existing_task_health("stoppedDL", 0.5), ExistingHealth::Paused);
-        assert_eq!(existing_task_health("pausedUP", 1.0), ExistingHealth::Usable);
-        assert_eq!(existing_task_health("downloading", 0.1), ExistingHealth::Usable);
+        assert_eq!(
+            existing_task_health("missingFiles", 1.0),
+            ExistingHealth::Broken
+        );
+        assert_eq!(
+            existing_task_health("pausedDL", 0.5),
+            ExistingHealth::Paused
+        );
+        assert_eq!(
+            existing_task_health("stoppedDL", 0.5),
+            ExistingHealth::Paused
+        );
+        assert_eq!(
+            existing_task_health("pausedUP", 1.0),
+            ExistingHealth::Usable
+        );
+        assert_eq!(
+            existing_task_health("downloading", 0.1),
+            ExistingHealth::Usable
+        );
     }
 }
 
 #[derive(Deserialize)]
 struct TorrentFile {
+    #[serde(default)]
+    index: Option<usize>,
     name: String,
     progress: f64,
+    /// 0 = do not download (F-1 selective files).
+    #[serde(default = "default_priority")]
+    priority: i64,
+}
+
+fn default_priority() -> i64 {
+    1
 }
 
 /// Pick our marker out of a client's comma-separated tag list.

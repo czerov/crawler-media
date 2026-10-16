@@ -175,6 +175,7 @@ fn admit_candidates(
         crate::delivery::RoutedDownloader::with_pending(state, subscribe, &context.existing);
     let facts = facts_with_pending(context.facts.clone(), &context.existing, subscribe, media);
     let overlap = overlap_policy(state);
+    let selective = crate::selective_files::enabled(state).then(|| facts.clone());
     let added = admit_and_add(RunInput {
         subscribe,
         media,
@@ -196,6 +197,9 @@ fn admit_candidates(
         tracing::error!(subscribe_id = %subscribe.id, media = %media.title, error = %e, "收录并添加种子失败");
         e.to_string()
     })?;
+    if let Some(before) = &selective {
+        crate::selective_files::apply(&routed, subscribe, &added.chosen, before);
+    }
     notify_search_additions(state, subscribe, media, &added);
     merge_added_pending(state, subscribe, &added, &routed)?;
     record_wanted_round(state, subscribe, &added)?;

@@ -45,6 +45,8 @@ pub const SUBSCRIBE_AIR_DATE_GATE: &str = "subscribe.air_date_gate";
 /// M1 overlap policy when a range pack and single episodes cover the same slots:
 /// `prefer_pack` (default) or `prefer_episode`.
 pub const SUBSCRIBE_OVERLAP_POLICY: &str = "subscribe.overlap_policy";
+/// F-1: download only the files of missing episodes when a pack fills a gap.
+pub const SUBSCRIBE_SELECTIVE_FILES: &str = "subscribe.selective_files";
 /// G-M5: "1"/"true" allows several instances on one data directory (unsafe).
 pub const INSTANCE_ALLOW_MULTI: &str = "instance.allow_multi";
 /// H3: days without download progress before a pending is marked stalled (default 7).

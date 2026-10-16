@@ -275,6 +275,14 @@ impl Downloader for RoutedDownloader<'_> {
         self.client_for(torrent)?.remember_identity(torrent, hash)
     }
 
+    fn select_files(
+        &self,
+        torrent: &Torrent,
+        keep: &dyn Fn(&str) -> bool,
+    ) -> Result<usize, DownloaderError> {
+        self.client_for(torrent)?.select_files(torrent, keep)
+    }
+
     fn add(&self, torrent: &Torrent) -> Result<(), DownloaderError> {
         let id = match self.pending.get(&torrent.enclosure) {
             Some(id) => *id,

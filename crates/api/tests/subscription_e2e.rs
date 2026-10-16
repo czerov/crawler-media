@@ -50,6 +50,8 @@ mod m1_overlap_policy;
 mod m2_owned_slot_skip;
 #[path = "subscription_e2e/m3_split_admission.rs"]
 mod m3_split_admission;
+#[path = "subscription_e2e/f1_selective_files.rs"]
+mod f1_selective_files;
 #[path = "subscription_e2e/m6_deletion_retry.rs"]
 mod m6_deletion_retry;
 #[path = "subscription_e2e/s1_wash_probe_fail.rs"]

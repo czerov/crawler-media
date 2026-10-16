@@ -95,6 +95,17 @@ pub trait Downloader: Send + Sync {
         ))
     }
 
+    /// F-1: mark files for which `keep(name)` is false as not-to-download.
+    /// Returns how many files were skipped (0 when the file list is not known
+    /// yet or the client cannot select files).
+    fn select_files(
+        &self,
+        _torrent: &Torrent,
+        _keep: &dyn Fn(&str) -> bool,
+    ) -> Result<usize, DownloaderError> {
+        Ok(0)
+    }
+
     /// Canonical actual task identity, not a title-derived snapshot match.
     /// None means ownership cannot be proven (including legacy HTTP deliveries).
     fn owned_identity(&self, torrent: &Torrent) -> Result<Option<String>, DownloaderError> {
