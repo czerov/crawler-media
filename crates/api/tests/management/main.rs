@@ -69,6 +69,7 @@ mod library_sidecar_cancellation;
 mod library_pagination_and_sorting;
 mod library_video;
 mod media_alias_links;
+mod obscura_install;
 mod obscura_lifecycle;
 mod playback;
 mod playback_clock;
