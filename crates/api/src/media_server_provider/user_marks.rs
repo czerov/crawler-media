@@ -35,27 +35,12 @@ pub(super) fn resolve_effective_played(
     season_unit: Option<(&crate::store::UnitState, i64)>,
     show_unit: Option<(&crate::store::UnitState, i64)>,
 ) -> bool {
-    if episode_unit.is_some_and(|(unit, _)| unit.played) {
-        return true;
-    }
-    let episode_updated_at = episode_unit.map(|(_, updated_at)| updated_at);
-    if let Some((_, updated_at)) = [season_unit, show_unit]
+    [episode_unit, season_unit, show_unit]
         .into_iter()
-        .flatten()
-        .filter(|(unit, _)| unit.played)
-        .max_by_key(|(_, updated_at)| *updated_at)
-        && episode_updated_at.is_none_or(|episode_updated_at| updated_at > episode_updated_at)
-    {
-        return true;
-    }
-    if episode_unit.is_some() {
-        return false;
-    }
-    [season_unit, show_unit]
-        .into_iter()
-        .flatten()
-        .max_by_key(|(_, updated_at)| *updated_at)
-        .is_some_and(|(unit, _)| unit.played)
+        .enumerate()
+        .filter_map(|(specificity, unit)| unit.map(|(state, updated_at)| (updated_at, 2 - specificity, state.played)))
+        .max_by_key(|(updated_at, specificity, _)| (*updated_at, *specificity))
+        .is_some_and(|(_, _, played)| played)
 }
 pub(super) fn item_is_played(
     store: &crate::Store,

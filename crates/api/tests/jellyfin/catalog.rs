@@ -75,6 +75,35 @@ async fn newer_show_played_mark_supersedes_older_unplayed_season_everywhere() {
     assert_eq!(get_json(&app, &format!("/Items/{}", episode.to_string().replace('-', ""))).await["UserData"]["Played"], true);
     assert!(get_json(&app, "/Shows/NextUp").await["Items"].as_array().unwrap().is_empty());
 }
+#[tokio::test]
+async fn newer_season_unplayed_mark_wins_detail_and_listing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _, _) = app(tmp.path());
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("tv-mark-precedence");
+    std::fs::create_dir_all(&root).unwrap();
+    store.create_library(MediaKind::Tv, "Mark precedence", &[root.to_str().unwrap()], "everyone", true, &[]).unwrap();
+    let show = new_media(MediaKind::Tv, "Mark precedence show");
+    store.insert_media(&show).unwrap();
+    let episode = insert_episode(&store, &root, show.id, 1, 1);
+    let user = store.admin_user_id().unwrap();
+    store.upsert_unit(user, show.id, 1, 1, 0, Some(true), None, None, None, None, false, 10).unwrap();
+    store.upsert_unit(user, show.id, 1, -1, 0, Some(false), None, None, None, None, false, 20).unwrap();
+    drop(store);
+
+    let episode_id = episode.to_string().replace('-', "");
+    assert_eq!(get_json(&app, &format!("/Items/{episode_id}")).await["UserData"]["Played"], false);
+    let listing = get_json(&app, "/Items").await;
+    let listed_show = listing["Items"].as_array().unwrap().iter().find(|item| item["Name"] == "Mark precedence show").unwrap();
+    assert_eq!(listed_show["UserData"]["Played"], false);
+    let next_up = get_json(&app, "/Shows/NextUp").await;
+    assert!(next_up["Items"].as_array().unwrap().iter().any(|item| item["Id"] == episode_id));
+
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    store.upsert_unit(user, show.id, 1, 1, 0, Some(true), None, None, None, None, false, 30).unwrap();
+    drop(store);
+    assert_eq!(get_json(&app, &format!("/Items/{episode_id}")).await["UserData"]["Played"], true);
+}
 
 #[tokio::test]
 async fn native_season_favorite_does_not_resurrect_explicitly_unplayed_episode() {
