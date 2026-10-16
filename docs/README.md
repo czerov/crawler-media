@@ -29,7 +29,7 @@
 | [0003 Site credentials](<adr/0003-plaintext-site-credentials.md>) | 有意的 SQLite 明文凭证边界，不等于可日志输出／进 Git |
 | [0005 Jellyfin](<adr/0005-jellyfin-compatible-playback.md>) | 实际客户端协议子集；未实现 UserConfiguration 明确保留 |
 | [0006 Indexer](<adr/0006-indexer-in-first-slice.md>) | 架构 rationale，不是当前外网验收结果 |
-| [0007 Browser](<adr/0007-cdp-browser-opt-in.md>) | Browser 仅用于登录/签到；导航前回退 HTTP；受管 Obscura；不主动删除 Browser cookie；fresh-start 无迁移 |
+| [0007 Browser](<adr/0007-cdp-browser-opt-in.md>) | Browser 仅用于登录/签到；导航前回退 HTTP；受管 Obscura；每会话独立 BrowserContext；存量库增量升级（r9） |
 | [0008 SQLite](<adr/0008-sqlite-system-of-record.md>) | 四 Store 生命周期分区＋jobs/fanart；root_id／路径与历史背景已更正 |
 | [0009 Job](<adr/0009-job-queue.md>) | Interval／queued-running 约束／状态事实；不宣称专用单写线程或全局 2 runner 上限 |
 | [0010 Password](<adr/0010-password-hashing.md>) | Argon2id；其他独立 credential 生命周期历史计划不得机械重跑 |

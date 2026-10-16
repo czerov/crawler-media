@@ -25,6 +25,12 @@
 
 - 2026-10-16 r7：按第六轮复审修订。R6-L1：T0 实测 Obscura 是否拒收公共后缀级 cookie，不拒收时清理一律删除并告警、必要时并发 1；R6-L2：IP 规范化为 `IpAddr::to_string()`；R6-L3：T1 验收确认构建镜像 rustc ≥ 1.88。
 - 2026-10-16 r8：按用户决定修订。Node 最低版本升至 22；取消所有 CDP/Site 设置迁移与旧数据兼容，要求空数据目录且应用不自动删数据；cookie 改为只做 host-only 注入与当前 Site URL 定向回读，不调用任何 cookie 删除/清空命令，保留第三方 Browser 原有及会话新增 cookie；补充 JobKind/worker 分发文件。
+- 2026-10-16 r9：按独立实现审核（/workspace/cdp-impl-review.md B1–B3、H1–H6）修订，**取代 r8 中的两条决定**：
+  1. 撤回 fresh-start：v7 及更早的库通过 `ensure_column(sites.maintenance_via DEFAULT 'http')` 增量升级到 app schema 8，存量 Site 一律为 `http`；只保留"版本高于本程序"的降级保护。
+  2. 撤回"完全不删 cookie"：每个会话通过 `Target.createBrowserContext` 建立独立上下文，用 `Target.createTarget{browserContextId}` 打开页面，结束时 `Target.disposeBrowserContext`。不删除、也不触碰其他上下文（包括外部浏览器用户）的 cookie，会话之间完全隔离。端点不支持 BrowserContext 时，以 `endpoint incompatible:` 前缀的 BrowserSetup 报错，并标记该端点为不兼容（导航前失败，回退 HTTP）。回读时，同名 cookie 以 host-only 优先。
+  3. 只有导航前失败（`BrowserSetup`/`BrowserBusy` → `PluginError::BrowserPreNavigation`）才回退 HTTP；回退时不再发第二次 Hook 事件。端点配置错误不再被吞掉。
+  4. 受管 daemon 的启停按 `ReconcileWant{switch_on, instance_endpoint_configured, managed_browser_sites}` 判定，未启动原因为 `switch_off`/`instance_endpoint_configured`/`no_managed_browser_sites`；Site 写入后触发 reconcile。启动在 blocking 线程池执行，start/stop 互斥；进程组 + PDEATHSIG；回收时识别 ` (deleted)`；手动 start/stop 同步更新端点。
+  5. T0：已加 `crates/indexer/tests/obscura_t0.rs`（`#[ignore]`，需真实 Obscura）。真实端点的验证结果待补进 ADR-0007。
 
 ## 起点
 
@@ -63,7 +69,7 @@ worktree 当前代码基线为 `de124b0`（功能分支从此处分出），而 
 7. **受管二进制被篡改**：哈希不符、超过大小上限、归档含意外条目，一律拒绝安装且不留临时文件（Task 4）。
 8. **cookie 不得误删或覆盖第三方浏览器数据**：只 host-only 注入，按 Site URL 读取，不发 cookie delete/clear 命令；断言第三方与无关域 cookie 保持原样（Task 1）。
 9. **导航后失败的重复签到**：导航已发出后失败不得再走 HTTP 签到（Task 8）。
-10. **Fresh-start 合同**：新 schema 的 Site 默认 `http`、CDP 默认关闭；旧 schema 在任何写入前给出重置提示，不迁移、不自动删除数据（Task 2）。
+10. **升级合同（r9 取代 fresh-start）**：新/旧库的 Site 均默认 `http`、CDP 默认关闭；v7 库通过 `ensure_column` 增量升级，不自动删除数据（Task 2）。
 
 ---
 

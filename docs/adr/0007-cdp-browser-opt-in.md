@@ -32,7 +32,7 @@
 ### 并发与 cookie 隔离
 
 - **多标签并发**：同一 CDP endpoint 的 tab 共用 cookie jar；实例全局并发上限默认 3（1–8 可配），同一可注册域串行以避免同一 cookie 范围内的并发覆盖。外部/第三方 Browser 的 cookie jar 不视为应用私有数据。
-- **不主动删除 cookie**：不调用 `Network.deleteCookies`、`Network.clearBrowserCookies` 或 `Storage.clearCookies`，不遍历 jar 做批量清理。外部/第三方 Browser 的既有 cookie 与会话中新建或更新的 cookie 都保留在原 jar，由正常浏览器/站点过期策略管理。
+- **会话隔离而非删除**（r9）：不调用 `Network.deleteCookies`、`Network.clearBrowserCookies` 或 `Storage.clearCookies`；每个会话在独立 BrowserContext 中运行，结束即 dispose，第三方 Browser 默认上下文的 cookie 不受影响，会话 cookie 不跨会话残留。
 - **host-only 注入与定向回读**：Site 已配置的 cookie 只经 `Network.setCookies` 使用当前 Site URL 做 host-only 注入；不得使用 `Network.setExtraHTTPHeaders`（会发给第三方主机）。读取 cookie 只发 `Network.getCookies{urls:[当前 Site URL]}`，结果按 name 去重后合并回该 Site 的 cookie 字段；不读取或回写无关域的 cookie。
 - **host 规范化**：Site URL host 用于 cookie host-only 注入与并发分组时统一小写、去尾点、IDNA 转 ASCII、IPv6 去方括号并规范化；不遍历或归类 cookie domain。
 - **公共后缀 cookie 前提**：Task 0 实测 Obscura 是否拒收公共后缀级 cookie（如 `Domain=.co.uk`、`.github.io`）。若该 endpoint 接受此类 cookie，视为 cookie 隔离不兼容，不用它执行 Browser maintenance；不以删除全局 cookie 补救。
@@ -70,7 +70,7 @@
 
 ### Fresh-start 数据边界（不做兼容迁移）
 
-- 本功能从空数据目录开始；上线此分支前，运维需自行备份需要保留的数据，并删除旧 `<data>` 后再启动。应用**不得自动删除**用户数据。
+- （r9）存量数据目录原地增量升级，存量 Site 维护方式为 `http`；应用**不得自动删除**用户数据。
 - 新建数据库的 `sites` 基表包含 `maintenance_via TEXT NOT NULL DEFAULT 'http'`；所有新 Site 默认 HTTP。新设置只读写 `cdp.enabled`、`cdp.url` 与 `obscura.install`，不读取、不迁移、不兼容 `cdp.sync.enabled`、`obscura.enabled`、`obscura.url`。
 - 旧 schema/旧数据目录不受支持。启动时应在任何 schema 写入前明确报错并提示删除旧数据目录；不自动 ALTER/backfill 旧 Site、不自动改变 `maintenance_via`，不因旧 `cdp_url` 或 Profile `render: true` 自动开启 CDP。
 - Profile 中遗留的 `render: true` 不再控制搜索，加载时忽略并 `warn!`；不创建旧 Site 的 `legacy_site_notices`、旧端点扫描或兼容迁移 API。
@@ -86,6 +86,12 @@
 
 - 默认镜像仍不带 Chromium，也不带 Obscura。离线或默认（`preinstalled`）部署须按 deploy 文档预置二进制，或配置外部 `cdp.url`。
 - `CRAWLER_MEDIA_BROWSER` 只设置开关的启动默认值（仅在 `cdp.enabled` 未设置时写入），不再导致启动失败；它**不**决定是否下载，也不保证启动浏览器（见上方启动条件）。
+
+## r9 修订（2026-10-16，取代 r8 中的 fresh-start 与"不删 cookie"）
+- **数据升级**：不要求空数据目录。v7 库增量补 `sites.maintenance_via`（默认 `http`），已有数据全部保留。
+- **会话隔离**：每个 Browser 会话使用独立的 BrowserContext（`Target.createBrowserContext` → `createTarget{browserContextId}` → `disposeBrowserContext`）。本应用不调用任何 cookie 删除命令，也不会碰到其他上下文里的 cookie；会话结束后，该会话的 cookie 随上下文一起销毁，因此不会串号，也不会残留凭据。不支持 BrowserContext 的端点标记为不兼容，登录/签到在导航前回退 HTTP。
+- **回退边界**：只有导航前失败（BrowserSetup/BrowserBusy）才回退 HTTP，且回退时不重复发 Hook 事件；导航后的失败原样报告。
+- **T0 验证表（待补）**：Obscura v0.2.3 对 `Target.createBrowserContext`、`getCookies{urls}`、拒收公共后缀 cookie 的支持情况，用 `cargo test -p indexer --test obscura_t0 -- --ignored`（设置 `OBSCURA_CDP_URL`）验证后填入。
 
 ## 历史边界（2026-10-10，已被上一节取代）
 
