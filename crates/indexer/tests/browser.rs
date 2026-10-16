@@ -729,3 +729,51 @@ fn render_respects_the_total_deadline_and_closes_the_target() {
     assert!(closed.load(std::sync::atomic::Ordering::Relaxed));
 }
 
+
+fn plain_req(proxy: Option<&str>) -> FetchRequest {
+    FetchRequest {
+        key: "t".into(),
+        url: "https://example.org/".into(),
+        method: FetchMethod::Get,
+        body: None,
+        cookie: Some("a=b".into()),
+        api_key: None,
+        proxy: proxy.map(Into::into),
+        cdp_url: Some("http://127.0.0.1:9222".into()),
+    }
+}
+
+#[test]
+fn render_rejects_proxy_before_opening_a_target() {
+    let opened = Arc::new(Mutex::new(0));
+    let o = opened.clone();
+    let browser = Browser::with_opener(BrowserConfig::enabled_for_test(), move |_| {
+        *o.lock().unwrap() += 1;
+        Err(IndexerError::BrowserSetup("unused".into()))
+    });
+    let err = browser.render(&plain_req(Some("http://proxy:8080"))).unwrap_err();
+    assert!(matches!(err, IndexerError::BrowserSetup(_)), "{err:?}");
+    assert_eq!(*opened.lock().unwrap(), 0);
+}
+
+#[test]
+fn cookie_injection_failure_is_setup_but_content_failure_is_not() {
+    struct P(bool);
+    impl PageSession for P {
+        fn goto(&self, _: &str) -> Result<(), IndexerError> { Ok(()) }
+        fn set_site_cookies(&self, _: &str, _: &str) -> Result<(), IndexerError> {
+            if self.0 { Err(IndexerError::Fetch("setCookies".into())) } else { Ok(()) }
+        }
+        fn content(&self) -> Result<String, IndexerError> { Err(IndexerError::Fetch("after goto".into())) }
+    }
+    let b = Browser::with_opener(BrowserConfig::enabled_for_test(), |_| Ok(Arc::new(P(true)) as Arc<dyn PageSession>));
+    assert!(matches!(b.render(&plain_req(None)), Err(IndexerError::BrowserSetup(_))));
+    let b = Browser::with_opener(BrowserConfig::enabled_for_test(), |_| Ok(Arc::new(P(false)) as Arc<dyn PageSession>));
+    assert!(matches!(b.render(&plain_req(None)), Err(IndexerError::Fetch(_))));
+}
+
+#[test]
+fn try_group_key_errors_on_unnormalizable_host() {
+    assert!(indexer::browser_host::try_group_key("").is_err());
+    assert_eq!(indexer::browser_host::try_group_key("a.example.org").unwrap(), "example.org");
+}

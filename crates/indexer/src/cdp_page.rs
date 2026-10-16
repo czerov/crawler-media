@@ -25,7 +25,7 @@ impl CdpPageSession {
         operation: impl FnOnce(&mut Transport, Instant) -> Result<T, IndexerError>,
     ) -> Result<T, IndexerError> {
         let now = Instant::now();
-        let deadline = match *self.deadline.lock().unwrap() {
+        let deadline = match *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) {
             Some(d) => now + TIMEOUT.min(d.saturating_duration_since(now)),
             None => now + TIMEOUT,
         };
@@ -88,6 +88,11 @@ impl PageSession for CdpPageSession {
             .host()
             .ok_or_else(|| IndexerError::BrowserSetup("missing host for cookies".into()))?;
         let norm_host = crate::browser_host::normalize_host(host)?;
+        let norm_host = if norm_host.contains(':') {
+            format!("[{norm_host}]")
+        } else {
+            norm_host
+        };
         let port_part = uri.port_u16().map(|p| format!(":{p}")).unwrap_or_default();
         let origin = format!("{scheme}://{norm_host}{port_part}/");
         let secure = scheme == "https";
@@ -151,7 +156,7 @@ impl PageSession for CdpPageSession {
     }
 
     fn set_deadline(&self, deadline: Instant) {
-        *self.deadline.lock().unwrap() = Some(deadline);
+        *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) = Some(deadline);
     }
 }
 
@@ -196,7 +201,31 @@ fn http_agent(timeout: Duration) -> ureq::Agent {
         .new_agent()
 }
 
+/// Open a page target. Every failure here happens before navigation, so it is
+/// reported as `BrowserSetup` (or `BrowserBusy`) and callers may fall back.
 pub fn open_cdp_session_until(
+    cdp_url: &str,
+    deadline: Instant,
+    target_close_cap: Duration,
+) -> Result<CdpPageSession, IndexerError> {
+    open_cdp_session_inner(cdp_url, deadline, target_close_cap).map_err(into_setup)
+}
+
+pub(crate) fn into_setup(error: IndexerError) -> IndexerError {
+    match error {
+        IndexerError::BrowserBusy | IndexerError::BrowserSetup(_) => error,
+        other => IndexerError::BrowserSetup(other.to_string()),
+    }
+}
+
+fn default_port(uri: &tungstenite::http::Uri) -> u16 {
+    uri.port_u16().unwrap_or(match uri.scheme_str() {
+        Some("https") | Some("wss") => 443,
+        _ => 80,
+    })
+}
+
+fn open_cdp_session_inner(
     cdp_url: &str,
     deadline: Instant,
     target_close_cap: Duration,
@@ -237,8 +266,8 @@ pub fn open_cdp_session_until(
     let ws_uri: tungstenite::http::Uri = ws_url.parse().map_err(|e| failure("WS URL", e))?;
     let base_host = base_uri.host().unwrap_or("");
     let ws_host = ws_uri.host().unwrap_or("");
-    let base_port = base_uri.port_u16().unwrap_or(80);
-    let ws_port = ws_uri.port_u16().unwrap_or(80);
+    let base_port = default_port(&base_uri);
+    let ws_port = default_port(&ws_uri);
     let norm_base = crate::browser_host::normalize_host(base_host)?;
     let norm_ws = crate::browser_host::normalize_host(ws_host)?;
     if norm_base != norm_ws || base_port != ws_port {
@@ -255,7 +284,10 @@ pub fn open_cdp_session_until(
         json!({"enabled": true}),
         deadline,
     )?;
-    *session.transport.get_mut().unwrap() = Some(transport);
+    *session
+        .transport
+        .get_mut()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(transport);
     tracing::debug!(target_id = %session.target_id, "CDP page session opened");
     Ok(session)
 }

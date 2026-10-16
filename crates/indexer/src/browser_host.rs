@@ -26,11 +26,23 @@ pub fn normalize_host(raw: &str) -> Result<String, IndexerError> {
 }
 
 /// Derives a grouping key for concurrency control based on registrable domain (eTLD+1).
+/// Like [`group_key`] but fails when the host cannot be normalized, instead of
+/// grouping by the raw string. Used on the request path.
+pub fn try_group_key(host: &str) -> Result<String, crate::IndexerError> {
+    let normalized = normalize_host(host)?;
+    Ok(group_key_normalized(normalized))
+}
+
+/// Infallible variant: an unnormalizable host groups by its raw lowercase form.
+/// Prefer [`try_group_key`] on any request path.
 pub fn group_key(host: &str) -> String {
-    let normalized = match normalize_host(host) {
-        Ok(n) => n,
+    match normalize_host(host) {
+        Ok(n) => group_key_normalized(n),
         Err(_) => host.trim().to_ascii_lowercase(),
-    };
+    }
+}
+
+fn group_key_normalized(normalized: String) -> String {
 
     if normalized.parse::<IpAddr>().is_ok() {
         return normalized;

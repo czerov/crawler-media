@@ -248,6 +248,11 @@ impl Browser {
 
     pub fn render(&self, request: &FetchRequest) -> Result<RenderedPage, IndexerError> {
         self.validate_timing()?;
+        if request.proxy.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+            return Err(IndexerError::BrowserSetup(
+                "Browser 不支持站点代理（proxy 与 browser 互斥）".into(),
+            ));
+        }
         let deadline = Instant::now() + self.render_deadline;
         let uri: tungstenite::http::Uri = request
             .url
@@ -256,8 +261,7 @@ impl Browser {
         let host = uri
             .host()
             .ok_or_else(|| IndexerError::BrowserSetup("missing host in request URL".into()))?;
-        let norm_host = crate::browser_host::normalize_host(host)?;
-        let group = crate::browser_host::group_key(&norm_host);
+        let group = crate::browser_host::try_group_key(host)?;
 
         let slot = self
             .slots
@@ -267,7 +271,8 @@ impl Browser {
 
         let result = (|| {
             if let Some(cookie) = &request.cookie {
-                page.set_site_cookies(&request.url, cookie)?;
+                page.set_site_cookies(&request.url, cookie)
+                    .map_err(crate::cdp_page::into_setup)?;
             }
             page.goto(&request.url)?;
             let html = page.content()?;
