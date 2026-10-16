@@ -6,6 +6,7 @@ pub mod password;
 pub use http_fetcher::HttpFetcher;
 mod air_gate;
 mod instance_lease;
+mod completion;
 mod selective_files;
 mod season_check;
 mod catalog_refresh;

@@ -107,6 +107,10 @@ fn search(state: &ApiState, job: &Job, rss_batch: Option<&RssBatch>) -> Result<(
     if subscribe.tracking_state == "paused" {
         return Ok(());
     }
+    let mut subscribe = subscribe;
+    if crate::completion::skip_search(state, &mut subscribe) {
+        return Ok(());
+    }
     if job.kind == JobKind::SubscribeSearch
         && subscribe.fetch_mode != FetchMode::Rss
         && crate::air_gate::all_wanted_unaired(state, &subscribe, &media)
@@ -231,6 +235,7 @@ pub(crate) fn notify_subscription_complete(
     subscribe: &domain::Subscribe,
     media: &domain::Media,
 ) -> Result<(), String> {
+    crate::completion::mark_if_complete(state, subscribe);
     if matches!(
         subscribe.coverage,
         domain::Coverage::Tv {
