@@ -420,6 +420,14 @@ impl Downloader for TransmissionDownloader {
     }
 
     fn completed_files(&self, torrent: &Torrent) -> Result<Vec<PathBuf>, DownloaderError> {
+        let (files, done) = self.collectable_files(torrent)?;
+        Ok(if done { files } else { Vec::new() })
+    }
+
+    fn collectable_files(
+        &self,
+        torrent: &Torrent,
+    ) -> Result<(Vec<PathBuf>, bool), DownloaderError> {
         let arguments = self.rpc(
             "torrent-get",
             json!({
@@ -432,7 +440,7 @@ impl Downloader for TransmissionDownloader {
             .and_then(Value::as_array)
             .unwrap_or(&empty);
         let Some(owned_hash) = self.owned_identity(torrent)? else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         };
         let matched: Vec<&Value> = torrents
             .iter()
@@ -443,7 +451,7 @@ impl Downloader for TransmissionDownloader {
             })
             .collect();
         if matched.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         if matched.len() > 1 {
             tracing::error!(torrent = %torrent.title, matched_count = matched.len(), "匹配到多个任务存在歧义，拒绝收集文件");
@@ -452,17 +460,15 @@ impl Downloader for TransmissionDownloader {
             ));
         }
         let target_item = matched[0];
-        if target_item
+        // percentDone covers the wanted files only.
+        let done = target_item
             .get("percentDone")
             .and_then(Value::as_f64)
             .unwrap_or(0.0)
-            < 1.0
-        {
-            return Ok(Vec::new());
-        }
+            >= 1.0;
         let mut files = Vec::new();
         extract_item_files(target_item, &self.config.path_maps, &mut files);
-        Ok(files)
+        Ok((files, done))
     }
 
     fn task_snapshots(&self) -> Result<Vec<crate::TaskSnapshot>, DownloaderError> {

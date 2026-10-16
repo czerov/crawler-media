@@ -310,6 +310,29 @@ impl Downloader for QbitDownloader {
             .collect())
     }
 
+    fn collectable_files(
+        &self,
+        torrent: &Torrent,
+    ) -> Result<(Vec<PathBuf>, bool), DownloaderError> {
+        let Some(info) = self.owned_info(torrent)? else {
+            return Ok((Vec::new(), false));
+        };
+        let listed = self.torrent_files(&info.hash)?;
+        let wanted_done = listed.iter().any(|file| file.priority > 0)
+            && listed
+                .iter()
+                .filter(|file| file.priority > 0)
+                .all(|file| file.progress >= 1.0);
+        let done = info.progress >= 1.0 || wanted_done;
+        let files = listed
+            .into_iter()
+            .filter(|file| file.priority > 0 && file.progress >= 1.0)
+            .map(|file| Path::new(&info.save_path).join(file.name))
+            .map(|path| apply_maps(&path, &self.config.path_maps))
+            .collect();
+        Ok((files, done))
+    }
+
     fn select_files(
         &self,
         torrent: &Torrent,

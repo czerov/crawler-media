@@ -98,8 +98,20 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
     // M2: video files skipped because their slots were already owned.
     let mut duplicate = false;
     let errors_before_torrent = collection_errors.len();
-    let completed_files = match added.input.downloader.completed_files(&scored.torrent) {
-        Ok(files) => files,
+    // D-L1: finished files are collected while the rest of the task is still
+    // downloading; the task only counts as transferred once it is done.
+    // Move would take files away from a running task, so it waits.
+    let (completed_files, task_done) = match added
+        .input
+        .downloader
+        .collectable_files(&scored.torrent)
+    {
+        Ok((files, done))
+            if done || !matches!(added.input.transfer_mode, Some(library::TransferMode::Move)) =>
+        {
+            (files, done)
+        }
+        Ok(_) => (Vec::new(), false),
         Err(error) => {
             tracing::error!(torrent = %scored.torrent.title, error = %error, "读取已完成下载文件失败");
             collection_errors.push(format!("{}: {error}", scored.torrent.title));
@@ -200,7 +212,7 @@ fn collect_scored_torrent<D: Downloader + ?Sized>(
     }
     // A download that only duplicated owned episodes (M2) is finished too.
     let has_work = !torrent_destinations.is_empty() || subs_count > 0 || duplicate;
-    if reported_any && has_work && collection_errors.len() == errors_before_torrent {
+    if task_done && reported_any && has_work && collection_errors.len() == errors_before_torrent {
         transferred_enclosures.push(scored.torrent.enclosure.clone());
     }
     if vetoed && !rejected_enclosures.contains(&scored.torrent.enclosure) {

@@ -132,6 +132,21 @@ impl MockQbit {
         };
     }
 
+    /// D-L1: set one file's progress (and the task's average progress).
+    pub fn set_file_progress(&self, index: usize, file: usize, progress: f64) {
+        let mut tasks = self.tasks.lock();
+        let task = &mut tasks[index];
+        task.files[file].1 = progress;
+        let total: f64 = task.files.iter().map(|(_, p)| p).sum();
+        task.progress = total / task.files.len() as f64;
+        task.state = if task.progress >= 1.0 {
+            "uploading"
+        } else {
+            "downloading"
+        }
+        .into();
+    }
+
     /// Finish task `index`: rename it, write the given files (relative to the
     /// task folder) with `content`, and mark everything 100%.
     pub fn complete(&self, index: usize, name: &str, files: &[(&str, &[u8])]) -> Vec<PathBuf> {

@@ -112,6 +112,13 @@ impl Downloader for DynamicDownloader {
         delegate!(self, completed_files(torrent))
     }
 
+    fn collectable_files(
+        &self,
+        torrent: &Torrent,
+    ) -> Result<(Vec<std::path::PathBuf>, bool), DownloaderError> {
+        delegate!(self, collectable_files(torrent))
+    }
+
     fn uploaded_by_category(&self, category: &str) -> Result<u64, DownloaderError> {
         delegate!(self, uploaded_by_category(category))
     }

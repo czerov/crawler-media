@@ -66,6 +66,8 @@ mod l4_completion_marker;
 mod l5_rejected_episode_bound;
 #[path = "subscription_e2e/l6_deletion_lock_audit.rs"]
 mod l6_deletion_lock_audit;
+#[path = "subscription_e2e/d_l1_partial_collect.rs"]
+mod d_l1_partial_collect;
 #[path = "subscription_e2e/m1_overlap_policy.rs"]
 mod m1_overlap_policy;
 #[path = "subscription_e2e/m2_owned_slot_skip.rs"]

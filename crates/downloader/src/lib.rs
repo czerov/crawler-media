@@ -73,6 +73,18 @@ pub trait Downloader: Send + Sync {
     }
     fn completed_files(&self, torrent: &Torrent) -> Result<Vec<PathBuf>, DownloaderError>;
 
+    /// D-L1: files finished so far (even while other files of the task are
+    /// still downloading) and whether the task's wanted files are all done.
+    /// The default keeps the whole-task behaviour of `completed_files`.
+    fn collectable_files(
+        &self,
+        torrent: &Torrent,
+    ) -> Result<(Vec<PathBuf>, bool), DownloaderError> {
+        let files = self.completed_files(torrent)?;
+        let done = !files.is_empty();
+        Ok((files, done))
+    }
+
     /// Uploaded bytes for torrents in a category (boost/刷流 stats).
     /// Downloaders without upload telemetry return 0.
     fn uploaded_by_category(&self, _category: &str) -> Result<u64, DownloaderError> {

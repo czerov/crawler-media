@@ -328,6 +328,13 @@ impl Downloader for RoutedDownloader<'_> {
         self.client_for(torrent)?.completed_files(torrent)
     }
 
+    fn collectable_files(
+        &self,
+        torrent: &Torrent,
+    ) -> Result<(Vec<std::path::PathBuf>, bool), DownloaderError> {
+        self.client_for(torrent)?.collectable_files(torrent)
+    }
+
     fn remove(&self, torrent: &Torrent, delete_files: bool) -> Result<(), DownloaderError> {
         self.client_for(torrent)?.remove(torrent, delete_files)
     }
