@@ -31,12 +31,16 @@ pub(crate) async fn patch_subscription(
             "订阅正在删除，无法修改",
         );
     }
+    let auto_next_season = body.auto_next_season;
     let (previous, subscribe, media) = match load_and_patch(&state, sid, user_id, body) {
         Ok(result) => result,
         Err(response) => return response,
     };
     if let Err(response) = persist_subscription(&state, &previous, &subscribe) {
         return response;
+    }
+    if let Some(auto) = auto_next_season {
+        crate::completion::set_auto_next_season(&state, subscribe.id, auto);
     }
     let store = state.store.lock();
     let facts = store.load_subscribe_facts(subscribe.id).unwrap_or_default();

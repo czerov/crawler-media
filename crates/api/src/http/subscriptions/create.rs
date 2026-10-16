@@ -159,6 +159,7 @@ fn persist_subscription(
     coverage: Coverage,
     body: CreateSubscriptionInput,
 ) -> Response {
+    let auto_next_season = body.auto_next_season;
     let incoming = incoming_media(media_kind, media_input);
     let subscribe =
         match subscribe_from_input(&state, user_id, incoming.id, fetch_mode, coverage, &body) {
@@ -183,6 +184,9 @@ fn persist_subscription(
                 );
             }
         };
+    if auto_next_season {
+        crate::completion::set_auto_next_season(&state, subscribe.id, true);
+    }
     let facts = {
         let store = state.store.lock();
         store.load_subscribe_facts(subscribe.id).unwrap_or_default()
