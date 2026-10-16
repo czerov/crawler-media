@@ -205,9 +205,8 @@ fn naming_templates_and_library_roots_have_defaults() {
 }
 
 #[test]
-fn legacy_libraries_table_is_rejected_by_fresh_start() {
-    // CDP 计划 r8：只支持 fresh-start。旧库（libraries 缺 access_mode 等列）不再迁移，
-    // 而是在任何写入前拒绝打开，且不改动/删除旧数据。
+fn legacy_libraries_table_gains_visibility_columns() {
+    // 模拟 Block 6 之前的旧库：libraries 表没有 access_mode 等列。
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
@@ -225,19 +224,17 @@ fn legacy_libraries_table_is_rejected_by_fresh_start() {
     .unwrap();
     drop(app);
 
-    assert!(crate::Store::open(&data).is_err(), "旧 schema 必须被 fresh-start 拒绝");
-
-    let app = rusqlite::Connection::open(data.join("app.db")).unwrap();
-    let cols: Vec<String> = app
-        .prepare("SELECT name FROM pragma_table_info('libraries')")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert!(!cols.iter().any(|c| c == "access_mode"), "拒绝前不得迁移列");
-    let rows: i64 = app.query_row("SELECT COUNT(*) FROM libraries", [], |r| r.get(0)).unwrap();
-    assert_eq!(rows, 1, "旧数据保持原样，不自动删除");
+    let store = crate::Store::open(&data).unwrap();
+    let libraries = store.list_libraries().unwrap();
+    // seed_defaults 会为缺省类型补默认库，旧电影库 + 新剧集库 = 2。
+    assert_eq!(libraries.len(), 2, "旧库行保留且默认库补齐");
+    let legacy = libraries
+        .iter()
+        .find(|l| l.name == "旧电影库")
+        .expect("旧库行");
+    assert_eq!(legacy.access_mode, "everyone", "新列按默认值补齐");
+    assert_eq!(legacy.admin_visible, true);
+    assert!(legacy.member_ids.is_empty());
 }
 
 #[test]

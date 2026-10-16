@@ -31,42 +31,30 @@ fn empty_data_directory_initializes_the_current_schema() {
 }
 
 #[test]
-fn existing_legacy_schema_is_rejected_before_any_schema_or_settings_write() {
+fn v7_database_upgrades_and_existing_sites_stay_http() {
     let dir = tempdir().unwrap();
+    // Build a current DB, then strip it back to the v7 shape (no maintenance_via).
+    drop(Store::open(dir.path()).unwrap());
     let app_path = dir.path().join("app.db");
     {
         let conn = Connection::open(&app_path).unwrap();
+        conn.execute_batch("ALTER TABLE sites DROP COLUMN maintenance_via;").unwrap();
+        conn.execute(
+            "INSERT INTO sites (id, name, url, profile_id, enabled) VALUES (?1, 'old', 'https://old.example/', 'demo', 1)",
+            [domain::SiteId::new().to_string()],
+        )
+        .unwrap();
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('keep', 'legacy_data')", []).unwrap();
         conn.pragma_update(None, "user_version", 7).unwrap();
-        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);").unwrap();
-        conn.execute("INSERT INTO settings (key, value) VALUES ('keep', 'legacy_data')", []).unwrap();
     }
 
-    let res = Store::open(dir.path());
-    let err_msg = match res {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("Store::open on old v7 schema must fail"),
-    };
-    assert!(err_msg.contains("空数据目录") || err_msg.contains("不兼容") || err_msg.contains("不受支持") || err_msg.contains("fresh"));
-
-    // Verify store never deleted or modified existing legacy data
+    let store = Store::open(dir.path()).expect("v7 database must upgrade, not be rejected");
+    let sites = store.list_sites().unwrap();
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].maintenance_via, domain::MaintenanceVia::Http);
+    assert_eq!(store.get_setting("keep").unwrap().as_deref(), Some("legacy_data"));
+    drop(store);
     let conn = Connection::open(&app_path).unwrap();
-    let val: String = conn.query_row("SELECT value FROM settings WHERE key='keep'", [], |r| r.get(0)).unwrap();
-    assert_eq!(val, "legacy_data");
-}
-
-#[test]
-fn store_never_deletes_existing_data_on_fresh_start_rejection() {
-    let dir = tempdir().unwrap();
-    let app_path = dir.path().join("app.db");
-    {
-        let conn = Connection::open(&app_path).unwrap();
-        conn.pragma_update(None, "user_version", 6).unwrap();
-        conn.execute_batch("CREATE TABLE user_data (id TEXT PRIMARY KEY);").unwrap();
-    }
-
-    assert!(Store::open(dir.path()).is_err());
-    assert!(app_path.exists());
-    let conn = Connection::open(&app_path).unwrap();
-    let count: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE name='user_data'", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 1);
+    let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+    assert_eq!(v, 8, "app schema bumped to 8 by the maintenance_via migration");
 }

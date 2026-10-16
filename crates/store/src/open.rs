@@ -39,8 +39,6 @@ impl Store {
             ("library", &library, schema::LIBRARY_SCHEMA_VERSION),
             ("subscribe", &subscribe, schema::SUBSCRIBE_SCHEMA_VERSION),
         ])?;
-        // Fresh-start 纯只读预检：app 库必须是全新或当前版本，拒绝旧版本旧数据。
-        schema::ensure_fresh_start(&app)?;
         // Enable WAL mode and set busy timeout for all connections.
         for conn in [&app, &catalog, &library, &subscribe] {
             apply_connection_policy(conn)?;

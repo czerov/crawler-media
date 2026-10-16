@@ -50,38 +50,6 @@ pub(crate) fn ensure_supported_versions(
     Ok(())
 }
 
-/// Fresh-start 纯只读预检：
-/// 全新 DB 必须是 user_version = 0 且无用户表，或者已经是当前目标版本。
-/// 任何低于版本 8 的旧 app DB 都明确拒绝并提示清空数据目录，应用绝不自动删除或迁移旧数据。
-pub(crate) fn ensure_fresh_start(
-    app: &Connection,
-) -> Result<(), StoreError> {
-    let version = read_schema_version(app)?;
-    if version > APP_SCHEMA_VERSION {
-        return Err(StoreError::Invalid(format!(
-            "app database schema version {version} is newer than supported {APP_SCHEMA_VERSION}"
-        )));
-    }
-    if version > 0 && version < APP_SCHEMA_VERSION {
-        return Err(StoreError::Invalid(format!(
-            "旧数据库 schema (版本 {version}) 不受支持，本版本要求从空数据目录启动，请备份需要保留的文件并清空 <data> 目录后重启"
-        )));
-    }
-    if version == 0 {
-        let table_count: i64 = app.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-            [],
-            |row| row.get(0),
-        )?;
-        if table_count > 0 {
-            return Err(StoreError::Invalid(
-                "检测到非空旧数据库，本版本要求从空数据目录启动，请备份需要保留的文件并清空 <data> 目录后重启".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Set the schema version after successful migration.
 fn set_schema_version(conn: &Connection, version: i64) -> Result<(), StoreError> {
     conn.pragma_update(None, "user_version", version)?;
@@ -104,6 +72,14 @@ pub fn migrate_app(conn: &Connection) -> Result<(), StoreError> {
     // Library 行已不存在」的键，重复执行安全，对 v7 老库也不是空操作。
     crate::library_deletion::repair_removed_library_settings(conn)?;
     ensure_column(conn, "downloaders", "path_maps", "TEXT")?;
+    // app schema 8：Site 维护方式。存量 Site（v7 及更早）一律补成 `http`，
+    // 与旧版本只走 HTTP 登录/签到的行为一致；不会自动切到 Browser。
+    ensure_column(
+        conn,
+        "sites",
+        "maintenance_via",
+        "TEXT NOT NULL DEFAULT 'http' CHECK (maintenance_via IN ('http','browser'))",
+    )?;
     // downloaders.enabled：停用的下载器不参与自动投递（手动提交仍可用）。
     ensure_column(conn, "downloaders", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(conn, "users", "role", "TEXT NOT NULL DEFAULT 'member'")?;
