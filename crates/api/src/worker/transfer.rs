@@ -1,6 +1,6 @@
 use domain::{LedgerRow, Media, Subscribe, SubscribeId};
 use filter::ScoredTorrent;
-use subscribe::{Added, RunInput, RunOutcome, SubscribeFacts, collect_completed_controlled};
+use subscribe::{Added, RunInput, RunOutcome, SubscribeFacts, collect_completed_recorded};
 
 use crate::management::ApiState;
 use crate::scrape_store::ScrapeStoreExt;
@@ -53,7 +53,6 @@ fn commit_transfer_outcome(
     subscribe: &Subscribe,
     outcome: &RunOutcome,
     lease: &crate::library_lifecycle::LibraryWorkLease,
-    plan: &TransferPlan,
     observation_revisions: &store::ReadRevisions,
 ) -> Result<(), String> {
     // Re-validate observation against current DB state before side effect
@@ -143,25 +142,40 @@ fn commit_transfer_outcome(
         }
     }
 
-    // Physical deletion of replaced files outside Store lock (after DB durability)
-    for path in &outcome.removed_paths {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::error!(path, %e, "物理删除旧文件失败"),
-        }
-    }
-
-    // Delete removed ledger rows in short Store section
-    if !outcome.removed_paths.is_empty() {
-        let store = state.store.lock();
-        for path in &outcome.removed_paths {
-            let _ = store.delete_ledger_path(path);
-        }
-    }
-
+    cleanup_replaced_files(state, outcome)?;
     let library_id = lease.library_id().to_string();
     state.projection.mark_dirty(&library_id);
+    Ok(())
+}
+
+fn cleanup_replaced_files(state: &ApiState, outcome: &RunOutcome) -> Result<(), String> {
+    // Only retire old rows after their files are gone. The new rows/source
+    // mappings remain durable on cleanup failure, so retries reuse them.
+    let mut removed = Vec::with_capacity(outcome.removed_paths.len());
+    let mut errors = Vec::new();
+    for path in &outcome.removed_paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => removed.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => removed.push(path),
+            Err(error) => {
+                tracing::error!(path, %error, "物理删除旧文件失败，保留台账行");
+                errors.push(format!("{path}: {error}"));
+            }
+        }
+    }
+    if !removed.is_empty() {
+        let store = state.store.lock();
+        for path in removed {
+            if let Err(error) = store.delete_ledger_path(path) {
+                tracing::error!(path, %error, "删除已替换文件的台账行失败");
+                errors.push(format!("{path}: {error}"));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(format!("Transfer replacement cleanup failed: {}", errors.join("; ")));
+    }
     Ok(())
 }
 
@@ -305,6 +319,69 @@ fn resolve_transfer_plan(
     })
 }
 
+pub(crate) struct PublicationRecorder<'a> {
+    pub state: &'a ApiState,
+    pub subscribe: &'a Subscribe,
+    pub lease: &'a crate::library_lifecycle::LibraryWorkLease,
+    pub revisions: store::ReadRevisions,
+}
+
+impl subscribe::TransferRecorder for PublicationRecorder<'_> {
+    fn prepare(&self, row: &LedgerRow, source: &std::path::Path, mode: library::TransferMode)
+        -> Result<LedgerRow, subscribe::SubscribeError>
+    {
+        let result = (|| -> Result<LedgerRow, String> {
+            let store = self.state.store.lock();
+            self.lease.control().check().map_err(|error| error.to_string())?;
+            if !store.library_accepts_work(self.lease.library_id()).map_err(|e| e.to_string())?
+                || store.read_revisions().map_err(|e| e.to_string())?.app != self.revisions.app
+                || store.get_subscribe(self.subscribe.id).map_err(|e| e.to_string())?.as_ref() != Some(self.subscribe)
+            {
+                return Err("Transfer source or Library configuration changed".into());
+            }
+            let mode = match mode {
+                library::TransferMode::Copy => "copy",
+                library::TransferMode::Move => "move",
+                library::TransferMode::Hardlink => "hardlink",
+            };
+            store.prepare_transfer(row, mode, &source.display().to_string()).map_err(|e| e.to_string())
+        })();
+        result.map_err(|error| {
+            tracing::error!(path = %row.path, %error, "Transfer publication reservation failed");
+            subscribe::SubscribeError::Downloader(downloader::DownloaderError::Message(error))
+        })
+    }
+
+    fn published(&self, row: &LedgerRow) -> Result<(), subscribe::SubscribeError> {
+        self.state.store.lock().complete_transfer_publication(row).map_err(|error| {
+            tracing::error!(path = %row.path, %error, "Transfer publication completion failed");
+            subscribe::SubscribeError::Downloader(downloader::DownloaderError::Message(error.to_string()))
+        })
+    }
+}
+
+/// Join existing Library work before observing facts or acquiring our own lease.
+/// In particular, a first scan must not claim a just-published Transfer file while
+/// probing is still running and before its authoritative ledger row is committed.
+fn wait_for_transfer_library(state: &ApiState, library_id: &str) -> Result<bool, String> {
+    let started = std::time::Instant::now();
+    let runtime = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
+    // Match the Library lifecycle drain budget; never hold Store while waiting.
+    let idle = runtime.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            state.wait_library_idle(library_id),
+        )
+        .await
+        .is_ok()
+    });
+    if !idle {
+        tracing::warn!(library_id, elapsed_ms = started.elapsed().as_millis(),
+            "Library 工作尚未结束，保留待处理下载供下一轮 Transfer 重试");
+    }
+    Ok(idle)
+}
+
 pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), String> {
     let guard = state.subscribe_guard(subscribe_id);
     let _guard = guard.lock();
@@ -333,11 +410,16 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
         return Ok(());
     }
 
+    let media = state.store.lock().get_media(subscribe.media_id)
+        .map_err(|error| error.to_string())?.ok_or("Media not found")?;
+    let plan = resolve_transfer_plan(state, &media, &subscribe)?;
+    if !wait_for_transfer_library(state, &plan.library_id)? {
+        return Ok(());
+    }
     let (media, filter, facts, wash_filter, observation_revisions) = load_transfer_context(state, &subscribe)?;
     let routed = crate::delivery::RoutedDownloader::with_pending(state, &subscribe, &pending);
     let chosen = filter_matched_pending(&subscribe, &media, pending);
 
-    let plan = resolve_transfer_plan(state, &media, &subscribe)?;
     let library_lease = state.acquire_library_work(&plan.library_id)?;
     library_lease.control().check().map_err(|e| e.to_string())?;
     tracing::info!(%subscribe_id, pending_count = chosen.len(), "Transfer 开始");
@@ -363,11 +445,14 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
     );
 
     let destinations = routed.imported_destinations().map_err(|e| e.to_string())?;
-    let outcome = collect_completed_controlled(
+    let recorder = PublicationRecorder { state, subscribe: &subscribe,
+        lease: &library_lease, revisions: observation_revisions };
+    let outcome = collect_completed_recorded(
         added,
         &library::Ffprobe::default(),
         &destinations,
         library_lease.control(),
+        Some(&recorder),
     )
     .map_err(|e| e.to_string())?;
     if state.subscribe_is_deleting(subscribe_id) {
@@ -382,7 +467,7 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
 
     library_lease.control().check().map_err(|e| e.to_string())?;
     let ledger_count = outcome.ledger.len();
-    commit_transfer_outcome(state, &subscribe, &outcome, &library_lease, &plan, &observation_revisions)?;
+    commit_transfer_outcome(state, &subscribe, &outcome, &library_lease, &observation_revisions)?;
 
     crate::http::library::enqueue_probes_for_rows(state, &outcome.ledger);
     if ledger_count > 0 {

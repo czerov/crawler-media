@@ -35,6 +35,46 @@ fn sample_media(id: MediaId) -> Media {
 }
 
 #[test]
+fn unpublished_transfer_survives_presence_and_present_publication_clears_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let row = sample_ledger("/movies/pending.mkv", MediaId::new());
+    store.insert_ledger(&row).unwrap();
+    let db = rusqlite::Connection::open(tmp.path().join("library.db")).unwrap();
+    db.execute("UPDATE ledger SET transfer_pending = 1 WHERE id = ?1", [row.id.to_string()]).unwrap();
+    for mode in [LedgerPresenceMode::Verify, LedgerPresenceMode::Prune] {
+        let result = store.apply_ledger_presence(&[LedgerPresenceObservation {
+            row: row.clone(), missing_at: None, presence: FilePresence::Missing,
+        }], mode, 100).unwrap();
+        assert_eq!(result.skipped, 1);
+        assert!(store.ledger_by_path(&row.path).unwrap().is_some());
+        assert!(store.missing_at_by_path().unwrap().is_empty());
+    }
+    store.apply_ledger_presence(&[LedgerPresenceObservation {
+        row: row.clone(), missing_at: None, presence: FilePresence::Present,
+    }], LedgerPresenceMode::Verify, 200).unwrap();
+    let pending: bool = db.query_row("SELECT transfer_pending FROM ledger WHERE id = ?1",
+        [row.id.to_string()], |r| r.get(0)).unwrap();
+    assert!(!pending);
+}
+
+#[test]
+fn pending_publication_migrates_idempotently_without_marking_existing_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let row = sample_ledger("/movies/existing.mkv", MediaId::new());
+    store.insert_ledger(&row).unwrap();
+    drop(store);
+    let db = rusqlite::Connection::open(tmp.path().join("library.db")).unwrap();
+    db.execute_batch("ALTER TABLE ledger DROP COLUMN transfer_pending; PRAGMA user_version=12;").unwrap();
+    for _ in 0..2 {
+        let store = Store::open(tmp.path()).unwrap();
+        assert!(!store.transfer_pending(&row.path).unwrap());
+        assert_eq!(store.ledger_by_path(&row.path).unwrap().unwrap().id, row.id);
+    }
+}
+
+#[test]
 fn stale_observation_does_not_delete_replacement_ledger() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path().join("data")).unwrap();

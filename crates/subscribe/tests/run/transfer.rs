@@ -1,5 +1,72 @@
 use super::*;
 
+struct ReservationRecorder(std::cell::RefCell<Option<domain::LedgerRow>>);
+
+impl subscribe::TransferRecorder for ReservationRecorder {
+    fn prepare(&self, row: &domain::LedgerRow, _: &Path, _: TransferMode)
+        -> Result<domain::LedgerRow, subscribe::SubscribeError>
+    {
+        assert!(!Path::new(&row.path).exists(), "reservation must precede publication");
+        *self.0.borrow_mut() = Some(row.clone());
+        Ok(row.clone())
+    }
+
+    fn published(&self, row: &domain::LedgerRow) -> Result<(), subscribe::SubscribeError> {
+        assert!(Path::new(&row.path).is_file());
+        assert_eq!(self.0.borrow().as_ref().unwrap().id, row.id);
+        Ok(())
+    }
+}
+
+#[test]
+fn recorded_collection_reserves_intended_path_before_publication() {
+    let tmp = tempfile::tempdir().unwrap();
+    let media = media_movie();
+    let filter = movie_filter();
+    let sub = movie_sub(&media, &filter, false);
+    let torrent = torrent("The.Matrix.1999.1080p.BluRay.x264-GROUP", "recorded");
+    let source = tmp.path().join("The.Matrix.1999.1080p.mkv");
+    fs::write(&source, b"video").unwrap();
+    let dl = MemoryDownloader::new(tmp.path().join("stage"));
+    map_file(&dl, &torrent, source);
+    let root = tmp.path().join("lib");
+    let added = subscribe::admit_and_add(run_input(&sub, &media, &filter, vec![torrent],
+        SubscribeFacts::default(), &dl, &root)).unwrap();
+    let recorder = ReservationRecorder(Default::default());
+    let outcome = subscribe::collect_completed_recorded(added, &FixedProbe, &[],
+        &library::WorkControl::default(), Some(&recorder)).unwrap();
+    assert_eq!(outcome.ledger.len(), 1);
+    assert_eq!(outcome.ledger[0].path, recorder.0.borrow().as_ref().unwrap().path);
+    assert!(outcome.collection_errors.is_empty());
+}
+
+#[test]
+fn pending_publication_retry_reuses_reserved_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let media = media_movie();
+    let filter = movie_filter();
+    let sub = movie_sub(&media, &filter, false);
+    let torrent = torrent("The.Matrix.1999.1080p.BluRay.x264-GROUP", "pending");
+    let source = tmp.path().join("The.Matrix.1999.1080p.mkv");
+    fs::write(&source, b"video").unwrap();
+    let dl = MemoryDownloader::new(tmp.path().join("stage"));
+    map_file(&dl, &torrent, source.clone());
+    let root = tmp.path().join("lib");
+    let destination = root.join("reserved.mkv");
+    let mut mapping = subscribe::collection_destinations::DestinationMapping::new(
+        tmp.path().join("stage").join(source.file_name().unwrap()).display().to_string(), &destination);
+    mapping.transfer_pending = true;
+    let added = subscribe::admit_and_add(run_input(&sub, &media, &filter, vec![torrent],
+        SubscribeFacts::default(), &dl, &root)).unwrap();
+    let recorder = ReservationRecorder(Default::default());
+    let outcome = subscribe::collect_completed_recorded(added, &FixedProbe, &[mapping],
+        &library::WorkControl::default(), Some(&recorder)).unwrap();
+    assert!(outcome.collection_errors.is_empty());
+    assert_eq!(outcome.ledger.len(), 1);
+    assert_eq!(outcome.ledger[0].path, destination.display().to_string());
+    assert_eq!(fs::read_dir(root).unwrap().count(), 1);
+}
+
 #[test]
 fn transfer_ledger_row_uses_probed_quality() {
     let tmp = tempfile::tempdir().unwrap();

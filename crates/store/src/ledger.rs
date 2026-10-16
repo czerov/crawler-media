@@ -81,6 +81,49 @@ impl Store {
         Ok(())
     }
 
+    /// Reserve a final path before filesystem publication. Existing identity is
+    /// never overwritten; only the same in-flight source can resume publication.
+    pub fn prepare_transfer(&self, row: &LedgerRow, mode: &str, source: &str)
+        -> Result<LedgerRow, StoreError>
+    {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.library, rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if let Some(existing) = self.ledger_by_path(&row.path)? {
+            let owned: bool = tx.query_row(
+                "SELECT transfer_pending = 1 AND COALESCE(source_path = ?2, 0) FROM ledger WHERE path = ?1",
+                params![row.path, source], |r| r.get(0),
+            )?;
+            if existing.media_id != row.media_id || !owned {
+                return Err(StoreError::Protected("Transfer destination already owned".into()));
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+        self.insert_ledger_with_mode_and_source(row, Some(mode), Some(source))?;
+        tx.execute("UPDATE ledger SET transfer_pending = 1 WHERE id = ?1", [row.id.to_string()])?;
+        tx.commit()?;
+        tracing::info!(ledger_id = %row.id, path = %row.path, "Reserved Transfer destination");
+        Ok(row.clone())
+    }
+
+    pub fn transfer_pending(&self, path: &str) -> Result<bool, StoreError> {
+        Ok(self.library.query_row("SELECT transfer_pending FROM ledger WHERE path = ?1",
+            [path], |r| r.get(0)).optional()?.unwrap_or(false))
+    }
+
+    pub fn complete_transfer_publication(&self, row: &LedgerRow) -> Result<(), StoreError> {
+        let changed = self.library.execute(
+            "UPDATE ledger SET transfer_pending = 0 WHERE id = ?1 AND media_id = ?2 AND path = ?3",
+            params![row.id.to_string(), row.media_id.to_string(), row.path],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Protected("Transfer reservation changed".into()));
+        }
+        tracing::info!(ledger_id = %row.id, path = %row.path, "Completed Transfer publication");
+        Ok(())
+    }
+
     fn insert_ledger_with_optional_source(
         &self,
         row: &LedgerRow,

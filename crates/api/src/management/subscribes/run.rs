@@ -297,7 +297,11 @@ fn execute(
     let destinations = routed
         .imported_destinations()
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    let mut outcome = subscribe::run_with_destinations_controlled(
+    let revisions = state.store.lock().read_revisions()?;
+    let recorder = crate::worker::transfer::PublicationRecorder {
+        state, subscribe: &context.subscribe, lease: &library_lease, revisions,
+    };
+    let added = subscribe::admit_and_add(
         RunInput {
             subscribe: &context.subscribe,
             media: &context.media,
@@ -314,10 +318,16 @@ fn execute(
             naming: Some(&naming),
             preserve_removed: true,
         },
-        &library::Ffprobe::default(),
-        &destinations,
-        library_lease.control(),
     )?;
+    let mut outcome = subscribe::collect_completed_recorded(
+        added, &library::Ffprobe::default(), &destinations,
+        library_lease.control(), Some(&recorder),
+    )?;
+    if !outcome.submission_errors.is_empty() && outcome.torrents_added.is_empty() {
+        return Err(subscribe::SubscribeError::Downloader(
+            downloader::DownloaderError::Message(outcome.submission_errors.join("; ")),
+        ).into());
+    }
     library_lease
         .control()
         .check()

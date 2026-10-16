@@ -7,6 +7,7 @@ pub struct DestinationMapping {
     pub destination_path: PathBuf,
     pub slots: Vec<(Option<u32>, Option<u32>)>,
     pub quality: Option<Release>,
+    pub transfer_pending: bool,
 }
 
 impl DestinationMapping {
@@ -16,6 +17,7 @@ impl DestinationMapping {
             destination_path: destination_path.into(),
             slots: Vec::new(),
             quality: None,
+            transfer_pending: false,
         }
     }
 
@@ -30,6 +32,7 @@ impl DestinationMapping {
             destination_path: destination_path.into(),
             slots,
             quality,
+            transfer_pending: false,
         }
     }
 }

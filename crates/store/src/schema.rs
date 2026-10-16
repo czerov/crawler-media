@@ -15,7 +15,7 @@ mod scan_operations;
 /// The version is stored via `PRAGMA user_version` on each database file.
 pub const APP_SCHEMA_VERSION: i64 = 7;
 pub const CATALOG_SCHEMA_VERSION: i64 = 2;
-pub const LIBRARY_SCHEMA_VERSION: i64 = 12;
+pub const LIBRARY_SCHEMA_VERSION: i64 = 13;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 5;
 
 /// Read the current schema version from a database file.
@@ -251,6 +251,7 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
     ensure_column(conn, "ledger", "missing_at", "INTEGER")?;
     ensure_column(conn, "ledger", "transfer_mode", "TEXT")?;
     ensure_column(conn, "ledger", "source_path", "TEXT")?;
+    ensure_column(conn, "ledger", "transfer_pending", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "ledger", "release_quality", "TEXT")?;
     ensure_column(conn, "file_meta", "chapters_json", "TEXT")?;
     ensure_column(conn, "file_meta", "video_json", "TEXT")?;
