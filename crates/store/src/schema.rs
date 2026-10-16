@@ -340,6 +340,9 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
         "state",
         "TEXT NOT NULL DEFAULT 'active'",
     )?;
+    // H3 stalled: last observed progress and when it last increased.
+    ensure_column(conn, "pending_downloads", "last_progress", "REAL")?;
+    ensure_column(conn, "pending_downloads", "last_progress_at", "INTEGER")?;
     // Index on (subscribe_id, state) — must come after the state column exists.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS pending_downloads_sub_state_idx \

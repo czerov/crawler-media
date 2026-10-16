@@ -4,6 +4,7 @@
 mod app_write;
 mod instance_lock;
 mod pending_file_deletions;
+mod pending_progress;
 mod browse_projection;
 pub use browse_projection::{
     BrowseFileFacts, BrowseMediaFacts, ProjectionBuild, ProjectionSnapshot, ReadRevisions,

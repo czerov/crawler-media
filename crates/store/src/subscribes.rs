@@ -111,7 +111,7 @@ impl Store {
         let next_state = if revive_rejected {
             "'active'"
         } else {
-            "CASE WHEN pending_downloads.state = 'rejected' THEN 'rejected' ELSE 'active' END"
+            "CASE WHEN pending_downloads.state IN ('rejected', 'stalled') THEN pending_downloads.state ELSE 'active' END"
         };
         let submitted = if refresh_submitted_at {
             "submitted_at = excluded.submitted_at,"
@@ -214,7 +214,7 @@ impl Store {
         subscribe_id: SubscribeId,
     ) -> Result<std::collections::HashSet<String>, StoreError> {
         let mut stmt = self.subscribe.prepare(
-            "SELECT enclosure FROM pending_downloads WHERE subscribe_id = ?1 AND state = 'rejected'",
+            "SELECT enclosure FROM pending_downloads WHERE subscribe_id = ?1 AND state IN ('rejected', 'stalled')",
         )?;
         let rows = stmt.query_map(params![subscribe_id.to_string()], |row| row.get::<_, String>(0))?;
         let mut out = std::collections::HashSet::new();

@@ -95,9 +95,70 @@ pub(crate) fn reconcile_subscribe(
                 Err(error) => tracing::error!(%subscribe_id, %error, "后台对账删除 pending 失败"),
             }
         }
+        if let Some(list) = list {
+            if is_stalled(state, subscribe_id, &item, list, now) {
+                continue;
+            }
+        }
         kept.push((score, item));
     }
     kept
+}
+
+/// H3 stalled: default days without progress before a pending is released.
+pub(crate) const DEFAULT_STALLED_TIMEOUT_DAYS: i64 = 7;
+
+fn stalled_timeout_secs(state: &ApiState) -> i64 {
+    let days = state
+        .store
+        .lock()
+        .get_setting(crate::settings_keys::SUBSCRIBE_STALLED_TIMEOUT_DAYS)
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(DEFAULT_STALLED_TIMEOUT_DAYS);
+    days * 86_400
+}
+
+/// Record the task's progress; mark the row `stalled` (task untouched) when
+/// it has not progressed for longer than the threshold. Returns true if marked.
+fn is_stalled(
+    state: &ApiState,
+    subscribe_id: SubscribeId,
+    item: &store::PendingDownload,
+    snapshots: &[downloader::TaskSnapshot],
+    now: i64,
+) -> bool {
+    let Some(snapshot) = snapshots.iter().find(|s| snapshot_matches_pending(&item.torrent, s)) else {
+        return false;
+    };
+    if snapshot.progress >= 1.0 {
+        return false;
+    }
+    let enclosure = &item.torrent.enclosure;
+    let last = match state.store.lock().touch_pending_progress(subscribe_id, enclosure, snapshot.progress, now) {
+        Ok(Some(last)) => last,
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::warn!(%subscribe_id, %error, "记录下载进度失败");
+            return false;
+        }
+    };
+    if now - last < stalled_timeout_secs(state) {
+        return false;
+    }
+    match state.store.lock().mark_pending_stalled(subscribe_id, enclosure) {
+        Ok(()) => {
+            tracing::warn!(%subscribe_id, torrent = %item.torrent.title, idle_secs = now - last,
+                "下载长时间无进度：标记 stalled 并释放占位（不删除下载器任务）");
+            true
+        }
+        Err(error) => {
+            tracing::error!(%subscribe_id, %error, "标记 stalled 失败");
+            false
+        }
+    }
 }
 
 #[cfg(test)]

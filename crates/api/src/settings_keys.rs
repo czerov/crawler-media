@@ -47,3 +47,5 @@ pub const SUBSCRIBE_AIR_DATE_GATE: &str = "subscribe.air_date_gate";
 pub const SUBSCRIBE_OVERLAP_POLICY: &str = "subscribe.overlap_policy";
 /// G-M5: "1"/"true" allows several instances on one data directory (unsafe).
 pub const INSTANCE_ALLOW_MULTI: &str = "instance.allow_multi";
+/// H3: days without download progress before a pending is marked stalled (default 7).
+pub const SUBSCRIBE_STALLED_TIMEOUT_DAYS: &str = "subscribe.stalled_timeout_days";
