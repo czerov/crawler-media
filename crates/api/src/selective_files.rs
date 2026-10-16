@@ -42,10 +42,30 @@ pub(crate) fn missing_episodes(
 
 /// Keep a file unless it names only episodes outside `missing`. Files without a
 /// recognisable episode (nfo, extras) are kept.
+///
+/// Review H-2: a file name without a season marker (`Show - E03.mkv`) parses
+/// with the default season 1 (`season_inferred`). Such a file inherits the
+/// season of its folder when the folder names one, else the subscribed season
+/// (the season of `missing`), so a season-2 pack is not deselected wholesale.
 pub(crate) fn keep_file(name: &str, missing: &BTreeSet<(u32, u32)>) -> bool {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let mut parts: Vec<&str> = name.split(['/', '\\']).collect();
+    let base = parts.pop().unwrap_or(name);
     let parsed = release::parse(base);
-    let units = parsed.covered_episodes();
+    let mut units = parsed.covered_episodes();
+    if parsed.season_inferred {
+        let folder_season = parts
+            .iter()
+            .rev()
+            .map(|dir| release::parse(dir))
+            .find(|dir| dir.season.is_some() && !dir.season_inferred)
+            .and_then(|dir| dir.season);
+        let Some(season) = folder_season.or_else(|| missing.iter().next().map(|(s, _)| *s)) else {
+            return true;
+        };
+        for unit in &mut units {
+            unit.0 = season;
+        }
+    }
     units.is_empty() || units.iter().any(|unit| missing.contains(unit))
 }
 
@@ -154,6 +174,11 @@ mod tests {
         assert!(keep_file("Pack/Show.S01E02.1080p.mkv", &missing));
         assert!(!keep_file("Pack/Show.S01E01.1080p.mkv", &missing));
         assert!(keep_file("Pack/Show.nfo", &missing));
+        // H-2: season-less names inherit the folder / subscribed season.
+        let s2 = BTreeSet::from([(2, 3)]);
+        assert!(keep_file("Show.S02/Show - E03.mkv", &s2));
+        assert!(keep_file("Pack/Show - E03.mkv", &s2));
+        assert!(!keep_file("Pack/Show - E01.mkv", &s2));
         let set = BTreeSet::from([(1, 2), (2, 10)]);
         assert_eq!(decode(&encode(&set)), set);
     }

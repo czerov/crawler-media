@@ -349,6 +349,13 @@ impl Downloader for TransmissionDownloader {
         else {
             return Ok(None); // metadata not received yet
         };
+        let names = listed
+            .iter()
+            .map(|file| file.get("name").and_then(Value::as_str).unwrap_or(""));
+        if crate::selection_drops_all_videos(names, keep) {
+            tracing::warn!(hash = %hash, "选择性下载会跳过全部视频文件，放弃筛选、整包下载");
+            return Ok(Some(0));
+        }
         let skipped: Vec<usize> = Some(listed)
             .map(|files| {
                 files

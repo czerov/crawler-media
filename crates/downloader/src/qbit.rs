@@ -345,6 +345,10 @@ impl Downloader for QbitDownloader {
         if files.is_empty() {
             return Ok(None); // metadata not received yet
         }
+        if crate::selection_drops_all_videos(files.iter().map(|f| f.name.as_str()), keep) {
+            tracing::warn!(hash = %hash, "选择性下载会跳过全部视频文件，放弃筛选、整包下载");
+            return Ok(Some(0));
+        }
         let skipped: Vec<String> = files
             .into_iter()
             .enumerate()
