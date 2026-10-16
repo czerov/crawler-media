@@ -121,7 +121,7 @@ Site 凭证（cookie / API key / RSS URL）按 [ADR-0003](<adr/0003-plaintext-si
 ### Obscura 受管浏览器补充（r9）
 - **预置方式**（`OBSCURA_INSTALL=preinstalled`，默认值），以下两种任选其一：
   - 把官方发布包放到 `<data>/bin/obscura.tar.gz`，程序会按写死的 sha256 校验后解包；
-  - 把 `obscura` 和 `obscura-worker` 两个二进制放进 `<data>/bin/`，并在同目录放一份 `obscura.sha256sums`（`sha256sum` 格式，每行一项）。两种方式下，每次启动都会重新校验二进制的 hash。
+  - 把 `obscura` 和 `obscura-worker` 两个二进制放进 `<data>/bin/`，并在同目录放一份 `obscura.sha256sums`（`sha256sum` 格式，每行一项）。两种方式下，每次启动都会重新校验二进制的 hash。注意：`obscura.sha256sums` 由部署者提供、与二进制放在同一目录，**只能防止文件损坏或误放，不能防篡改**——能改二进制的人也能改清单。需要防篡改时请使用官方发布包方式（hash 写死在程序里），或通过镜像/只读挂载保证 `<data>/bin` 可信。
 - **局域网或内网站点**：Obscura 默认禁止访问私网地址。如果确实需要，设置 `CRAWLER_MEDIA_OBSCURA_ALLOW_PRIVATE_NETWORK=1`（默认关闭，注意 SSRF 风险）。
 - **版本核对**用 `obscura --version`；不符时显示在状态的 `last_error` 里。
 - **进程回收**：daemon 以独立进程组运行，停止时整组回收。应用崩溃后，由下次启动时的 pidfile 回收。
