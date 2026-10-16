@@ -315,6 +315,8 @@ mod tests {
         assert!(absence_is_provable(&magnet, &generic_only));
         // Review M-2: an empty list is no evidence for HTTP torrents.
         assert!(!absence_is_provable(&http, &[]));
+        // Review L-8: nor for magnets (client may still be loading torrents).
+        assert!(!absence_is_provable(&magnet, &[]));
         let visible = vec![snapshot(&[downloader::ownership_tag("https://x/other")])];
         assert!(absence_is_provable(&http, &visible));
     }
