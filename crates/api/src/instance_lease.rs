@@ -18,6 +18,30 @@ pub const ALLOW_MULTI_INSTANCE_ENV: &str = "CRAWLER_MEDIA_ALLOW_MULTI_INSTANCE";
 pub struct InstanceLease {
     store: Arc<Mutex<Store>>,
     owner: String,
+    /// H-1: set by the heartbeat when another instance took the lease over.
+    lost: std::sync::atomic::AtomicBool,
+}
+
+impl InstanceLease {
+    pub(crate) fn is_lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn env_ms(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+}
+
+/// H-1: how often a read-only instance retries the lease (TTL/2).
+pub(crate) fn retry_interval() -> Duration {
+    env_ms(
+        "CRAWLER_MEDIA_LEASE_RETRY_MS",
+        Duration::from_secs((INSTANCE_LEASE_TTL_SECS / 2) as u64),
+    )
 }
 
 impl Drop for InstanceLease {
@@ -66,6 +90,7 @@ pub(crate) fn acquire(store: &Arc<Mutex<Store>>) -> std::io::Result<Option<Arc<I
     let lease = Arc::new(InstanceLease {
         store: store.clone(),
         owner,
+        lost: std::sync::atomic::AtomicBool::new(false),
     });
     spawn_heartbeat(Arc::downgrade(&lease));
     Ok(Some(lease))
@@ -76,7 +101,7 @@ fn spawn_heartbeat(lease: Weak<InstanceLease>) {
         .name("instance-lease".into())
         .spawn(move || {
             loop {
-                std::thread::sleep(HEARTBEAT_EVERY);
+                std::thread::sleep(env_ms("CRAWLER_MEDIA_LEASE_HEARTBEAT_MS", HEARTBEAT_EVERY));
                 let Some(lease) = lease.upgrade() else { return };
                 let now = crate::job_loop::unix_now();
                 match lease
@@ -85,7 +110,11 @@ fn spawn_heartbeat(lease: Weak<InstanceLease>) {
                     .heartbeat_instance_lock(&lease.owner, now)
                 {
                     Ok(true) => {}
-                    Ok(false) => tracing::error!(owner = %lease.owner, "实例锁已被其他实例接管"),
+                    Ok(false) => {
+                        tracing::error!(owner = %lease.owner, "实例锁已被其他实例接管：停止后台任务并降级为只读");
+                        lease.lost.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
                     Err(error) => tracing::warn!(%error, "实例锁心跳失败"),
                 }
             }

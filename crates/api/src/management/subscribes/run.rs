@@ -34,6 +34,13 @@ pub(crate) async fn run_subscribe(
     axum::Extension(user_id): axum::Extension<UserId>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // H-1: manual runs write pending rows and library files.
+    if !state.instance_writable() {
+        return Err(lifecycle_conflict(
+            "instance.read_only",
+            "数据目录由另一个实例占用，本实例为只读模式",
+        ));
+    }
     let state_for_work = state.clone();
     // 整段同步业务 pipeline（搜索 → 准入 → 海报）都在 blocking worker 上跑到
     // 结束：订阅 guard / LibraryLease 在闭包内持有，响应语义不变（不是排队返回）。

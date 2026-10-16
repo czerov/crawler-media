@@ -286,6 +286,10 @@ pub(crate) async fn submit(
     axum::Extension(user_id): axum::Extension<Option<UserId>>,
     Json(body): Json<SubmitInput>,
 ) -> Response {
+    // H-1: manual submission writes pending rows.
+    if let Err(response) = state.require_writable() {
+        return response;
+    }
     if body
         .site_id
         .as_deref()
