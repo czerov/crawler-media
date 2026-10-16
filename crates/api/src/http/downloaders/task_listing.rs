@@ -313,7 +313,8 @@ mod tests {
         let generic_only = vec![snapshot(&[])];
         assert!(!absence_is_provable(&http, &generic_only));
         assert!(absence_is_provable(&magnet, &generic_only));
-        assert!(absence_is_provable(&http, &[]));
+        // Review M-2: an empty list is no evidence for HTTP torrents.
+        assert!(!absence_is_provable(&http, &[]));
         let visible = vec![snapshot(&[downloader::ownership_tag("https://x/other")])];
         assert!(absence_is_provable(&http, &visible));
     }
