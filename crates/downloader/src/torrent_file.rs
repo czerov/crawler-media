@@ -11,7 +11,7 @@ pub fn torrent_info_hash(bytes: &[u8]) -> Option<String> {
     let mut i = 1;
     while *bytes.get(i)? != b'e' {
         let (key, after_key) = read_string(bytes, i)?;
-        let end = skip(bytes, after_key)?;
+        let end = skip(bytes, after_key, 0)?;
         if key == b"info" {
             let digest = Sha1::digest(&bytes[after_key..end]);
             return Some(digest.iter().map(|b| format!("{b:02x}")).collect());
@@ -29,14 +29,18 @@ fn read_string(bytes: &[u8], i: usize) -> Option<(&[u8], usize)> {
     Some((bytes.get(start..end)?, end))
 }
 
+/// Review M-5: deepest list/dict nesting accepted. Real torrents nest a few
+/// levels; site responses are untrusted, so recursion is bounded.
+const MAX_DEPTH: usize = 64;
+
 /// End index (exclusive) of the bencoded value starting at `i`.
-fn skip(bytes: &[u8], i: usize) -> Option<usize> {
+fn skip(bytes: &[u8], i: usize, depth: usize) -> Option<usize> {
     match *bytes.get(i)? {
         b'i' => Some(i + bytes.get(i..)?.iter().position(|b| *b == b'e')? + 1),
-        b'l' | b'd' => {
+        b'l' | b'd' if depth < MAX_DEPTH => {
             let mut j = i + 1;
             while *bytes.get(j)? != b'e' {
-                j = skip(bytes, j)?;
+                j = skip(bytes, j, depth + 1)?;
             }
             Some(j + 1)
         }
@@ -68,6 +72,19 @@ mod tests {
     fn sha1_hex(data: &[u8]) -> String {
         use sha1::Digest;
         sha1::Sha1::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Review M-5: hostile nesting must not overflow the worker stack.
+    #[test]
+    fn deeply_nested_info_is_rejected_without_overflow() {
+        let depth = 100_000;
+        let mut torrent = b"d4:info".to_vec();
+        torrent.extend(std::iter::repeat_n(b'l', depth));
+        torrent.extend(std::iter::repeat_n(b'e', depth));
+        torrent.push(b'e');
+        assert_eq!(torrent_info_hash(&torrent), None);
+        // Ordinary nesting still works.
+        assert!(torrent_info_hash(b"d4:infod5:filesld4:pathl1:aeeeee").is_some());
     }
 
     #[test]
