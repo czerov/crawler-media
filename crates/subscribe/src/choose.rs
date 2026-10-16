@@ -632,7 +632,9 @@ fn is_pack(release: &Release, subscribe: &Subscribe) -> bool {
         return false;
     }
     // 明确标注了范围 E01-E10 的整季包，或者省略集号的 S01 纯季包
-    (release.episode == Some(episode_from) && release.episode_to == Some(episode_to))
+    // L2: an explicit range pack is accepted when it covers the whole window
+    // (E01-E13 for E01-E12); episodes outside the window are not imported.
+    matches!((release.episode, release.episode_to), (Some(from), Some(to)) if from <= episode_from && to >= episode_to)
         || (release.episode.is_none() && release.episode_to.is_none())
 }
 

@@ -708,3 +708,19 @@ fn l1_small_bare_season_is_not_a_pack() {
     let big = bare_pack(3_500_000_000);
     assert_eq!(choose(&subscribe, None, &[big, single], &facts).len(), 1);
 }
+
+#[test]
+fn l2_wider_range_pack_is_accepted() {
+    let mut subscribe = tv_subscribe(domain::MediaId::new());
+    subscribe.full_season_pack = true;
+    subscribe.coverage = Coverage::Tv {
+        season: 1,
+        episode_from: 1,
+        episode_to: Some(12),
+    };
+    let facts = SubscribeFacts::default();
+    let wide = scored("Show.S01E01-E13", 1, 13, 50);
+    assert_eq!(choose(&subscribe, None, &[wide], &facts).len(), 1);
+    let narrow = scored("Show.S01E01-E11", 1, 11, 50);
+    assert!(choose(&subscribe, None, &[narrow], &facts).is_empty());
+}
