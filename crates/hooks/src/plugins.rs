@@ -54,6 +54,7 @@ pub struct LoginPlugin<'a> {
     store: &'a dyn SiteCredentials,
     via: LoginVia<'a>,
     policy: &'a dyn SiteResponsePolicy,
+    emit_hook: bool,
 }
 
 enum LoginVia<'a> {
@@ -68,6 +69,7 @@ impl<'a> LoginPlugin<'a> {
             store,
             via: LoginVia::Http(http),
             policy: &DEFAULT_POLICY,
+            emit_hook: true,
         }
     }
 
@@ -77,11 +79,19 @@ impl<'a> LoginPlugin<'a> {
             store,
             via: LoginVia::Browser(browser),
             policy: &DEFAULT_POLICY,
+            emit_hook: true,
         }
     }
 
     pub fn with_policy(mut self, policy: &'a dyn SiteResponsePolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Skip the Bus hook event: used when a browser attempt already emitted it
+    /// and failed before navigation, so an HTTP fallback must not emit twice.
+    pub fn without_hook_event(mut self) -> Self {
+        self.emit_hook = false;
         self
     }
 
@@ -102,7 +112,9 @@ impl<'a> LoginPlugin<'a> {
     }
 
     fn login_inner(&self, id: SiteId) -> Result<(), PluginError> {
-        self.bus.emit(&HookEvent { step: Step::Login })?;
+        if self.emit_hook {
+            self.bus.emit(&HookEvent { step: Step::Login })?;
+        }
         let mut site = self.store.load(id)?;
         require_cookie(&site)?;
         // No credentials can be submitted: verify the supplied session, not an empty login form.
@@ -229,6 +241,7 @@ pub struct CheckInPlugin<'a> {
     store: &'a dyn SiteCredentials,
     via: Option<CheckInVia<'a>>,
     policy: &'a dyn SiteResponsePolicy,
+    emit_hook: bool,
 }
 
 impl<'a> CheckInPlugin<'a> {
@@ -238,6 +251,7 @@ impl<'a> CheckInPlugin<'a> {
             store,
             via: None,
             policy: &DEFAULT_POLICY,
+            emit_hook: true,
         }
     }
 
@@ -247,6 +261,7 @@ impl<'a> CheckInPlugin<'a> {
             store,
             via: Some(CheckInVia::Http(http)),
             policy: &DEFAULT_POLICY,
+            emit_hook: true,
         }
     }
 
@@ -256,11 +271,19 @@ impl<'a> CheckInPlugin<'a> {
             store,
             via: Some(CheckInVia::Browser(browser)),
             policy: &DEFAULT_POLICY,
+            emit_hook: true,
         }
     }
 
     pub fn with_policy(mut self, policy: &'a dyn SiteResponsePolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Skip the Bus hook event: used when a browser attempt already emitted it
+    /// and failed before navigation, so an HTTP fallback must not emit twice.
+    pub fn without_hook_event(mut self) -> Self {
+        self.emit_hook = false;
         self
     }
 
@@ -276,9 +299,11 @@ impl<'a> CheckInPlugin<'a> {
 
     fn check_in_inner(&self, id: SiteId) -> Result<(), PluginError> {
         let mut site = self.store.load(id)?;
-        self.bus.emit(&HookEvent {
-            step: Step::CheckIn,
-        })?;
+        if self.emit_hook {
+            self.bus.emit(&HookEvent {
+                step: Step::CheckIn,
+            })?;
+        }
         let via = self.via.as_ref().ok_or_else(|| {
             PluginError::Fetch("Check-in 不支持仅分发 Hook；请配置 transport".into())
         })?;

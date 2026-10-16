@@ -24,12 +24,12 @@ pub(crate) fn run_with_browser_fallback(
     action: &str,
     endpoint_resolves: Result<bool, PluginError>,
     browser: impl FnOnce() -> Result<(), PluginError>,
-    http: impl FnOnce() -> Result<(), PluginError>,
+    http: impl FnOnce(bool) -> Result<(), PluginError>,
 ) -> Result<(), PluginError> {
     if !endpoint_resolves? {
         tracing::warn!(site_id = %site.id, site_name = %site.name, action,
             "Browser CDP disabled or no endpoint, falling back to HTTP");
-        return http();
+        return http(false);
     }
     tracing::info!(site_id = %site.id, site_name = %site.name, action, "Attempting browser maintenance");
     match browser() {
@@ -37,7 +37,8 @@ pub(crate) fn run_with_browser_fallback(
         Err(error) if error.is_browser_pre_navigation() => {
             tracing::warn!(site_id = %site.id, site_name = %site.name, action, %error,
                 "Browser failed before navigation, falling back to HTTP");
-            http()
+            // The browser attempt already emitted the hook event.
+            http(true)
         }
         Err(error) => {
             tracing::error!(site_id = %site.id, site_name = %site.name, action, %error,
@@ -55,9 +56,12 @@ pub fn perform_login(
 ) -> Result<(), PluginError> {
     let policy = crate::check_in::site_policy(state, site)?;
     let http = crate::check_in::attendance_http();
-    let via_http = || LoginPlugin::http(bus, creds, &http).with_policy(&policy).login(site.id);
+    let via_http = |fallback: bool| {
+        let plugin = LoginPlugin::http(bus, creds, &http).with_policy(&policy);
+        if fallback { plugin.without_hook_event() } else { plugin }.login(site.id)
+    };
     match site.maintenance_via {
-        domain::MaintenanceVia::Http => via_http(),
+        domain::MaintenanceVia::Http => via_http(false),
         domain::MaintenanceVia::Browser => run_with_browser_fallback(
             site,
             "login",
@@ -80,13 +84,12 @@ pub fn perform_check_in(
 ) -> Result<(), PluginError> {
     let policy = crate::check_in::site_policy(state, site)?;
     let http = crate::check_in::attendance_http();
-    let via_http = || {
-        CheckInPlugin::http(bus, creds, &http)
-            .with_policy(&policy)
-            .check_in(site.id)
+    let via_http = |fallback: bool| {
+        let plugin = CheckInPlugin::http(bus, creds, &http).with_policy(&policy);
+        if fallback { plugin.without_hook_event() } else { plugin }.check_in(site.id)
     };
     match site.maintenance_via {
-        domain::MaintenanceVia::Http => via_http(),
+        domain::MaintenanceVia::Http => via_http(false),
         domain::MaintenanceVia::Browser => run_with_browser_fallback(
             site,
             "check_in",
@@ -129,8 +132,10 @@ mod tests {
         browser: Result<(), PluginError>,
     ) -> (Result<(), PluginError>, u32) {
         let http_calls = Cell::new(0u32);
+        let browser_was_pre_nav = matches!(browser, Err(PluginError::BrowserPreNavigation(_)));
         let s = site();
-        let r = run_with_browser_fallback(&s, "check_in", resolves, || browser, || {
+        let r = run_with_browser_fallback(&s, "check_in", resolves, || browser, |fallback| {
+            assert_eq!(fallback, matches!(browser_was_pre_nav, true));
             http_calls.set(http_calls.get() + 1);
             Ok(())
         });
