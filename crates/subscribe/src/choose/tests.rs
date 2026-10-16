@@ -256,7 +256,12 @@ fn huge_release_range_does_not_allocate_unbounded_choose_slots() {
         chosen.iter().any(|c| c.torrent.title.contains("S01E02")),
         "higher-scoring single episode must still win its slot: {chosen:?}"
     );
-    let chosen = choose(&subscribe, None, &[huge, precise], &SubscribeFacts::default());
+    let chosen = choose(
+        &subscribe,
+        None,
+        &[huge, precise],
+        &SubscribeFacts::default(),
+    );
     assert_eq!(chosen.len(), 1, "capped range must not explode chosen set");
 }
 
@@ -570,7 +575,11 @@ fn inferred_season_never_matches_a_later_season_subscribe() {
     let mut m = media("The Long Watch", None);
     m.kind = MediaKind::Tv;
     let mut subscribe = tv_subscribe(m.id);
-    subscribe.coverage = Coverage::Tv { season: 2, episode_from: 1, episode_to: Some(2) };
+    subscribe.coverage = Coverage::Tv {
+        season: 2,
+        episode_from: 1,
+        episode_to: Some(2),
+    };
     let mut guessed = release("The Long Watch Episode 1");
     guessed.season = Some(2);
     guessed.episode = Some(1);
@@ -584,7 +593,11 @@ fn ten_episode_subscribe() -> (Media, Subscribe) {
     let mut m = media("Show", None);
     m.kind = MediaKind::Tv;
     let mut subscribe = tv_subscribe(m.id);
-    subscribe.coverage = Coverage::Tv { season: 1, episode_from: 1, episode_to: Some(10) };
+    subscribe.coverage = Coverage::Tv {
+        season: 1,
+        episode_from: 1,
+        episode_to: Some(10),
+    };
     (m, subscribe)
 }
 
@@ -601,8 +614,14 @@ fn overlapping_pack_and_single_choose_exactly_one_per_policy() {
             .map(|c| c.torrent.title)
             .collect::<Vec<_>>()
     };
-    assert_eq!(pick(super::OverlapPolicy::PreferPack), vec!["pack".to_string()]);
-    assert_eq!(pick(super::OverlapPolicy::PreferEpisode), vec!["e06".to_string()]);
+    assert_eq!(
+        pick(super::OverlapPolicy::PreferPack),
+        vec!["pack".to_string()]
+    );
+    assert_eq!(
+        pick(super::OverlapPolicy::PreferEpisode),
+        vec!["e06".to_string()]
+    );
 }
 
 #[test]
@@ -611,10 +630,60 @@ fn non_overlapping_singles_are_each_chosen_and_best_score_wins_a_slot() {
     let picks = choose(
         &subscribe,
         None,
-        &[scored("e01", 1, 1, 50), scored("e02", 2, 2, 50), scored("e01-better", 1, 1, 70)],
+        &[
+            scored("e01", 1, 1, 50),
+            scored("e02", 2, 2, 50),
+            scored("e01-better", 1, 1, 70),
+        ],
         &SubscribeFacts::default(),
     );
     let mut titles: Vec<_> = picks.into_iter().map(|c| c.torrent.title).collect();
     titles.sort();
     assert_eq!(titles, vec!["e01-better".to_string(), "e02".to_string()]);
+}
+
+#[test]
+fn m9_scanned_2160p_is_not_replaced_by_high_scoring_1080p_without_ladder() {
+    let mut subscribe = tv_subscribe(domain::MediaId::new());
+    subscribe.wash_cut = true;
+    let mut facts = SubscribeFacts::default();
+    let path = "/library/Show.S01E01.mkv";
+    facts.replace(
+        Some(1),
+        Some(1),
+        crate::QualityFact {
+            score: 0, // scanned into the library: no filter score
+            path: Some(path.into()),
+        },
+    );
+    let mut old = release("Show");
+    old.resolution = Some("2160p".into());
+    facts.set_quality(path.into(), old);
+    let mut candidate = scored("Show.S01E01.1080p", 1, 1, 90);
+    candidate.release.resolution = Some("1080p".into());
+    assert!(choose(&subscribe, None, &[candidate], &facts).is_empty());
+}
+
+#[test]
+fn m9_same_quality_falls_back_to_score_tie_break() {
+    let mut subscribe = tv_subscribe(domain::MediaId::new());
+    subscribe.wash_cut = true;
+    let mut facts = SubscribeFacts::default();
+    let path = "/library/Show.S01E01.mkv";
+    facts.replace(
+        Some(1),
+        Some(1),
+        crate::QualityFact {
+            score: 10,
+            path: Some(path.into()),
+        },
+    );
+    let mut old = release("Show");
+    old.resolution = Some("1080p".into());
+    facts.set_quality(path.into(), old);
+    let mut better = scored("Show.S01E01.1080p.A", 1, 1, 20);
+    better.release.resolution = Some("1080p".into());
+    assert_eq!(choose(&subscribe, None, &[better.clone()], &facts).len(), 1);
+    better.score = 5;
+    assert!(choose(&subscribe, None, &[better], &facts).is_empty());
 }

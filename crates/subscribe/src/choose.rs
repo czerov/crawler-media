@@ -1,4 +1,3 @@
-
 use domain::{Coverage, Media, MediaKind, Release, Subscribe};
 use filter::ScoredTorrent;
 
@@ -10,7 +9,13 @@ pub fn choose(
     admitted: &[ScoredTorrent],
     facts: &SubscribeFacts,
 ) -> Vec<ScoredTorrent> {
-    choose_with_policy(subscribe, wash_filter, admitted, facts, OverlapPolicy::default())
+    choose_with_policy(
+        subscribe,
+        wash_filter,
+        admitted,
+        facts,
+        OverlapPolicy::default(),
+    )
 }
 
 /// How overlapping TV candidates (range pack vs single episodes) are resolved (M1).
@@ -66,7 +71,9 @@ fn choose_tv_greedy(
     let mut chosen: Vec<ScoredTorrent> = Vec::new();
     for (candidate, slots) in ranked {
         if slots.iter().any(|slot| claimed.contains(slot))
-            || chosen.iter().any(|c| c.torrent.enclosure == candidate.torrent.enclosure)
+            || chosen
+                .iter()
+                .any(|c| c.torrent.enclosure == candidate.torrent.enclosure)
         {
             continue;
         }
@@ -189,11 +196,17 @@ pub(crate) fn should_replace_slots(
                         })
                     }
                     None => {
-                        if !old_quality.as_ref().is_some_and(quality_known) {
+                        let Some(old) = old_quality.as_ref().filter(|q| quality_known(q)) else {
                             tracing::warn!(path = ?existing.path, "已有质量未知，拒绝按分数批准 Wash-cut");
                             return false;
+                        };
+                        // M9: built-in default ladder; score only breaks ties
+                        // between equal (comparable) quality.
+                        match default_ladder_compare(&candidate.release, old) {
+                            std::cmp::Ordering::Greater => true,
+                            std::cmp::Ordering::Equal => candidate.score > existing.score,
+                            std::cmp::Ordering::Less => false,
                         }
-                        candidate.score > existing.score
                     }
                 }
             }
@@ -334,6 +347,35 @@ fn ladder_compare(new: &Release, old: &Release, ladder: &[String]) -> Option<std
         }
     }
     Some(result)
+}
+
+/// M9: default `resolution,hdr,codec,source` ordering used when no
+/// UpgradeLadder is configured. Dimensions unknown on either side are skipped;
+/// any known downgrade makes the candidate worse.
+fn default_ladder_compare(new: &Release, old: &Release) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let dims: [(Option<&str>, Option<&str>, fn(&str) -> i32); 4] = [
+        (
+            new.resolution.as_deref(),
+            old.resolution.as_deref(),
+            resolution_level,
+        ),
+        (new.hdr.as_deref(), old.hdr.as_deref(), hdr_level),
+        (new.codec.as_deref(), old.codec.as_deref(), codec_level),
+        (new.source.as_deref(), old.source.as_deref(), source_level),
+    ];
+    let mut result = Ordering::Equal;
+    for (new_value, old_value, level) in dims {
+        let (Some(new_value), Some(old_value)) = (new_value, old_value) else {
+            continue;
+        };
+        match level(new_value).cmp(&level(old_value)) {
+            Ordering::Less => return Ordering::Less,
+            Ordering::Greater if result == Ordering::Equal => result = Ordering::Greater,
+            _ => {}
+        }
+    }
+    result
 }
 
 fn resolution_level(value: &str) -> i32 {
@@ -495,7 +537,11 @@ pub(crate) fn candidate_matches_subscribe_with_keywords(
 /// `candidate_matches_subscribe`, but a pure season pack of the subscribed
 /// season counts even when the chooser would not pick packs itself (a pack
 /// admitted by hand still occupies the season).
-pub(crate) fn pending_matches_subscribe(subscribe: &Subscribe, media: &Media, release: &Release) -> bool {
+pub(crate) fn pending_matches_subscribe(
+    subscribe: &Subscribe,
+    media: &Media,
+    release: &Release,
+) -> bool {
     if candidate_matches_subscribe(subscribe, media, release) {
         return true;
     }
@@ -520,7 +566,9 @@ fn release_matches_subscribe(subscribe: &Subscribe, media: &Media, release: &Rel
             release.season.is_none() && release.episode.is_none() && release.episode_to.is_none()
         }
         // G-H2: a defaulted S01 never stands in for another season.
-        (Coverage::Tv { season, .. }, MediaKind::Tv) if release.season_inferred && *season != 1 => false,
+        (Coverage::Tv { season, .. }, MediaKind::Tv) if release.season_inferred && *season != 1 => {
+            false
+        }
         (Coverage::Tv { .. }, MediaKind::Tv) => !covered_slots(subscribe, release).is_empty(),
         _ => false,
     }
