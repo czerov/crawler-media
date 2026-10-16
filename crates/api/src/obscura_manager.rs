@@ -91,6 +91,8 @@ pub struct ObscuraManager {
     last_error: Mutex<Option<String>>,
     not_started_reason: Mutex<Option<String>>,
     install_policy: Mutex<InstallPolicy>,
+    /// Serializes start/stop so concurrent callers cannot each spawn a daemon.
+    lifecycle: Mutex<()>,
 }
 
 impl ObscuraManager {
@@ -113,6 +115,7 @@ impl ObscuraManager {
             last_error: Mutex::new(None),
             not_started_reason: Mutex::new(None),
             install_policy: Mutex::new(InstallPolicy::PreinstalledOnly),
+            lifecycle: Mutex::new(()),
         };
         manager.reap_stale_pidfile();
         manager
@@ -243,6 +246,7 @@ impl ObscuraManager {
     }
 
     pub fn start(&self, policy: InstallPolicy) -> Result<(), String> {
+        let _lifecycle = self.lifecycle.lock();
         *self.install_policy.lock() = policy;
         if self.owns_live_daemon() {
             return Ok(());
@@ -330,6 +334,7 @@ impl ObscuraManager {
     }
 
     pub fn stop(&self) {
+        let _lifecycle = self.lifecycle.lock();
         let mut guard = self.child.lock();
         if let Some(child) = guard.take() {
             child.kill();
@@ -366,7 +371,14 @@ impl ObscuraManager {
                         // Check if pid is alive and belongs to obscura
                         let proc_exe = format!("/proc/{pid}/exe");
                         let is_obscura = if Path::new(&proc_exe).exists() {
-                            fs::read_link(&proc_exe).map(|l| l == self.binary_path()).unwrap_or(false)
+                            fs::read_link(&proc_exe)
+                                .map(|l| {
+                                    // A reinstalled binary shows up as "<path> (deleted)".
+                                    let raw = l.to_string_lossy();
+                                    let live = raw.strip_suffix(" (deleted)").unwrap_or(&raw);
+                                    Path::new(live) == self.binary_path()
+                                })
+                                .unwrap_or(false)
                         } else {
                             // On macOS or if /proc doesn't exist, check ps
                             let output = Command::new("ps")
@@ -385,7 +397,9 @@ impl ObscuraManager {
                         };
                         if is_obscura {
                             tracing::info!(pid, "Reaping orphaned managed Obscura daemon");
-                            let _ = Command::new("kill").arg(pid.to_string()).output();
+                            // Signal the whole group (obscura + obscura-worker).
+                            let _ = Command::new("kill").arg("-TERM").arg("--").arg(format!("-{pid}")).output();
+                            let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).output();
                         }
                     }
                 }

@@ -141,7 +141,7 @@ fn auth_type(site: &Site) -> &'static str {
     }
 }
 
-pub(crate) async fn create_site(
+async fn create_site_inner(
     State(state): State<ApiState>,
     Json(body): Json<SiteInput>,
 ) -> Response {
@@ -265,7 +265,7 @@ pub(crate) async fn list_sites(
     .into_response()
 }
 
-pub(crate) async fn put_site(
+async fn put_site_inner(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(body): Json<SiteInput>,
@@ -420,7 +420,7 @@ pub(crate) async fn get_site(
     .into_response()
 }
 
-pub(crate) async fn patch_site(
+async fn patch_site_inner(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(body): Json<PatchSiteInput>,
@@ -506,7 +506,7 @@ pub(crate) async fn patch_site(
     ok(site_public(&site, auth_type(&site), true)).into_response()
 }
 
-pub(crate) async fn delete_site(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+async fn delete_site_inner(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let id = match SiteId::from_str(&id) {
         Ok(id) => id,
         Err(_) => return err(StatusCode::BAD_REQUEST, "site.invalid", "站点 id 无效"),
@@ -757,8 +757,6 @@ pub(crate) async fn boost_stats(State(state): State<ApiState>) -> Response {
 }
 
 pub(crate) async fn site_catalog(State(state): State<ApiState>) -> Response {
-    let store = state.store.lock();
-    let _ = store;
     // Profiles are compile-time + overlay; expose id/name only.
     // demo 是测试桩，不列进站点配置。
     let items: Vec<Value> = state
@@ -774,4 +772,42 @@ pub(crate) async fn site_catalog(State(state): State<ApiState>) -> Response {
         })
         .collect();
     ok(Value::Array(items)).into_response()
+}
+
+pub(crate) async fn create_site(
+    State(state): State<ApiState>,
+    Json(body): Json<SiteInput>,
+) -> Response {
+    after_site_write(&state, create_site_inner(State(state.clone()), Json(body)).await)
+}
+
+pub(crate) async fn put_site(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<SiteInput>,
+) -> Response {
+    after_site_write(&state, put_site_inner(State(state.clone()), Path(id), Json(body)).await)
+}
+
+pub(crate) async fn patch_site(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchSiteInput>,
+) -> Response {
+    after_site_write(&state, patch_site_inner(State(state.clone()), Path(id), Json(body)).await)
+}
+
+pub(crate) async fn delete_site(
+    State(state): State<ApiState>, Path(id): Path<String>
+) -> Response {
+    after_site_write(&state, delete_site_inner(State(state.clone()), Path(id)).await)
+}
+
+/// Site writes can change `managed_browser_sites`; re-run the managed-daemon
+/// decision in the background after any successful write.
+fn after_site_write(state: &ApiState, response: Response) -> Response {
+    if response.status().is_success() {
+        crate::http::browser_settings::spawn_reconcile(state);
+    }
+    response
 }

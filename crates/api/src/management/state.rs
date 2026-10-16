@@ -265,7 +265,7 @@ impl ApiState {
             gallery_expansions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if tokio::runtime::Handle::try_current().is_ok() {
-            crate::http::browser_settings::reconcile_obscura(&state);
+            crate::http::browser_settings::spawn_reconcile(&state);
             crate::library_lifecycle::resume_library_removals(&state)
                 .map_err(std::io::Error::other)?;
             state.probe.try_start_workers();

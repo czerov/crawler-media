@@ -358,20 +358,69 @@ impl DaemonHandle for ChildHandle {
     fn kill(&self) {
         let mut guard = self.0.lock();
         if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_group(&mut child, self.1);
+        }
+    }
+}
+
+/// The daemon is spawned as its own process group leader, so signalling the
+/// negative pid also reaches `obscura-worker` children. SIGTERM first, then
+/// SIGKILL after a short grace period.
+fn terminate_group(child: &mut Child, pid: u32) {
+    #[cfg(unix)]
+    {
+        let pgid = -(pid as i32);
+        // SAFETY: plain kill(2) on our own process group.
+        unsafe { libc::kill(pgid, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                // Leader gone; make sure no worker in the group survives.
+                unsafe { libc::kill(pgid, libc::SIGKILL) };
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        unsafe { libc::kill(pgid, libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+impl Drop for ChildHandle {
+    /// Dropping a handle (e.g. a lost start race) must never leave an orphan.
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.get_mut().take() {
+            terminate_group(&mut child, self.1);
         }
     }
 }
 
 impl DaemonLauncher for ProcessLauncher {
     fn spawn(&self, binary: &Path, port: u16) -> Result<Box<dyn DaemonHandle>, String> {
-        let child = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .arg("serve")
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
-            .arg(port.to_string())
+            .arg(port.to_string());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+            #[cfg(target_os = "linux")]
+            // SAFETY: only async-signal-safe prctl(2) between fork and exec.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    Ok(())
+                });
+            }
+        }
+        let child = command
             .spawn()
             .map_err(|e| format!("Failed to spawn Obscura daemon: {e}"))?;
         let pid = child.id();

@@ -270,7 +270,7 @@ async fn saving_browser_settings_reconciles_managed_obscura() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     let body = crate::common::json_body(resp).await;
-    assert_eq!(body["data"]["not_started_reason"], "external_endpoint_configured");
+    assert_eq!(body["data"]["not_started_reason"], "instance_endpoint_configured");
 
     // 2. Configure CDP disabled -> Obscura stopped, reason cdp_disabled
     let req = Request::builder()
@@ -291,9 +291,31 @@ async fn saving_browser_settings_reconciles_managed_obscura() {
         .header("Authorization", "Bearer management-secret")
         .body(Body::empty())
         .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = crate::common::json_body(resp).await;
+    assert_eq!(body["data"]["not_started_reason"], "switch_off");
+
+    // 3. Switch on, no instance endpoint, but no Browser Site needs the managed daemon.
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings/browser")
+        .header("Authorization", "Bearer management-secret")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::json!({
+            "cdp": { "enabled": true, "url": "" }
+        }).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings/browser/obscura")
+        .header("Authorization", "Bearer management-secret")
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let body = crate::common::json_body(resp).await;
-    assert_eq!(body["data"]["not_started_reason"], "cdp_disabled");
+    assert_eq!(body["data"]["not_started_reason"], "no_managed_browser_sites");
 }
 
 #[tokio::test]
