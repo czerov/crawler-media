@@ -132,10 +132,10 @@ fn wanted_units(
     media: &Media,
 ) -> Option<Vec<(Option<u32>, Option<u32>)>> {
     let store = state.store.lock();
-    if let Ok(Some(value)) = store.get_setting(crate::settings_keys::SUBSCRIBE_AIR_DATE_GATE) {
-        if matches!(value.trim(), "0" | "false" | "off") {
-            return None;
-        }
+    if let Ok(Some(value)) = store.get_setting(crate::settings_keys::SUBSCRIBE_AIR_DATE_GATE)
+        && matches!(value.trim(), "0" | "false" | "off")
+    {
+        return None;
     }
     let facts = store
         .load_library_subscribe_facts(subscribe, media.kind)

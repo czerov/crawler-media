@@ -141,10 +141,10 @@ pub(crate) fn reconcile_subscribe(
                 Err(error) => tracing::error!(%subscribe_id, %error, "后台对账删除 pending 失败"),
             }
         }
-        if let Some(list) = list {
-            if is_stalled(state, subscribe_id, &item, hash, list, now) {
-                continue;
-            }
+        if let Some(list) = list
+            && is_stalled(state, subscribe_id, &item, hash, list, now)
+        {
+            continue;
         }
         kept.push((score, item));
     }

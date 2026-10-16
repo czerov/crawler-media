@@ -25,7 +25,7 @@ fn serve(fake: Arc<Fake>) -> String {
             let (status, body, extra) = if req.starts_with("POST /api/v2/auth/login") {
                 let n = fake.logins.fetch_add(1, Ordering::SeqCst);
                 ("200 OK", "Ok.".to_string(), format!("Set-Cookie: SID=sid-{n}; HttpOnly\r\n"))
-            } else if fake.forbid.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+            } else if fake.forbid.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
                 ("403 Forbidden", "Forbidden".into(), String::new())
             } else {
                 ("200 OK", "[]".into(), String::new())

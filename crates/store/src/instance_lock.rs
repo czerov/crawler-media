@@ -22,10 +22,11 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if let Some((other, beat)) = current {
-            if other != owner && now - beat < ttl_secs {
-                return Ok(Some(other));
-            }
+        if let Some((other, beat)) = current
+            && other != owner
+            && now - beat < ttl_secs
+        {
+            return Ok(Some(other));
         }
         tx.execute(
             "INSERT INTO instance_lock (id, owner, heartbeat_at) VALUES (1, ?1, ?2)

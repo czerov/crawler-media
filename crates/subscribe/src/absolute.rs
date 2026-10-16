@@ -3,6 +3,10 @@
 
 use domain::Release;
 
+/// The release crosses seasons or lies beyond the catalog; drop it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unmappable;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AbsoluteEpisodes {
     /// (season, episode count) in season order, starting at season 1.
@@ -38,9 +42,9 @@ impl AbsoluteEpisodes {
     }
 
     /// Remap an inferred-season release whose episodes lie beyond season 1.
-    /// `Ok(None)` = untouched; `Err(())` = unmappable (crosses seasons or
+    /// `Ok(None)` = untouched; `Err(Unmappable)` = unmappable (crosses seasons or
     /// beyond the catalog), so the caller should drop it.
-    pub fn remap(&self, release: &Release) -> Result<Option<Release>, ()> {
+    pub fn remap(&self, release: &Release) -> Result<Option<Release>, Unmappable> {
         if !release.season_inferred || release.season != Some(1) {
             return Ok(None);
         }
@@ -52,10 +56,10 @@ impl AbsoluteEpisodes {
             return Ok(None);
         }
         let (Some((sa, ea)), Some((sb, eb))) = (self.locate(from), self.locate(to)) else {
-            return Err(());
+            return Err(Unmappable);
         };
         if sa != sb {
-            return Err(());
+            return Err(Unmappable);
         }
         let mut mapped = release.clone();
         mapped.season = Some(sa);
@@ -93,6 +97,6 @@ mod tests {
         );
         assert_eq!(map.remap(&release::parse("Show Episode 5 1080p")), Ok(None));
         assert_eq!(map.remap(&release::parse("Show.S01E13.1080p")), Ok(None));
-        assert_eq!(map.remap(&release::parse("Show Episode 30 1080p")), Err(()));
+        assert_eq!(map.remap(&release::parse("Show Episode 30 1080p")), Err(Unmappable));
     }
 }

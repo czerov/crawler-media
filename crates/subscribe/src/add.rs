@@ -40,7 +40,7 @@ pub fn admit_and_add<D: Downloader + ?Sized>(
                         candidate.release = mapped;
                     }
                     Ok(None) => {}
-                    Err(()) => {
+                    Err(crate::absolute::Unmappable) => {
                         tracing::info!(torrent = %candidate.torrent.title, "绝对集号跨季或超出目录，跳过");
                         return None;
                     }
