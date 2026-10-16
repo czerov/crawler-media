@@ -58,6 +58,8 @@ mod f1_selective_files;
 mod m4a_completed_state;
 #[path = "subscription_e2e/m5_follow_future.rs"]
 mod m5_follow_future;
+#[path = "subscription_e2e/m7_abandoned_transfer.rs"]
+mod m7_abandoned_transfer;
 #[path = "subscription_e2e/m6_deletion_retry.rs"]
 mod m6_deletion_retry;
 #[path = "subscription_e2e/s1_wash_probe_fail.rs"]

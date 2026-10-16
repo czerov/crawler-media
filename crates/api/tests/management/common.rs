@@ -259,7 +259,7 @@ pub(crate) fn install_fake_ffprobe() {
         let staging = dir.join("ffprobe.tmp");
         std::fs::write(
             &staging,
-            "#!/bin/sh\nfor last; do :; done\nif [ \"$(head -c 6 \"$last\" 2>/dev/null)\" = \"PROBE:\" ]; then tail -c +7 \"$last\"; exit 0; fi\necho 'Invalid data found when processing input' >&2\nexit 1\n",
+            "#!/bin/sh\nfor last; do :; done\nif grep -q SLOWPROBE \"$last\" 2>/dev/null; then sleep 2; fi\nif [ \"$(head -c 6 \"$last\" 2>/dev/null)\" = \"PROBE:\" ]; then tail -c +7 \"$last\"; exit 0; fi\necho 'Invalid data found when processing input' >&2\nexit 1\n",
         )
         .unwrap();
         #[cfg(unix)]

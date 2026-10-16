@@ -317,6 +317,15 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
     );
 
     let destinations = routed.imported_destinations().map_err(|e| e.to_string())?;
+    // M7: do not start writing library files for a subscription being deleted.
+    if state.subscribe_is_deleting(subscribe_id) {
+        tracing::warn!(subscribe_id = %subscribe_id, "订阅已被预留删除，跳过 Transfer");
+        return Ok(());
+    }
+    let known: std::collections::HashSet<std::path::PathBuf> = destinations
+        .iter()
+        .map(|m| m.destination_path.clone())
+        .collect();
     let outcome = collect_completed_controlled(
         added,
         &library::Ffprobe::default(),
@@ -325,11 +334,15 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
     )
     .map_err(|e| e.to_string())?;
     if state.subscribe_is_deleting(subscribe_id) {
-        tracing::warn!(subscribe_id = %subscribe_id, "Transfer 完成但订阅已被预留删除，取消提交");
+        tracing::warn!(subscribe_id = %subscribe_id, "Transfer 完成但订阅已被预留删除，取消提交并回滚本轮新文件");
+        rollback_new_files(&outcome, plan.mode, &known);
         return Ok(());
     }
 
-    library_lease.control().check().map_err(|e| e.to_string())?;
+    if let Err(error) = library_lease.control().check() {
+        rollback_new_files(&outcome, plan.mode, &known);
+        return Err(error.to_string());
+    }
     if plan.scrape {
         attach_metadata_and_chapters(state, &media, &outcome.ledger);
     }
@@ -363,4 +376,46 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// M7: undo library files this abandoned round created. Only paths that were
+/// not already known destinations before the round are touched. Hardlink /
+/// Copy: delete the new file (the download keeps its data). Move: move the
+/// file back to its download source; if that fails it is left in place.
+fn rollback_new_files(
+    outcome: &subscribe::RunOutcome,
+    mode: Option<library::TransferMode>,
+    known: &std::collections::HashSet<std::path::PathBuf>,
+) {
+    for row in &outcome.ledger {
+        let path = std::path::PathBuf::from(&row.path);
+        if known.contains(&path) || !path.exists() {
+            continue;
+        }
+        let source = outcome
+            .ledger_sources
+            .iter()
+            .find(|s| s.ledger_path == row.path)
+            .map(|s| std::path::PathBuf::from(&s.source_path));
+        let result = match (mode, source) {
+            (Some(library::TransferMode::Move), Some(source)) => {
+                if source.exists() {
+                    tracing::warn!(path = %path.display(), "回滚：Move 源路径已存在，保留库文件");
+                    continue;
+                }
+                std::fs::rename(&path, &source)
+            }
+            (Some(library::TransferMode::Move), None) => {
+                tracing::warn!(path = %path.display(), "回滚：Move 模式缺少源路径，保留库文件");
+                continue;
+            }
+            _ => std::fs::remove_file(&path),
+        };
+        match result {
+            Ok(()) => tracing::info!(path = %path.display(), "回滚放弃提交的 Transfer 新文件"),
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "回滚 Transfer 新文件失败")
+            }
+        }
+    }
 }
