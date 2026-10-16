@@ -92,6 +92,7 @@ fn run_wash_cut_test(
         hooks: None,
         naming: None,
         preserve_removed: false,
+        overlap: Default::default(),
     })
     .unwrap()
 }
@@ -239,6 +240,7 @@ fn wash_cut_does_not_delete_merged_file_still_referenced_by_other_slots() {
         hooks: None,
         naming: None,
         preserve_removed: false,
+        overlap: Default::default(),
     }, &Probed1080)
     .unwrap();
     assert!(

@@ -3,7 +3,7 @@ use downloader::Downloader;
 use filter::ScoredTorrent;
 use hooks::{HookEvent, Step};
 
-use crate::choose::{candidate_matches_subscribe_with_keywords, choose, is_complete};
+use crate::choose::{candidate_matches_subscribe_with_keywords, is_complete};
 use crate::{RunInput, RunOutcome, SubscribeError};
 
 pub struct Added<'a, D: Downloader + ?Sized> {
@@ -51,11 +51,12 @@ pub fn admit_and_add<D: Downloader + ?Sized>(
         "候选种子通过过滤准入"
     );
     let effective_wash_filter = input.wash_filter.or(Some(input.filter));
-    let chosen = choose(
+    let chosen = crate::choose::choose_with_policy(
         input.subscribe,
         effective_wash_filter,
         &admitted,
         &input.facts,
+        input.overlap,
     );
     emit(input.hooks, Step::ChooseTorrent)?;
     let mut submitted = Vec::new();

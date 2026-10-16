@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 
 use domain::{Coverage, Media, MediaKind, Release, Subscribe};
 use filter::ScoredTorrent;
@@ -10,6 +9,79 @@ pub fn choose(
     wash_filter: Option<&domain::Filter>,
     admitted: &[ScoredTorrent],
     facts: &SubscribeFacts,
+) -> Vec<ScoredTorrent> {
+    choose_with_policy(subscribe, wash_filter, admitted, facts, OverlapPolicy::default())
+}
+
+/// How overlapping TV candidates (range pack vs single episodes) are resolved (M1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlapPolicy {
+    /// Larger packs claim their slots first.
+    #[default]
+    PreferPack,
+    /// Single episodes claim their slots first; packs only fill untouched slots.
+    PreferEpisode,
+}
+
+impl OverlapPolicy {
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "prefer_episode" => Self::PreferEpisode,
+            _ => Self::PreferPack,
+        }
+    }
+}
+
+/// M1 greedy coverage: candidates are ordered by policy (slot count) then
+/// score, and one is chosen only when none of its window slots is already
+/// claimed, so overlapping packs and singles are never downloaded together.
+fn choose_tv_greedy(
+    subscribe: &Subscribe,
+    wash_filter: Option<&domain::Filter>,
+    admitted: &[ScoredTorrent],
+    facts: &SubscribeFacts,
+    policy: OverlapPolicy,
+) -> Vec<ScoredTorrent> {
+    let mut ranked: Vec<(&ScoredTorrent, Vec<(u32, u32)>)> = admitted
+        .iter()
+        .filter(|c| should_take(subscribe, wash_filter, facts, c))
+        .map(|c| {
+            // 只竞争订阅窗口里这个候选真正能填的槽。
+            let slots = covered_slots(subscribe, &c.release)
+                .into_iter()
+                .filter_map(|(s, e)| Some((s?, e?)))
+                .collect::<Vec<_>>();
+            (c, slots)
+        })
+        .filter(|(_, slots)| !slots.is_empty())
+        .collect();
+    ranked.sort_by(|(a, a_slots), (b, b_slots)| {
+        let by_size = match policy {
+            OverlapPolicy::PreferPack => b_slots.len().cmp(&a_slots.len()),
+            OverlapPolicy::PreferEpisode => a_slots.len().cmp(&b_slots.len()),
+        };
+        by_size.then(b.score.cmp(&a.score))
+    });
+    let mut claimed: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    let mut chosen: Vec<ScoredTorrent> = Vec::new();
+    for (candidate, slots) in ranked {
+        if slots.iter().any(|slot| claimed.contains(slot))
+            || chosen.iter().any(|c| c.torrent.enclosure == candidate.torrent.enclosure)
+        {
+            continue;
+        }
+        claimed.extend(slots);
+        chosen.push(candidate.clone());
+    }
+    chosen
+}
+
+pub fn choose_with_policy(
+    subscribe: &Subscribe,
+    wash_filter: Option<&domain::Filter>,
+    admitted: &[ScoredTorrent],
+    facts: &SubscribeFacts,
+    policy: OverlapPolicy,
 ) -> Vec<ScoredTorrent> {
     let mut chosen = Vec::new();
     if subscribe.full_season_pack {
@@ -35,38 +107,7 @@ pub fn choose(
             }
         }
         Coverage::Tv { .. } => {
-            let mut best_by_ep: HashMap<(u32, u32), &ScoredTorrent> = HashMap::new();
-            for candidate in admitted
-                .iter()
-                .filter(|c| should_take(subscribe, wash_filter, facts, c))
-            {
-                // 只竞争订阅窗口里这个候选真正能填的槽。范围包在窗口外的集数
-                // 不能让它和窗口内的更高分单集一起被下载。
-                for (season, ep) in covered_slots(subscribe, &candidate.release) {
-                    let (Some(season), Some(ep)) = (season, ep) else {
-                        continue;
-                    };
-                    best_by_ep
-                        .entry((season, ep))
-                        .and_modify(|current| {
-                            if candidate.score > current.score {
-                                *current = candidate;
-                            }
-                        })
-                        .or_insert(candidate);
-                }
-            }
-            let mut seen = Vec::new();
-            for candidate in best_by_ep.into_values() {
-                if seen
-                    .iter()
-                    .any(|c: &&ScoredTorrent| c.torrent.enclosure == candidate.torrent.enclosure)
-                {
-                    continue;
-                }
-                seen.push(candidate);
-                chosen.push(candidate.clone());
-            }
+            chosen = choose_tv_greedy(subscribe, wash_filter, admitted, facts, policy);
         }
     }
     chosen

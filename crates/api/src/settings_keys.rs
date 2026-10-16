@@ -42,3 +42,6 @@ pub const PROBE_CONCURRENCY: &str = "probe.concurrency";
 pub const GLOBAL_USER_AGENT: &str = "network.user_agent";
 /// G-H1 air-date gate for scheduled TV searches ("0"/"false" disables; default on).
 pub const SUBSCRIBE_AIR_DATE_GATE: &str = "subscribe.air_date_gate";
+/// M1 overlap policy when a range pack and single episodes cover the same slots:
+/// `prefer_pack` (default) or `prefer_episode`.
+pub const SUBSCRIBE_OVERLAP_POLICY: &str = "subscribe.overlap_policy";

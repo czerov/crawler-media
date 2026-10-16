@@ -34,6 +34,8 @@ mod h2_probe_rejected;
 mod h3_background_reconcile;
 #[path = "subscription_e2e/h4_season_pack_pending.rs"]
 mod h4_season_pack_pending;
+#[path = "subscription_e2e/m1_overlap_policy.rs"]
+mod m1_overlap_policy;
 #[path = "subscription_e2e/s1_wash_probe_fail.rs"]
 mod s1_wash_probe_fail;
 

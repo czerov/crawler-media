@@ -303,6 +303,7 @@ fn execute(
     let destinations = routed
         .imported_destinations()
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    let overlap = crate::worker::finish_search::overlap_policy(state);
     let mut outcome = subscribe::run_with_destinations_controlled(
         RunInput {
             subscribe: &context.subscribe,
@@ -319,6 +320,7 @@ fn execute(
             hooks: None,
             naming: Some(&naming),
             preserve_removed: true,
+            overlap,
         },
         &library::Ffprobe::default(),
         &destinations,

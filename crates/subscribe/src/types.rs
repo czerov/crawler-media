@@ -40,6 +40,8 @@ pub struct RunInput<'a, D: Downloader + ?Sized> {
     pub naming: Option<&'a str>,
     /// 洗版替换时保留被替换文件（不删除），交由调用方决定去处（回收站）。
     pub preserve_removed: bool,
+    /// M1: how overlapping range packs and single episodes are resolved.
+    pub overlap: crate::choose::OverlapPolicy,
 }
 
 pub struct RunOutcome {

@@ -243,21 +243,21 @@ fn huge_release_range_does_not_allocate_unbounded_choose_slots() {
     let subscribe = tv_subscribe(media_id);
     let huge = scored("Show.S01E01-E4294967295", 1, u32::MAX, 10);
     let precise = scored("Show.S01E02", 2, 2, 20);
-    let chosen = choose(
+    // M1: overlapping candidates never download together; with PreferEpisode
+    // the higher-scoring single still wins its slot.
+    let chosen = super::choose_with_policy(
         &subscribe,
         None,
-        &[huge, precise],
+        &[huge.clone(), precise.clone()],
         &SubscribeFacts::default(),
+        super::OverlapPolicy::PreferEpisode,
     );
     assert!(
         chosen.iter().any(|c| c.torrent.title.contains("S01E02")),
         "higher-scoring single episode must still win its slot: {chosen:?}"
     );
-    assert!(
-        chosen.len() <= 2,
-        "capped range must not explode chosen set: {}",
-        chosen.len()
-    );
+    let chosen = choose(&subscribe, None, &[huge, precise], &SubscribeFacts::default());
+    assert_eq!(chosen.len(), 1, "capped range must not explode chosen set");
 }
 
 #[test]
@@ -578,4 +578,43 @@ fn inferred_season_never_matches_a_later_season_subscribe() {
     assert!(!candidate_matches_subscribe(&subscribe, &m, &guessed));
     guessed.season_inferred = false;
     assert!(candidate_matches_subscribe(&subscribe, &m, &guessed));
+}
+
+fn ten_episode_subscribe() -> (Media, Subscribe) {
+    let mut m = media("Show", None);
+    m.kind = MediaKind::Tv;
+    let mut subscribe = tv_subscribe(m.id);
+    subscribe.coverage = Coverage::Tv { season: 1, episode_from: 1, episode_to: Some(10) };
+    (m, subscribe)
+}
+
+#[test]
+fn overlapping_pack_and_single_choose_exactly_one_per_policy() {
+    let (_, subscribe) = ten_episode_subscribe();
+    let pack = scored("pack", 1, 10, 90);
+    let single = scored("e06", 6, 6, 95);
+    let facts = SubscribeFacts::default();
+    let both = [pack.clone(), single.clone()];
+    let pick = |policy| {
+        super::choose_with_policy(&subscribe, None, &both, &facts, policy)
+            .into_iter()
+            .map(|c| c.torrent.title)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(pick(super::OverlapPolicy::PreferPack), vec!["pack".to_string()]);
+    assert_eq!(pick(super::OverlapPolicy::PreferEpisode), vec!["e06".to_string()]);
+}
+
+#[test]
+fn non_overlapping_singles_are_each_chosen_and_best_score_wins_a_slot() {
+    let (_, subscribe) = ten_episode_subscribe();
+    let picks = choose(
+        &subscribe,
+        None,
+        &[scored("e01", 1, 1, 50), scored("e02", 2, 2, 50), scored("e01-better", 1, 1, 70)],
+        &SubscribeFacts::default(),
+    );
+    let mut titles: Vec<_> = picks.into_iter().map(|c| c.torrent.title).collect();
+    titles.sort();
+    assert_eq!(titles, vec!["e01-better".to_string(), "e02".to_string()]);
 }

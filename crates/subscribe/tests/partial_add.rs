@@ -113,6 +113,7 @@ fn successful_download_additions_are_returned_when_another_add_fails() {
         hooks: None,
         naming: None,
         preserve_removed: false,
+        overlap: Default::default(),
     })
     .unwrap();
 

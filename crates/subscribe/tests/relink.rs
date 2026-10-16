@@ -102,6 +102,7 @@ fn transfer_once(
         hooks: None,
         naming: None,
         preserve_removed: false,
+        overlap: Default::default(),
     };
     let added = Added {
         input,

@@ -170,6 +170,7 @@ fn admit_candidates(
     let routed =
         crate::delivery::RoutedDownloader::with_pending(state, subscribe, &context.existing);
     let facts = facts_with_pending(context.facts.clone(), &context.existing, subscribe, media);
+    let overlap = overlap_policy(state);
     let added = admit_and_add(RunInput {
         subscribe,
         media,
@@ -185,6 +186,7 @@ fn admit_candidates(
         hooks: None,
         naming: Some(&context.naming),
         preserve_removed: false,
+        overlap,
     })
     .map_err(|e| {
         tracing::error!(subscribe_id = %subscribe.id, media = %media.title, error = %e, "收录并添加种子失败");
@@ -276,4 +278,16 @@ pub(crate) fn pending_releases(existing: &[(i32, crate::store::PendingDownload)]
                 .unwrap_or_else(|| release::parse(&pending.torrent.title))
         })
         .collect()
+}
+
+/// M1: overlap policy from settings (`prefer_pack` default). Takes the store lock briefly.
+pub(crate) fn overlap_policy(state: &ApiState) -> subscribe::OverlapPolicy {
+    state
+        .store
+        .lock()
+        .get_setting(crate::settings_keys::SUBSCRIBE_OVERLAP_POLICY)
+        .ok()
+        .flatten()
+        .map(|value| subscribe::OverlapPolicy::parse(&value))
+        .unwrap_or_default()
 }

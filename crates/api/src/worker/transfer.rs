@@ -268,6 +268,7 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
             hooks: None,
             naming: Some(&plan.naming),
             preserve_removed: true,
+            overlap: Default::default(),
         },
         chosen,
     );
