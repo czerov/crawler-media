@@ -204,19 +204,22 @@ fn migrate_app_library_columns(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    Ok(conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == column))
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
     column: &str,
     decl: &str,
 ) -> Result<(), StoreError> {
-    let has: bool = conn
-        .prepare(&format!("PRAGMA table_info({table})"))?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|name| name == column);
-    if !has {
+    if !has_column(conn, table, column)? {
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
     }
     Ok(())
@@ -360,7 +363,16 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     )?;
     // H3 stalled: last observed progress and when it last increased.
     ensure_column(conn, "pending_downloads", "last_progress", "REAL")?;
+    // Review L-3: rows that predate the column start their stall clock now
+    // (one-time, only when the column is added), not at old submitted_at.
+    let had_progress_at = has_column(conn, "pending_downloads", "last_progress_at")?;
     ensure_column(conn, "pending_downloads", "last_progress_at", "INTEGER")?;
+    if !had_progress_at {
+        conn.execute_batch(
+            "UPDATE pending_downloads SET last_progress_at = CAST(strftime('%s','now') AS INTEGER)
+             WHERE last_progress_at IS NULL;",
+        )?;
+    }
     // D-M3: torrent info hash recorded at submit time (when known).
     ensure_column(conn, "pending_downloads", "info_hash", "TEXT")?;
     ensure_column(conn, "pending_downloads", "selective_missing", "TEXT")?;

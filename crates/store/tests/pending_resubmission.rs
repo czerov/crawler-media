@@ -213,3 +213,44 @@ fn rejected_pending_is_only_revived_by_manual_submission() {
     assert_eq!(store.load_pending(id).unwrap().len(), 1, "manual submission revives");
     assert!(store.load_rejected_enclosures(id).unwrap().is_empty());
 }
+
+/// Review L-3: rows from a database that predates `last_progress_at` start
+/// their stall clock at upgrade time, not at their old `submitted_at`.
+#[test]
+fn upgrade_starts_stall_clock_for_old_pending_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (sub_id, torrent) = {
+        let store = Store::open(tmp.path()).unwrap();
+        let (sub_id, torrent) = create_sub(&store);
+        store
+            .merge_pending(
+                sub_id,
+                &[(
+                    50,
+                    PendingDownload {
+                        submitted_at: Some(1000),
+                        torrent: torrent.clone(),
+                        release_override: None,
+                        downloader_id: None,
+                    },
+                )],
+            )
+            .unwrap();
+        (sub_id, torrent)
+    };
+    // Simulate the pre-H3 schema.
+    let conn = rusqlite::Connection::open(tmp.path().join("subscribe.db")).unwrap();
+    conn.execute_batch("ALTER TABLE pending_downloads DROP COLUMN last_progress_at;")
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(tmp.path()).unwrap();
+    let since = store
+        .touch_pending_progress(sub_id, &torrent.enclosure, 0.0, 1_000_000)
+        .unwrap()
+        .unwrap();
+    assert!(
+        since > 1000,
+        "stall clock restarted at upgrade, got {since}"
+    );
+}
