@@ -248,8 +248,9 @@ impl ObscuraManager {
             return Ok(());
         }
 
-        // Install
-        if !self.is_installed() {
+        // Install / re-verify: always go through the installer so the on-disk
+        // binaries are re-hashed against the marker, never trusting it alone.
+        {
             if self
                 .is_downloading
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)

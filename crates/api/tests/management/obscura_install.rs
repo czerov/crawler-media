@@ -107,7 +107,19 @@ fn verified_archive_is_installed_atomically() {
     assert!(res.is_ok(), "{res:?}");
     assert!(bin_dir.join("obscura").is_file());
     assert!(bin_dir.join("obscura-worker").is_file());
-    assert_eq!(fs::read_to_string(bin_dir.join(".obscura.sha256")).unwrap(), hash_leaked);
+    let marker = fs::read_to_string(bin_dir.join(".obscura.sha256")).unwrap();
+    assert!(marker.contains(&format!("archive={}", hash_leaked.to_ascii_lowercase())), "{marker}");
+    assert!(marker.contains("obscura-worker="), "{marker}");
+
+    // Verified fast path: untouched binaries are accepted without the archive.
+    assert!(installer.ensure_installed(&bin_dir, InstallPolicy::PreinstalledOnly).is_ok());
+
+    // A tampered binary next to a correct marker must not be trusted.
+    fs::write(bin_dir.join("obscura"), b"tampered").unwrap();
+    assert!(
+        installer.ensure_installed(&bin_dir, InstallPolicy::PreinstalledOnly).is_err(),
+        "tampered binary must fail re-verification"
+    );
 }
 
 #[test]
@@ -302,5 +314,23 @@ fn content_length_mismatch_is_rejected() {
     stop.store(true, Ordering::Relaxed);
 
     assert!(res.is_err());
+    assert!(!bin_dir.join("obscura").exists());
+}
+
+#[test]
+fn archive_entries_must_match_full_top_level_path() {
+    let tmp = tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let archive = make_tar_gz(&[("nested/obscura", b"bin"), ("obscura-worker", b"worker")]);
+    let hash = Box::leak(sha256_hex(&archive).into_boxed_str()) as &'static str;
+    let size = archive.len() as u64;
+    let custom_asset: &'static [(&'static str, &'static str, &'static str, &'static str, u64)] = Box::leak(Box::new([
+        (std::env::consts::OS, std::env::consts::ARCH, "asset.tar.gz", hash, size),
+    ]));
+    fs::write(bin_dir.join("obscura.tar.gz"), &archive).unwrap();
+    let installer = ReleaseInstaller::new().with_assets(custom_asset);
+    let res = installer.ensure_installed(&bin_dir, InstallPolicy::PreinstalledOnly);
+    assert!(matches!(res, Err(api::obscura_manager::InstallError::InvalidArchive(_))), "{res:?}");
     assert!(!bin_dir.join("obscura").exists());
 }

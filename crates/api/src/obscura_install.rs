@@ -119,13 +119,13 @@ impl crate::obscura_manager::ObscuraInstaller for ReleaseInstaller {
                 arch: arch.into(),
             })?;
 
-        // 1. Check if already installed and verified
+        // 1. Already installed: the marker must name the pinned archive AND the
+        //    on-disk binaries must still hash to what was recorded at install.
         if binary_path.is_file() && worker_path.is_file() && hash_path.is_file() {
-            if let Ok(recorded) = fs::read_to_string(&hash_path) {
-                if recorded.trim().eq_ignore_ascii_case(expected_hash) {
-                    return Ok(binary_path);
-                }
+            if installed_marker_matches(&hash_path, expected_hash, &binary_path, &worker_path) {
+                return Ok(binary_path);
             }
+            tracing::warn!(path = %bin_dir.display(), "Obscura install marker or binary hash mismatch; reinstalling");
         }
 
         fs::create_dir_all(bin_dir)?;
@@ -245,8 +245,15 @@ impl crate::obscura_manager::ObscuraInstaller for ReleaseInstaller {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| InstallError::InvalidArchive("invalid entry filename".into()))?;
+            // Full-path match: only top-level `obscura` / `obscura-worker` (an
+            // optional leading `./` is tolerated); `x/obscura` is rejected.
+            let top_level = path
+                .components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .count()
+                == 1;
 
-            if !EXPECTED_ENTRIES.contains(&file_name) || !entry.header().entry_type().is_file() {
+            if !top_level || !EXPECTED_ENTRIES.contains(&file_name) || !entry.header().entry_type().is_file() {
                 let _ = fs::remove_dir_all(&temp_unpack_dir);
                 if archive_source_path != preinstalled_archive {
                     let _ = fs::remove_file(&archive_source_path);
@@ -288,10 +295,46 @@ impl crate::obscura_manager::ObscuraInstaller for ReleaseInstaller {
             let _ = fs::remove_file(&archive_source_path);
         }
 
-        fs::write(&hash_path, expected_hash)?;
+        let marker = format!(
+            "archive={}\nobscura={}\nobscura-worker={}\n",
+            expected_hash.to_ascii_lowercase(),
+            sha256_file(&binary_path)?,
+            sha256_file(&worker_path)?,
+        );
+        fs::write(&hash_path, marker)?;
         tracing::info!(path = %binary_path.display(), "Obscura daemon verified and installed");
         Ok(binary_path)
     }
+}
+
+fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Marker format: `archive=<sha>\nobscura=<sha>\nobscura-worker=<sha>\n`.
+fn installed_marker_matches(marker: &Path, expected_archive: &str, bin: &Path, worker: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(marker) else { return false };
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+            .map(|v| v.trim().to_ascii_lowercase())
+    };
+    let (Some(archive), Some(b), Some(w)) = (field("archive"), field("obscura"), field("obscura-worker")) else {
+        return false;
+    };
+    archive.eq_ignore_ascii_case(expected_archive)
+        && sha256_file(bin).is_ok_and(|h| h == b)
+        && sha256_file(worker).is_ok_and(|h| h == w)
 }
 
 pub struct ProcessLauncher;
