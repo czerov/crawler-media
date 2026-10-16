@@ -285,6 +285,18 @@ pub fn target_reached(owned: &Release, target: &Release) -> bool {
 }
 
 /// Ordered Wash-cut comparison dimensions configured on the Filter.
+/// L3: dimensions an `UpgradeLadder` may name.
+pub const LADDER_DIMENSIONS: [&str; 4] = ["resolution", "source", "codec", "hdr"];
+
+/// L3: the first ladder dimension that is not in `LADDER_DIMENSIONS`.
+pub fn unknown_ladder_dimension(raw: &str) -> Option<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|dim| !dim.is_empty())
+        .find(|dim| !LADDER_DIMENSIONS.contains(dim))
+        .map(str::to_string)
+}
+
 fn ladder_for(wash_filter: Option<&domain::Filter>) -> Option<Vec<String>> {
     let filter = wash_filter?;
     filter.atoms.iter().find_map(|atom| match &atom.rule {
@@ -333,7 +345,15 @@ fn ladder_compare(new: &Release, old: &Release, ladder: &[String]) -> Option<std
             "source" => (&new.source, &old.source, source_level),
             "codec" => (&new.codec, &old.codec, codec_level),
             "hdr" => (&new.hdr, &old.hdr, hdr_level),
-            _ => continue,
+            other => {
+                // L3: saved ladders are validated; an old row may still hold a
+                // bad name. Report it once instead of silently ignoring it.
+                static REPORTED: std::sync::Once = std::sync::Once::new();
+                REPORTED.call_once(|| {
+                    tracing::error!(dimension = %other, "UpgradeLadder 含未知维度，已忽略");
+                });
+                continue;
+            }
         };
         match (new_value.as_deref(), old_value.as_deref()) {
             (Some(new_value), Some(old_value)) => {

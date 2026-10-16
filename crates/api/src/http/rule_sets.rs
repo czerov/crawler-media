@@ -60,7 +60,17 @@ fn atom_from_input(input: AtomInput) -> Result<FilterAtom, String> {
         "audio_language" => AtomRule::AudioLanguage(value()?),
         "site" => AtomRule::Site(value()?),
         "wash_target" => AtomRule::WashTarget(value()?),
-        "upgrade_ladder" => AtomRule::UpgradeLadder(value()?),
+        "upgrade_ladder" => {
+            let ladder = value()?;
+            // L3: only the dimensions the chooser understands are accepted.
+            if let Some(bad) = subscribe::unknown_ladder_dimension(&ladder) {
+                return Err(format!(
+                    "upgrade_ladder 维度 {bad} 无效（可选 {}）",
+                    subscribe::LADDER_DIMENSIONS.join("/")
+                ));
+            }
+            AtomRule::UpgradeLadder(ladder)
+        }
         // 黑名单原子：命中即排除（平台/制作组标记通常可见于标题）。
         "platforms_block" | "hdr_block" | "release_group_block" => {
             if !input.exclude {
@@ -271,7 +281,13 @@ pub(crate) async fn patch_rule_set(
     let existing = match store.get_filter(id) {
         Ok(Some(f)) => f,
         Ok(None) => return err(StatusCode::NOT_FOUND, "rule_set.missing", "规则组不存在"),
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &e.to_string()),
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store.error",
+                &e.to_string(),
+            );
+        }
     };
     let filter = Filter {
         id,

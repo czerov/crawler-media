@@ -658,3 +658,28 @@ async fn today_arrivals_carry_release_forecast_for_upcoming_episodes() {
     );
     assert!(with_forecast.unwrap()["release_forecast"]["target_air_date"].is_string());
 }
+
+#[tokio::test]
+async fn l3_upgrade_ladder_rejects_unknown_dimensions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = authed_app(&tmp);
+    let save = |ladder: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(request(
+                "POST",
+                "/api/v1/rule-sets",
+                Some("management-secret"),
+                json!({
+                    "name": "ladder",
+                    "atoms": [{ "kind": "upgrade_ladder", "value": ladder, "priority": 50 }],
+                }),
+            ))
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+    assert_eq!(save("resolutions").await, StatusCode::BAD_REQUEST);
+    assert_eq!(save("resolution, hdr").await, StatusCode::CREATED);
+}

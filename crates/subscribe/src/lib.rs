@@ -15,7 +15,8 @@ mod types;
 pub use absolute::AbsoluteEpisodes;
 pub use add::{Added, admit_and_add};
 pub use choose::{
-    OverlapPolicy, candidate_matches_subscribe, choose, choose_with_policy, is_complete, target_reached,
+    LADDER_DIMENSIONS, OverlapPolicy, candidate_matches_subscribe, choose, choose_with_policy,
+    is_complete, target_reached, unknown_ladder_dimension,
 };
 pub use collect::{
     collect_completed, collect_completed_controlled, collect_completed_with_destinations,
