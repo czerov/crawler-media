@@ -96,17 +96,21 @@ fn missing_units(
     subscribe: &domain::Subscribe,
     media: &domain::Media,
 ) -> Result<Vec<Unit>, crate::store::StoreError> {
+    let cap = crate::air_gate::aired_cap(state, subscribe, media);
     let store = state.store.lock();
     let facts = store.load_subscribe_facts(subscribe.id)?;
     let pending = store.load_pending(subscribe.id)?;
     let history = store.load_wanted_history(subscribe.id)?;
-    Ok(crate::open_coverage::units(
-        subscribe,
-        media,
-        &facts,
-        &pending,
-        &history,
-        std::iter::empty(),
+    Ok(crate::air_gate::cap_units(
+        crate::open_coverage::units(
+            subscribe,
+            media,
+            &facts,
+            &pending,
+            &history,
+            std::iter::empty(),
+        ),
+        cap,
     )
     .into_iter()
     .filter(|(season, episode)| {

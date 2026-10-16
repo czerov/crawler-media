@@ -21,6 +21,13 @@ pub(crate) fn all_wanted_unaired(state: &ApiState, subscribe: &Subscribe, media:
     if wanted.is_empty() {
         return false;
     }
+    if let Some(cap) = aired_cap(state, subscribe, media) {
+        // M5: follow_future=false — nothing aired is missing, nothing to search.
+        if cap_units(wanted.clone(), Some(cap)).is_empty() {
+            tracing::info!(subscribe_id = %subscribe.id, cap, "follow_future=false：已播集均已在库/在途，跳过搜索");
+            return true;
+        }
+    }
     // Store lock must be released before calling the catalog (deadlock, see http/subscriptions.rs).
     let air_dates: HashMap<u32, Option<String>> = match state
         .catalog
@@ -55,6 +62,57 @@ pub(crate) fn all_wanted_unaired(state: &ApiState, subscribe: &Subscribe, media:
         tracing::info!(subscribe_id = %subscribe.id, wanted = wanted.len(), "air-date gate: all wanted episodes unaired, skipping site search");
     }
     unaired
+}
+
+/// M5: for an open TV window with `follow_future=false`, the highest episode
+/// the catalog lists as already aired. `None` = no cap (follow_future, bounded
+/// coverage, or catalog without dates). Call without the store lock.
+pub(crate) fn aired_cap(state: &ApiState, subscribe: &Subscribe, media: &Media) -> Option<u32> {
+    let (
+        false,
+        MediaKind::Tv,
+        Some(tmdb_id),
+        Coverage::Tv {
+            season,
+            episode_to: None,
+            ..
+        },
+    ) = (
+        subscribe.follow_future,
+        media.kind,
+        media.tmdb_id.as_deref(),
+        &subscribe.coverage,
+    )
+    else {
+        return None;
+    };
+    let episodes = state.catalog.season_episodes(tmdb_id, *season).ok()?;
+    let today = crate::compact_time::local_date(crate::job_loop::unix_now());
+    let mut dated = false;
+    let mut cap = 0;
+    for ep in episodes {
+        if let Some(date) = ep.air_date.as_deref().filter(|d| d.len() >= 10) {
+            dated = true;
+            if !is_future(date, &today) {
+                cap = cap.max(ep.episode_number);
+            }
+        }
+    }
+    dated.then_some(cap)
+}
+
+/// Drop units beyond `cap` (M5).
+pub(crate) fn cap_units(
+    units: Vec<(Option<u32>, Option<u32>)>,
+    cap: Option<u32>,
+) -> Vec<(Option<u32>, Option<u32>)> {
+    match cap {
+        Some(cap) => units
+            .into_iter()
+            .filter(|(_, e)| e.is_none_or(|e| e <= cap))
+            .collect(),
+        None => units,
+    }
 }
 
 fn is_future(air_date: &str, today: &str) -> bool {
@@ -98,6 +156,16 @@ fn wanted_units(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cap_units_filters_beyond_cap() {
+        let units = vec![(Some(1), Some(3)), (Some(1), Some(4))];
+        assert_eq!(
+            super::cap_units(units.clone(), Some(3)),
+            vec![(Some(1), Some(3))]
+        );
+        assert_eq!(super::cap_units(units.clone(), None), units);
+    }
+
     #[test]
     fn future_compare() {
         assert!(super::is_future("2026-10-20", "2026-10-16"));
