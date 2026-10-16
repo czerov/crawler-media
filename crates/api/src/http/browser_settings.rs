@@ -205,6 +205,14 @@ pub async fn reconcile_off_runtime(state: &ApiState) {
 /// Fire-and-forget reconcile usable from sync code (startup, Site writes).
 pub fn spawn_reconcile(state: &ApiState) {
     let worker = state.clone();
+    // A stop/no-op decision is cheap (settings read, no download): apply it
+    // inline so no background task contends for the store lock. Only a start
+    // (possible download + readiness wait) goes to the blocking pool.
+    let (want, _) = load_want(state);
+    if not_started_reason(want).is_some() {
+        reconcile_obscura(&worker);
+        return;
+    }
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn_blocking(move || reconcile_obscura(&worker));
     } else {
