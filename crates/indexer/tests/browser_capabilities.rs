@@ -9,6 +9,9 @@ impl PageSession for EndpointPage {
     fn set_cookie_header(&self, _: &str) -> Result<(), IndexerError> {
         Ok(())
     }
+    fn set_site_cookies(&self, _: &str, _: &str) -> Result<(), IndexerError> {
+        Ok(())
+    }
     fn content(&self) -> Result<String, IndexerError> {
         Ok(self.0.clone())
     }
