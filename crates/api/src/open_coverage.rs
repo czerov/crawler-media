@@ -14,6 +14,26 @@ pub(crate) fn units(
     history: &HashMap<(Option<u32>, Option<u32>), WantedHistory>,
     observed: impl IntoIterator<Item = u32>,
 ) -> Vec<(Option<u32>, Option<u32>)> {
+    units_bounded(subscribe, media, facts, pending, history, observed, None)
+}
+
+/// Episodes more than this far past the known highest one are not trusted
+/// from rejected candidates (L5).
+const OBSERVED_SLACK: u32 = 3;
+
+/// L5: like `units`, but `observed` (episode numbers parsed from rejected
+/// candidates) may only extend the window up to
+/// `max(known highest + 3, catalog_max)` when `catalog_max` is given as
+/// `Some(..)`; pass `Some(0)` without catalog data to apply the +3 rule alone.
+pub(crate) fn units_bounded(
+    subscribe: &Subscribe,
+    media: &Media,
+    facts: &subscribe::SubscribeFacts,
+    pending: &[(i32, PendingDownload)],
+    history: &HashMap<(Option<u32>, Option<u32>), WantedHistory>,
+    observed: impl IntoIterator<Item = u32>,
+    catalog_max: Option<u32>,
+) -> Vec<(Option<u32>, Option<u32>)> {
     let Coverage::Tv {
         season,
         episode_from,
@@ -44,7 +64,12 @@ pub(crate) fn units(
             highest = highest.max(release.episode_to.or(release.episode).unwrap_or(0));
         }
     }
+    let limit = catalog_max.map(|max| highest.saturating_add(OBSERVED_SLACK).max(max));
     for ep in observed {
+        if limit.is_some_and(|limit| ep > limit) {
+            tracing::debug!(subscribe_id = %subscribe.id, episode = ep, "被拒候选集号超出合理范围，不扩展 wanted 单元");
+            continue;
+        }
         highest = highest.max(ep);
     }
     let to = highest

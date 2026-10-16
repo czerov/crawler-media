@@ -68,8 +68,20 @@ pub(crate) fn all_wanted_unaired(state: &ApiState, subscribe: &Subscribe, media:
 /// the catalog lists as already aired. `None` = no cap (follow_future, bounded
 /// coverage, or catalog without dates). Call without the store lock.
 pub(crate) fn aired_cap(state: &ApiState, subscribe: &Subscribe, media: &Media) -> Option<u32> {
+    if subscribe.follow_future {
+        return None;
+    }
+    catalog_aired_max(state, subscribe, media)
+}
+
+/// Highest aired episode of an open TV window's season per the catalog
+/// (None without dated catalog episodes). Ignores `follow_future`.
+pub(crate) fn catalog_aired_max(
+    state: &ApiState,
+    subscribe: &Subscribe,
+    media: &Media,
+) -> Option<u32> {
     let (
-        false,
         MediaKind::Tv,
         Some(tmdb_id),
         Coverage::Tv {
@@ -77,12 +89,7 @@ pub(crate) fn aired_cap(state: &ApiState, subscribe: &Subscribe, media: &Media) 
             episode_to: None,
             ..
         },
-    ) = (
-        subscribe.follow_future,
-        media.kind,
-        media.tmdb_id.as_deref(),
-        &subscribe.coverage,
-    )
+    ) = (media.kind, media.tmdb_id.as_deref(), &subscribe.coverage)
     else {
         return None;
     };

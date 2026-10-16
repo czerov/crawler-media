@@ -276,6 +276,7 @@ fn record_wanted_round<D: downloader::Downloader + ?Sized>(
 ) -> Result<(), String> {
     let now = crate::job_loop::unix_now();
     let cap = crate::air_gate::aired_cap(state, subscribe, added.input.media);
+    let catalog_max = crate::air_gate::catalog_aired_max(state, subscribe, added.input.media);
     let store = state.store.lock();
     let facts = store
         .load_subscribe_facts(subscribe.id)
@@ -295,13 +296,14 @@ fn record_wanted_round<D: downloader::Downloader + ?Sized>(
         })
         .filter_map(|candidate| candidate.release.episode_to.or(candidate.release.episode));
     let tracked: Vec<(Option<u32>, Option<u32>)> = crate::air_gate::cap_units(
-        crate::open_coverage::units(
+        crate::open_coverage::units_bounded(
             subscribe,
             added.input.media,
             &facts,
             &pending,
             &history,
             observed,
+            Some(catalog_max.unwrap_or(0)),
         ),
         cap,
     )

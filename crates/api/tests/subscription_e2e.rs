@@ -62,6 +62,8 @@ mod l1_small_season_pack;
 mod l2_wider_pack;
 #[path = "subscription_e2e/l4_completion_marker.rs"]
 mod l4_completion_marker;
+#[path = "subscription_e2e/l5_rejected_episode_bound.rs"]
+mod l5_rejected_episode_bound;
 #[path = "subscription_e2e/m1_overlap_policy.rs"]
 mod m1_overlap_policy;
 #[path = "subscription_e2e/m2_owned_slot_skip.rs"]
