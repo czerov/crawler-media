@@ -743,3 +743,18 @@ crates/api/tests/subscription_e2e/
 - **流程测试场景**：库中已有 S01E01–E08，订阅 S01 共 10 集；搜索只返回 S01 全季包（10 个文件）。分别在 mock qB 与 mock Transmission（rpc≥16）上：开启 `subscribe.selective_files` → 提交 → 断言 mock 收到 E01–E08 的 priority=0 / files-unwanted → mock 仅完成 E09、E10 → Transfer。另跑一组关闭设置的对照。
 - **通过标准**：开启组 E09/E10 入库、E01–E08 不被重复导入、pending 为 imported；关闭组 mock 无文件优先级调用。
 - **风险与回滚**：风险：文件名集号解析错误导致误跳过所需文件——仅在设置开启时生效，且无法解析的文件一律保留。回滚：关闭设置或 revert。
+
+### G-H2b. 绝对集号映射为“季+集”（P3，承接 G-H2 推迟部分）
+
+- **严重度**：中
+- **涉及文件/函数**：`crates/subscribe/src/absolute.rs`（新增 `AbsoluteEpisodes`）；`RunInput.absolute`；`subscribe/src/add.rs`（准入后重映射）；`subscribe/src/collect.rs` `collect_one`（文件名重映射）；`crates/api/src/season_check.rs`（按目录构建映射，取代仅丢弃）
+- **根因**：无季号标题（如 `Show - 13`，多见于动画）被解析为 S01E13；G-H2 只能在集号超过目录 S01 集数时丢弃，无法把它正确归到后续季。
+- **具体改法**：
+  1. 目录逐季读取集数，得到累计表；仅当存在“季号为推断且集号超出 S01 集数”的候选时才构建（惰性，最多 50 季）。
+  2. 映射规则：季号为推断、集号区间整体落在同一后续季内 → 改写为该季的“季+集”，并清除 `season_inferred`；跨季或超出目录总集数 → 丢弃（保留 G-H2 行为）。S01 范围内的集号不变。
+  3. 同一映射在 Transfer 收集时作用于包内文件名，保证文件入对的槽位。
+  4. 搜索、手动执行、Transfer 三条路径都传入映射；目录不可用时退化为原 G-H2 行为。
+- **验收标准**：订阅 S02 时，`Show Episode 13`（S01 共 12 集）被选中并入库为 S02E01。
+- **流程测试场景**：FakeCatalog S01=12 集、S02=10 集；订阅 S02E01–E02；搜索返回 `The Long Watch Episode 13 1080p…`；提交 → mock qB 完成文件 `The Long Watch - 13 1080p.mkv` → Transfer。
+- **通过标准**：pending 被选中、库内出现 S02E01；G-H2 原用例（S01 订阅不接收 13）仍通过。
+- **风险与回滚**：风险：目录集数与站点编号习惯不一致（如 OVA 计入）会映射错位——仅影响无季号标题。回滚：revert。
