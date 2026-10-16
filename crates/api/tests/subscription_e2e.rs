@@ -20,6 +20,8 @@ mod d_h1_qbit_relogin;
 mod d_h2_existing_infohash;
 #[path = "subscription_e2e/d_h3_m8_no_overwrite.rs"]
 mod d_h3_m8_no_overwrite;
+#[path = "subscription_e2e/d_m4_torrent_validation.rs"]
+mod d_m4_torrent_validation;
 #[path = "subscription_e2e/d_m3_persisted_infohash.rs"]
 mod d_m3_persisted_infohash;
 #[path = "subscription_e2e/d_s1_pending_cleanup.rs"]

@@ -179,7 +179,13 @@ impl Downloader for QbitDownloader {
         let mut fallback_url = true;
         if download_url.starts_with("http://") || download_url.starts_with("https://") {
             if let Ok(bytes) = self.download_torrent_bytes(download_url, UA) {
-                if bytes.len() >= 8 {
+                // D-M4: only a bencoded dictionary with an `info` key is a
+                // torrent; an HTML login page / error body is not uploaded.
+                let valid = crate::torrent_info_hash(&bytes).is_some();
+                if !valid {
+                    tracing::warn!(torrent = %torrent.title, bytes = bytes.len(), "种子链接返回的不是 .torrent（可能站点 Cookie 失效），不上传");
+                }
+                if valid {
                     static NONCE: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -205,7 +211,7 @@ impl Downloader for QbitDownloader {
         }
         if temp_path.is_none() && fallback_url && download_url != torrent.enclosure {
             return Err(DownloaderError::Message(
-                "failed to fetch resolved Torrent before the signed URL expired".into(),
+                "failed to fetch resolved Torrent before the signed URL expired (站点 Cookie 失效或链接未返回 .torrent)".into(),
             ));
         }
         // The multipart form is consumed per request, so rebuild it for a
@@ -230,7 +236,12 @@ impl Downloader for QbitDownloader {
             }
             form
         };
-        self.post_add_form(&build_form, &torrent.title, &tag)
+        let result = self.post_add_form(&build_form, &torrent.title, &tag);
+        // D-M4: never leave the staged .torrent behind.
+        if let Some(path) = &temp_path {
+            let _ = std::fs::remove_file(path);
+        }
+        result
     }
 
     fn uploaded_by_category(&self, category: &str) -> Result<u64, DownloaderError> {
@@ -576,7 +587,7 @@ impl QbitDownloader {
 
 fn http_agent() -> ureq::Agent {
     let config = ureq::config::Config::builder()
-        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
         .build();
     ureq::Agent::new_with_config(config)
 }
