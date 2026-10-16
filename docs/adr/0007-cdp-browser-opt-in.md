@@ -27,21 +27,22 @@
 
 - **登录 / Check-in**：只有**导航之前**的失败（端点解析、排队超时 `BrowserBusy`、target / WebSocket 建立、cookie 注入失败——服务端尚未收到请求）才回退 HTTP，并 `warn!`（Site、route、原因）。**导航已发出之后**的失败不回退，直接报错，避免重复签到或重复登录请求。
 - 回退不等于成功；HTTP 遇到质询照常报错，不重试浏览器路径。
-- 单个浏览器会话有总时限（默认 30s，可配置，**含排队等待**），各步骤共用剩余时间；会话结束的 cookie 清理与 target 关闭另有独立上限（默认 2s），超时只 `warn!`，因此单会话最长占用为「总时限 + 2 × 清理上限」。
+- 单个浏览器会话有总时限（默认 30s，可配置，含排队），各步骤共用剩余时间；排队另有独立上限（默认 15s），拿到名额后剩余时间不足 10s 即在导航前返回 busy（可回退 HTTP），避免排队把失败推到「导航后」；会话结束的 cookie 清理与 target 关闭另有独立上限（默认 2s），超时只 `warn!`，因此单会话最长占用为「总时限 + 2 × 清理上限」。
 
 ### 并发与 cookie 隔离
 
 - 站点 cookie 只经 `Network.setCookies` 按站点 host 注入（host-only，https 置 `secure`），**不得**使用 `Network.setExtraHTTPHeaders`（会发给第三方主机）。
-- **多标签并发**：所有 tab 共用 daemon 的 cookie jar，cookie 按 host 绑定，不同站点天然隔离。全局并发上限默认 3（1–8 可配）。
-- **按站点清理**：会话结束时只删除本会话站点 origin 下的 cookie（`Network.getCookies{urls:[origin]}` + 逐个 `Network.deleteCookies{name,url}`），**不使用** `Network.clearBrowserCookies`（会清掉其它 tab 的 cookie）。不依赖 `Target.createBrowserContext`；每会话独立上下文是后续增强。
-- **同站点串行**：同一站点（scheme+host+port）同一时刻最多一个会话，避免一方的注入或清理冲掉另一方的 cookie。
-- **有界等待**：拿不到全局名额或站点锁时排队，最多等到会话总时限；超时返回 busy（属于导航前失败，可回退 HTTP）。登录与签到是后台 Job，排队可接受。
-- `Network.deleteCookies` 的支持以计划 Task 0 实测为准；不支持时改用过期覆盖删除，仍不可行则并发上限降为 1。
+- **多标签并发**：所有 tab 共用 daemon 的 cookie jar。我们注入的 cookie 按 host 绑定，但服务器可能在会话中写入父域 cookie，因此另需下面的分组串行与精确清理。全局并发上限默认 3（1–8 可配）。
+- **精确清理**：会话结束时用 `Network.getAllCookies`（或 `Storage.getCookies`）取全部 cookie，筛出 domain 属于本站 host、其父域或本会话跳转访问过的 host 的条目，按每条 cookie **自身的** name+domain+path 调 `Network.deleteCookies` 删除（仅给 url 删不到 `path=/forum` 这类 cookie）；删除后复查，残留只 `warn!`。**不使用** `Network.clearBrowserCookies`（会清掉其它 tab 的 cookie）。不依赖 `Target.createBrowserContext`；每会话独立上下文是后续增强。
+- **按可注册域分组串行**：忽略 scheme 与端口（cookie 不按它们隔离）；host 相同、互为后缀，或都至少 3 个 label 且去掉首个 label 后相同（兄弟子域）的站点同组，同一时刻最多一个会话，避免父域 cookie 串号或被另一会话删除。不引入 PSL，`*.co.uk` 之类会被保守串行。
+- **有界 FIFO 排队**：拿不到全局名额或分组时按票号先来先服务排队，超过排队上限或剩余时间不足即返回 busy（导航前失败，可回退 HTTP）。登录与签到是后台 Job，排队可接受。
+- 前提以计划 Task 0 实测为准：`getAllCookies`/`Storage.getCookies` 至少一个可用，且带 domain+path 的 `deleteCookies` 能删除 path 级 cookie。不满足时并发上限**降为 1**（`deleteCookies` 缺失时先尝试过期覆盖删除）。
 
 ### 受管 Obscura 生命周期
 
-**启动条件**（全部满足）：开关开启、未配置 `cdp.url`、至少一个启用中、`maintenance_via = browser` 且没有自己 Site `cdp_url` 的 Site（`browser_sites > 0`）、二进制已安装（或安装策略允许下载）。默认所有 Site 为 `http`，因此只开开关不会启动浏览器进程。不满足时 `/settings/browser` 返回未启动原因（`switch_off` / `instance_endpoint_configured` / `no_browser_sites` / `not_installed` / `start_failed`）。Site 的 `maintenance_via`、`cdp_url`、启用状态变化后重新评估。
+**启动条件**（全部满足）：开关开启、未配置 `cdp.url`、至少一个启用中、`maintenance_via = browser` 且没有自己 Site `cdp_url` 的 Site（`managed_browser_sites > 0`；设置页另显示含自带端点的 `browser_sites`）、二进制已安装（或安装策略允许下载）。默认所有 Site 为 `http`，因此只开开关不会启动浏览器进程。不满足时 `/settings/browser` 返回未启动原因（`switch_off` / `instance_endpoint_configured` / `no_browser_sites` / `not_installed` / `start_failed`）。Site 的 `maintenance_via`、`cdp_url`、启用状态变化后重新评估。
 
+- **浏览器会话不使用 Site 代理**（浏览器自己出网）。配置了 `proxy` 的 Site 不能选择浏览器方式（写入时 400），以免直连暴露真实出口或因 IP 不一致失败。
 - **安装策略** `obscura.install`：默认 `preinstalled`（只用预置二进制，不联网）；Admin 显式改为 `download` 才会从发布地址下载。启动默认值可由 `CRAWLER_MEDIA_OBSCURA_INSTALL` 设置。
 - **端口与绑定**：每次启动选随机空闲端口，并以 `--host 127.0.0.1` 绑定回环（以 Task 0 实测为准；无法保证回环绑定则拒绝启用受管模式）。就绪与身份以 `/json/version` 加本进程子进程存活判定。端口竞争导致启动失败时换端口重试至多 2 次。
 - **进程身份**：pidfile `<data>/run/obscura.pid`（pid、端口、nonce）。启动时只回收 exe 指向 `<data>/bin/obscura` 的旧进程；其它进程只删 pidfile，不杀。应用正常退出时停止受管 daemon。
@@ -67,9 +68,11 @@
 ### 迁移规则（一次性，启动时）
 
 - `cdp.enabled` 已存在 → 不迁移。
-- 否则 `cdp.enabled = cdp.sync.enabled || obscura.enabled`；若两者都关但有 Site 配了非空 `cdp_url`（旧边界允许「全局关 + Site 端点」）→ 置 `cdp.enabled=1` 并记 `info!`，避免升级后静默失去渲染。
+- 否则 `cdp.enabled = cdp.sync.enabled || obscura.enabled`。**不**因为 Site 配了 `cdp_url` 而打开开关：旧 Site 端点只服务已删除的搜索渲染。
 - `cdp.url` 为空且 `obscura.url` 非空 → 写入 `cdp.url`。
-- Site 新增 `maintenance_via`（默认 `http`）；`cdp_url` 非空或 Profile 曾为 `render: true` 的 Site 迁移为 `browser`，保持旧版本下这些 Site 用浏览器登录/签到的行为。写入新 key 后删除三个旧 key；迁移代码在下一个 minor 版本删除。
+- Site 新增 `maintenance_via`，迁移后**所有 Site 均为 `http`**。旧版本生产代码的登录与签到只走 HTTP（`crates/api/src/check_in.rs` 与 `crates/api/src/http/sites.rs` 的 `site_login`/`site_check_in` 只用 HTTP 插件，浏览器登录只存在于 hooks 测试），因此保持 `http` 才是保持旧行为；升级不得在用户不知情时改变登录/签到方式、打开开关或触发受管 Obscura。
+- 原有 `cdp_url` 或使用 `render: true` Profile 的 Site 在 `/settings/browser` 的 `legacy_site_notices` 与 Site 列表中提示：「原 CDP 端点已不再用于搜索」「render 搜索已移除，搜索改走 HTTP，可能拿不到结果，请改用可直接 HTTP 抓取的 Profile」；如需浏览器登录/签到，由用户手动改为浏览器方式。
+- 写入新 key 后删除三个旧 key；迁移代码在下一个 minor 版本删除。
 - 已保存的 `https://` 实例或 Site 端点在新规则下非法：**不自动改写**，记 `warn!`，并在 `/settings/browser` 的 `invalid_endpoints` 中列出，由 UI 提示用户修改；在修改前这些 Site 的浏览器会话在导航前失败并回退 HTTP。
 
 ### 凭据

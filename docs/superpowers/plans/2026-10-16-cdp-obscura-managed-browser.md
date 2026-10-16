@@ -19,6 +19,8 @@
 - 2026-10-16 r4 补记：r2 修订时 Global Constraints 与 Review Focus 两节被误删，r4 已恢复并按新范围更新。
 - 2026-10-16 r4：**范围调整**（用户决定）：删除搜索渲染——搜索/RSS 永不使用 CDP，Browser 只服务登录与 Check-in。删除 Profile `render` 搜索路径、`RoutedFetcher`、`FetchSource`/`HttpFallback`、`SiteFailureKind::CdpFallbackEmpty` 及其 UI、插件 Profile `render` 拒绝；新增 Site 级 `maintenance_via`（`http`/`browser`），受管 daemon 在 `browser_sites > 0` 时按需启动。多标签并发：cookie 清理改为按会话站点 `Network.deleteCookies`（不依赖 `createBrowserContext`），删除 `CookieIsolation`/强制并发 1；默认并发 3，permit 有界等待；同站点会话串行（per-site 锁）；清理与 close 有独立上限。R3-M1（多 render 站点搜索必然降级）随搜索渲染删除而**不再适用**。
 
+- 2026-10-16 r5：按第四轮复审修订。R4-H1：核对代码（`check_in.rs::run`、`http/sites.rs` 的 `site_login`/`site_check_in` 只用 `LoginPlugin::http`/`CheckInPlugin::http`，`LoginVia::Browser` 仅在 hooks 测试中使用），旧版本登录/签到从未走浏览器——迁移一律 `maintenance_via = http`，删除「有 Site `cdp_url` 就打开开关」，改为提示用户手动选择。R4-M1：清理改用 `Network.getAllCookies`（或 `Storage.getCookies`）按 domain 过滤后以 cookie 自身 `domain`+`path` 精确删除；同站点锁按可注册域（后缀互含）分组，忽略 scheme/端口。R4-M2：独立排队上限 + 剩余时间下限 + FIFO 票号。R4-M3：旧 render overlay 站点可见提示。R4-L1–L4。
+
 ## 起点
 
 分支 `feat/cdp-obscura` 自 `d201fcf` 起，代码与 `main` 相同。**不存在、也不依赖任何本机补丁**；Task 1 从现有代码（`crates/indexer/src/browser.rs` 中 `PageSession::cookie_header` 默认返回 `Ok("session=browser")`、`cdp_page.rs` 未实现 `cookie_header`、`set_cookie_header` 走 `Network.setExtraHTTPHeaders`）直接改起。
@@ -52,8 +54,9 @@
 5. **浏览器路径与 HTTP 路径的登录/签到判定必须同源**：同一个 `SiteResponsePolicy`（Task 7）。
 6. **端点非法**（`https`、`ws://`、内嵌凭据、带 query）：写入时 400 拒绝；存量非法端点只提示不改写（Task 2/3）。
 7. **受管二进制被篡改**：哈希不符、超过大小上限、归档含意外条目，一律拒绝安装且不留文件（Task 4）。
-8. **站点 cookie 外泄与串号**：cookie 只经 `Network.setCookies` 绑定站点 host，不出现在 `setExtraHTTPHeaders`；会话结束只删除本站点 cookie，不清整个 jar；同站点会话串行（Task 1）。
+8. **站点 cookie 外泄与串号**：cookie 只经 `Network.setCookies` 绑定站点 host，不出现在 `setExtraHTTPHeaders`；会话结束按 cookie 自身 domain+path 删除本站点（含父域、跳转 host）cookie，不清整个 jar；同 host 与兄弟子域会话串行（Task 1）。
 9. **导航后失败的重复签到**：导航已发出后失败不得再走 HTTP 签到（Task 8）。
+10. **升级不得改变登录/签到方式**：迁移后所有 Site 仍为 `http`，开关不被自动打开，旧 `cdp_url`/render 配置只产生提示（Task 2）。
 
 ---
 
@@ -61,7 +64,7 @@
 
 执行者开工前要读的三份规格必须与本计划一致。r3 提交已改写：
 
-- `docs/adr/0007-cdp-browser-opt-in.md`：默认 `preinstalled`、显式 `download`；随机端口 + 回环绑定 + 身份确认；端点只接受 `http`；登录/签到导航后失败不回退；受管 daemon 仅在 `browser_sites > 0` 时启动（r4）；搜索不使用 CDP（r4）；新增「并发与 cookie 隔离」「信任模型」「迁移规则」（含 https 存量端点）；「验证边界」留出 Task 0 实测表。
+- `docs/adr/0007-cdp-browser-opt-in.md`：默认 `preinstalled`、显式 `download`；随机端口 + 回环绑定 + 身份确认；端点只接受 `http`；登录/签到导航后失败不回退；受管 daemon 仅在 `managed_browser_sites > 0` 时启动（r4/r5）；搜索不使用 CDP（r4）；新增「并发与 cookie 隔离」「信任模型」「迁移规则」（含 https 存量端点）；「验证边界」留出 Task 0 实测表。
 - `docs/deploy.md`：Browser 段落与环境变量表（`CRAWLER_MEDIA_BROWSER` 只控制开关、新增 `CRAWLER_MEDIA_OBSCURA_INSTALL`）、预置规则、`network_mode: host` 风险。
 - `CONTEXT.md` 的 **Browser** 词条。
 
@@ -97,13 +100,14 @@ curl -s http://127.0.0.1:$PORT/json/version
 - [ ] **Step 3: 逐项验证方法**
 
 `obscura_compat.rs` 中每个方法一个 `#[ignore]` 测试，用本地 `python3 -m http.server` 服务 fixture：
-`PUT /json/new`（及 GET 回退）、`PUT /json/close/{id}`、`webSocketDebuggerUrl` 的 scheme/host/port、`Network.enable`、`Page.enable`、`Page.setLifecycleEventsEnabled` + `Page.lifecycleEvent(load)`、`Page.navigate`（`frameId`/`loaderId`）、`Runtime.evaluate`（`returnByValue`）、`Network.setCookies`、`Network.getCookies{urls}`、`Network.deleteCookies{name,url}`（**必需**：删除后 `getCookies` 应为空；同时另一 tab 中另一站点的 cookie 不受影响）、`Target.createBrowserContext` / `Target.disposeBrowserContext`（可选，仅记录）、两个 tab 并发导航不同站点。另测一次 NexusPHP 签到页：浏览器 GET `attendance.php` 是否真实签到（L7）。
+`PUT /json/new`（及 GET 回退）、`PUT /json/close/{id}`、`webSocketDebuggerUrl` 的 scheme/host/port、`Network.enable`、`Page.enable`、`Page.setLifecycleEventsEnabled` + `Page.lifecycleEvent(load)`、`Page.navigate`（`frameId`/`loaderId`）、`Runtime.evaluate`（`returnByValue`）、`Network.setCookies`、`Network.getCookies{urls}`、`Network.deleteCookies{name,url}`（**必需**：删除后 `getCookies` 应为空；同时另一 tab 中另一站点的 cookie 不受影响）、`Network.getAllCookies` 与 `Storage.getCookies`（至少一个可用）、带 `domain`+`path` 的 `Network.deleteCookies` 能删除 `path=/forum` 的 cookie、服务器设置父域 cookie（`Domain=.example.test`）后兄弟子域 tab 是否可见、`Target.createBrowserContext` / `Target.disposeBrowserContext`（可选，仅记录）、两个 tab 并发导航不同站点（R4-M1）。另测一次 NexusPHP 签到页：浏览器 GET `attendance.php` 是否真实签到（L7）。
 
 - [ ] **Step 4: 写入 ADR「验证边界」**
 
 表格：方法 → 支持/不支持 → 降级方式。约定的降级：
 - 无 `Target.createBrowserContext` → 无影响：v1 用按站点 `Network.deleteCookies` 清理，不依赖独立上下文；独立上下文是后续增强。
-- 无 `Network.deleteCookies` → 改为对本站点每个 cookie 发 `Network.setCookie{expires: 1}` 覆盖删除；仍不可行则 `Browser` 并发上限降为 1 并在 ADR 记录。
+- 无 `Network.getAllCookies` 且无 `Storage.getCookies`，或带 domain+path 的 `deleteCookies` 删不掉 path 级 cookie → 无法精确清理：`Browser` 并发上限**降为 1**（`with_max_sessions` 被钳制），会话结束仍尽力按 `getCookies{urls}` 清理，并在 ADR 写明这一前提。
+- 无 `Network.deleteCookies` → 改为对每个待删 cookie 发 `Network.setCookie{name, domain, path, expires: 1}` 覆盖删除；仍不可行同样降为并发 1。
 - 无 `Network.getCookies` → `cookie_header` 返回 `Err`，`RenderedPage.cookie_header = None`（保留原 cookie）。
 - 无 `Network.setCookies` → **不渲染带 cookie 的请求**（报 `CdpUnsupported`，回退 HTTP），绝不退回 `setExtraHTTPHeaders`。
 - 无 lifecycle 事件 → 仅以 `document.readyState == complete` 判定。
@@ -148,11 +152,13 @@ git commit -m "test(indexer): add ignored Obscura CDP compatibility probe and re
             let _ = page_url;
             Err(IndexerError::Fetch("Browser cookie readback unsupported".into()))
         }
-        /// 删除本会话站点 origin 下的全部 cookie；默认 no-op。
-        fn clear_site_cookies(&self, page_url: &str, deadline: Instant) -> Result<(), IndexerError> {
-            let _ = (page_url, deadline);
-            Ok(())
+        /// 删除 domain 属于 `hosts`（本站 host、其父域、会话中访问过的 host）的全部 cookie；默认 no-op。
+        fn clear_site_cookies(&self, hosts: &[String], deadline: Instant) -> Result<CleanupReport, IndexerError> {
+            let _ = (hosts, deadline);
+            Ok(CleanupReport::default())
         }
+        /// 会话中实际访问过的 host（含跳转），用于清理；默认空。
+        fn visited_hosts(&self) -> Vec<String> { Vec::new() }
         fn set_deadline(&self, deadline: Instant) { let _ = deadline; }
     }
     ```
@@ -162,16 +168,20 @@ git commit -m "test(indexer): add ignored Obscura CDP compatibility probe and re
   - 删除 `Browser::fetch_html`（唯一调用方 `hooks/src/plugins.rs::browser_page` 在 Task 7 改用 `render`）
   - `Browser::with_max_sessions(self, n: usize) -> Self`：全局同时打开的 tab 数，**默认 3**，允许 1–8
   - `Browser::with_render_deadline(self, Duration) -> Self`：默认 30s（登录/签到是后台任务），**包含排队等待**
+  - `Browser::with_queue_cap(self, Duration) -> Self`：排队上限，默认 15s（R4-M2）
+  - `Browser::with_min_work(self, Duration) -> Self`：拿到名额后至少要剩的工作时间，默认 10s（R4-M2）
+  - `Browser::with_precise_cleanup(self, bool) -> Self`：默认 `true`；Task 0 证明不能精确清理时由 api 设为 `false`，此时有效并发上限钳制为 1（R4-M1）
   - `Browser::with_cleanup_cap(self, Duration) -> Self`：默认 2s，是清理 cookie 和关闭 target 的**独立**上限，不占 render 预算（R3-L4）
   - `IndexerError::BrowserBusy` 与 `IndexerError::BrowserSetup(String)` 变体：排队超时、`open`、`set_site_cookies` 等**导航前**失败都归为 setup 阶段（Task 7/8 据此决定是否允许回退）
 
-**多标签与站点隔离（r4，不依赖 `Target.createBrowserContext`）：**
-- 所有 tab 共用 daemon 的默认 cookie jar。cookie 用 `url` 字段做 host-only 绑定，不同站点的 cookie 天然按 host 分开，A 站的 tab 不会带上 B 站的 cookie。
-- **同站点串行**：`BrowserSlots` 持有 `Mutex<SlotState{active, sites: HashSet<String>}>` 和一个 `Condvar`，站点 key 为 `scheme://authority`。同一站点的登录和签到不会同时开两个 tab，避免一方的注入或清理冲掉另一方的 cookie。
-- **全局上限**：`active < max_sessions`。
-- **有界等待**：同时拿全局名额和站点锁时用 `Condvar::wait_timeout`，最多等到 render 截止时间；超时返回 `BrowserBusy`（属于 setup 阶段，可以回退 HTTP）。登录和签到都是后台 Job，排队可以接受。
-- **按站点清理**：会话结束时先 `Network.getCookies{urls:[origin]}` 列出本站点的 cookie，再逐个 `Network.deleteCookies{name, url: origin}`，只影响本站点 host。**不再使用 `Network.clearBrowserCookies`**，因为它会清掉其他 tab 的 cookie。
-- 清理和 `/json/close` 都在**释放站点锁与全局名额之前**完成，各自受 `cleanup_cap` 约束，超时只 `warn!`。单个会话最长占用 = `render_deadline + 2 × cleanup_cap`。
+**多标签与站点隔离（r4/r5，不依赖 `Target.createBrowserContext`）：**
+- 所有 tab 共用 daemon 的默认 cookie jar。我们注入的 cookie 用 `url` 字段做 host-only 绑定；但服务器在会话中可能写入父域 cookie（`Domain=.example.org`），host-only 只隔离我们注入的部分，因此还需要下面的锁粒度与精确清理。
+- **同站点串行（按可注册域分组）**：`BrowserSlots` 持有 `Mutex<SlotState{active, groups: Vec<String>, queue: VecDeque<u64>, next_ticket}>` 和一个 `Condvar`。站点 key 取 host（**忽略 scheme 与端口**，因为 cookie 不按它们隔离）；两个 host 相等或一个是另一个的「`.` 边界后缀」（`a.example.org` 与 `example.org`），或两者都至少有 3 个 label 且去掉首个 label 后相同（`a.example.org` 与 `b.example.org` 共享 `example.org`）时视为冲突，同组串行；`example.org` 与 `other.org` 不冲突。不引入 PSL 依赖；代价是 `a.co.uk`/`b.co.uk` 这类会被保守串行，可以接受。
+- **全局上限**：`active < effective_max`，`effective_max = if precise_cleanup { max_sessions } else { 1 }`。
+- **有界等待 + FIFO（R4-M2）**：`acquire` 先领票号入队，只有队首且满足名额与分组条件时才出队（被分组阻塞的队首不阻塞后面不冲突的票，按票号顺序扫描第一个可运行的）。最长等待 `min(queue_cap, render_deadline − min_work)`；超时返回 `BrowserBusy`。拿到名额时若剩余时间 `< min_work`，立即释放并返回 `BrowserBusy`。两种情况都发生在 opener 调用之前，属于**导航前失败**，可回退 HTTP。
+- **精确清理（R4-M1）**：会话结束时 `Network.getAllCookies`（不可用时 `Storage.getCookies`）取全部 cookie，筛出 `domain`（去掉前导 `.`）等于或是 `hosts` 中任一 host 的父域/子域的条目，对每条按其**自身的** `name`+`domain`+`path` 发 `Network.deleteCookies{name, domain, path}`。删除后再查一次，残留则 `warn!(remaining)`。**不使用 `Network.clearBrowserCookies`**。由于同组串行，删除父域 cookie 不会影响正在运行的兄弟子域会话。
+- `hosts` = 本站 host ∪ `visited_hosts()`（`Page.frameNavigated` 事件中记录的 host，覆盖 SSO 子域跳转）。
+- 清理和 `/json/close` 都在**释放分组与全局名额之前**完成，各自受 `cleanup_cap` 约束，超时只 `warn!`。单个会话最长占用 = `render_deadline + 2 × cleanup_cap`。
 - 每会话独立的 `Target.createBrowserContext` 留作后续增强（Task 0 只记录能力），v1 不实现。
 
 - [ ] **Step 1: 写失败测试（cookie 注入与清理）**
@@ -189,10 +199,20 @@ fn site_cookies_are_bound_to_the_site_host_not_sent_as_extra_headers() {
 #[test]
 fn https_site_cookies_are_marked_secure() {}
 #[test]
-fn session_end_deletes_only_this_site_cookies() {
-    // 结束时收到 getCookies{urls:[origin]}，并对每个 name 收到一条 deleteCookies{name, url: origin}
+fn session_end_deletes_this_site_cookies_by_their_own_domain_and_path() {
+    // getAllCookies 返回：sid(domain a.example.test, path /)、fid(domain a.example.test, path /forum)、
+    //   pd(domain .example.test, path /)、other(domain other.test)
+    // 断言：收到 deleteCookies{sid,a.example.test,/}、{fid,a.example.test,/forum}、{pd,example.test,/}，没有 other
     // 断言：从未收到 Network.clearBrowserCookies
 }
+#[test]
+fn cookies_from_visited_redirect_hosts_are_cleaned_too() {
+    // Page.frameNavigated 到 sso.example2.test；该 host 的 cookie 也被删除
+}
+#[test]
+fn falls_back_to_storage_get_cookies_when_get_all_cookies_is_missing() {}
+#[test]
+fn residual_cookies_after_cleanup_only_warn() {}
 #[test]
 fn cleanup_is_capped_and_failures_only_warn() {
     // deleteCookies 挂起；with_cleanup_cap(100ms)；render 结果不受影响，总耗时 ≤ deadline + 2×cap
@@ -234,11 +254,24 @@ fn default_page_session_cookie_header_is_an_error_not_a_fake_session() {
 #[test] fn extra_session_waits_then_runs_when_a_slot_frees() {
     // with_max_sessions(1)；第二个站点排队，第一个结束后完成；两者的 cookie 互不干扰
 }
-#[test] fn waiting_beyond_the_deadline_is_busy() {
-    // with_max_sessions(1) + with_render_deadline(100ms)；第一个占用 300ms → 第二个 Err(BrowserBusy)
+#[test] fn waiting_beyond_the_queue_cap_is_busy_before_navigation() {
+    // with_max_sessions(1) + with_queue_cap(100ms)；第一个占用 300ms → 第二个 Err(BrowserBusy)，其 opener 从未被调用
+}
+#[test] fn too_little_time_left_after_queueing_is_busy_before_navigation() {
+    // render_deadline 300ms、min_work 200ms、queue_cap 1s；第一个占用 150ms → 第二个拿到名额时剩余 < 200ms → BrowserBusy，opener 未被调用
+}
+#[test] fn waiters_are_served_in_fifo_order() {
+    // max 1；依次提交 3 个不同站点；完成顺序与提交顺序一致
 }
 #[test] fn same_site_sessions_are_serialized() {
-    // 同一 origin 的两个 render：opener 记录的最大并发为 1，且第二个在第一个清理完成后才 setCookies
+    // 同一 host 不同端口/scheme 的两个 render：opener 记录的最大并发为 1
+}
+#[test] fn unrelated_two_label_hosts_do_not_conflict() {}
+#[test] fn sibling_subdomains_are_serialized() {
+    // a.example.test 与 b.example.test：最大并发 1；第一个删除 .example.test 父域 cookie 时第二个尚未开始
+}
+#[test] fn imprecise_cleanup_clamps_concurrency_to_one() {
+    // with_precise_cleanup(false) + with_max_sessions(3)：不同站点最大并发 1
 }
 #[test] fn render_respects_the_total_deadline() {
     // with_render_deadline(200ms)；假 CDP 每步延迟 80ms
@@ -272,7 +305,7 @@ Expected: 编译失败（没有 `render`/`RenderedPage`/`set_site_cookies`/`Brow
    Ok(by_name.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; "))
    ```
    （`BTreeMap` 同时完成去重和排序。）
-3. `clear_site_cookies(page_url, deadline)`：先 `getCookies{urls:[origin]}`，再对去重后的每个 name 发 `Network.deleteCookies{name, url: origin}`（会删掉该 host 下所有 path 的同名 cookie）。日志只记 `deleted_count`。
+3. `clear_site_cookies(hosts, deadline)`：`Network.getAllCookies`（方法不存在时 `Storage.getCookies`）取全部 cookie；保留 `domain.trim_start_matches('.')` 与 `hosts` 中任一 host 相等或互为 `.` 边界后缀的条目；对每条发 `Network.deleteCookies{name, domain: <cookie 自身 domain>, path: <cookie 自身 path>}`（CDP 按 domain+path 精确匹配；仅给 `url` 时只能删掉适用于该 URL 的 cookie，删不到 `path=/forum` 这类，故不用 `url`）。删除后再取一次，统计残留，返回 `CleanupReport{deleted, remaining}`。日志只记计数。另外在 transport 事件循环中处理 `Page.frameNavigated`，把 `frame.url` 的 host 记入 `visited_hosts`。
 4. `open_cdp_session`：拿到 `webSocketDebuggerUrl` 后，校验它的 host 和 port 与 discovery `base` 一致（`ws` 与 `http` 的默认端口都是 80），不一致即 `Err`（H4）。此时 `session` 已构造，`Drop` 会 close target。
 5. `Drop`：只做 `transport.close()` 和 `/json/close`（`http_agent` 的超时取 `cleanup_cap`，在构造 session 时记录），失败只 `warn!`。cookie 清理由 `Browser::render` 显式调用，不放在 Drop 里（Drop 没有 deadline 语义）。
 
@@ -285,8 +318,8 @@ Expected: 编译失败（没有 `render`/`RenderedPage`/`set_site_cookies`/`Brow
 ```rust
 pub fn render(&self, request: &FetchRequest) -> Result<RenderedPage, IndexerError> {
     let deadline = Instant::now() + self.render_deadline;
-    let origin = site_origin(&request.url)?;                            // 出错即 BrowserSetup
-    let slot = self.slots.acquire(&origin, deadline)?;                  // 有界等待；超时 BrowserBusy
+    let host = site_host(&request.url)?;                                // 出错即 BrowserSetup；忽略 scheme/端口
+    let slot = self.slots.acquire(&host, deadline, self.queue_cap, self.min_work)?; // FIFO 有界等待；超时或剩余 < min_work → BrowserBusy
     let page = self.open_until(request.cdp_url.as_deref(), deadline)?;  // 失败时尚无 target
     page.set_deadline(deadline);
     let result = (|| {
@@ -300,17 +333,21 @@ pub fn render(&self, request: &FetchRequest) -> Result<RenderedPage, IndexerErro
             .ok();
         Ok(RenderedPage { html, cookie_header })
     })();
-    if let Err(error) = page.clear_site_cookies(&request.url, Instant::now() + self.cleanup_cap) {
-        tracing::warn!(%error, key = %request.key, "Browser site cookie cleanup failed");
+    let mut hosts = vec![host.clone()];
+    hosts.extend(page.visited_hosts());
+    match page.clear_site_cookies(&hosts, Instant::now() + self.cleanup_cap) {
+        Ok(report) if report.remaining > 0 => tracing::warn!(remaining = report.remaining, key = %request.key, "Browser site cookies left after cleanup"),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, key = %request.key, "Browser site cookie cleanup failed"),
     }
     drop(page);   // /json/close，受 cleanup_cap 约束
     drop(slot);   // 清理与 close 完成后才释放站点锁和全局名额
     result.inspect_err(|error| tracing::error!(%error, request_key = %request.key, "Browser session failed"))
 }
 ```
-总时限：deadline 经 `open_cdp_session_until(endpoint, deadline)` 和 `set_deadline` 传入；`with_transport` 取 `min(Instant::now() + TIMEOUT, deadline)`，HTTP discovery 的 `http_agent` 超时取剩余时间。排队花掉的时间计入同一个 deadline。
+总时限：deadline 经 `open_cdp_session_until(endpoint, deadline)` 和 `set_deadline` 传入；`with_transport` 取 `min(Instant::now() + TIMEOUT, deadline)`，HTTP discovery 的 `http_agent` 超时取剩余时间。排队花掉的时间计入同一个 deadline，但排队本身另受 `queue_cap` 约束，且拿到名额后必须剩余 `min_work`，否则在导航前返回 busy（R4-M2）。
 
-`BrowserSlots`（约 60 行）：`acquire` 循环 `while active >= max || sites.contains(origin) { cvar.wait_timeout(guard, remaining) }`，超时返回 `BrowserBusy`；RAII guard 的 `Drop` 中减计数、移除站点并 `notify_all`。不引入 tokio。删除 `PageSession::set_cookie_header` 的所有实现与调用；`Browser` 加 `#[derive(Clone)]`。
+`BrowserSlots`（约 90 行）：`acquire(host, deadline, queue_cap, min_work)` 领取票号入 `VecDeque`；循环中按票号顺序找出第一个「名额未满且与运行中分组不冲突」的票，若是自己则出队运行，否则 `cvar.wait_timeout(guard, remaining)`；等待截止 = `min(now + queue_cap, deadline − min_work)`，超时出队并返回 `BrowserBusy`；出队后再检查 `deadline − now >= min_work`。冲突判定函数 `hosts_conflict(a, b)` 单独单测。RAII guard 的 `Drop` 中减计数、移除分组并 `notify_all`。不引入 tokio。删除 `PageSession::set_cookie_header` 的所有实现与调用；`Browser` 加 `#[derive(Clone)]`。
 
 - [ ] **Step 7: 导出**
 
@@ -369,17 +406,23 @@ git commit -m "feat(indexer): bind site cookies per host, clean them per site an
 
 **Site `maintenance_via` 的 schema 迁移（store）：**
 - `ALTER TABLE sites ADD COLUMN maintenance_via TEXT NOT NULL DEFAULT 'http' CHECK (maintenance_via IN ('http','browser'))`，按 `schema.rs` 既有的版本化迁移方式加一步。
-- 同一迁移中，`cdp_url` 非空的 Site 置为 `'browser'`（旧行为下这些 Site 的登录和签到会用浏览器）。使用 `render: true` Profile 的 overlay Site 由 api 启动期迁移置为 `'browser'` 并 `info!`（store 不认识 Profile）。
+- 迁移**一律保持 `'http'`**，不因 `cdp_url` 或 Profile `render` 改为 `'browser'`（R4-H1）。依据：旧版本生产代码的登录与签到只用 HTTP 插件——`crates/api/src/check_in.rs::run` 用 `CheckInPlugin::http`，`crates/api/src/http/sites.rs` 的 `site_login`/`site_check_in` 用 `LoginPlugin::http`/`CheckInPlugin::http`；`LoginVia::Browser` 只出现在 `hooks/tests/login_checkin.rs`、`review_remediation_login.rs`。旧的 Site `cdp_url` 与 `render` 只影响搜索渲染，而搜索渲染已删除。
+- 想用浏览器登录/签到的用户需手动在 Site 上选择 `browser`；`response()` 与 Site 列表给出提示（见下）。
+- Site 配置了 `proxy` 时不允许选择 `browser`（R4-L2）：CDP 会话由浏览器自己出网，不使用 Site 代理；`PUT/PATCH /sites/{id}` 返回 400 `site.browser_proxy_unsupported`。
 - `cdp_url` 的语义不变：只是该 Site 浏览器会话的端点覆盖；`maintenance_via = http` 时被忽略。
 
 **`BrowserSettings` 的遗留迁移（写回一次，L4 + M1）：**
-- 新增 `pub fn migrate_legacy(store: &Store, site_endpoints_present: bool) -> Result<bool, StoreError>`，在 `seed_store_settings` 中于启动时调用一次，单事务：
+- 新增 `pub fn migrate_legacy(store: &Store) -> Result<bool, StoreError>`，在 `seed_store_settings` 中于启动时调用一次，单事务：
   - `cdp.enabled` 已存在 → no-op。
-  - 否则 `enabled = cdp.sync.enabled || obscura.enabled`（未知取值报错，不得静默关闭）；**若两者都关但有 Site 配了非空 `cdp_url`**（旧 ADR 允许「全局关 + Site 端点」）→ `enabled = true` 并 `info!(sites = n, "legacy per-Site CDP endpoints kept the Browser on; cdp.enabled=1")`，避免升级后静默失去浏览器登录/签到。
+  - 否则 `enabled = cdp.sync.enabled || obscura.enabled`（未知取值报错，不得静默关闭）。**不再**因为 Site 配了 `cdp_url` 而打开开关（R4-H1：旧 Site 端点只服务已删除的搜索渲染）。
   - `cdp.url` 为空且 `obscura.url` 非空 → 写入 `cdp.url`。
   - 写入新 key 后删除 `cdp.sync.enabled`、`obscura.enabled`、`obscura.url`。
 - `load()` 只读新 key。旧读取逻辑只存在于 `migrate_legacy`，计划在下一个 minor 版本删除它（在 `CHANGELOG`/ADR 记录这个时间点）。
-- `response()` 增加 `"ignored_site_endpoints": n`（开关关闭时配了 `cdp_url` 的 Site 数）和 `"browser_sites": n`（启用中且 `maintenance_via = browser` 的 Site 数），UI 显示。
+- `response()` 增加（R4-L1 统一口径）：
+  - `"browser_sites": n`：启用中且 `maintenance_via = browser` 的 Site 数（UI 显示）；
+  - `"managed_browser_sites": n`：其中没有自己 Site `cdp_url` 的数量（Task 5 启动判定只用它）；
+  - `"ignored_site_endpoints": n`：开关关闭或 `maintenance_via = http` 时配了 `cdp_url` 的 Site 数；
+  - `"legacy_site_notices": [{site_id, reasons: ["cdp_url_unused" | "render_profile_ignored"], profile}]`（R4-H1/M3）：原有 `cdp_url` 已不再用于搜索、或 Profile 为 `render: true` 而搜索已改走 HTTP（可能 0 结果，需要换成可直接 HTTP 抓取的 Profile）。Site 列表 DTO 同样带 `legacy_notices` 字段，UI 在设置页与站点列表告警，并提示「如需浏览器登录/签到，请手动改为浏览器方式」。
 - **存量 https 端点（R2-M2）**：Task 1 起只接受 `http`。`migrate_legacy` 和每次 `response()` 都扫描实例 `cdp.url` 与所有 Site 的 `cdp_url`，非法的（含 `https://`）**不自动改写**；迁移时 `warn!(count, "stored CDP endpoints are no longer valid")`（只记 Site id，不记 URL）；`response()` 返回 `"invalid_endpoints": [{"scope":"instance"} | {"scope":"site","site_id":n,"reason":"https_unsupported"}]`，UI 提示修改。修改前，这些 Site 的浏览器会话会在 resolve 阶段（导航前）报错，回退 HTTP。
 
 **`response()` 形状：**
@@ -387,7 +430,8 @@ git commit -m "feat(indexer): bind site cookies per host, clean them per site an
 {
   "cdp": {"enabled": true, "url": "", "configured": false, "route": "managed", "status": "unverified"},
   "user_agent": "crawler-media/0.1.0",
-  "browser_sites": 1, "ignored_site_endpoints": 0, "invalid_endpoints": [],
+  "browser_sites": 1, "managed_browser_sites": 1, "ignored_site_endpoints": 0, "invalid_endpoints": [],
+  "legacy_site_notices": [{"site_id": 3, "reasons": ["render_profile_ignored"], "profile": "foo-overlay"}],
   "capabilities": {
     "mode": "cdp-opt-in", "managed_chromium": false, "managed_obscura": true,
     "endpoint_schemes": ["http"],
@@ -443,8 +487,9 @@ fn migration_maps_legacy_switches_once_and_deletes_them() {
     // 仅 obscura.enabled=1 → cdp.enabled=1；cdp.enabled=maybe → load() 报错
 }
 #[test]
-fn migration_keeps_the_browser_for_legacy_site_endpoints() {
-    // 两个旧开关都关 + 某 Site cdp_url 非空 → cdp.enabled=1，且该 Site 的 maintenance_via = browser
+fn legacy_site_endpoints_do_not_turn_the_switch_on_or_change_maintenance() {
+    // 两个旧开关都关 + 某 Site cdp_url 非空 → cdp.enabled=0，该 Site maintenance_via = http，
+    // legacy_site_notices 含 {site_id, reasons:["cdp_url_unused"]}
 }
 #[test]
 fn legacy_obscura_url_is_adopted_as_the_instance_endpoint() {}
@@ -453,9 +498,11 @@ fn migration_never_overrides_an_explicit_switch() {}
 #[test]
 fn stored_https_endpoints_are_reported_not_rewritten() {}
 #[test]
-fn render_overlay_sites_are_migrated_to_browser_maintenance() {}
+fn render_overlay_sites_stay_http_and_get_a_notice() {
+    // render: true overlay Site → maintenance_via = http；notices 含 render_profile_ignored 与 profile id
+}
 ```
-`crates/api/tests/management/site_credentials_review.rs` 新增 `site_maintenance_via_round_trips_and_rejects_unknown_values`。
+`crates/api/tests/management/site_credentials_review.rs` 新增 `site_maintenance_via_round_trips_and_rejects_unknown_values`、`site_with_proxy_cannot_choose_browser_maintenance`、`site_list_carries_legacy_notices`。
 
 `crates/api/tests/browser_runtime.rs` 改为断言 `response()["capabilities"]["route_precedence"] == ["site","instance","managed"]` 且 `search == "http_only"`；`browser_runtime.rs:83` 的 `RoutedFetcher` 用例改为断言 Indexer 搜索从不打开 Browser。
 
@@ -643,10 +690,10 @@ git commit -m "feat(api): verify Obscura releases by pinned SHA-256 and own the 
   - `GET/PUT /settings/browser` 的响应新增 `"obscura"` 字段（进程事实，来自 manager），`cdp` 段保持 Task 2 形状
   - `ApiState::with_obscura(self, Arc<ObscuraManager>) -> Self`
   - `JobKind::BrowserReconcile`（M5）与 `pub fn reconcile(manager, want: ReconcileWant) -> Result<(), String>`
-  - `pub struct ReconcileWant { switch_on: bool, instance_endpoint_configured: bool, browser_sites: usize }`
+  - `pub struct ReconcileWant { switch_on: bool, instance_endpoint_configured: bool, managed_browser_sites: usize }`
   - `PUT /settings/browser` 的 body 可带 `"obscura": {"install": "download" | "preinstalled"}`
 
-**按需启动（M2，r4）：** 只有 `switch_on && !instance_endpoint_configured && browser_sites > 0` 才启动；`browser_sites` = 启用中且 `maintenance_via = browser` **且未配置自己的 Site `cdp_url`** 的 Site 数（自带端点的 Site 不需要受管 daemon）。否则 `stop()`。`response()` 的 `browser_sites`（Task 2）在 UI 显示为「当前有 N 个站点用浏览器登录/签到」。Site 增删改（含 `maintenance_via`、`cdp_url`、`enabled` 变化）后投递一次 `BrowserReconcile`。
+**按需启动（M2，r4/r5）：** 只有 `switch_on && !instance_endpoint_configured && managed_browser_sites > 0` 才启动；`managed_browser_sites` 与 Task 2 `response()` 同一函数计算（启用中、`maintenance_via = browser`、没有自己 `cdp_url` 的 Site 数），UI 同时显示 `browser_sites` 与 `managed_browser_sites`，两者口径固定、不另算（R4-L1）。否则 `stop()`。Site 增删改（含 `maintenance_via`、`cdp_url`、`enabled` 变化）后投递一次 `BrowserReconcile`。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -660,9 +707,8 @@ git commit -m "feat(api): verify Obscura releases by pinned SHA-256 and own the 
 #[tokio::test] async fn switch_on_without_any_browser_site_does_not_start_the_daemon() {
     // 且 status.not_started_reason == "no_browser_sites"
 }
-#[tokio::test] async fn sites_with_their_own_cdp_url_do_not_count_as_browser_sites() {}
-#[tokio::test] async fn switching_a_site_to_browser_maintenance_queues_a_reconcile() {
-}
+#[tokio::test] async fn sites_with_their_own_cdp_url_count_as_browser_but_not_managed_browser_sites() {}
+#[tokio::test] async fn switching_a_site_to_browser_maintenance_queues_a_reconcile() {}
 #[tokio::test] async fn preinstalled_policy_without_binary_reports_not_installed() {}
 #[tokio::test] async fn obscura_status_route_matches_the_obscura_status_struct() {}
 #[tokio::test] async fn saving_returns_before_the_install_finishes() {
@@ -711,7 +757,7 @@ git commit -m "feat(api): expose managed Obscura status/start/stop and reconcile
   - provider closure 每次读取设置后返回：`enabled = cdp.enabled`；`endpoint = cdp.url` 非空时 `Some`；`managed_endpoint = if enabled && url 为空 { manager.cdp_url() } else { None }`——`cdp_url()` 只在本 manager 持有存活且身份已确认的子进程时为 `Some`（读内存状态 + `try_wait`，无 TCP 探测）
 
 **行为约束：**
-- `CRAWLER_MEDIA_BROWSER=1` 不再拒绝启动，**只**设置开关默认值（经 `seed_switch_default` 落成显式设置），用户已显式设置过 `cdp.enabled` 时 env 不得覆盖。它不决定安装策略，也不保证启动：在默认 `preinstalled` 且无预置二进制、或 `browser_sites == 0` 时不启动，启动日志 `info!(reason = not_started_reason)` 一次，设置页显示原因（R2-M3）。`CRAWLER_MEDIA_OBSCURA_INSTALL` 同理只在 `obscura.install` 未设置时写入默认值，并在 `crates/api/src/config.rs` 注册该变量。
+- `CRAWLER_MEDIA_BROWSER=1` 不再拒绝启动，**只**设置开关默认值（经 `seed_switch_default` 落成显式设置），用户已显式设置过 `cdp.enabled` 时 env 不得覆盖。它不决定安装策略，也不保证启动：在默认 `preinstalled` 且无预置二进制、或 `managed_browser_sites == 0` 时不启动，启动日志 `info!(reason = not_started_reason)` 一次，设置页显示原因（R2-M3）。`CRAWLER_MEDIA_OBSCURA_INSTALL` 同理只在 `obscura.install` 未设置时写入默认值，并在 `crates/api/src/config.rs` 注册该变量。
 - 受管端点**不做**每请求 TCP 探活；只读 manager 的内存状态（H3）。端口被外部进程占用时 `cdp_url()` 为 `None`，按 Task 2 的「无可用端点」回退 HTTP 并 warn。
 - `boot_reconcile` 只投递 `JobKind::BrowserReconcile`，不在启动路径上下载。
 - `main.rs` shutdown 时调用 `manager.shutdown()`（M4）。
@@ -774,6 +820,7 @@ git commit -m "feat(api): make CRAWLER_MEDIA_BROWSER the boot default and inject
 - 浏览器签到默认用导航（GET）访问 `{site_base}attendance.php`；若 Task 0 证明 GET 不真实签到（L7），改为先导航 `index.php`，再 `Runtime.evaluate` 点击签到链接/提交签到表单，并在 ADR 中按站点记录。HTTP 路径保持 POST 不变。
 - 插件返回的错误区分阶段（H5）：`PluginError::BrowserPreNavigation(String)`（端点解析、`BrowserBusy`、`/json/new`、WebSocket、`setCookies` 失败——服务端未收到请求）与 `PluginError::Fetch`（已发出导航之后）。实现方式：`Browser::render` 的错误用 `IndexerError::BrowserSetup(String)` 标识导航前失败（Task 1 的 `open`/`set_site_cookies`/`BrowserBusy` 映射到它），hooks 原样映射。
 - `cookie` 只经 `Network.setCookies` 注入（Task 1），不会发往第三方主机。
+- 浏览器会话**不使用 Site 代理**（R4-L2）：`browser_page` 构造 `FetchRequest` 时不再传 `proxy`；配置了代理的 Site 在写入时已被禁止选择浏览器（Task 2），插件层再加一道防御：`site.proxy.is_some()` 时返回 `BrowserPreNavigation("browser maintenance does not use the Site proxy")`。
 - 两条路径共用同一 `SiteResponsePolicy`（`NexusPhpPolicy`），transport 不影响判定。
 
 - [ ] **Step 1: 写失败测试**
@@ -788,6 +835,7 @@ git commit -m "feat(api): make CRAWLER_MEDIA_BROWSER the boot default and inject
     // body 含「您今天已签到」/"You have already attended"（site_policy.rs:77-83）→ Ok
 }
 #[test] fn setup_failure_is_reported_as_pre_navigation() {}
+#[test] fn proxied_site_is_refused_before_navigation() {}
 ```
 
 - [ ] **Step 2: 运行并确认失败**
@@ -914,7 +962,7 @@ git commit -m "feat(api): resolve the cookie-sync endpoint from the single switc
 
 **Files:**
 - Modify: `web/components/site-config-section.tsx:1293-1530`
-- Create: `web/lib/browser-settings.ts`（纯函数：`buildBrowserSettingsBody`、`describeObscuraStatus`）
+- Create: `web/lib/browser-settings.ts`（纯函数：`buildBrowserSettingsBody`、`describeObscuraStatus`、`describeLegacyNotice`）
 - Test: `web/test/cdp-browser-settings.test.mjs`（新建）
 
 **Interfaces:**
@@ -933,6 +981,7 @@ test("body carries one switch and no legacy obscura toggle", () => {
 test("status text reflects process facts, browser site count and ignored endpoints", () => {
   assert.match(describeObscuraStatus({ running: false, downloading: true, browser_sites: 2 }), /下载中/);
   assert.match(describeObscuraStatus({ running: false, not_started_reason: "no_browser_sites", browser_sites: 0 }), /没有站点用浏览器登录\/签到/);
+  assert.match(describeLegacyNotice({ reasons: ["render_profile_ignored"], profile: "foo" }), /搜索改走 HTTP/);
   assert.match(describeObscuraStatus({ running: false, not_started_reason: "not_installed" }), /预置|下载/);
 });
 ```
@@ -944,7 +993,7 @@ Expected: FAIL。
 
 - [ ] **Step 3: 改造面板**
 
-删除独立的 Obscura 开关与 URL 输入；`cdp.url` 留空即表示使用受管 Obscura，UI 必须显式提示这一点。新增安装策略选择（仅预置 / 允许自动下载，默认仅预置）、`browser_sites`、`ignored_site_endpoints` 与 `invalid_endpoints` 告警、`not_started_reason` 与 `last_error` 显示；Site 编辑表单增加「登录/签到方式：HTTP / 浏览器」（`maintenance_via`），`cdp_url` 输入只在选择浏览器时显示；文案写明「搜索始终走 HTTP」；start 返回 202 后轮询状态。
+删除独立的 Obscura 开关与 URL 输入；`cdp.url` 留空即表示使用受管 Obscura，UI 必须显式提示这一点。新增安装策略选择（仅预置 / 允许自动下载，默认仅预置）、`browser_sites` / `managed_browser_sites`、`ignored_site_endpoints`、`invalid_endpoints` 与 `legacy_site_notices` 告警（站点列表行内也显示 `legacy_notices`：「原 CDP 端点已不再用于搜索」「render Profile 已失效，搜索改走 HTTP，请更换 Profile」，并提示可手动改为浏览器登录/签到）、`not_started_reason` 与 `last_error` 显示；Site 编辑表单增加「登录/签到方式：HTTP / 浏览器」（`maintenance_via`），`cdp_url` 输入只在选择浏览器时显示；配置了代理的 Site 禁用「浏览器」选项并说明原因；文案写明「搜索始终走 HTTP」；start 返回 202 后轮询状态。
 
 - [ ] **Step 4: 运行并确认通过**
 
@@ -972,8 +1021,8 @@ git commit -m "feat(web): one CDP switch with managed Obscura status and control
 
 - [ ] `cargo check --workspace --all-targets` 与 `cargo test --workspace` 全绿。
 - [ ] `cd web && node --test && pnpm typecheck` 全绿。
-- [ ] **手动验收（有网络的机器，结果写进 ADR）**：设 `obscura.install=download` → 开关开启 → 下载并哈希校验 → 启动（确认仅监听 127.0.0.1、端口随机）→ 把一个 Site 设为 `maintenance_via = browser` → 确认搜索仍走 HTTP（日志无 Browser 会话）→ 浏览器登录与签到（同时触发两个站点，确认两个 tab 并发且 cookie 互不干扰） → cookie 回读并合并 → 关闭开关后进程退出、pidfile 删除。
-- [ ] 按 Review Focus 九条逐条确认对应测试存在且真的在断言该行为。
+- [ ] **手动验收（有网络的机器，结果写进 ADR）**：设 `obscura.install=download` → 开关开启 → 下载并哈希校验 → 启动（确认仅监听 127.0.0.1、端口随机）→ 把一个 Site 设为 `maintenance_via = browser` → 确认搜索仍走 HTTP（日志无 Browser 会话）→ 确认升级前带 `cdp_url`/render 的 Site 仍为 `http` 且设置页与站点列表有提示→ 浏览器登录与签到（同时触发两个不同站点，确认两个 tab 并发且 cookie 互不干扰；同时触发两个兄弟子域站点，确认串行；确认 `path=/forum` 的 cookie 与父域 cookie 在会话后被删除；把排队上限调小，确认剩余时间不足时在导航前返回 busy 并回退 HTTP） → cookie 回读并合并 → 关闭开关后进程退出、pidfile 删除。
+- [ ] 按 Review Focus 十条逐条确认对应测试存在且真的在断言该行为。
 - [x] （已在 Task −1 完成，收尾只复核）ADR-0007 与 `docs/deploy.md`：信任根是写死的 SHA-256（Task 4）；离线预置**只需**放原始发布归档 `<data>/bin/obscura.tar.gz`，应用校验哈希后自行解出（`.obscura.sha256` 是应用写入的安装标记，运维无需也不应手写）；`obscura.install` 默认 `preinstalled`；`network_mode: host` 风险；端点仅 `http`；Browser 只用于登录/签到。
 - [ ] 确认 `docs/adr/0007-cdp-browser-opt-in.md`、`CONTEXT.md`、`docs/deploy.md` 的描述与最终实现一致；如有偏差，改代码或改文档，不允许两边不一致。
 - [ ] 在 worktree 提交完整分支，`main` 保持干净。
