@@ -70,6 +70,10 @@ impl Runner for StateRunner {
             JobKind::DatabaseMaintenance
             | JobKind::JobsRetention
             | JobKind::PlaybackHistoryRetention => crate::maintenance::run(&self.state, job),
+            JobKind::BrowserReconcile => {
+                crate::http::browser_settings::reconcile_obscura(&self.state);
+                Ok(())
+            }
         }
     }
 }

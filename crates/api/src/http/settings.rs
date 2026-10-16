@@ -216,9 +216,10 @@ pub(crate) async fn test_metadata(State(state): State<ApiState>) -> Response {
 
 pub(crate) use super::proxy_settings::{diagnose_proxy, get_proxy, put_proxy, test_proxy};
 
-#[path = "browser_settings.rs"]
-mod browser_settings;
-pub(crate) use browser_settings::{get_browser_settings, put_browser_settings};
+pub(crate) use super::browser_settings::{
+    get_browser_settings, get_obscura_status, post_obscura_start, post_obscura_stop,
+    put_browser_settings,
+};
 
 /// Trigger CDP Cookie Sync across all supported PT sites.
 /// Discovers cookies from Chrome, updates existing sites, and returns discovered candidate sites.

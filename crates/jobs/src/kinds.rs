@@ -15,6 +15,8 @@ pub enum JobKind {
     JobsRetention,
     /// 播放历史清理。
     PlaybackHistoryRetention,
+    /// 浏览器生命周期对账。
+    BrowserReconcile,
 }
 
 impl JobKind {
@@ -22,7 +24,10 @@ impl JobKind {
     pub fn is_maintenance(self) -> bool {
         matches!(
             self,
-            Self::DatabaseMaintenance | Self::JobsRetention | Self::PlaybackHistoryRetention
+            Self::DatabaseMaintenance
+                | Self::JobsRetention
+                | Self::PlaybackHistoryRetention
+                | Self::BrowserReconcile
         )
     }
 }
@@ -40,6 +45,7 @@ impl JobKind {
             Self::DatabaseMaintenance => "database_maintenance",
             Self::JobsRetention => "jobs_retention",
             Self::PlaybackHistoryRetention => "playback_history_retention",
+            Self::BrowserReconcile => "browser_reconcile",
         }
     }
 }
@@ -59,6 +65,7 @@ impl FromStr for JobKind {
             "database_maintenance" => Ok(Self::DatabaseMaintenance),
             "jobs_retention" => Ok(Self::JobsRetention),
             "playback_history_retention" => Ok(Self::PlaybackHistoryRetention),
+            "browser_reconcile" => Ok(Self::BrowserReconcile),
             other => Err(other.to_string()),
         }
     }

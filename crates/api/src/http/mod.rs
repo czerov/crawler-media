@@ -7,6 +7,7 @@
 //! `downloaders` / `library` / `jobs` / `directory` / `notify` / `playback`.
 
 pub(crate) mod auth;
+pub(crate) mod browser_settings;
 pub(crate) mod collections;
 pub(crate) mod directory;
 pub(crate) mod discover;
@@ -346,6 +347,10 @@ fn member_library_routes() -> Router<ApiState> {
         .route("/settings/languages", get(scrape_settings::languages))
         .route("/settings/countries", get(scrape_settings::countries))
         .route("/settings/browser", get(settings::get_browser_settings))
+        .route(
+            "/settings/browser/obscura",
+            get(settings::get_obscura_status),
+        )
 }
 
 fn member_playback_routes() -> Router<ApiState> {
@@ -656,6 +661,14 @@ fn admin_ops_routes() -> Router<ApiState> {
             put(scrape_settings::put_scrape_settings),
         )
         .route("/settings/browser", put(settings::put_browser_settings))
+        .route(
+            "/settings/browser/obscura/start",
+            post(settings::post_obscura_start),
+        )
+        .route(
+            "/settings/browser/obscura/stop",
+            post(settings::post_obscura_stop),
+        )
         .route(
             "/settings/browser/sync-cdp",
             post(settings::sync_cdp_cookies),

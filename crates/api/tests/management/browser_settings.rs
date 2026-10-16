@@ -176,10 +176,122 @@ async fn member_cannot_modify_browser_settings_or_sync_cdp() {
         .header("Authorization", format!("Bearer {member_token}"))
         .body(Body::empty())
         .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
         "普通成员禁止触发全局 CDP 同步"
     );
+
+    // 4. 普通成员尝试 POST /api/v1/settings/browser/obscura/start：必须返回 403 Forbidden
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/settings/browser/obscura/start")
+        .header("Authorization", format!("Bearer {member_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 5. 普通成员可以 GET /api/v1/settings/browser/obscura
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings/browser/obscura")
+        .header("Authorization", format!("Bearer {member_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn obscura_status_and_admin_start_stop() {
+    let tmp = tempdir().unwrap();
+    let fetcher = Arc::new(Fixtures {
+        requests: Mutex::new(Vec::new()),
+        bodies: HashMap::new(),
+    });
+    let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("dl")));
+    let state = state(tmp.path(), fetcher, downloader);
+    let app = router(state);
+
+    // GET status
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings/browser/obscura")
+        .header("Authorization", "Bearer management-secret")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = crate::common::json_body(resp).await;
+    assert_eq!(body["data"]["expected_version"], "v0.2.3");
+
+    // POST stop
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/settings/browser/obscura/stop")
+        .header("Authorization", "Bearer management-secret")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn saving_browser_settings_reconciles_managed_obscura() {
+    let tmp = tempdir().unwrap();
+    let fetcher = Arc::new(Fixtures {
+        requests: Mutex::new(Vec::new()),
+        bodies: HashMap::new(),
+    });
+    let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("dl")));
+    let state = state(tmp.path(), fetcher, downloader);
+    let app = router(state);
+
+    // 1. Configure CDP enabled with external endpoint -> Obscura not started, reason external_endpoint_configured
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings/browser")
+        .header("Authorization", "Bearer management-secret")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::json!({
+            "cdp": { "enabled": true, "url": "http://127.0.0.1:9222" }
+        }).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings/browser/obscura")
+        .header("Authorization", "Bearer management-secret")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = crate::common::json_body(resp).await;
+    assert_eq!(body["data"]["not_started_reason"], "external_endpoint_configured");
+
+    // 2. Configure CDP disabled -> Obscura stopped, reason cdp_disabled
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings/browser")
+        .header("Authorization", "Bearer management-secret")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::json!({
+            "cdp": { "enabled": false, "url": "" }
+        }).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings/browser/obscura")
+        .header("Authorization", "Bearer management-secret")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = crate::common::json_body(resp).await;
+    assert_eq!(body["data"]["not_started_reason"], "cdp_disabled");
 }
