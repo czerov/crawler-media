@@ -168,6 +168,13 @@ fn persist_subscription(
     let (media, subscribe) =
         match crate::subscribe_create::create(&state, incoming, subscribe, None) {
             Ok(result) => result,
+            Err(crate::subscribe_create::CreateError::Overlap(other)) => {
+                return err(
+                    StatusCode::CONFLICT,
+                    "subscription.overlap",
+                    &format!("同一媒体库中已有覆盖重叠的订阅（{other}），请合并或调整集数范围"),
+                );
+            }
             Err(error) => {
                 return err(
                     StatusCode::INTERNAL_SERVER_ERROR,

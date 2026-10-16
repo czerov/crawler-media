@@ -50,6 +50,8 @@ mod h3_stalled_timeout;
 mod h4_season_pack_pending;
 #[path = "subscription_e2e/g_h2b_absolute_episode.rs"]
 mod g_h2b_absolute_episode;
+#[path = "subscription_e2e/g_m1_overlapping_subscriptions.rs"]
+mod g_m1_overlapping_subscriptions;
 #[path = "subscription_e2e/m1_overlap_policy.rs"]
 mod m1_overlap_policy;
 #[path = "subscription_e2e/m2_owned_slot_skip.rs"]

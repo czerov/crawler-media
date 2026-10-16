@@ -88,6 +88,18 @@ fn persist_subscription(
     previous: &Subscribe,
     subscribe: &Subscribe,
 ) -> Result<(), Response> {
+    // G-M1: a coverage / library change must not overlap a sibling subscription.
+    if previous.coverage != subscribe.coverage || previous.library_id != subscribe.library_id {
+        let overlap =
+            crate::subscribe_create::overlapping_subscription(&state.store.lock(), subscribe);
+        if let Ok(Some(other)) = overlap {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "subscription.overlap",
+                &format!("同一媒体库中已有覆盖重叠的订阅（{other}），请合并或调整集数范围"),
+            ));
+        }
+    }
     if let Err(error) = state.store.lock().update_subscribe(subscribe) {
         return Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,

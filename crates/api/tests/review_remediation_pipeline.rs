@@ -113,6 +113,10 @@ async fn existing_library_prevents_redundant_download_for_new_subscribe() {
     std::fs::create_dir_all(owned.parent().unwrap()).unwrap();
     std::fs::write(&owned, b"owned").unwrap();
     state.store().lock().insert_ledger(&owned_row(media_id, &owned)).unwrap();
+    // G-M1: one subscription per media/library/coverage — the first one is
+    // gone before the new one is created; the library file still counts.
+    let original_id: SubscribeId = original["id"].as_str().unwrap().parse().unwrap();
+    state.store().lock().delete_subscribe(original_id).unwrap();
     let created = create_alias_subscribe(&app).await;
     assert_eq!(created["media"]["id"], original["media"]["id"]);
     let id = created["id"].as_str().unwrap();
