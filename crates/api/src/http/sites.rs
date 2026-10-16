@@ -53,6 +53,8 @@ pub(crate) struct SiteInput {
     cdp_url: Option<String>,
     #[serde(default)]
     downloader_id: Option<String>,
+    #[serde(default)]
+    maintenance_via: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -82,6 +84,8 @@ pub(crate) struct PatchSiteInput {
     #[serde(default)]
     downloader_id: Option<String>,
     #[serde(default)]
+    maintenance_via: Option<String>,
+    #[serde(default)]
     enabled: Option<bool>,
 }
 
@@ -110,6 +114,7 @@ fn site_json(site: &Site) -> Value {
         "cdp_url": site.cdp_url,
         "downloader_id": site.downloader_id.map(|id| id.to_string()),
         "enabled": site.enabled,
+        "maintenance_via": site.maintenance_via.as_str(),
     })
 }
 
@@ -167,6 +172,28 @@ pub(crate) async fn create_site(
         .as_deref()
         .filter(|id| !id.is_empty())
         .and_then(|id| domain::DownloaderId::from_str(id).ok());
+    let maintenance_via = match body.maintenance_via.as_deref() {
+        Some(s) => match s.parse::<domain::MaintenanceVia>() {
+            Ok(v) => v,
+            Err(_) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "site.invalid_maintenance_via",
+                    "无效的 maintenance_via",
+                );
+            }
+        },
+        None => domain::MaintenanceVia::Http,
+    };
+    if maintenance_via == domain::MaintenanceVia::Browser
+        && body.proxy.as_deref().is_some_and(|p| !p.trim().is_empty())
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "site.browser_proxy_unsupported",
+            "浏览器维护方式不支持配置代理",
+        );
+    }
     let site = Site {
         id: SiteId::new(),
         name: body.name,
@@ -180,6 +207,7 @@ pub(crate) async fn create_site(
         cdp_url: body.cdp_url,
         downloader_id,
         enabled: body.enabled,
+        maintenance_via,
     };
     let store = state.store.lock();
     if let Err(error) = store.insert_site(&site) {
@@ -260,7 +288,10 @@ pub(crate) async fn put_site(
         Ok(None) => return err(StatusCode::NOT_FOUND, "site.missing", "站点不存在"),
         Err(error) => return site_store_error(&error),
     };
-    let site = replacement_site(current, body, downloader_id);
+    let site = match replacement_site(current, body, downloader_id) {
+        Ok(site) => site,
+        Err((status, code, msg)) => return err(status, code, msg),
+    };
     let updated = match store.save_site(&site) {
         Ok(updated) => updated,
         Err(error) => {
@@ -282,8 +313,31 @@ fn replacement_site(
     current: Site,
     body: SiteInput,
     downloader_id: Option<domain::DownloaderId>,
-) -> Site {
-    Site {
+) -> Result<Site, (StatusCode, &'static str, &'static str)> {
+    let maintenance_via = match body.maintenance_via.as_deref() {
+        Some(s) => match s.parse::<domain::MaintenanceVia>() {
+            Ok(v) => v,
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "site.invalid_maintenance_via",
+                    "无效的 maintenance_via",
+                ));
+            }
+        },
+        None => current.maintenance_via,
+    };
+    let proxy = replacement_credential(body.proxy, current.proxy);
+    if maintenance_via == domain::MaintenanceVia::Browser
+        && proxy.as_deref().is_some_and(|p| !p.trim().is_empty())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "site.browser_proxy_unsupported",
+            "浏览器维护方式不支持配置代理",
+        ));
+    }
+    Ok(Site {
         id: current.id,
         name: body.name,
         url: body.url,
@@ -291,12 +345,13 @@ fn replacement_site(
         cookie: replacement_credential(body.cookie, current.cookie),
         api_key: replacement_credential(body.api_key, current.api_key),
         rss_url: replacement_credential(body.rss_url, current.rss_url),
-        proxy: replacement_credential(body.proxy, current.proxy),
+        proxy,
         rate_limit_per_minute: body.rate_limit_per_minute,
         cdp_url: replacement_credential(body.cdp_url, current.cdp_url),
         downloader_id,
         enabled: body.enabled,
-    }
+        maintenance_via,
+    })
 }
 
 fn replacement_credential(input: Option<String>, current: Option<String>) -> Option<String> {
@@ -388,8 +443,29 @@ pub(crate) async fn patch_site(
             .then(|| domain::DownloaderId::from_str(&downloader_id).ok())
             .flatten();
     }
+    if let Some(mv_str) = body.maintenance_via {
+        match mv_str.parse::<domain::MaintenanceVia>() {
+            Ok(v) => site.maintenance_via = v,
+            Err(_) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "site.invalid_maintenance_via",
+                    "无效的 maintenance_via",
+                );
+            }
+        }
+    }
     if let Some(enabled) = body.enabled {
         site.enabled = enabled;
+    }
+    if site.maintenance_via == domain::MaintenanceVia::Browser
+        && site.proxy.as_deref().is_some_and(|p| !p.trim().is_empty())
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "site.browser_proxy_unsupported",
+            "浏览器维护方式不支持配置代理",
+        );
     }
     if let Err(error) = store.save_site(&site) {
         return err(

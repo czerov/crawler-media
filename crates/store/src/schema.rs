@@ -13,7 +13,7 @@ mod scan_operations;
 
 /// Schema version constants. Bump when adding new migrations.
 /// The version is stored via `PRAGMA user_version` on each database file.
-pub const APP_SCHEMA_VERSION: i64 = 7;
+pub const APP_SCHEMA_VERSION: i64 = 8;
 pub const CATALOG_SCHEMA_VERSION: i64 = 2;
 pub const LIBRARY_SCHEMA_VERSION: i64 = 14;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 5;
@@ -45,6 +45,38 @@ pub(crate) fn ensure_supported_versions(
             return Err(StoreError::Invalid(format!(
                 "{name} database schema version {found} is newer than supported {supported}"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Fresh-start 纯只读预检：
+/// 全新 DB 必须是 user_version = 0 且无用户表，或者已经是当前目标版本。
+/// 任何低于版本 8 的旧 app DB 都明确拒绝并提示清空数据目录，应用绝不自动删除或迁移旧数据。
+pub(crate) fn ensure_fresh_start(
+    app: &Connection,
+) -> Result<(), StoreError> {
+    let version = read_schema_version(app)?;
+    if version > APP_SCHEMA_VERSION {
+        return Err(StoreError::Invalid(format!(
+            "app database schema version {version} is newer than supported {APP_SCHEMA_VERSION}"
+        )));
+    }
+    if version > 0 && version < APP_SCHEMA_VERSION {
+        return Err(StoreError::Invalid(format!(
+            "旧数据库 schema (版本 {version}) 不受支持，本版本要求从空数据目录启动，请备份需要保留的文件并清空 <data> 目录后重启"
+        )));
+    }
+    if version == 0 {
+        let table_count: i64 = app.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_count > 0 {
+            return Err(StoreError::Invalid(
+                "检测到非空旧数据库，本版本要求从空数据目录启动，请备份需要保留的文件并清空 <data> 目录后重启".into(),
+            ));
         }
     }
     Ok(())

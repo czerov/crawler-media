@@ -28,14 +28,12 @@ pub const PROXY_PASSWORD: &str = "proxy.password";
 pub const PROXY_DOUBAN_BYPASS: &str = "proxy.douban_bypass";
 /// Comma or newline-separated custom allowed domains for proxy.
 pub const PROXY_ALLOWED_DOMAINS: &str = "proxy.allowed_domains";
-/// CDP cookie sync enabled flag ("1" or "0").
-pub const CDP_SYNC_ENABLED: &str = "cdp.sync.enabled";
+/// CDP enabled flag ("1" or "0").
+pub const CDP_ENABLED: &str = "cdp.enabled";
 /// CDP remote debugging URL (e.g. "http://127.0.0.1:9222").
 pub const CDP_URL: &str = "cdp.url";
-/// Obscura browser anti-detect enabled flag ("1" or "0").
-pub const OBSCURA_ENABLED: &str = "obscura.enabled";
-/// Obscura CDP / endpoint URL (e.g. "ws://127.0.0.1:9223" or "http://127.0.0.1:9223").
-pub const OBSCURA_URL: &str = "obscura.url";
+/// Obscura install policy ("preinstalled" or "download").
+pub const OBSCURA_INSTALL: &str = "obscura.install";
 /// 媒体信息探测 worker 并发数（默认 1；上限 8）。声纹使用独立的单 worker 队列。
 pub const PROBE_CONCURRENCY: &str = "probe.concurrency";
 /// 系统全局统一 User-Agent（默认 crawler-media/0.1.0）。

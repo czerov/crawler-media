@@ -19,6 +19,7 @@ fn site() -> Site {
         cdp_url: Some("http://127.0.0.1:9222".into()),
         downloader_id: None,
         enabled: true,
+        maintenance_via: domain::MaintenanceVia::Http,
     }
 }
 
@@ -118,7 +119,7 @@ fn login_plugin_can_use_browser_session() {
         navigated: Mutex::new(Vec::new()),
     });
     let page_for_open = page.clone();
-    let browser = Browser::with_opener(BrowserConfig::disabled(), move |_| {
+    let browser = Browser::with_opener(BrowserConfig::enabled_for_test(), move |_| {
         Ok(page_for_open.clone() as Arc<dyn PageSession>)
     });
     let bus = Bus::new();

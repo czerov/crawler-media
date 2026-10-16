@@ -226,7 +226,7 @@ pub(crate) async fn sync_cdp_cookies(State(state): State<ApiState>) -> Response 
     let (cdp_enabled, cdp_url) = {
         let store = state.store.lock();
         let enabled = store
-            .get_setting(settings_keys::CDP_SYNC_ENABLED)
+            .get_setting(settings_keys::CDP_ENABLED)
             .ok()
             .flatten()
             .and_then(|v| crate::config::parse_bool(&v))

@@ -122,7 +122,6 @@ fn browser_page(browser: &Browser, site: &Site, url: &str) -> Result<String, Plu
         cookie: site.cookie.clone(),
         api_key: None,
         proxy: site.proxy.clone(),
-        render: true,
         cdp_url: site.cdp_url.clone(),
     };
     // Fetching HTML does not expose Browser cookies; never synthesize a session credential.

@@ -374,7 +374,7 @@ fn cookie_readback_deduplicates_same_name_across_paths() {
 #[test]
 fn readback_failure_yields_none_and_keeps_the_html() {
     let fixture = Fixture::start("cookies_error");
-    let browser = Browser::with_opener(BrowserConfig::disabled(), {
+    let browser = Browser::with_opener(BrowserConfig::enabled_for_test(), {
         let fixture_url = fixture.url.clone();
         move |_cdp| {
             open_cdp_session(&fixture_url).map(|s| Arc::new(s) as Arc<dyn PageSession>)
@@ -388,7 +388,6 @@ fn readback_failure_yields_none_and_keeps_the_html() {
         cookie: Some("session=secret".into()),
         api_key: None,
         proxy: None,
-        render: true,
         cdp_url: Some(fixture.url.clone()),
     };
     let rendered = browser.render(&req).unwrap();

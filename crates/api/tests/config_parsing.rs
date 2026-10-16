@@ -162,25 +162,59 @@ fn env_flag_accepts_on_and_ignores_typos() {
 }
 
 #[test]
-fn browser_settings_store_flag_uses_the_shared_vocabulary() {
+fn cdp_switch_reads_only_new_key_and_defaults_off() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
-    store
-        .put_setting(settings_keys::CDP_SYNC_ENABLED, "on")
-        .unwrap();
     let settings = api::runtime_browser::BrowserSettings::load(&store).unwrap();
-    assert_eq!(
-        settings.response()["cdp"]["enabled"], true,
-        "\"on\" 必须开启 CDP（与 env flag 同一套取值）"
-    );
+    assert_eq!(settings.response()["cdp"]["enabled"], false);
 
-    store
-        .put_setting(settings_keys::CDP_SYNC_ENABLED, "maybe")
-        .unwrap();
-    assert!(
-        api::runtime_browser::BrowserSettings::load(&store).is_err(),
-        "未知取值必须报错，而不是静默关闭"
-    );
+    store.put_setting(settings_keys::CDP_ENABLED, "on").unwrap();
+    let settings = api::runtime_browser::BrowserSettings::load(&store).unwrap();
+    assert_eq!(settings.response()["cdp"]["enabled"], true);
+}
+
+#[test]
+fn unknown_new_switch_value_is_an_error_not_http_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.put_setting(settings_keys::CDP_ENABLED, "maybe").unwrap();
+    assert!(api::runtime_browser::BrowserSettings::load(&store).is_err());
+}
+
+#[test]
+fn unknown_obscura_install_policy_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    assert!(api::runtime_browser::BrowserSettings::save(
+        &store,
+        &serde_json::json!({
+            "obscura": { "install": "invalid_policy" }
+        })
+    ).is_err());
+}
+
+#[test]
+fn new_site_defaults_to_http_maintenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let site = domain::Site {
+        id: domain::SiteId::new(),
+        name: "test".into(),
+        url: "https://example.com/".into(),
+        profile_id: "demo".into(),
+        cookie: None,
+        api_key: None,
+        rss_url: None,
+        proxy: None,
+        rate_limit_per_minute: None,
+        cdp_url: None,
+        downloader_id: None,
+        enabled: true,
+        maintenance_via: domain::MaintenanceVia::Http,
+    };
+    store.insert_site(&site).unwrap();
+    let loaded = store.get_site(site.id).unwrap().unwrap();
+    assert_eq!(loaded.maintenance_via, domain::MaintenanceVia::Http);
 }
 
 #[test]

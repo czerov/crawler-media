@@ -19,6 +19,7 @@ fn demo_site(id: SiteId, profile_id: &str) -> Site {
         cdp_url: None,
         downloader_id: None,
         enabled: true,
+        maintenance_via: domain::MaintenanceVia::Http,
     }
 }
 

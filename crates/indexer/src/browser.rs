@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,117 +34,83 @@ pub struct RenderedPage {
     pub cookie_header: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserRoute {
+    Site,
+    Instance,
+    Managed,
+}
+
 type Opener = Arc<dyn Fn(Option<&str>) -> Result<Arc<dyn PageSession>, IndexerError> + Send + Sync>;
 type ConfigProvider = Arc<dyn Fn() -> Result<BrowserConfig, IndexerError> + Send + Sync>;
 
-/// Only external HTTP(S) CDP discovery endpoints are supported. No managed launcher exists.
-#[derive(Clone, Debug)]
+/// Configuration for browser endpoint resolution.
+#[derive(Clone, Debug, Default)]
 pub struct BrowserConfig {
     pub enabled: bool,
-    pub headless: bool,
-    pub obscura_enabled: bool,
-    pub obscura_url: Option<String>,
-    pub cdp_enabled: bool,
-    pub cdp_url: Option<String>,
+    pub endpoint: Option<String>,
+    pub managed_endpoint: Option<String>,
 }
 
 impl BrowserConfig {
     pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    pub fn enabled_for_test() -> Self {
         Self {
-            enabled: false,
-            headless: true,
-            obscura_enabled: false,
-            obscura_url: None,
-            cdp_enabled: false,
-            cdp_url: None,
+            enabled: true,
+            endpoint: None,
+            managed_endpoint: None,
         }
     }
 
-    pub fn enable_in(_data_dir: &Path) -> Result<Self, IndexerError> {
-        let error = IndexerError::Fetch(
-            "managed Chromium is unsupported; configure an external HTTP(S) CDP endpoint".into(),
-        );
-        tracing::error!(%error, capability = "managed_chromium", "Browser capability rejected");
-        Err(error)
-    }
-
-    pub fn with_obscura(mut self, enabled: bool, url: Option<String>) -> Self {
-        self.obscura_enabled = enabled;
-        self.obscura_url = url;
-        self
-    }
-
-    pub fn with_cdp(mut self, enabled: bool, url: Option<String>) -> Self {
-        self.cdp_enabled = enabled;
-        self.cdp_url = url;
-        self
-    }
-
-    pub fn chromium_present(&self) -> bool {
-        false
-    }
-    pub fn chromium_path(&self) -> &Path {
-        Path::new("")
-    }
-
-    fn validate_managed(&self) -> Result<(), IndexerError> {
-        if self.enabled {
-            return Err(IndexerError::Fetch(
-                "managed Chromium is unsupported; use external CDP".into(),
-            ));
+    pub fn validate_endpoint(endpoint: &str) -> Result<(), IndexerError> {
+        let uri = endpoint
+            .parse::<tungstenite::http::Uri>()
+            .map_err(|_| IndexerError::Fetch("Browser requires a valid HTTP CDP discovery URL; only http scheme is supported without credentials or query".into()))?;
+        if uri.scheme_str() != Some("http") {
+            return Err(IndexerError::Fetch("仅支持 http CDP discovery（建议仅回环或受信内网）".into()));
+        }
+        if uri.host().is_none_or(|host| host.is_empty())
+            || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+            || uri.path_and_query().is_some_and(|p| p.query().is_some())
+        {
+            return Err(IndexerError::Fetch("Browser requires a valid HTTP CDP discovery URL; empty, credentials, query and ws/wss endpoints are unsupported".into()));
         }
         Ok(())
     }
 
-    pub fn validate(&self) -> Result<(), IndexerError> {
-        self.validate_managed()?;
-        if self.obscura_enabled {
-            Self::validate_endpoint(self.obscura_url.as_deref())?;
+    pub fn resolve(
+        &self,
+        site: Option<&str>,
+    ) -> Result<Option<(String, BrowserRoute)>, IndexerError> {
+        if !self.enabled {
+            return Ok(None);
         }
-        if self.cdp_enabled {
-            Self::validate_endpoint(self.cdp_url.as_deref())?;
-        }
-        Ok(())
-    }
-
-    pub fn validate_endpoint(endpoint: Option<&str>) -> Result<(), IndexerError> {
-        let valid = endpoint
-            .and_then(|url| url.parse::<tungstenite::http::Uri>().ok())
-            .is_some_and(|uri| {
-                matches!(uri.scheme_str(), Some("http" | "https"))
-                    && uri.host().is_some_and(|host| !host.is_empty())
-                    && uri.authority().is_some_and(|a| !a.as_str().contains('@'))
-                    && uri.path_and_query().is_none_or(|p| p.query().is_none())
-            });
-        if valid {
-            Ok(())
-        } else {
-            Err(IndexerError::Fetch("Browser requires a valid HTTP(S) CDP discovery URL; empty, credentials, query and ws/wss endpoints are unsupported".into()))
-        }
-    }
-
-    fn endpoint<'a>(
-        &'a self,
-        site: Option<&'a str>,
-    ) -> Result<(&'a str, &'static str), IndexerError> {
-        self.validate_managed()?;
-        let (endpoint, route) = if let Some(endpoint) = site {
-            (Some(endpoint), "site")
-        } else {
-            self.validate()?;
-            if self.obscura_enabled {
-                (self.obscura_url.as_deref(), "obscura")
-            } else if self.cdp_enabled {
-                (self.cdp_url.as_deref(), "global_cdp")
-            } else {
-                (None, "unconfigured")
+        if let Some(site_url) = site {
+            let trimmed = site_url.trim();
+            if trimmed.is_empty() {
+                return Err(IndexerError::BrowserSetup("Site CDP URL cannot be empty".into()));
             }
-        };
-        Self::validate_endpoint(endpoint)?;
-        Ok((
-            endpoint.ok_or_else(|| IndexerError::Fetch("Browser endpoint missing".into()))?,
-            route,
-        ))
+            Self::validate_endpoint(trimmed)?;
+            return Ok(Some((trimmed.to_string(), BrowserRoute::Site)));
+        }
+        if let Some(endpoint) = &self.endpoint {
+            let trimmed = endpoint.trim();
+            if !trimmed.is_empty() {
+                Self::validate_endpoint(trimmed)?;
+                return Ok(Some((trimmed.to_string(), BrowserRoute::Instance)));
+            }
+        }
+        if let Some(managed) = &self.managed_endpoint {
+            let trimmed = managed.trim();
+            if !trimmed.is_empty() {
+                Self::validate_endpoint(trimmed)?;
+                return Ok(Some((trimmed.to_string(), BrowserRoute::Managed)));
+            }
+        }
+        Err(IndexerError::BrowserSetup("CDP 已开启但没有可用端点".into()))
     }
 }
 
@@ -235,26 +200,39 @@ impl Browser {
         Ok(())
     }
 
-    pub fn config(&self) -> &BrowserConfig {
-        &self.config
-    }
-
-    fn open_until(&self, cdp_url: Option<&str>, deadline: Instant) -> Result<Arc<dyn PageSession>, IndexerError> {
+    pub fn cdp_enabled(&self) -> Result<bool, IndexerError> {
         let config = match &self.provider {
             Some(provider) => provider()?,
             None => self.config.clone(),
         };
-        let (endpoint, route) = config.endpoint(cdp_url).inspect_err(|error| {
-            tracing::error!(%error, "Browser route rejected");
-        })?;
-        tracing::debug!(route, "Opening external Browser session");
+        Ok(config.enabled)
+    }
+
+    pub fn config(&self) -> &BrowserConfig {
+        &self.config
+    }
+
+    fn open_until(
+        &self,
+        cdp_url: Option<&str>,
+        deadline: Instant,
+    ) -> Result<Arc<dyn PageSession>, IndexerError> {
+        let config = match &self.provider {
+            Some(provider) => provider()?,
+            None => self.config.clone(),
+        };
+        let (endpoint, route) = match config.resolve(cdp_url)? {
+            Some((ep, r)) => (ep, r),
+            None => return Err(IndexerError::BrowserSetup("CDP disabled".into())),
+        };
+        tracing::debug!(?route, endpoint = %endpoint, "Opening external Browser session");
         let session = match &self.opener {
-            Some(opener) => opener(Some(endpoint)),
-            None => crate::cdp_page::open_cdp_session_until(endpoint, deadline, self.target_close_cap)
+            Some(opener) => opener(Some(&endpoint)),
+            None => crate::cdp_page::open_cdp_session_until(&endpoint, deadline, self.target_close_cap)
                 .map(|session| Arc::new(session) as Arc<dyn PageSession>),
         };
         session.inspect_err(|error| {
-            tracing::error!(%error, route, "Browser session open failed");
+            tracing::error!(%error, ?route, "Browser session open failed");
         })
     }
 
@@ -305,27 +283,6 @@ impl Browser {
     }
 }
 
-pub struct RoutedFetcher<H> {
-    http: H,
-    browser: Browser,
-}
-
-impl<H: Fetcher> RoutedFetcher<H> {
-    pub fn new(http: H, browser: Browser) -> Self {
-        Self { http, browser }
-    }
-}
-
-impl<H: Fetcher> Fetcher for RoutedFetcher<H> {
-    fn fetch(&self, request: &FetchRequest) -> Result<String, IndexerError> {
-        if request.render {
-            self.browser.fetch_html(request)
-        } else {
-            self.http.fetch(request)
-        }
-    }
-}
-
 pub struct RecordingFetcher {
     bodies: std::collections::HashMap<String, Result<String, String>>,
     requests: Arc<std::sync::Mutex<Vec<FetchRequest>>>,
@@ -353,7 +310,6 @@ impl Fetcher for RecordingFetcher {
                 cookie: request.cookie.clone(),
                 api_key: request.api_key.clone(),
                 proxy: request.proxy.clone(),
-                render: request.render,
                 cdp_url: request.cdp_url.clone(),
             });
         match self.bodies.get(&request.key) {

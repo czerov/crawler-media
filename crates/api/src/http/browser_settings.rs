@@ -9,8 +9,9 @@ use crate::management::ApiState;
 use crate::runtime_browser::{BrowserSettings, BrowserSettingsError};
 
 pub(crate) async fn get_browser_settings(State(state): State<ApiState>) -> Response {
-    match BrowserSettings::load(&state.store.lock()) {
-        Ok(settings) => ok(settings.response()).into_response(),
+    let store = state.store.lock();
+    match BrowserSettings::load(&store) {
+        Ok(settings) => ok(settings.response_with_store(&store)).into_response(),
         Err(error) => settings_error(error),
     }
 }
@@ -23,7 +24,7 @@ pub(crate) async fn put_browser_settings(
     match BrowserSettings::save(&store, &body) {
         Ok(settings) => {
             crate::user_agent::sync_user_agent(&store);
-            ok(settings.response()).into_response()
+            ok(settings.response_with_store(&store)).into_response()
         }
         Err(error) => settings_error(error),
     }

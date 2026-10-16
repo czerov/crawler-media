@@ -32,14 +32,15 @@ impl Store {
         let catalog = Connection::open(data_dir.join("catalog.db"))?;
         let library = Connection::open(data_dir.join("library.db"))?;
         let subscribe = Connection::open(data_dir.join("subscribe.db"))?;
-        // 降级保护：在任何迁移 / seed / 连接模式改动之前先做只读预检。只要有一个
-        // 库比本程序新就整体拒绝，四个库都不会被改动（也不写 user_version）。
+        // 降级保护：在任何迁移 / seed / 连接模式改动之前先做只读预检。
         schema::ensure_supported_versions(&[
             ("app", &app, schema::APP_SCHEMA_VERSION),
             ("catalog", &catalog, schema::CATALOG_SCHEMA_VERSION),
             ("library", &library, schema::LIBRARY_SCHEMA_VERSION),
             ("subscribe", &subscribe, schema::SUBSCRIBE_SCHEMA_VERSION),
         ])?;
+        // Fresh-start 纯只读预检：app 库必须是全新或当前版本，拒绝旧版本旧数据。
+        schema::ensure_fresh_start(&app)?;
         // Enable WAL mode and set busy timeout for all connections.
         for conn in [&app, &catalog, &library, &subscribe] {
             apply_connection_policy(conn)?;

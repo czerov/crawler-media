@@ -14,7 +14,7 @@ use api::{
     cli, router, spawn_job_loop,
 };
 use downloader::Downloader;
-use indexer::{ProfileSet, RoutedFetcher};
+use indexer::ProfileSet;
 
 #[tokio::main]
 async fn main() {
@@ -187,7 +187,7 @@ fn create_api_state(
     let mut state = ApiState::new_arc_with_admin_bootstrap(
         store.clone(),
         ProfileSet::load(Some(overlay_dir))?,
-        Arc::new(RoutedFetcher::new(HttpFetcher, browser)),
+        Arc::new(HttpFetcher),
         downloader,
         data_dir.join("library"),
         action,
