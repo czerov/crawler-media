@@ -47,6 +47,9 @@ pub(crate) struct SubmitInput {
     pub(super) save_path: Option<String>,
     #[serde(default)]
     pub(super) auto_route: bool,
+    /// D-M5: submit even when the subscription already owns / downloads the slot.
+    #[serde(default)]
+    pub(super) force: bool,
 }
 
 /// 下载器工作失败的两层结果：解析失败 vs 调用失败 vs 预算失败。

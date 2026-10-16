@@ -22,6 +22,8 @@ mod d_h2_existing_infohash;
 mod d_h3_m8_no_overwrite;
 #[path = "subscription_e2e/d_m4_torrent_validation.rs"]
 mod d_m4_torrent_validation;
+#[path = "subscription_e2e/d_m5_manual_submit.rs"]
+mod d_m5_manual_submit;
 #[path = "subscription_e2e/d_m3_persisted_infohash.rs"]
 mod d_m3_persisted_infohash;
 #[path = "subscription_e2e/d_s1_pending_cleanup.rs"]
