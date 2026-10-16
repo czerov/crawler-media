@@ -226,6 +226,17 @@ impl Store {
         Ok(out)
     }
 
+    /// D-L4: active pending rows routed to a deleted downloader become
+    /// `orphan`: Transfer stops polling them, and (unlike `rejected`) the
+    /// release may be picked again for another downloader.
+    pub fn mark_pending_orphaned(&self, downloader_id: DownloaderId) -> Result<usize, StoreError> {
+        Ok(self.subscribe.execute(
+            "UPDATE pending_downloads SET state = 'orphan'
+             WHERE state = 'active' AND json_extract(torrent_json, '$.downloader_id') = ?1",
+            params![downloader_id.to_string()],
+        )?)
+    }
+
     pub fn delete_pending(
         &self,
         subscribe_id: SubscribeId,

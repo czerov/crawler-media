@@ -195,7 +195,7 @@ fn seed_subscribe_for_pending(store: &Store) -> Subscribe {
             exclude: false,
         }],
         keep_old_versions: false,
-};
+    };
     store.insert_filter(&filter).unwrap();
     let subscribe = Subscribe {
         id: SubscribeId::new(),
@@ -740,5 +740,82 @@ async fn untagged_reachable_snapshot_does_not_prune_stale_pending() {
         store.list_all_pending().unwrap().len(),
         1,
         "不能证明归属时绝不能清理超过宽限期的 pending"
+    );
+}
+
+#[tokio::test]
+async fn d_l4_deleting_a_downloader_orphans_its_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app(&tmp);
+    let created = post_dl(
+        &app,
+        json!({
+            "name": "qb-gone",
+            "kind": "qbittorrent",
+            "url": "http://qb-gone:8080",
+            "username": "admin",
+            "password": "a",
+            "is_default": false
+        }),
+    )
+    .await;
+    let dl: domain::DownloaderId = created["id"].as_str().unwrap().parse().unwrap();
+    let subscribe_id = {
+        let store = Store::open(tmp.path().join("data")).unwrap();
+        let subscribe = seed_subscribe_for_pending(&store);
+        let torrent = Torrent {
+            id: None,
+            site_id: SiteId::new(),
+            title: "Movie.2026.1080p".into(),
+            enclosure: "https://pt.example/gone".into(),
+            size_bytes: Some(100),
+            seeders: Some(1),
+            free: false,
+            hr: false,
+            imdb_id: None,
+            leechers: None,
+            snatched: None,
+            upload_time: None,
+            detail_url: None,
+            category: None,
+            poster_url: None,
+        };
+        store
+            .merge_pending(
+                subscribe.id,
+                &[(
+                    80,
+                    api::store::PendingDownload {
+                        submitted_at: Some(1),
+                        torrent,
+                        release_override: None,
+                        downloader_id: Some(dl),
+                    },
+                )],
+            )
+            .unwrap();
+        subscribe.id
+    };
+    let response = app
+        .clone()
+        .oneshot(request(
+            "DELETE",
+            &format!("/api/v1/downloaders/{dl}"),
+            Some("management-secret"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["data"]["orphaned_pending"], 1);
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    assert!(store.load_pending(subscribe_id).unwrap().is_empty());
+    assert_eq!(
+        store
+            .load_pending_state(subscribe_id, "orphan")
+            .unwrap()
+            .len(),
+        1
     );
 }
