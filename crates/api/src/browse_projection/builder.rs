@@ -10,10 +10,15 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use domain::{LedgerRow, Media, MediaId};
-use store::{BrowseFileFacts, BrowseMediaFacts, CatalogCacheRow, ProjectionBuild, ReadRevisions};
+use store::{
+    BrowseFileFacts, BrowseMediaCandidate, BrowseMediaFacts, CatalogCacheRow, ProjectionBuild,
+    ReadRevisions,
+};
 
 use crate::browse_file_read::BrowseFileRead;
 use crate::http::library::selection::metadata::{self, CacheIndex};
+use crate::http::library::selection::{LightFacts, is_provisional};
+use crate::http::library::selection::projected::total_size;
 use crate::http::library::{backdrop_path_with, poster_path_with, preferred_row};
 use crate::management::ApiState;
 use crate::store::Library;
@@ -35,6 +40,7 @@ pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, Proj
     let cache = CacheIndex::build(&catalog_rows);
     let files = state.browse_files.as_ref();
     let mut rows_by_media: HashMap<MediaId, Vec<LedgerRow>> = HashMap::new();
+    let mut row_facts_by_media: HashMap<MediaId, Vec<FileFacts>> = HashMap::new();
     let mut file_facts = Vec::with_capacity(owned.rows.len());
     for row in &owned.rows {
         rows_by_media
@@ -42,10 +48,26 @@ pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, Proj
             .or_default()
             .push(row.clone());
         if let Some(media) = media_map.get(&row.media_id) {
-            file_facts.push(file_facts_for(files, row, media, owned.missing.contains(&row.path)));
+            let facts = file_facts_for(files, row, media, owned.missing.contains(&row.path));
+            file_facts.push(BrowseFileFacts {
+                ledger_id: row.id,
+                media_id: row.media_id,
+                facts: facts.to_json(),
+            });
+            row_facts_by_media
+                .entry(row.media_id)
+                .or_default()
+                .push(facts);
         }
     }
-    let media_facts = media_facts_for(&owned.media_ids, &media_map, &rows_by_media, &cache, files);
+    let (media_facts, candidates) = media_facts_for(
+        &owned.media_ids,
+        &media_map,
+        &rows_by_media,
+        &row_facts_by_media,
+        &cache,
+        files,
+    );
     let (expected_dirty_token, next_generation) = {
         let store = state.store.lock();
         let head = store
@@ -64,6 +86,7 @@ pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, Proj
         expected_dirty_token,
         files: file_facts,
         media: media_facts,
+        candidates,
     })
 }
 
@@ -167,7 +190,7 @@ fn file_facts_for(
     row: &LedgerRow,
     media: &Media,
     missing: bool,
-) -> BrowseFileFacts {
+) -> FileFacts {
     let path = Path::new(&row.path);
     let (size, has_stat, created_ns, modified_ns) = observe(files, path);
     let mut sidecars = serde_json::Map::new();
@@ -177,7 +200,7 @@ fn file_facts_for(
     for candidate in artwork_candidates(path) {
         sidecars.insert(candidate.display().to_string(), observe_version(files, &candidate));
     }
-    let facts = FileFacts {
+    FileFacts {
         row: row.clone(),
         size,
         has_stat,
@@ -186,11 +209,6 @@ fn file_facts_for(
         missing,
         has_still: crate::episode_still::existing_with(path, files).is_some(),
         sidecars,
-    };
-    BrowseFileFacts {
-        ledger_id: row.id,
-        media_id: row.media_id,
-        facts: facts.to_json(),
     }
 }
 
@@ -253,20 +271,25 @@ fn to_ns(time: std::time::SystemTime) -> Option<i64> {
         .map(|d| d.as_nanos() as i64)
 }
 
+/// 每个 Media 的投影事实与轻候选：同一遍算完，保证两者同源。
 fn media_facts_for(
     media_ids: &[MediaId],
     media_map: &HashMap<MediaId, Media>,
     rows_by_media: &HashMap<MediaId, Vec<LedgerRow>>,
+    row_facts_by_media: &HashMap<MediaId, Vec<FileFacts>>,
     cache: &CacheIndex<'_>,
     files: &dyn BrowseFileRead,
-) -> Vec<BrowseMediaFacts> {
-    let empty: Vec<LedgerRow> = Vec::new();
+) -> (Vec<BrowseMediaFacts>, Vec<BrowseMediaCandidate>) {
+    let empty_rows: Vec<LedgerRow> = Vec::new();
+    let empty_facts: Vec<FileFacts> = Vec::new();
     let mut out = Vec::with_capacity(media_ids.len());
+    let mut candidates = Vec::with_capacity(media_ids.len());
     for mid in media_ids {
         let Some(media) = media_map.get(mid) else {
             continue;
         };
-        let rows = rows_by_media.get(mid).unwrap_or(&empty);
+        let rows = rows_by_media.get(mid).unwrap_or(&empty_rows);
+        let row_facts = row_facts_by_media.get(mid).unwrap_or(&empty_facts);
         let (has_poster, has_backdrop) = match preferred_row(rows) {
             Some(row) => (
                 poster_path_with(row, files).is_some(),
@@ -280,6 +303,7 @@ fn media_facts_for(
             has_poster,
             has_backdrop,
         };
+        candidates.push(candidate_for(media, &facts, rows, row_facts));
         out.push(BrowseMediaFacts {
             media_id: *mid,
             title: media.title.clone(),
@@ -287,7 +311,49 @@ fn media_facts_for(
             facts: facts.to_json(),
         });
     }
-    out
+    (out, candidates)
+}
+
+/// 轻候选：过滤/排序字段的物化（无 LedgerRow、无整份 facts JSON）。
+///
+/// 轻事实（resolutions/hdr/release_date）与全量路径**同一个** [`LightFacts::from_rows`]，
+/// 因此选页前的过滤排序与全量路径逐字段一致。
+fn candidate_for(
+    media: &Media,
+    facts: &MediaFacts,
+    rows: &[LedgerRow],
+    row_facts: &[FileFacts],
+) -> BrowseMediaCandidate {
+    let light = LightFacts::from_rows(media, &facts.metadata, rows);
+    let mut episode_keys: Vec<(u32, u32)> = row_facts
+        .iter()
+        .filter_map(|fact| fact.row.season.zip(fact.row.episode))
+        .collect();
+    episode_keys.sort_unstable();
+    episode_keys.dedup();
+    BrowseMediaCandidate {
+        media_id: media.id,
+        kind: media.kind,
+        title: media.title.clone(),
+        year: media.year,
+        added_at_ns: row_facts.iter().filter_map(FileFacts::added_at_ns).min(),
+        release_date: light.release_date,
+        rating: facts.metadata.rating,
+        runtime: facts.metadata.runtime,
+        size_bytes: total_size(row_facts),
+        provisional: is_provisional(media),
+        scraped: facts.metadata.scraped,
+        missing: row_facts.iter().any(|fact| fact.missing),
+        hdr: light.hdr,
+        resolutions: light.resolutions,
+        genres: facts.metadata.genres.clone(),
+        countries: facts.metadata.countries.clone(),
+        language: facts.metadata.language.clone(),
+        has_poster: facts.has_poster,
+        has_backdrop: facts.has_backdrop,
+        has_still: row_facts.iter().any(|fact| fact.has_still),
+        episode_keys,
+    }
 }
 
 /// Scope 身份指纹：kind + 排序后的根路径。读路径据此拒绝跨 scope 的旧代。

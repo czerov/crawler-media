@@ -8,6 +8,10 @@ pub use browse_projection::{
 };
 mod browse_changes;
 pub use browse_changes::{BrowseChange, BrowseChangeSource, ProjectionHead};
+mod browse_pages;
+pub use browse_pages::{
+    BROWSE_CANDIDATE_VERSION, BrowseMediaCandidate, BrowsePageOrder, BrowsePageRequest,
+};
 mod browse_reads;
 mod catalog;
 mod collections;
@@ -179,4 +183,18 @@ pub struct Store {
     pub(crate) catalog: Connection,
     pub(crate) library: Connection,
     pub(crate) subscribe: Connection,
+}
+
+impl Store {
+    /// Times `list_ledger` executed its unfiltered `FROM ledger` statement.
+    ///
+    /// Incremented beside that statement, so filtering the returned rows cannot
+    /// hide the scan. `ledger_for_media` does not increment it.
+    pub fn root_ledger_scans(&self) -> usize {
+        ledger::root_ledger_scans()
+    }
+
+    pub fn reset_root_ledger_scans(&self) {
+        ledger::reset_root_ledger_scans();
+    }
 }

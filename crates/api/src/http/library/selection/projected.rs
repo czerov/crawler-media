@@ -152,7 +152,7 @@ pub(crate) fn snapshot_from_projection(
 }
 
 /// 与 `file_stats::aggregate_added_at` 同口径：created 优先、modified 兜底，取最早。
-fn min_added_at(facts: &[FileFacts]) -> Result<Option<SystemTime>, String> {
+pub(crate) fn min_added_at(facts: &[FileFacts]) -> Result<Option<SystemTime>, String> {
     facts
         .iter()
         .filter_map(FileFacts::added_at_ns)
@@ -162,7 +162,7 @@ fn min_added_at(facts: &[FileFacts]) -> Result<Option<SystemTime>, String> {
 }
 
 /// 与 `file_stats::aggregate_size` 同口径：只有观察到普通文件的行计入。
-fn total_size(facts: &[FileFacts]) -> Option<u64> {
+pub(crate) fn total_size(facts: &[FileFacts]) -> Option<u64> {
     let mut total = 0u64;
     let mut known = false;
     for fact in facts {
@@ -174,7 +174,7 @@ fn total_size(facts: &[FileFacts]) -> Option<u64> {
     known.then_some(total)
 }
 
-fn ns_to_system_time(ns: i64) -> Result<SystemTime, String> {
+pub(crate) fn ns_to_system_time(ns: i64) -> Result<SystemTime, String> {
     let shifted = if ns >= 0 {
         UNIX_EPOCH.checked_add(Duration::from_nanos(ns as u64))
     } else {

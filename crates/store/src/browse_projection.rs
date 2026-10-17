@@ -5,6 +5,7 @@ use std::str::FromStr;
 use domain::{LedgerId, MediaId};
 use rusqlite::params;
 
+use super::browse_pages::BrowseMediaCandidate;
 use super::{CatalogCacheRow, Store, StoreError};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -52,6 +53,20 @@ pub struct ProjectionBuild {
     pub expected_dirty_token: Option<i64>,
     pub files: Vec<BrowseFileFacts>,
     pub media: Vec<BrowseMediaFacts>,
+    /// 每 Media 的轻候选：与 `media` 同源写入（`browse_media` 的排序键列 +
+    /// `candidate_json`）。缺一条时写空候选并 `warn!`：常用排序的 SQL 分页仍可用，
+    /// 高级查询会回退到全量读取。
+    pub candidates: Vec<BrowseMediaCandidate>,
+}
+
+/// `browse_media` 现有行的发布比对快照（含排序键列与候选 JSON）。
+struct ExistingMedia {
+    title: String,
+    year: Option<u16>,
+    facts: String,
+    added_at_ns: Option<i64>,
+    release_date: String,
+    candidate: String,
 }
 
 #[derive(Clone, Debug)]
@@ -222,20 +237,24 @@ impl Store {
         }
 
         // Read existing media
-        let mut existing_media: std::collections::HashMap<String, (String, Option<u16>, String)> =
+        let mut existing_media: std::collections::HashMap<String, ExistingMedia> =
             std::collections::HashMap::new();
         {
             let mut stmt = tx.prepare(
-                "SELECT media_id, title, year, facts_json FROM browse_media WHERE library_id = ?1",
+                "SELECT media_id, title, year, facts_json, added_at_ns, release_date, candidate_json
+                 FROM browse_media WHERE library_id = ?1",
             )?;
             let rows = stmt.query_map([&build.library_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    (
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<u16>>(2)?,
-                        r.get::<_, String>(3)?,
-                    ),
+                    ExistingMedia {
+                        title: r.get(1)?,
+                        year: r.get(2)?,
+                        facts: r.get(3)?,
+                        added_at_ns: r.get(4)?,
+                        release_date: r.get(5)?,
+                        candidate: r.get(6)?,
+                    },
                 ))
             })?;
             for r in rows {
@@ -244,41 +263,77 @@ impl Store {
             }
         }
 
+        // 轻候选与 media 行同源写入。缺候选时写空串（读路径据此判定投影过旧、回退
+        // 全量读取并 warn 留痕），不拒绝发布：常用排序的 SQL 分页不依赖候选。
+        let candidates: std::collections::HashMap<domain::MediaId, &BrowseMediaCandidate> =
+            build.candidates.iter().map(|c| (c.media_id, c)).collect();
         let mut new_media_keys = std::collections::HashSet::new();
         for m in &build.media {
             let mid_str = m.media_id.to_string();
             let facts_str = m.facts.to_string();
             new_media_keys.insert(mid_str.clone());
+            let candidate = candidates.get(&m.media_id).copied();
+            if candidate.is_none() {
+                tracing::warn!(
+                    library_id = %build.library_id,
+                    media_id = %m.media_id,
+                    "投影构建缺少轻候选：该库的高级浏览查询将回退到全量读取"
+                );
+            }
+            let candidate_str = candidate
+                .map(|candidate| candidate.to_json().to_string())
+                .unwrap_or_default();
+            let added_at_ns = candidate.and_then(|candidate| candidate.added_at_ns);
+            let release_date = candidate
+                .map(|candidate| candidate.release_date.clone())
+                .unwrap_or_default();
 
-            if let Some((cur_title, cur_year, cur_facts)) = existing_media.get(&mid_str) {
-                if cur_title != &m.title || cur_year != &m.year || cur_facts != &facts_str {
+            match existing_media.get(&mid_str) {
+                Some(existing)
+                    if existing.title == m.title
+                        && existing.year == m.year
+                        && existing.facts == facts_str
+                        && existing.added_at_ns == added_at_ns
+                        && existing.release_date == release_date
+                        && existing.candidate == candidate_str => {}
+                Some(_) => {
                     tx.execute(
                         "UPDATE browse_media
-                         SET generation = ?1, title = ?2, year = ?3, facts_json = ?4
-                         WHERE library_id = ?5 AND media_id = ?6",
+                         SET generation = ?1, title = ?2, year = ?3, facts_json = ?4,
+                             added_at_ns = ?5, release_date = ?6, candidate_json = ?7
+                         WHERE library_id = ?8 AND media_id = ?9",
                         params![
                             build.generation,
                             m.title,
                             m.year,
                             facts_str,
+                            added_at_ns,
+                            release_date,
+                            candidate_str,
                             build.library_id,
                             mid_str
                         ],
                     )?;
                 }
-            } else {
-                tx.execute(
-                    "INSERT INTO browse_media (library_id, media_id, generation, title, year, facts_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        build.library_id,
-                        mid_str,
-                        build.generation,
-                        m.title,
-                        m.year,
-                        facts_str
-                    ],
-                )?;
+                None => {
+                    tx.execute(
+                        "INSERT INTO browse_media
+                            (library_id, media_id, generation, title, year, facts_json,
+                             added_at_ns, release_date, candidate_json)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            build.library_id,
+                            mid_str,
+                            build.generation,
+                            m.title,
+                            m.year,
+                            facts_str,
+                            added_at_ns,
+                            release_date,
+                            candidate_str
+                        ],
+                    )?;
+                }
             }
         }
 

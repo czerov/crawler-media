@@ -7,6 +7,7 @@ mod library_deletion;
 mod probe_state;
 mod tables;
 mod browse_changes;
+mod browse_page_facts;
 mod browse_projection;
 mod read_revisions;
 mod scan_operations;
@@ -15,7 +16,7 @@ mod scan_operations;
 /// The version is stored via `PRAGMA user_version` on each database file.
 pub const APP_SCHEMA_VERSION: i64 = 7;
 pub const CATALOG_SCHEMA_VERSION: i64 = 2;
-pub const LIBRARY_SCHEMA_VERSION: i64 = 14;
+pub const LIBRARY_SCHEMA_VERSION: i64 = 15;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 7;
 
 /// Read the current schema version from a database file.
@@ -289,6 +290,12 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
     )?;
     scan_operations::migrate_scan_operations(conn)?;
     browse_projection::migrate_browse_projection(conn)?;
+    // library schema 15：browse_media 的 SQL 排序键列与索引（A4 浏览页）。
+    browse_page_facts::migrate_browse_page_facts(conn)?;
+    if previous < 15 {
+        // 旧代的投影没有候选 JSON：标脏让下一次请求重建，而不是永久回退全量读取。
+        browse_page_facts::invalidate_legacy_projections(conn)?;
+    }
     // library schema 10：一次性清理指向已删除台账行的探测工作项，并把因此
     // 空掉的活动任务收尾，避免旧库残留悬空 ledger 引用。
     if previous < 10 {

@@ -21,7 +21,7 @@ pub struct PlaybackUnitSnapshot {
     pub state: UnitState,
 }
 
-const MEDIA_BATCH_CHUNK: usize = 500;
+pub(super) const MEDIA_BATCH_CHUNK: usize = 500;
 
 impl Store {
     /// Media rows for `ids`; unknown ids are simply absent, and empty input is
@@ -132,42 +132,6 @@ impl Store {
             }
         }
         Ok(units)
-    }
-
-    /// Page browse_media rows directly from the projection for simple title queries.
-    pub fn browse_title_page(
-        &self,
-        library_id: &str,
-        offset: usize,
-        limit: usize,
-        desc: bool,
-    ) -> Result<Vec<super::BrowseMediaFacts>, StoreError> {
-        let order = if desc { "DESC" } else { "ASC" };
-        let sql = format!(
-            "SELECT media_id, title, year, facts_json
-             FROM browse_media
-             WHERE library_id = ?1
-             ORDER BY title {order}, media_id ASC
-             LIMIT ?2 OFFSET ?3"
-        );
-        let mut stmt = self.library.prepare(&sql)?;
-        let rows = stmt.query_map(params![library_id, limit, offset], |row| {
-            let mid: String = row.get(0)?;
-            let title: String = row.get(1)?;
-            let year: Option<u16> = row.get(2)?;
-            let facts_str: String = row.get(3)?;
-            use std::str::FromStr;
-            let media_id = MediaId::from_str(&mid)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
-            let facts = serde_json::from_str(&facts_str).unwrap_or_default();
-            Ok(super::BrowseMediaFacts {
-                media_id,
-                title,
-                year,
-                facts,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Candidate ledger rows for one Library under the historical ownership

@@ -200,6 +200,7 @@ fn new_dirty_during_build_is_not_swallowed() {
         expected_dirty_token: Some(1),
         files: vec![],
         media: vec![],
+        candidates: vec![],
     };
 
     // Before publish commits, a new change arrives and increments dirty_token to 2!

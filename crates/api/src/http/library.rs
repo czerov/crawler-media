@@ -246,12 +246,11 @@ pub(crate) async fn list_items(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     // 显式分页参数先校验：越界直接 400，不静默 clamp；省略 limit 仍是"返回全部"。
-    let page = match page::PageWindow::parse(&query) {
-        Ok(page) => page,
-        Err(message) => return err(StatusCode::BAD_REQUEST, "library.invalid", &message),
-    };
-    // 授权从当前配置判定；浏览事实优先取目标 Library 的 ready 投影（零文件 IO），
-    // 投影不可用时回退到旧的全量读取（已在 helper 内 warn）。
+    if let Err(message) = page::PageWindow::parse(&query) {
+        return err(StatusCode::BAD_REQUEST, "library.invalid", &message);
+    }
+    // 授权从当前配置判定；热页只读投影 head 并按选中 Media 读本页 facts（零文件 IO），
+    // 投影未就绪/不可解析或省略 limit 时回退旧的全量读取（已在 helper 内 warn）。
     let library = {
         let store = state.store.lock();
         match require_visible_library(&store, &id, user_id) {
@@ -259,24 +258,18 @@ pub(crate) async fn list_items(
             Err(response) => return response,
         }
     };
-    let (snapshot, artwork) =
-        match selection::load_browse_snapshot_or_projection(&state, &library, user_id).await {
-            Ok(loaded) => loaded,
-            Err(response) => return response,
-        };
+    let (items, artwork) = match selection::load_browse_page(&state, &library, user_id, &query).await
+    {
+        Ok(loaded) => loaded,
+        Err(response) => return response,
+    };
     let files = state.browse_files.clone();
+    let library_id = library.id.clone();
     let work = state
         .http_work
         .run(selection::BROWSE_DEADLINE, move || {
-            let library_id = snapshot.library_id.clone();
-            let selected = match selection::select_snapshot(snapshot, &query, files.as_ref()) {
-                Ok(items) => items,
-                Err(response) => return response,
-            };
-            // 过滤与排序已在 select_snapshot 内完成，分页发生在其后。
-            let bounds = page.bounds(selected.len());
-            let art = selection::BrowseArtwork::new(artwork.as_ref(), files.as_ref());
-            let paged: Vec<_> = selected[bounds]
+            let art = selection::BrowseArtwork::new(Some(&artwork), files.as_ref());
+            let paged: Vec<_> = items
                 .iter()
                 .map(|item| wall_item_json(&library_id, item, &art))
                 .collect();

@@ -72,7 +72,7 @@ fn old_library_gains_nullable_release_quality_idempotently() {
                 .find(|(name, _)| *name == "library")
                 .unwrap()
                 .1,
-            14
+            15
         );
         let quality: Option<String> = db
             .query_row(

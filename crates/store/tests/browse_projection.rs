@@ -102,6 +102,7 @@ fn projection_publication_and_retrieval() {
             year: Some(2024),
             facts: serde_json::json!({ "poster": true }),
         }],
+        candidates: vec![],
     };
 
     let published = store.publish_browse_projection(&build).unwrap();

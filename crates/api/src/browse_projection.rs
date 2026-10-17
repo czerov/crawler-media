@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use store::{ProjectionSnapshot, ReadRevisions};
+use store::{ProjectionHead, ProjectionSnapshot, ReadRevisions};
 use tokio::sync::broadcast;
 
 use crate::blocking_budget::{BlockingBudget, BlockingError};
@@ -588,8 +588,53 @@ impl ProjectionService {
         state: &ApiState,
         library_id: &str,
     ) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
-        // A ready projection is usable only after this request has consumed a bounded
-        // amount of pending journal work. Incomplete sources force the build path.
+        if !self.journal_ready(state, library_id).await? {
+            return Ok(None);
+        }
+        self.load_snapshot(state, library_id).await
+    }
+
+    /// 只读 head 的新鲜度检查（A4 热页）：与 [`Self::ensure`] 同一套 journal 消费、
+    /// 脏标记与 scope 判定，但**不装载整份投影行**。
+    ///
+    /// `Ok(Some(head))` 表示当前 ready 代可直接按页读 facts；`Ok(None)`（脏/scope
+    /// 变化）与 `Err`（容量/超时/取消）一律交回调用方走 `ensure`，不静默降级。
+    pub async fn fresh_head(
+        &self,
+        state: &ApiState,
+        library_id: &str,
+    ) -> Result<Option<ProjectionHead>, ProjectionError> {
+        if self.disabled {
+            return Err(ProjectionError::Failed("browse projection disabled".into()));
+        }
+        self.visited.lock().insert(library_id.to_string());
+        if !self.journal_ready(state, library_id).await? {
+            return Ok(None);
+        }
+        let budget = state.http_work.clone();
+        let state = state.clone();
+        let library_id = library_id.to_string();
+        match budget
+            .run(
+                crate::http::library::selection::BROWSE_DEADLINE,
+                move || fresh_head_inner(&state, &library_id),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(budget_error(error)),
+        }
+    }
+
+    /// journal 消费 + 脏标记判定：整份快照与只读 head 两条新鲜度检查共用。
+    ///
+    /// A ready projection is usable only after this request has consumed a bounded
+    /// amount of pending journal work. Incomplete sources force the build path.
+    async fn journal_ready(
+        &self,
+        state: &ApiState,
+        library_id: &str,
+    ) -> Result<bool, ProjectionError> {
         let budget = state.http_work.clone();
         let consumer = self.consumer.clone();
         let state_for_poll = state.clone();
@@ -606,62 +651,74 @@ impl ProjectionService {
                 },
             )
             .await
-            .map_err(|error| match error {
-                BlockingError::Busy => ProjectionError::Busy,
-                BlockingError::Timeout => ProjectionError::Timeout,
-                BlockingError::Worker(message) => ProjectionError::Failed(message),
-            })??;
+            .map_err(budget_error)??;
         if !sources_complete {
             tracing::debug!(library_id = %library_id, "浏览投影等待 journal 完整消费");
             return Err(ProjectionError::Busy);
         }
-        if self.dirty_libraries.lock().contains_key(library_id) {
-            return Ok(None);
-        }
+        Ok(!self.dirty_libraries.lock().contains_key(library_id))
+    }
+
+    /// 锁内装载整份投影行（facets/item-index/回退路径仍需要它）。
+    async fn load_snapshot(
+        &self,
+        state: &ApiState,
+        library_id: &str,
+    ) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
         let budget = state.http_work.clone();
         let state = state.clone();
         let library_id = library_id.to_string();
         match budget
             .run(
                 crate::http::library::selection::BROWSE_DEADLINE,
-                move || fresh_snapshot_inner(&state, &library_id),
+                move || {
+                    let store = state.store.lock();
+                    store
+                        .browse_projection(&library_id)
+                        .map_err(|e| ProjectionError::Failed(e.to_string()))
+                },
             )
             .await
         {
             Ok(result) => result,
-            Err(BlockingError::Busy) => Err(ProjectionError::Busy),
-            Err(BlockingError::Timeout) => Err(ProjectionError::Timeout),
-            Err(BlockingError::Worker(message)) => Err(ProjectionError::Failed(message)),
+            Err(error) => Err(budget_error(error)),
         }
     }
 }
 
-/// 锁内读当前 scope 指纹 / 投影状态，仅依据 per-library dirty_token 与 state='ready'
-/// 判定普通新鲜度（D3-01 / D3-02），全局 revisions 仅保留在发布时的回退检查中。
-fn fresh_snapshot_inner(
+fn budget_error(error: BlockingError) -> ProjectionError {
+    match error {
+        BlockingError::Busy => ProjectionError::Busy,
+        BlockingError::Timeout => ProjectionError::Timeout,
+        BlockingError::Worker(message) => ProjectionError::Failed(message),
+    }
+}
+
+/// 锁内只读 head：仅依据 per-library scope 指纹、`state='ready'` 与 dirty_token
+/// 判定普通新鲜度（D3-01 / D3-02），不装载投影行。
+fn fresh_head_inner(
     state: &ApiState,
     library_id: &str,
-) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
-    let current = {
-        let store = state.store.lock();
-        let scope_signature = store
-            .get_library(library_id)
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?
-            .map(|library| builder::scope_signature(&library));
-        let head = store
-            .browse_projection_head(library_id)
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
-        let snapshot = match head {
-            Some(h) if h.ready && Some(h.scope_signature.as_str()) == scope_signature.as_deref() => {
-                store
-                    .browse_projection(library_id)
-                    .map_err(|e| ProjectionError::Failed(e.to_string()))?
+) -> Result<Option<ProjectionHead>, ProjectionError> {
+    let store = state.store.lock();
+    let scope_signature = store
+        .get_library(library_id)
+        .map_err(|e| ProjectionError::Failed(e.to_string()))?
+        .map(|library| builder::scope_signature(&library));
+    let head = store
+        .browse_projection_head(library_id)
+        .map_err(|e| ProjectionError::Failed(e.to_string()))?;
+    Ok(
+        match head {
+            Some(head)
+                if head.ready
+                    && Some(head.scope_signature.as_str()) == scope_signature.as_deref() =>
+            {
+                Some(head)
             }
             _ => None,
-        };
-        snapshot
-    };
-    Ok(current)
+        },
+    )
 }
 
 fn poll_changes_inner(
