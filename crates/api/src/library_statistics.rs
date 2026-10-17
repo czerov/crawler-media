@@ -364,6 +364,19 @@ async fn finish_statistics(
     if let Some(barrier) = &state.statistics_phase_barrier {
         barrier();
     }
+    // 2) 先有界消费 journal：内存脏标记与 head 代次必须反映本次请求之前的变化，
+    //    否则同数量路径变化（.mkv -> .strm）会把旧体积报成 fresh。
+    let mut journal_drained: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    {
+        let projection = state.projection.clone();
+        for plan in &plans {
+            let drained = projection
+                .journal_ready(&state, &plan.library.id)
+                .await
+                .unwrap_or(false);
+            journal_drained.insert(plan.library.id.clone(), drained);
+        }
+    }
     let mut totals = read_totals(&state, ready_ids(&plans)).await?;
     // 3) 从未建过投影的库：一次有界构建（单飞 + 共享容量），再按新代读 facts。
     let cold: Vec<usize> = plans
@@ -422,6 +435,11 @@ async fn finish_statistics(
                 .is_some_and(|library| scope_signature(library) == scope_signature(&plan.library));
             // 内存里的脏标记同样使旧 facts 失效（journal 尚未被后台消费时）。
             let dirty = state.projection.is_dirty(&plan.library.id);
+            // 一轮没排空不等于不可用：脏标记才是权威信号（下一轮会继续消费）。
+            let _drained = journal_drained
+                .get(&plan.library.id)
+                .copied()
+                .unwrap_or(false);
             let current = store
                 .browse_projection_head(&plan.library.id)
                 .map_err(|error| StatisticsFailure::Store(error.to_string()))?;
