@@ -24,7 +24,7 @@ use crate::store::{CatalogCacheRow, Store, UnitState};
 use super::metadata::{self, BrowseMetadata, CacheIndex};
 use super::projected::{self, ProjectedFacts};
 use super::{
-    BROWSE_DEADLINE, LibraryFilter, LibrarySelection, browse_work_error, file_stats,
+    BROWSE_DEADLINE, LibraryFilter, LibrarySelection, LightFacts, browse_work_error, file_stats,
     projection_error_response, watch_state_from_units,
 };
 
@@ -120,9 +120,12 @@ pub(crate) async fn load_browse_snapshot_or_projection(
             // 不在 async worker 上持 Store 锁。
             let work = state
                 .http_work
-                .run(BROWSE_DEADLINE, move || {
+                .run(BROWSE_DEADLINE, move || -> Result<_, String> {
                     let store = state_clone.store.lock();
-                    projected::snapshot_from_projection(&store, &snapshot, user)
+                    let loaded = projected::snapshot_from_projection(&store, &snapshot, user)?;
+                    // 全量路径解码了整份投影：热页路径只解码本页（计数 seam）。
+                    state_clone.count_decoded(snapshot.files.len(), snapshot.media.len());
+                    Ok(loaded)
                 })
                 .await;
             match work {
@@ -170,18 +173,13 @@ fn read_units(
     user: Option<UserId>,
     ids: &[MediaId],
 ) -> Result<HashMap<(MediaId, i32, i32), UnitState>, Response> {
-    match user {
-        Some(user) => store
-            .playback_units_for_media(user, ids)
-            .map_err(super::store_error)
-            .map(|units| {
-                units
-                    .into_iter()
-                    .map(|unit| ((unit.media_id, unit.season, unit.episode), unit.state))
-                    .collect()
-            }),
-        None => Ok(HashMap::new()),
-    }
+    let Some(user) = user else {
+        return Ok(HashMap::new());
+    };
+    super::units_for_media(store, user, ids).map_err(|message| {
+        tracing::error!(%message, "Library browse store read failed");
+        err(StatusCode::INTERNAL_SERVER_ERROR, "store.error", &message)
+    })
 }
 
 /// 锁外执行：NFO/stat、过滤、排序。分页由调用方在排序之后做。
@@ -256,6 +254,7 @@ fn collect_items(
             None => file_stats::total_size(&rows, files),
         });
         let mut item = LibrarySelection {
+            light: LightFacts::from_rows(&media, &metadata, &rows),
             media,
             metadata,
             missing: is_missing,

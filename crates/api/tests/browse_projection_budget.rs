@@ -106,6 +106,52 @@ fn second_library(fix: &PresenceFixture) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn media_batch_read_failure_does_not_publish_projection() {
+    let fix = PresenceFixture::new();
+    let (media_id, _) = fix.insert_media_and_ledger("Unreadable.mkv");
+    let db_path = fix.state.store().lock().app_db_path().to_path_buf();
+    rusqlite::Connection::open(db_path)
+        .unwrap()
+        .execute_batch("DROP TABLE media;")
+        .unwrap();
+
+    let state = fix.state.clone().with_projection_service(Arc::new(
+        ProjectionService::new().with_build_capacity(1),
+    ));
+    let result = state
+        .projection
+        .ensure(state.clone(), fix.library_id.clone())
+        .await;
+
+    assert!(matches!(result, Err(ProjectionError::Failed(_))), "Media read failure must be surfaced: {result:?}");
+    let store = state.store();
+    let guard = store.lock();
+    assert!(guard.browse_projection(&fix.library_id).unwrap().is_none());
+    assert!(!state.projection.has_media_dependency(&fix.library_id, media_id));
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publication_store_failure_is_failed_and_keeps_library_visited() {
+    let fix = PresenceFixture::new();
+    let (media_id, _) = fix.insert_media_and_ledger("PublishFailure.mkv");
+    let state = fix.state.clone().with_projection_service(Arc::new(
+        ProjectionService::new().with_build_capacity(1),
+    ));
+    let library_db = fix.state.store().lock().data_dir().join("library.db");
+    rusqlite::Connection::open(library_db)
+        .unwrap()
+        .execute_batch("CREATE TRIGGER fail_projection_publish BEFORE INSERT ON browse_files BEGIN SELECT RAISE(ABORT, 'simulated projection publish failure'); END;")
+        .unwrap();
+
+    let result = state
+        .projection
+        .ensure(state.clone(), fix.library_id.clone())
+        .await;
+
+    assert!(matches!(result, Err(ProjectionError::Failed(_))), "Store publication failure must surface as Failed: {result:?}");
+    assert!(state.projection.has_visited(&fix.library_id));
+    assert!(!state.projection.has_media_dependency(&fix.library_id, media_id));
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn saturated_projection_build_capacity_returns_503() {
     let fix = PresenceFixture::new();
     fix.insert_media_and_ledger("Gated.mkv");
@@ -621,4 +667,52 @@ async fn late_follower_replays_stale_scope_outcome() {
         matches!(leader.await.unwrap(), Err(ProjectionError::StaleScope)),
         "leader 必须回报 StaleScope"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_removal_waits_for_blocked_projection_build() {
+    let fix = PresenceFixture::new();
+    fix.insert_media_and_ledger("Gated.mkv");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let files = Arc::new(GatedFiles {
+        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let state = fix.state.clone().with_browse_file_read(files).with_projection_service(
+        Arc::new(ProjectionService::new().with_build_capacity(1)),
+    );
+    let leader_state = state.clone();
+    let leader_library = fix.library_id.clone();
+    let leader = tokio::spawn(async move {
+        leader_state.projection.ensure(leader_state.clone(), leader_library).await
+    });
+    started_rx.await.expect("projection build must enter gated metadata read");
+
+    let removal = api::library_lifecycle::start_library_removal(&state, &fix.library_id).unwrap();
+    let completed_while_blocked = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            let current = state.store().lock().library_removal(&removal.operation_id).unwrap().unwrap();
+            if current.state == "succeeded" { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.is_ok();
+    release_tx.send(()).unwrap();
+    assert!(!completed_while_blocked, "removal must drain the in-flight projection build");
+    assert!(leader.await.unwrap().is_err());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let current = state.store().lock().library_removal(&removal.operation_id).unwrap().unwrap();
+            let dependencies_remain = state.projection.has_dependencies(&fix.library_id);
+            if current.state == "succeeded" && !dependencies_remain { break; }
+            assert_ne!(current.state, "failed", "{:?}", current.error);
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(state.store().lock().get_library(&fix.library_id).unwrap().is_none());
+    assert!(!state.projection.has_dependencies(&fix.library_id), "deleted Library must have no dependency entries");
+
+    let retry = state.projection.ensure(state.clone(), fix.library_id.clone()).await;
+    assert!(retry.is_err(), "deleted Library must not retain a buildable projection");
+    assert_eq!(state.projection.available_build_permits(), 1, "completed worker must release capacity");
 }

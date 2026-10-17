@@ -55,6 +55,7 @@ fn refresh_state(root: &std::path::Path) -> api::ApiState {
             title: "The Matrix Reloaded".into(),
             year: Some(2003),
             original_title: Some("The Matrix Reloaded".into()),
+            aliases: Vec::new(),
             tmdb_id: Some("603".into()),
             douban_id: None,
             tvdb_id: None,

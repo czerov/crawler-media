@@ -10,6 +10,7 @@ fn insert_ledger_row(store: &Store, path: &std::path::Path) {
         title: "Movie".to_string(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

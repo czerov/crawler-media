@@ -20,6 +20,7 @@ mod tests {
                 title: "Fixture".into(),
                 year: None,
                 original_title: None,
+                aliases: Vec::new(),
                 tmdb_id: None,
                 douban_id: None,
                 tvdb_id: None,
@@ -124,51 +125,98 @@ mod tests {
 
 impl ProbeManager {
     pub(crate) fn recover_pending_jobs(&self) {
-        let jobs = match self.store.lock().recover_probe_jobs() {
+        if let Err(error) = self.store.lock().reset_running_probe_units() {
+            tracing::error!(%error, "恢复探测任务时重置运行中单元失败");
+            return;
+        }
+        self.repair_removed_window();
+        self.recover_completed_jobs();
+        self.recover_marker_refreshes();
+        self.fill_dispatch_windows();
+    }
+
+    fn repair_removed_window(&self) {
+        let refs = match self.store.lock().active_probe_unit_refs(64) {
+            Ok(refs) => refs,
+            Err(error) => {
+                tracing::error!(%error, "读取待修复探测窗口失败");
+                return;
+            }
+        };
+        for (job_id, ledger_id) in refs {
+            let removed = self.removed_recovery_units(&[store_unit_stub(&job_id, &ledger_id)]);
+            if removed.is_empty() {
+                continue;
+            }
+            let kind = self
+                .store
+                .lock()
+                .get_probe_job(&job_id)
+                .ok()
+                .flatten()
+                .map(|job| job.kind);
+            if kind.as_deref() == Some("marker_refresh") {
+                if let Err(error) = self.store.lock().cancel_probe_job(&job_id, "Library removed") {
+                    tracing::error!(%error, %job_id, "恢复时取消删除库任务失败");
+                }
+                continue;
+            }
+            if let Err(error) = self
+                .store
+                .lock()
+                .cancel_probe_unit(&job_id, &ledger_id, "Library removed")
+            {
+                tracing::error!(%error, %job_id, %ledger_id, "恢复时取消删除库单元失败");
+            }
+        }
+    }
+
+    fn recover_completed_jobs(&self) {
+        let jobs = match self.store.lock().active_completed_probe_jobs(64) {
             Ok(jobs) => jobs,
             Err(error) => {
-                tracing::error!(%error, "读取待恢复媒体探测任务失败");
+                tracing::error!(%error, "读取已完成待收尾探测任务失败");
+                return;
+            }
+        };
+        for job in jobs {
+            self.finalize_recovered_job(&job);
+        }
+    }
+
+    fn recover_marker_refreshes(&self) {
+        let jobs = match self.store.lock().active_probe_jobs_by_kind("marker_refresh") {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                tracing::error!(%error, "读取片头片尾刷新任务失败");
                 return;
             }
         };
         for (job, units) in jobs {
-            let removed_units = self.removed_recovery_units(&units);
-            if !removed_units.is_empty() && job.kind == "marker_refresh" {
-                if let Err(error) = self
-                    .store
-                    .lock()
-                    .cancel_probe_job(&job.id, "Library removed")
-                {
-                    tracing::error!(%error, job_id=%job.id, "恢复时取消删除库任务失败");
-                }
-                continue;
-            }
-            tracing::info!(
-                job_id = %job.id,
-                media_id = %job.media_id,
-                status = %job.status,
-                pending = units.iter().filter(|unit| unit.status == "queued").count(),
-                completed = job.completed,
-                total = job.total,
-                "【探测任务】从数据库恢复未完成任务"
-            );
-            // A crash may occur after the unit cancellation commits and before the
-            // parent job cancellation. An atomic refresh must never resume that batch.
-            if job.kind == "marker_refresh" && units.iter().any(|unit| unit.status == "cancelled") {
+            if units.iter().any(|unit| unit.status == "cancelled") {
                 let reason = units
                     .iter()
                     .find(|unit| unit.status == "cancelled")
                     .and_then(|unit| unit.error.as_deref())
                     .unwrap_or("file_deleted");
-                match self.store.lock().cancel_probe_job(&job.id, reason) {
-                    Ok(()) => tracing::info!(job_id = %job.id, reason,
-                        "恢复已中止的原子刷新，释放任务范围"),
-                    Err(error) => tracing::error!(%error, job_id = %job.id,
-                        "恢复原子刷新取消状态失败"),
+                if let Err(error) = self.store.lock().cancel_probe_job(&job.id, reason) {
+                    tracing::error!(%error, job_id = %job.id, "恢复原子刷新取消状态失败");
                 }
                 continue;
             }
-            self.recover_retained_units(&job, units, &removed_units);
+            let removed = self.removed_recovery_units(&units);
+            if !removed.is_empty() {
+                if let Err(error) = self.store.lock().cancel_probe_job(&job.id, "Library removed") {
+                    tracing::error!(%error, job_id = %job.id, "恢复时取消删除库刷新失败");
+                }
+                continue;
+            }
+            tracing::info!(
+                job_id = %job.id,
+                pending = units.iter().filter(|unit| unit.status == "queued").count(),
+                "【探测任务】恢复片头片尾刷新"
+            );
+            self.recover_job_units(&job, &units);
             self.finalize_recovered_job(&job);
         }
     }
@@ -360,12 +408,10 @@ impl ProbeManager {
             };
             if self.queue_metadata(unit).is_err() {
                 self.seen.lock().remove(&persisted.ledger_id);
-                tracing::error!(job_id = %job.id, ledger_id = %persisted.ledger_id, "恢复探测任务加入队列失败");
-                let _ = self.store.lock().finish_probe_unit(
-                    &job.id,
-                    &persisted.ledger_id,
-                    false,
-                    Some("恢复任务加入内存队列失败"),
+                tracing::info!(
+                    job_id = %job.id,
+                    ledger_id = %persisted.ledger_id,
+                    "恢复窗口已满，任务保持数据库排队"
                 );
             }
         }
@@ -417,5 +463,22 @@ impl ProbeManager {
             marker_refresh_id: Some(self.next_marker_refresh_id.fetch_add(1, Ordering::Relaxed)),
             job_id: Some(job.id.clone()),
         })
+    }
+}
+
+fn store_unit_stub(job_id: &str, ledger_id: &str) -> crate::store::ProbeJobUnit {
+    crate::store::ProbeJobUnit {
+        job_id: job_id.to_string(),
+        ledger_id: ledger_id.to_string(),
+        kind: String::new(),
+        force_fingerprint: false,
+        reuse_fingerprint_cache: false,
+        overwrite_markers: false,
+        status: "queued".into(),
+        error: None,
+        sampling_plan_json: None,
+        detection_outcome_json: None,
+        reuse_media_info_cache: false,
+        stage: store::ProbeDispatchStage::Metadata,
     }
 }

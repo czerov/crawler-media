@@ -90,6 +90,7 @@ fn create_test_media_and_filter() -> (domain::Media, domain::Filter) {
         title: "Test Show".into(),
         year: Some(2024),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         bangumi_id: None,

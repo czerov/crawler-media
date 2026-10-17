@@ -115,6 +115,7 @@ impl ProbeScenario {
             title: "Test Comedy".into(),
             year: Some(2026),
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: None,
             douban_id: None,
             tvdb_id: None,
@@ -226,6 +227,8 @@ impl ProbeScenario {
         let row = self.ledgers.iter().find(|l| l.episode == Some(episode)).unwrap();
         self.manager.request_probe(row, origin).unwrap()
     }
+
+
 
     pub async fn drain(&self) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);

@@ -50,6 +50,7 @@ fn seed_movie(state: &ApiState, title: &str, root: &Path, with_poster: bool) {
         title: title.into(),
         year: Some(2024),
         original_title: Some(title.into()),
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

@@ -11,6 +11,7 @@ fn create_test_media_and_ledger(store: &Store, path_suffix: &str) -> (Media, Led
         title: "Test Show".into(),
         year: Some(2026),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

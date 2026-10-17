@@ -76,6 +76,7 @@ fn rich_tv_app(root: &Path) -> (axum::Router, String, MediaId, PathBuf, PathBuf)
         title: "Pantheon".into(),
         year: Some(2022),
         original_title: Some("Pantheon".into()),
+        aliases: Vec::new(),
         tmdb_id: Some("195339".into()),
         douban_id: None,
         tvdb_id: None,

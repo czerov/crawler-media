@@ -86,6 +86,7 @@ fn seed_media(store: &Store, root: &Path, kind: MediaKind, title: &str, id: &str
     std::fs::write(&path, b"video").unwrap();
     let media = store.ensure_media(Media {
         id: MediaId::new(), kind, title: title.into(), year: None, original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some(id.into()), douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None,
     }).unwrap();
     store.insert_ledger(&LedgerRow {

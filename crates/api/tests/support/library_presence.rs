@@ -203,6 +203,7 @@ impl PresenceFixture {
             kind: MediaKind::Movie,
             title: "Test Movie".to_string(),
             original_title: None,
+            aliases: Vec::new(),
             year: None,
             tmdb_id: None,
             douban_id: None,

@@ -62,6 +62,35 @@ fn normalized_boundary_title(raw: &str) -> String {
     words.join(" ")
 }
 
+/// 集号只接受 1 到 999。8 位 `20YYMMDD` 是日期，即使前面写了 `E` 也不是集。
+pub(super) fn plausible_episode(digits: &str) -> bool {
+    let Ok(episode) = digits.parse::<u32>() else {
+        return false;
+    };
+    if !(1..=999).contains(&episode) {
+        return false;
+    }
+    if digits.len() == 8 && is_calendar_date(digits) {
+        return false;
+    }
+    true
+}
+
+pub(super) fn reject_date_token(token: &str) {
+    tracing::warn!(token, "日期格式被拒绝为集号");
+}
+
+pub(super) fn is_calendar_date_text(digits: &str) -> bool {
+    is_calendar_date(digits)
+}
+
+fn is_calendar_date(digits: &str) -> bool {
+    let year = &digits[..4];
+    let month: u32 = digits[4..6].parse().unwrap_or(0);
+    let day: u32 = digits[6..8].parse().unwrap_or(0);
+    crate::attributes::parse_year(year).is_some() && (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
 fn is_likely_resolution(bytes: &[u8], ep: u32, m: usize) -> bool {
     matches!(ep, 480 | 576 | 720 | 1080 | 2160 | 4320)
         || (m < bytes.len() && matches!(bytes[m], b'P' | b'p' | b'I' | b'i'))
@@ -95,11 +124,10 @@ fn try_parse_s_followed(
         while m < len && bytes[m].is_ascii_digit() {
             m += 1;
         }
-        if m > e_start {
-            if let Ok(ep) = upper[e_start..m].parse::<u32>() {
-                let (ep_to, _) = parse_episode_range(&upper[m..]);
-                return Some((i, Some(season), Some(ep), ep_to));
-            }
+        if m > e_start && plausible_episode(&upper[e_start..m]) {
+            let ep = upper[e_start..m].parse::<u32>().ok()?;
+            let (ep_to, _) = parse_episode_range(&upper[m..]);
+            return Some((i, Some(season), Some(ep), ep_to));
         }
     }
     if k < len && bytes[k].is_ascii_digit() {
@@ -107,10 +135,12 @@ fn try_parse_s_followed(
         while m < len && bytes[m].is_ascii_digit() {
             m += 1;
         }
-        if let Ok(ep) = upper[k..m].parse::<u32>() {
-            if ep < 1000 && !is_likely_resolution(bytes, ep, m) {
-                let (ep_to, _) = parse_episode_range(&upper[m..]);
-                return Some((i, Some(season), Some(ep), ep_to));
+        if plausible_episode(&upper[k..m]) {
+            if let Ok(ep) = upper[k..m].parse::<u32>() {
+                if !is_likely_resolution(bytes, ep, m) {
+                    let (ep_to, _) = parse_episode_range(&upper[m..]);
+                    return Some((i, Some(season), Some(ep), ep_to));
+                }
             }
         }
     }
@@ -142,8 +172,14 @@ pub(super) fn find_s_e_pattern(
             while j < len && bytes[j].is_ascii_digit() {
                 j += 1;
             }
-            if let Ok(ep) = upper[i + 1..j].parse::<u32>() {
+            let digits = &upper[i + 1..j];
+            if !plausible_episode(digits) {
+                if is_calendar_date(digits) {
+                    reject_date_token(&upper[i..j]);
+                }
+            } else if let Ok(ep) = digits.parse::<u32>() {
                 let (ep_to, _) = parse_episode_range(&upper[j..]);
+                let ep_to = ep_to.filter(|to| plausible_episode(&to.to_string()));
                 return Some((i, Some(1), Some(ep), ep_to));
             }
         }

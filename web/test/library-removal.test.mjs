@@ -74,6 +74,13 @@ test("list API preserves removal JSON for reload resume", async () => {
   assert.deepEqual((await api.listLibraries())[0].removal, removal);
 });
 
+test("list API preserves strm file statistics for UI consumers", async () => {
+  const api = await loadApi(async () => ({ ok: true, data: [{ id: "lib", stats: {
+    item_count: 2, file_count: 3, strm_file_count: 2, total_size_bytes: 4096,
+  } }] }));
+  assert.equal((await api.listLibraries())[0].stats.strm_file_count, 2);
+});
+
 test("DELETE acceptance waits for terminal GET and forwards cancellation signal", async () => {
   const controller = new AbortController();
   const requests = [];

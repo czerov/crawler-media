@@ -30,6 +30,7 @@ pub(super) fn fixture(tmp: &tempfile::TempDir, tv: bool) -> (axum::Router, Value
         title: "Playback fixture".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         bangumi_id: None,

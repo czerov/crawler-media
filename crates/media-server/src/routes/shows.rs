@@ -16,53 +16,19 @@ pub(super) async fn shows_next_up(
     Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    let mut next_up = Vec::new();
-    if let Some(series_id) = query.series_id.as_deref().map(|s| s.replace('-', "")) {
-        let mut episodes = state
-            .provider
-            .list_visible_items(user.id, Some(&series_id))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        episodes.sort_by_key(|item| {
-            (
-                item.row.season.unwrap_or_default(),
-                item.row.episode.unwrap_or_default(),
-            )
-        });
-        if let Some(episode) = episodes.into_iter().find(|item| !item.played) {
-            next_up.push(item_dto_json(episode));
-        }
-    } else {
-        let series = state
-            .provider
-            .list_visible_items(user.id, None)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        for show in series
-            .iter()
-            .filter(|item| item.media.kind == domain::MediaKind::Tv && item.is_series)
-        {
-            let series_id = show.media.id.to_string().replace('-', "");
-            let mut episodes = state
-                .provider
-                .list_visible_items(user.id, Some(&series_id))
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            episodes.sort_by_key(|item| {
-                (
-                    item.row.season.unwrap_or_default(),
-                    item.row.episode.unwrap_or_default(),
-                )
-            });
-            if let Some(episode) = episodes.into_iter().find(|item| !item.played) {
-                next_up.push(item_dto_json(episode));
-            }
-        }
-    }
-    let total = next_up.len();
-    let start_index = query.start_index.unwrap_or(0);
-    let listed: Vec<Value> = next_up.into_iter().skip(start_index).take(limit).collect();
-    Ok(Json(json!({ "Items": listed, "TotalRecordCount": total })))
+    let offset = query.start_index.unwrap_or(0);
+    // 一次聚合：候选按 Media 分组、每个 Media 取第一条未看，再整体分页。读取失败
+    // 必须变成错误响应，绝不能被吞成「空的一页」。
+    let page = state
+        .provider
+        .next_up_items(user.id, query.series_id.as_deref(), offset, limit)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, user_id = %user.id, "Jellyfin NextUp 聚合失败");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let listed: Vec<Value> = page.items.into_iter().map(item_dto_json).collect();
+    Ok(Json(json!({ "Items": listed, "TotalRecordCount": page.total })))
 }
 pub(super) async fn show_seasons(
     State(state): State<AppState>,

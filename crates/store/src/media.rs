@@ -1,7 +1,7 @@
 use domain::{Media, MediaId};
 use rusqlite::{OptionalExtension, params};
 
-use super::maps::map_media;
+use super::maps::{aliases_json, map_media};
 use super::schema::MEDIA_COLS;
 use super::{Store, StoreError};
 
@@ -30,8 +30,8 @@ fn identity_conflict(incoming: &Media) -> StoreError {
 impl Store {
     pub fn insert_media(&self, media: &Media) -> Result<(), StoreError> {
         self.app.execute(
-            "INSERT INTO media (id, kind, title, year, original_title, tmdb_id, douban_id, tvdb_id, bangumi_id, anilist_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO media (id, kind, title, year, original_title, tmdb_id, douban_id, tvdb_id, bangumi_id, anilist_id, aliases_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 media.id.to_string(),
                 media.kind.as_str(),
@@ -43,6 +43,7 @@ impl Store {
                 media.tvdb_id,
                 media.bangumi_id,
                 media.anilist_id,
+                aliases_json(&media.aliases),
             ],
         )?;
         Ok(())
@@ -229,7 +230,7 @@ impl Store {
     pub fn update_media(&self, media: &Media) -> Result<(), StoreError> {
         self.app.execute(
             "UPDATE media SET title = ?2, year = ?3, original_title = ?4, tmdb_id = ?5,
-                    douban_id = ?6, tvdb_id = ?7, bangumi_id = ?8, anilist_id = ?9 WHERE id = ?1",
+                    douban_id = ?6, tvdb_id = ?7, bangumi_id = ?8, anilist_id = ?9, aliases_json = ?10 WHERE id = ?1",
             params![
                 media.id.to_string(),
                 media.title,
@@ -240,6 +241,7 @@ impl Store {
                 media.tvdb_id,
                 media.bangumi_id,
                 media.anilist_id,
+                aliases_json(&media.aliases),
             ],
         )?;
         Ok(())
@@ -390,7 +392,7 @@ impl Store {
             }
             tx.execute(
                 "UPDATE media SET title = ?2, year = ?3, original_title = ?4, tmdb_id = ?5,
-                 douban_id = ?6, tvdb_id = ?7, bangumi_id = ?8, anilist_id = ?9
+                 douban_id = ?6, tvdb_id = ?7, bangumi_id = ?8, anilist_id = ?9, aliases_json = ?10
                  WHERE id = ?1",
                 params![
                     previous.id.to_string(),
@@ -402,6 +404,7 @@ impl Store {
                     previous.tvdb_id,
                     previous.bangumi_id,
                     previous.anilist_id,
+                    aliases_json(&previous.aliases),
                 ],
             )?;
             tx.commit()?;

@@ -175,6 +175,7 @@ fn season_pack_without_explicit_episodes_matches_season_pack_subscription() {
         title: "The Expanse".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

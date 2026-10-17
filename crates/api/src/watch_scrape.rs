@@ -58,6 +58,7 @@ fn scrape_dir(state: &ApiState, path: PathBuf, nfo: bool) -> Result<(), String> 
         title: "inplace".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

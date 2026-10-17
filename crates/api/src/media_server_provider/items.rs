@@ -99,7 +99,7 @@ fn direct_series_rollup(
     user_id: UserId,
     media_id: domain::MediaId,
 ) -> (bool, usize, (usize, usize)) {
-    let Ok(snapshot) = super::read_snapshot::collect_server_read(store, user_id, None) else {
+    let Ok(snapshot) = super::read_snapshot::collect_server_read(store, user_id, None, None) else {
         return (false, 0, (0, 0));
     };
     let mut episodes = HashSet::new();
@@ -130,12 +130,31 @@ pub(super) async fn list_visible_items(
     user_id: UserId,
     parent_id: Option<&str>,
 ) -> Result<Vec<MediaItemSnapshot>, String> {
+    list_visible_items_with_library_scope(provider, user_id, parent_id, None).await
+}
+
+pub(super) async fn list_visible_items_in_library(
+    provider: &ApiServerProvider,
+    user_id: UserId,
+    parent_id: Option<&str>,
+    library_id: &str,
+) -> Result<Vec<MediaItemSnapshot>, String> {
+    list_visible_items_with_library_scope(provider, user_id, parent_id, Some(library_id)).await
+}
+
+async fn list_visible_items_with_library_scope(
+    provider: &ApiServerProvider,
+    user_id: UserId,
+    parent_id: Option<&str>,
+    library_scope: Option<&str>,
+) -> Result<Vec<MediaItemSnapshot>, String> {
     let state = provider.state.clone();
     let budget = state.http_work.clone();
     let parent_id = parent_id.map(str::to_owned);
+    let library_scope = library_scope.map(str::to_owned);
     budget
         .run(std::time::Duration::from_secs(30), move || {
-            list_visible_items_blocking(&state, user_id, parent_id.as_deref())
+            list_visible_items_blocking(&state, user_id, parent_id.as_deref(), library_scope.as_deref())
         })
         .await
         .map_err(|error| {
@@ -148,9 +167,10 @@ fn list_visible_items_blocking(
     state: &ApiState,
     user_id: UserId,
     parent_id: Option<&str>,
+    library_scope: Option<&str>,
 ) -> Result<Vec<MediaItemSnapshot>, String> {
     let store_guard = state.store.lock();
-    let snapshot = collect_pending(&store_guard, user_id, parent_id)?;
+    let snapshot = collect_pending(&store_guard, user_id, parent_id, library_scope)?;
     drop(store_guard);
     let (pending, ingest_paths) = snapshot;
     let browse = state.browse_files.as_ref();
@@ -166,40 +186,31 @@ fn list_visible_items_blocking(
     Ok(visible)
 }
 
-type UnitIndex<'a> = HashMap<(domain::MediaId, i32, i32), &'a crate::store::PlaybackUnitSnapshot>;
+pub(super) type UnitIndex<'a> = HashMap<(domain::MediaId, i32, i32), &'a crate::store::PlaybackUnitSnapshot>;
 
 /// 一次索引：`find_unit` 的线性扫描在剧集聚合里是 O(集数 × 单元数)。
-fn unit_index(units: &[crate::store::PlaybackUnitSnapshot]) -> UnitIndex<'_> {
+pub(super) fn unit_index(units: &[crate::store::PlaybackUnitSnapshot]) -> UnitIndex<'_> {
     units.iter().map(|unit| ((unit.media_id, unit.season, unit.episode), unit)).collect()
 }
 
-fn find_unit<'a>(units: &UnitIndex<'a>, media_id: domain::MediaId, season: i32, episode: i32) -> Option<&'a crate::store::PlaybackUnitSnapshot> {
+pub(super) fn find_unit<'a>(units: &UnitIndex<'a>, media_id: domain::MediaId, season: i32, episode: i32) -> Option<&'a crate::store::PlaybackUnitSnapshot> {
     units.get(&(media_id, season, episode)).copied()
 }
 
-fn effective_played(
+pub(super) fn effective_played(
     units: &UnitIndex<'_>,
     media_id: domain::MediaId,
     season: i32,
     episode: i32,
 ) -> bool {
-    let episode_unit = find_unit(units, media_id, season, episode);
-    if episode_unit.is_some_and(|unit| unit.state.played) {
-        return true;
-    }
-    let episode_updated_at = episode_unit.map(|unit| unit.state.updated_at);
-    if let Some(season_unit) = (season >= 0)
-        .then(|| find_unit(units, media_id, season, crate::store::UNIT_WHOLE))
-        .flatten()
-        .filter(|unit| episode_updated_at.is_none_or(|updated_at| unit.state.updated_at > updated_at))
-    {
-        return season_unit.state.played;
-    }
-    find_unit(units, media_id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)
-        .filter(|unit| episode_updated_at.is_none_or(|updated_at| unit.state.updated_at > updated_at))
-        .is_some_and(|unit| unit.state.played)
+    super::user_marks::resolve_effective_played(
+        find_unit(units, media_id, season, episode).map(|unit| (&unit.state, unit.state.updated_at)),
+        find_unit(units, media_id, season, crate::store::UNIT_WHOLE).map(|unit| (&unit.state, unit.state.updated_at)),
+        find_unit(units, media_id, crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE)
+            .map(|unit| (&unit.state, unit.state.updated_at)),
+    )
 }
-fn unit_counts_from_snapshot(
+pub(super) fn unit_counts_from_snapshot(
     units: &UnitIndex<'_>, row: &domain::LedgerRow, media: &domain::Media,
     is_series: bool, show_episodes: &HashMap<domain::MediaId, HashSet<(u32, u32)>>,
 ) -> (bool, i64, Option<usize>) {
@@ -226,10 +237,13 @@ fn collect_pending(
     store: &crate::Store,
     user_id: UserId,
     parent_id: Option<&str>,
+    library_scope: Option<&str>,
 ) -> Result<(Vec<PendingSnapshot>, Vec<(domain::MediaId, String)>), String> {
-    let snapshot = super::read_snapshot::collect_server_read(store, user_id, parent_id)?;
+    let snapshot = super::read_snapshot::collect_server_read(store, user_id, parent_id, library_scope)?;
     let ServerReadSnapshot { ownership, is_admin, media, rows: ledger_rows, units, .. } = snapshot;
-    let requested_library = parent_id.and_then(|id| ownership.library(id)).map(|library| library.id.as_str());
+    let requested_library = library_scope.or_else(|| {
+        parent_id.and_then(|id| ownership.library(id)).map(|library| library.id.as_str())
+    });
     let mut show_episodes: HashMap<domain::MediaId, HashSet<(u32, u32)>> = HashMap::new();
     let mut show_seasons: HashMap<domain::MediaId, HashSet<u32>> = HashMap::new();
     let row_visible = |row: &domain::LedgerRow| -> bool {
@@ -379,7 +393,7 @@ fn playback_ticks(
 }
 
 /// 锁外：把「可见行的 ingest 时间」按 Media 取最大值。
-fn latest_ingest_by_media(
+pub(super) fn latest_ingest_by_media(
     browse: &dyn crate::browse_file_read::BrowseFileRead,
     paths: &[(domain::MediaId, String)],
 ) -> HashMap<domain::MediaId, SystemTime> {
@@ -396,7 +410,7 @@ fn latest_ingest_by_media(
     latest
 }
 
-fn file_date_created(
+pub(super) fn file_date_created(
     browse: &dyn crate::browse_file_read::BrowseFileRead,
     path: &str,
 ) -> Option<SystemTime> {
@@ -420,7 +434,7 @@ fn file_date_created(
     }
 }
 
-fn with_date_created(
+pub(super) fn with_date_created(
     mut metadata: media_server::provider::MediaItemMetadata,
     date_created: Option<SystemTime>,
 ) -> media_server::provider::MediaItemMetadata {
@@ -448,6 +462,7 @@ mod tests {
                 position_ms: 0,
                 played,
                 favorite: false,
+                favorite_at: 0,
                 duration_ms: None,
                 audio_track: None,
                 subtitle_track: None,
@@ -464,6 +479,7 @@ mod tests {
             title: "Show".into(),
             year: None,
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: None,
             douban_id: None,
             tvdb_id: None,

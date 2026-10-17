@@ -63,6 +63,7 @@ fn restricted_root_cannot_move_while_owned_ledger_rows_remain() {
         title: "secret".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

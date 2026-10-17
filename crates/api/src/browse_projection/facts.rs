@@ -150,6 +150,7 @@ impl MediaFacts {
                 .and_then(Value::as_u64)
                 .map(|v| v as u16),
             original_title: opt_string(media_json, "original_title")?,
+            aliases: Vec::new(),
             tmdb_id: opt_string(media_json, "tmdb_id")?,
             douban_id: opt_string(media_json, "douban_id")?,
             tvdb_id: opt_string(media_json, "tvdb_id")?,

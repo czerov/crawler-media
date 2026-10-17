@@ -8,6 +8,9 @@ export function acceptPreview<T>(currentSignature: string, responseSignature: st
 export function maintenanceReportSummary(report: MaintenanceReport | null): string | null {
   if (!report) return null;
   const parts: string[] = [];
+  if (typeof report.examined === "number" && report.examined > 0) {
+    parts.push(`检视 ${report.examined}`);
+  }
   if (typeof report.deleted === "number") parts.push(`删除 ${report.deleted}`);
   if (typeof report.protected === "number") {
     parts.push(
@@ -17,6 +20,7 @@ export function maintenanceReportSummary(report: MaintenanceReport | null): stri
     );
   }
   if (report.budget_exhausted) parts.push("预算用尽");
+  if (report.remaining) parts.push("仍有剩余，留到下一轮");
   const skipped = (report.databases ?? [])
     .map((entry) => entry.skip_reason)
     .filter((reason): reason is string => typeof reason === "string" && reason.length > 0);

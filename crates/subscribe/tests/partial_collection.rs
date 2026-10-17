@@ -41,6 +41,7 @@ fn one_failed_file_does_not_discard_successful_files_from_same_torrent() {
         title: "The Expanse".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

@@ -7,6 +7,7 @@ fn media(title: &str, tmdb: Option<&str>) -> Media {
         title: title.into(),
         year: Some(2022),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: tmdb.map(str::to_owned),
         douban_id: None,
         tvdb_id: None,

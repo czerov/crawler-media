@@ -23,6 +23,7 @@ fn sample_media() -> domain::Media {
         title: "Burst Movie".to_string(),
         year: Some(2025),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("4242".to_string()),
         douban_id: None,
         tvdb_id: None,

@@ -124,6 +124,7 @@ async fn failed_catalog_seed_removes_search_job_and_restores_existing_media() {
         title: "Old title".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("atomic-tmdb".into()),
         douban_id: None,
         tvdb_id: None,

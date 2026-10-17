@@ -19,6 +19,10 @@ pub const MAX_RETENTION_DAYS: u32 = 36_500;
 pub const DEFAULT_DATABASE_INTERVAL_SECS: u64 = 21_600;
 pub const DEFAULT_JOBS_INTERVAL_SECS: u64 = 86_400;
 pub const DEFAULT_PLAYBACK_INTERVAL_SECS: u64 = 86_400;
+pub const DEFAULT_DATA_RETENTION_INTERVAL_SECS: u64 = 86_400;
+
+/// DB-05 三类历史的默认窗口（设计固定 90 天）。
+pub const DEFAULT_DATA_RETENTION_DAYS: u32 = 90;
 
 /// 维护任务的执行周期范围（只对维护任务生效，其他任务契约不变）。
 pub const MIN_MAINTENANCE_INTERVAL_SECS: u64 = 3_600;
@@ -61,11 +65,22 @@ pub struct PlaybackHistoryRetentionPolicy {
     pub dry_run: bool,
 }
 
+/// DB-05：分类历史保留。三个窗口各自独立；策略只存这份 payload。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataRetentionPolicy {
+    pub version: u32,
+    pub dry_run: bool,
+    pub qoe_days: u32,
+    pub transient_cache_days: u32,
+    pub probe_days: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MaintenancePolicy {
     Database(DatabaseMaintenancePolicy),
     Jobs(JobsRetentionPolicy),
     PlaybackHistory(PlaybackHistoryRetentionPolicy),
+    DataRetention(DataRetentionPolicy),
 }
 
 impl MaintenancePolicy {
@@ -108,6 +123,19 @@ impl MaintenancePolicy {
                     dry_run: raw.dry_run,
                 }))
             }
+            JobKind::DataRetention => {
+                let raw: RawDataRetention = decode(value)?;
+                validate_retention_days(raw.qoe_days)?;
+                validate_retention_days(raw.transient_cache_days)?;
+                validate_retention_days(raw.probe_days)?;
+                Ok(Self::DataRetention(DataRetentionPolicy {
+                    version: POLICY_VERSION,
+                    dry_run: raw.dry_run,
+                    qoe_days: raw.qoe_days,
+                    transient_cache_days: raw.transient_cache_days,
+                    probe_days: raw.probe_days,
+                }))
+            }
             other => Err(format!("{} 不是维护任务", other.as_str())),
         }
     }
@@ -116,7 +144,8 @@ impl MaintenancePolicy {
         match self {
             Self::Jobs(policy) => Some(policy.retention_days),
             Self::PlaybackHistory(policy) => Some(policy.retention_days),
-            Self::Database(_) => None,
+            // 分类保留有三个独立窗口，不存在单一 `retention_days`。
+            Self::DataRetention(_) | Self::Database(_) => None,
         }
     }
 
@@ -124,6 +153,7 @@ impl MaintenancePolicy {
         match self {
             Self::Jobs(policy) => Some(policy.dry_run),
             Self::PlaybackHistory(policy) => Some(policy.dry_run),
+            Self::DataRetention(policy) => Some(policy.dry_run),
             Self::Database(_) => None,
         }
     }
@@ -139,6 +169,17 @@ struct RawDatabase {
     #[allow(dead_code)]
     version: u32,
     vacuum_enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDataRetention {
+    #[allow(dead_code)]
+    version: u32,
+    dry_run: bool,
+    qoe_days: u32,
+    transient_cache_days: u32,
+    probe_days: u32,
 }
 
 #[derive(Deserialize)]

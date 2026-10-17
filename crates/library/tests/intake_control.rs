@@ -8,7 +8,7 @@ fn fixture() -> (tempfile::TempDir, WatchJob, Media) {
     let job = WatchJob { kind: WatchKind::Intake, path: intake,
         library_root: temp.path().join("movies"), tv_library_root: Some(temp.path().join("tv")), scrape: true };
     let media = Media { id: MediaId::new(), kind: MediaKind::Movie, title: "Fixture".into(),
-        year: None, original_title: None, tmdb_id: Some("123".into()), douban_id: None,
+        year: None, original_title: None, aliases: Vec::new(), tmdb_id: Some("123".into()), douban_id: None,
         tvdb_id: None, bangumi_id: None, anilist_id: None };
     (temp, job, media)
 }

@@ -50,6 +50,7 @@ fn successful_download_additions_are_returned_when_another_add_fails() {
         title: "The Expanse".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

@@ -83,13 +83,11 @@ pub(super) fn apply_marker_refresh(
         tracing::error!(%error, job_id = %job.id, %media_id, seasons = ?seasons, "【片头片尾】多季原子写入失败，旧标记保持可见");
         return;
     }
-    let registry = mgr.library_work.lock().clone();
-    if let Some(registry) = registry {
+    if let Some(service) = mgr.chapter_frames() {
         for rep in &replacements {
             crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
                 &rep.chapter_updates,
-                &mgr.store,
-                &registry,
+                &service,
             );
         }
     }

@@ -10,7 +10,6 @@ use crate::auth::authenticate;
 use crate::provider::MediaServerProvider;
 
 mod catalog;
-mod item_filters;
 mod media;
 mod parent_scope;
 mod people;
@@ -20,6 +19,8 @@ mod system;
 mod user_data;
 mod users;
 mod websocket;
+
+pub(super) use crate::provider::query::parse_season_id;
 
 use catalog::{
     genre_by_name, genres, item_by_id, items, latest_items, resume_items, search_hints,
@@ -193,12 +194,29 @@ pub fn media_routes(provider: Arc<dyn MediaServerProvider>) -> Router {
 
 // Handlers
 
-fn parse_season_id(series_id: &str, season_id: &str) -> Option<u32> {
-    let series_id = series_id.replace('-', "");
-    let season_id = season_id.replace('-', "");
-    let suffix = season_id.get(series_id.len()..)?;
-    if !season_id[..series_id.len()].eq_ignore_ascii_case(&series_id) {
-        return None;
+impl ItemsQuery {
+    /// 协议字段 → provider 的 typed 查询。默认值与 clamp 留在路由这一层：
+    /// `Recursive` 缺省 true，`Limit` 缺省 100 并 clamp 到 1..=200。
+    pub(crate) fn to_server_query(&self) -> crate::provider::ServerItemQuery {
+        crate::provider::ServerItemQuery {
+            parent_id: self.parent_id.clone(),
+            series_id: self.series_id.clone(),
+            season_id: self.season_id.clone(),
+            person_ids: self.person_ids.clone(),
+            filters: self.filters.clone(),
+            is_favorite: self.is_favorite,
+            is_played: self.is_played,
+            sort_by: self.sort_by.clone(),
+            sort_order: self.sort_order.clone(),
+            include_item_types: self.include_item_types.clone(),
+            recursive: self.recursive.unwrap_or(true),
+            is_folder: self.is_folder,
+            search_term: self.search_term.clone(),
+            genres: self.genres.clone(),
+            genre_ids: self.genre_ids.clone(),
+            studio_ids: self.studio_ids.clone(),
+            offset: self.start_index.unwrap_or(0),
+            limit: self.limit.unwrap_or(100).clamp(1, 200),
+        }
     }
-    suffix.parse().ok()
 }

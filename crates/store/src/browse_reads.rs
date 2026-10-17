@@ -21,7 +21,18 @@ pub struct PlaybackUnitSnapshot {
     pub state: UnitState,
 }
 
-const MEDIA_BATCH_CHUNK: usize = 500;
+/// 一个 Library 的投影 file facts 汇总（一次 SQL 聚合，零 JSON 解码）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BrowseFileTotals {
+    /// `browse_files` 行数：该库当前拥有的台账文件数。
+    pub file_count: u64,
+    /// 物理体积合计；`.strm` 指针文件记 0（与 Library 统计既有口径一致）。
+    pub total_size_bytes: u64,
+    /// `.strm` 指针文件数。
+    pub strm_file_count: u64,
+}
+
+pub(super) const MEDIA_BATCH_CHUNK: usize = 500;
 
 impl Store {
     /// Media rows for `ids`; unknown ids are simply absent, and empty input is
@@ -54,7 +65,7 @@ impl Store {
         let mut stmt = self.subscribe.prepare(
             "SELECT media_id, season, episode,
                     position_ms, played, favorite, duration_ms, audio_track,
-                    subtitle_track, play_count, updated_at
+                    subtitle_track, play_count, updated_at, favorite_at
              FROM playback_units WHERE user_id = ?1
              ORDER BY media_id, season, episode",
         )?;
@@ -72,6 +83,7 @@ impl Store {
                     subtitle_track: row.get(8)?,
                     play_count: row.get(9)?,
                     updated_at: row.get(10)?,
+                    favorite_at: row.get(11)?,
                 },
             })
         })?;
@@ -97,7 +109,7 @@ impl Store {
             let sql = format!(
                 "SELECT media_id, season, episode,
                         position_ms, played, favorite, duration_ms, audio_track,
-                        subtitle_track, play_count, updated_at
+                        subtitle_track, play_count, updated_at, favorite_at
                  FROM playback_units
                  WHERE user_id = ?1 AND media_id IN ({placeholders})
                  ORDER BY media_id, season, episode"
@@ -122,6 +134,7 @@ impl Store {
                         subtitle_track: row.get(8)?,
                         play_count: row.get(9)?,
                         updated_at: row.get(10)?,
+                        favorite_at: row.get(11)?,
                     },
                 })
             })?;
@@ -130,42 +143,6 @@ impl Store {
             }
         }
         Ok(units)
-    }
-
-    /// Page browse_media rows directly from the projection for simple title queries.
-    pub fn browse_title_page(
-        &self,
-        library_id: &str,
-        offset: usize,
-        limit: usize,
-        desc: bool,
-    ) -> Result<Vec<super::BrowseMediaFacts>, StoreError> {
-        let order = if desc { "DESC" } else { "ASC" };
-        let sql = format!(
-            "SELECT media_id, title, year, facts_json
-             FROM browse_media
-             WHERE library_id = ?1
-             ORDER BY title {order}, media_id ASC
-             LIMIT ?2 OFFSET ?3"
-        );
-        let mut stmt = self.library.prepare(&sql)?;
-        let rows = stmt.query_map(params![library_id, limit, offset], |row| {
-            let mid: String = row.get(0)?;
-            let title: String = row.get(1)?;
-            let year: Option<u16> = row.get(2)?;
-            let facts_str: String = row.get(3)?;
-            use std::str::FromStr;
-            let media_id = MediaId::from_str(&mid)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
-            let facts = serde_json::from_str(&facts_str).unwrap_or_default();
-            Ok(super::BrowseMediaFacts {
-                media_id,
-                title,
-                year,
-                facts,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Candidate ledger rows for one Library under the historical ownership
@@ -334,6 +311,69 @@ impl Store {
         }
         Ok(missing)
     }
+
+    /// 一个 Library 的投影 file facts 汇总：行数、物理体积、`.strm` 指针数。
+    ///
+    /// 一次 SQL 聚合，不解码整库 facts JSON，也不碰文件系统；体积口径与旧逐文件
+    /// `stat` 一致（`.strm` 只有几十字节 URL 文本，记 0）。任何一行的 facts JSON
+    /// 不是 `facts_version`（升级前的旧代或损坏行）时返回 `None`：调用方据此判定
+    /// 投影过旧并重建，而不是把 0 当成「空库」。
+    pub fn browse_file_totals(
+        &self,
+        library_id: &str,
+        facts_version: u64,
+    ) -> Result<Option<BrowseFileTotals>, StoreError> {
+        // A5-01: TOTAL() 浮点聚合避免 SQLite 整数加法溢出。
+        // 每一行 facts_json 必须通过严格的有效性验证：
+        // - json_valid(facts_json)
+        // - json_extract(facts_json, '$.version') = ?2
+        // - json_type(facts_json, '$.size') IN ('integer', 'real')
+        // - json_extract(facts_json, '$.size') >= 0 且 <= 100_000_000_000_000_000 (100 PB)
+        // 任何损坏/非法/负数/越界 size 的行都记入 foreign 计数，使该库 facts 标记不可用 (None) 等待重建，
+        // 而不是静默吞掉负数或让整个请求 500 崩溃。
+        const MAX_SANE_FILE_SIZE: f64 = 100_000_000_000_000_000.0; // 100 PB
+        let mut stmt = self.library.prepare(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN json_valid(facts_json)
+                                       AND json_extract(facts_json, '$.version') = ?2
+                                       AND json_type(facts_json, '$.size') IN ('integer', 'real')
+                                       AND json_extract(facts_json, '$.size') >= 0
+                                       AND json_extract(facts_json, '$.size') <= ?3
+                                      THEN 0 ELSE 1 END), 0),
+                    COALESCE(SUM(CASE WHEN json_valid(facts_json)
+                                       AND json_extract(facts_json, '$.version') = ?2
+                                       AND lower(COALESCE(json_extract(facts_json, '$.path'), ''))
+                                           LIKE '%.strm'
+                                      THEN 1 ELSE 0 END), 0),
+                    TOTAL(CASE WHEN json_valid(facts_json)
+                                    AND json_extract(facts_json, '$.version') = ?2
+                                    AND lower(COALESCE(json_extract(facts_json, '$.path'), ''))
+                                        NOT LIKE '%.strm'
+                                    AND json_type(facts_json, '$.size') IN ('integer', 'real')
+                                    AND json_extract(facts_json, '$.size') >= 0
+                                    AND json_extract(facts_json, '$.size') <= ?3
+                               THEN json_extract(facts_json, '$.size')
+                               ELSE 0.0 END)
+             FROM browse_files WHERE library_id = ?1",
+        )?;
+        let (file_count, foreign, strm, size_float): (i64, i64, i64, f64) = stmt.query_row(
+            params![library_id, facts_version as i64, MAX_SANE_FILE_SIZE],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if foreign > 0 || !size_float.is_finite() || size_float < 0.0 {
+            return Ok(None);
+        }
+        let total_size_bytes = if size_float >= (u64::MAX as f64) {
+            u64::MAX
+        } else {
+            size_float.round() as u64
+        };
+        Ok(Some(BrowseFileTotals {
+            file_count: file_count.max(0) as u64,
+            total_size_bytes,
+            strm_file_count: strm.max(0) as u64,
+        }))
+    }
 }
 
 /// Separator spellings, other than a single `/`, that `Path::components()`
@@ -475,6 +515,135 @@ mod tests {
                 filter_score: None,
             })
             .unwrap();
+    }
+
+    /// 整库 facts 汇总：一次 SQL 聚合、`.strm` 记 0、版本不符返回 `None`。
+    #[test]
+    fn browse_file_totals_zeroes_strm_and_rejects_old_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("data")).unwrap();
+        let library = store
+            .default_library(MediaKind::Movie)
+            .unwrap()
+            .expect("seeded default movie library");
+        let media_id = MediaId::new();
+        let file = |path: &str, size: u64| crate::BrowseFileFacts {
+            ledger_id: LedgerId::new(),
+            media_id,
+            path: path.to_owned(),
+            facts: serde_json::json!({
+                "version": 3,
+                "path": path,
+                "size": size,
+                "missing": false,
+            }),
+        };
+        let scope = format!(
+            "{}|{}",
+            library.kind.as_str(),
+            library
+                .root_paths
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\u{1f}")
+        );
+        let build = crate::ProjectionBuild {
+            library_id: library.id.clone(),
+            generation: 1,
+            scope_signature: scope,
+            revisions: store.read_revisions().unwrap(),
+            expected_dirty_token: None,
+            files: vec![file("/movies/a.mkv", 10), file("/movies/b.strm", 7)],
+            media: Vec::new(),
+            candidates: Vec::new(),
+        };
+        assert!(store.publish_browse_projection(&build).unwrap());
+
+        let totals = store
+            .browse_file_totals(&library.id, 3)
+            .unwrap()
+            .expect("current facts");
+        assert_eq!(totals.file_count, 2);
+        assert_eq!(totals.total_size_bytes, 10, ".strm 指针不计物理体积");
+        assert_eq!(totals.strm_file_count, 1);
+        // 旧代 facts 版本：不能把 0 当成空库，必须让调用方去重建。
+        assert_eq!(store.browse_file_totals(&library.id, 4).unwrap(), None);
+    }
+
+    /// A5-01: Invalid sizes make the projection unusable; valid huge values use TOTAL.
+    #[test]
+    fn browse_file_totals_rejects_invalid_sizes_and_saturates_safe_totals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("data")).unwrap();
+        let library = store
+            .default_library(MediaKind::Movie)
+            .unwrap()
+            .expect("seeded default movie library");
+        let media_id = MediaId::new();
+        let scope = format!(
+            "{}|{}",
+            library.kind.as_str(),
+            library
+                .root_paths
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\u{1f}")
+        );
+        let publish = |generation, sizes: &[serde_json::Value]| {
+            let files = sizes
+                .iter()
+                .enumerate()
+                .map(|(index, size)| {
+                    let path = format!("/movies/{generation}-{index}.mkv");
+                    crate::BrowseFileFacts {
+                        ledger_id: LedgerId::new(),
+                        media_id,
+                        path: path.clone(),
+                        facts: serde_json::json!({
+                            "version": 3,
+                            "path": path,
+                            "size": size,
+                            "missing": false,
+                        }),
+                    }
+                })
+                .collect();
+            let build = crate::ProjectionBuild {
+                library_id: library.id.clone(),
+                generation,
+                scope_signature: scope.clone(),
+                revisions: store.read_revisions().unwrap(),
+                expected_dirty_token: None,
+                files,
+                media: Vec::new(),
+                candidates: Vec::new(),
+            };
+            assert!(store.publish_browse_projection(&build).unwrap());
+        };
+
+        publish(1, &[serde_json::json!(100), serde_json::json!(-90)]);
+        assert_eq!(store.browse_file_totals(&library.id, 3).unwrap(), None);
+        publish(2, &[serde_json::json!(100), serde_json::json!("invalid")]);
+        assert_eq!(store.browse_file_totals(&library.id, 3).unwrap(), None);
+        publish(3, &[serde_json::json!(90_000_000_000_000_000u64), serde_json::json!(90_000_000_000_000_000u64)]);
+        let totals = store
+            .browse_file_totals(&library.id, 3)
+            .unwrap()
+            .expect("valid bounded sizes aggregate");
+        assert_eq!(totals.file_count, 2);
+        assert_eq!(totals.total_size_bytes, 180_000_000_000_000_000u64);
+        // A pair of values that overflow SQLite SUM(i64) is rejected as invalid
+        // facts, not surfaced as an aggregate error/HTTP 500.
+        publish(4, &[serde_json::json!(9_000_000_000_000_000_000u64), serde_json::json!(9_000_000_000_000_000_000u64)]);
+        assert_eq!(store.browse_file_totals(&library.id, 3).unwrap(), None);
+        publish(5, &[serde_json::json!(100_000_000_000_000_001u64)]);
+        assert_eq!(
+            store.browse_file_totals(&library.id, 3).unwrap(),
+            None,
+            "sizes above the configured sane bound make facts unusable"
+        );
     }
 
     /// P3-D：非默认库的候选读走 `ledger_path_idx`，VM steps 不随无关台账增长。

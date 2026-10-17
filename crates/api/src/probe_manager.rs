@@ -6,9 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-
 use domain::{LedgerRow, MediaId, MediaKind};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
@@ -20,6 +19,7 @@ use crate::scrape_store::ScrapeStoreExt;
 use crate::Store;
 
 pub mod clock;
+mod dispatch;
 mod marker_jobs;
 mod markers;
 pub mod policy;
@@ -60,23 +60,31 @@ pub(crate) enum ProbeEnqueueError {
 pub struct ProbeManager {
     store: Arc<Mutex<Store>>,
     library_work: Mutex<Option<Arc<crate::library_lifecycle::LibraryWorkRegistry>>>,
+    chapter_frames: Mutex<Option<Arc<crate::chapter_frame_service::ChapterFrameService>>>,
     fingerprint_engine: Arc<dyn FingerprintEngine>,
     capture_engine: Arc<dyn FingerprintCaptureEngine>,
-    metadata_tx: mpsc::UnboundedSender<ProbeUnit>,
-    fingerprint_tx: mpsc::UnboundedSender<probe::FingerprintWork>,
-    /// 幂等去重：正在排队或执行中的 ledger_id。
+    metadata_tx: mpsc::Sender<store::ProbeDispatchId>,
+    fingerprint_tx: mpsc::Sender<(store::ProbeDispatchId, probe::FingerprintWork)>,
+    /// 幂等去重：窗口内或执行中的 ledger_id，不是全量积压。
     seen: Mutex<HashSet<String>>,
     last_failure: Mutex<HashMap<String, Instant>>,
     next_marker_refresh_id: AtomicU64,
     pub(crate) metadata_pending: Arc<AtomicUsize>,
     pub(crate) metadata_idle: Arc<Notify>,
+    pub(crate) metadata_idle_generation: AtomicUsize,
     pub(crate) timings: timings::ProbeTimingLedger,
-    /// Metadata workers share the high-priority queue; voiceprint has its own worker.
-    metadata_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<ProbeUnit>>>,
-    fingerprint_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<probe::FingerprintWork>>>,
+    metadata_rx: Mutex<Option<mpsc::Receiver<store::ProbeDispatchId>>>,
+    fingerprint_rx: Mutex<Option<mpsc::Receiver<(store::ProbeDispatchId, probe::FingerprintWork)>>>,
     pub(crate) recovered_marker_refreshes: Mutex<Vec<(crate::store::ProbeJob, ProbeUnit)>>,
     clock: Mutex<Arc<dyn clock::ProbeClock>>,
     pub comparison_runs: std::sync::atomic::AtomicUsize,
+    /// Times `request_probe` assessed a row. Selection must not assess rows
+    /// that are not on the selected page.
+    pub assessments: AtomicUsize,
+    workers_started: AtomicBool,
+    shutting_down: AtomicBool,
+    workers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    wake: Notify,
 }
 
 impl ProbeManager {
@@ -100,26 +108,32 @@ impl ProbeManager {
         fingerprint_engine: Arc<dyn FingerprintEngine>,
         capture_engine: Arc<dyn FingerprintCaptureEngine>,
     ) -> Self {
-        let (metadata_tx, metadata_rx) = mpsc::unbounded_channel();
-        let (fingerprint_tx, fingerprint_rx) = mpsc::unbounded_channel();
+        let channels = dispatch::channels();
         let manager = Self {
             store,
             library_work: Mutex::new(None),
+            chapter_frames: Mutex::new(None),
             fingerprint_engine,
             capture_engine,
-            metadata_tx,
-            fingerprint_tx,
+            metadata_tx: channels.metadata_tx,
+            fingerprint_tx: channels.fingerprint_tx,
             seen: Mutex::new(HashSet::new()),
             last_failure: Mutex::new(HashMap::new()),
             next_marker_refresh_id: AtomicU64::new(1),
             metadata_pending: Arc::new(AtomicUsize::new(0)),
             metadata_idle: Arc::new(Notify::new()),
+            metadata_idle_generation: AtomicUsize::new(0),
             timings: timings::ProbeTimingLedger::default(),
-            metadata_rx: Arc::new(tokio::sync::Mutex::new(metadata_rx)),
-            fingerprint_rx: Arc::new(tokio::sync::Mutex::new(fingerprint_rx)),
+            metadata_rx: Mutex::new(Some(channels.metadata_rx)),
+            fingerprint_rx: Mutex::new(Some(channels.fingerprint_rx)),
             recovered_marker_refreshes: Mutex::new(Vec::new()),
             clock: Mutex::new(Arc::new(clock::SystemClock)),
             comparison_runs: std::sync::atomic::AtomicUsize::new(0),
+            assessments: AtomicUsize::new(0),
+            workers_started: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            workers: Mutex::new(Vec::new()),
+            wake: Notify::new(),
         };
         manager.recover_pending_jobs();
         manager
@@ -127,6 +141,19 @@ impl ProbeManager {
 
     pub(crate) fn set_library_registry(&self, registry: Arc<crate::library_lifecycle::LibraryWorkRegistry>) {
         *self.library_work.lock() = Some(registry);
+    }
+
+    pub(crate) fn set_chapter_frames(
+        &self,
+        service: Arc<crate::chapter_frame_service::ChapterFrameService>,
+    ) {
+        *self.chapter_frames.lock() = Some(service);
+    }
+
+    pub(crate) fn chapter_frames(
+        &self,
+    ) -> Option<Arc<crate::chapter_frame_service::ChapterFrameService>> {
+        self.chapter_frames.lock().clone()
     }
 
     pub fn priority_gate(&self) -> Arc<dyn crate::fingerprint_job::CaptureGate> {
@@ -139,7 +166,12 @@ impl ProbeManager {
         origin: policy::ProbeRequestOrigin,
     ) -> Result<policy::ProbeRequestResult, store::StoreError> {
         let now_ms = self.clock.lock().now_ms();
-        let need = policy::assess_probe_need(&self.store.lock(), row, origin, now_ms);
+        self.assessments.fetch_add(1, Ordering::SeqCst);
+        let source_version = crate::fingerprint_job::current_source_version(std::path::Path::new(&row.path));
+        let need = {
+            let store = self.store.lock();
+            policy::assess_probe_need(&store, row, origin, now_ms, source_version)
+        };
         if !matches!(need.retry, policy::ProbeRequestResult::Complete) {
             return Ok(need.retry);
         }
@@ -192,7 +224,6 @@ impl ProbeManager {
         }
         let job_id = self.persist_single_unit(&unit, "fingerprint_probe")?;
         unit.job_id = Some(job_id.clone());
-
         let work = probe::FingerprintWork {
             unit: unit.clone(),
             media_duration_ms,
@@ -200,11 +231,15 @@ impl ProbeManager {
             duration_secs,
             start_job: true,
         };
-
-        if self.fingerprint_tx.send(work).is_err() {
-            seen.remove(&ledger_id);
-            self.finish(&unit, false);
-            return None;
+        let id = store::ProbeDispatchId {
+            job_id: job_id.clone(),
+            ledger_id,
+            stage: store::ProbeDispatchStage::Fingerprint,
+        };
+        if self.fingerprint_tx.try_send((id, work)).is_err() {
+            seen.remove(&unit.row.id.to_string());
+            tracing::info!(job_id, "声纹窗口已满，直接声纹任务保持数据库排队");
+            self.wake.notify_waiters();
         }
         Some(job_id)
     }
@@ -215,7 +250,7 @@ impl ProbeManager {
         unit.reuse_media_info_cache = true;
         let ledger_id = unit.row.id.to_string();
         let mut seen = self.seen.lock();
-        if !seen.insert(ledger_id.clone()) {
+        if seen.contains(&ledger_id) {
             return false;
         }
         if self
@@ -224,12 +259,11 @@ impl ProbeManager {
             .get(&ledger_id)
             .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
         {
-            seen.remove(&ledger_id);
             return false;
         }
         self.last_failure.lock().remove(&ledger_id);
+        drop(seen);
         let Some(job_id) = self.persist_single_unit(&unit, "media_probe") else {
-            seen.remove(&ledger_id);
             return false;
         };
         unit.job_id = Some(job_id.clone());
@@ -238,14 +272,15 @@ impl ProbeManager {
             job_id,
             "【媒体信息】已进入高优先级探测队列；声纹将在媒体信息写入后另行排队"
         );
-        if self.queue_metadata(unit.clone()).is_err() {
-            seen.remove(&ledger_id);
-            drop(seen);
-            self.finish(&unit, false);
+        if self.queue_metadata(unit).is_err() {
+            tracing::info!(ledger_id, job_id, "媒体信息窗口已满，取消本次入队并保持可恢复");
+            self.store.lock().cancel_probe_unit(&job_id, &ledger_id, "dispatch window full").ok();
             return false;
         }
+        self.seen.lock().insert(ledger_id);
         true
     }
+
 
     /// 强制探测：同一文件已有任务时拒绝重复排队；终态后用户可重试。
     pub fn enqueue_force(&self, mut unit: ProbeUnit) -> bool {
@@ -263,11 +298,10 @@ impl ProbeManager {
             return false;
         };
         unit.job_id = Some(job_id.clone());
-        if self.queue_metadata(unit.clone()).is_err() {
+        if self.queue_metadata(unit).is_err() {
             seen.remove(&ledger_id);
-            drop(seen);
-            self.finish(&unit, false);
-            return false;
+            tracing::info!(ledger_id, job_id, "强制探测窗口已满，任务保持数据库排队");
+            self.wake.notify_waiters();
         }
         true
     }
@@ -341,7 +375,8 @@ impl ProbeManager {
             if self.queue_metadata(unit.clone()).is_ok() {
                 queued += 1;
             } else {
-                self.finish(unit, false);
+                self.seen.lock().remove(&unit.row.id.to_string());
+                tracing::info!(job_id, ledger_id = %unit.row.id, "刷新窗口已满，单元保持数据库排队");
             }
         }
         tracing::info!(%media_id, season, refresh_id = id, job_id, episodes = episode_count, queued,
@@ -446,7 +481,8 @@ impl ProbeManager {
             if self.queue_metadata(unit.clone()).is_ok() {
                 queued += 1;
             } else {
-                self.finish(unit, false);
+                self.seen.lock().remove(&unit.row.id.to_string());
+                tracing::info!(job_id, ledger_id = %unit.row.id, "整条目窗口已满，单元保持数据库排队");
             }
         }
         tracing::info!(
@@ -483,8 +519,15 @@ impl ProbeManager {
 
     /// 是否已在排队/执行（前端「探测中」状态用）。
     pub fn is_queued(&self, ledger_id: &str) -> bool {
-        let queued = self.store.lock().is_probe_queued(ledger_id);
-        queued.unwrap_or_else(|_| self.seen.lock().contains(ledger_id))
+        match self.store.lock().is_probe_queued(ledger_id) {
+            Ok(queued) => queued,
+            Err(_) => self.seen.lock().contains(ledger_id),
+        }
+    }
+
+    /// True only while this ledger sits in the in-memory dispatch window.
+    pub fn holds_dispatch_id(&self, ledger_id: &str) -> bool {
+        self.seen.lock().contains(ledger_id)
     }
 
     pub(crate) fn marker_refresh_job(
@@ -508,22 +551,76 @@ impl ProbeManager {
 
     #[cfg(test)]
     pub(crate) fn take_queued_for_test(&self) -> Option<ProbeUnit> {
-        self.metadata_rx.try_lock().ok()?.try_recv().ok()
+        let id = self.metadata_rx.lock().as_mut()?.try_recv().ok()?;
+        self.seen.lock().remove(&id.ledger_id);
+
+        if let Some((unit, _)) = self.load_dispatch_unit_inner(&id, false) {
+            return Some(unit);
+        }
+        Some(ProbeUnit {
+            row: domain::LedgerRow {
+                id: id.ledger_id.parse().expect("dispatch ledger id"),
+                media_id: domain::MediaId::new(),
+                path: String::new(),
+                season: None,
+                episode: None,
+                resolution: None,
+                codec: None,
+                hdr: None,
+                quality_source: domain::QualitySource::Release,
+                confidence: domain::Confidence::High,
+                filter_score: None,
+            },
+            kind: domain::MediaKind::Movie,
+            force_fingerprint: false,
+            reuse_fingerprint_cache: true,
+            overwrite_markers: false,
+            reuse_media_info_cache: true,
+            marker_refresh_id: None,
+            job_id: Some(id.job_id),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_fingerprint_for_test(&self) -> Option<ProbeUnit> {
+        let (id, _work) = self.fingerprint_rx.lock().as_mut()?.try_recv().ok()?;
+        if let Some((unit, _)) = self.load_dispatch_unit_inner(&id, false) {
+            return Some(unit);
+        }
+        Some(ProbeUnit {
+            row: domain::LedgerRow {
+                id: id.ledger_id.parse().expect("dispatch ledger id"),
+                media_id: domain::MediaId::new(),
+                path: String::new(),
+                season: None,
+                episode: None,
+                resolution: None,
+                codec: None,
+                hdr: None,
+                quality_source: domain::QualitySource::Release,
+                confidence: domain::Confidence::High,
+                filter_score: None,
+            },
+            kind: domain::MediaKind::Movie,
+            force_fingerprint: true,
+            reuse_fingerprint_cache: true,
+            overwrite_markers: false,
+            reuse_media_info_cache: true,
+            marker_refresh_id: None,
+            job_id: Some(id.job_id),
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn has_fingerprint_queued_for_test(&self) -> bool {
-        let Ok(mut rx) = self.fingerprint_rx.try_lock() else {
-            return false;
-        };
-        match rx.try_recv() {
-            Ok(work) => {
-                drop(rx);
-                self.fingerprint_tx.send(work).is_ok()
-            }
-            Err(_) => false,
-        }
+        self.fingerprint_rx
+            .lock()
+            .as_mut()
+            .and_then(|rx| rx.try_recv().ok().map(|(id, _)| id))
+            .is_some()
     }
+
+
 
     fn finish(&self, unit: &ProbeUnit, succeeded: bool) {
         let status = if succeeded { "succeeded" } else { "failed" };
@@ -722,6 +819,9 @@ impl ProbeManager {
         worker::try_start(self)
     }
 
+    pub async fn shutdown_workers(&self) -> Result<(), String> {
+        ProbeManager::shutdown_dispatch(self).await
+    }
     pub fn set_clock(&self, clock: Arc<dyn clock::ProbeClock>) {
         *self.clock.lock() = clock;
     }

@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use media_server::provider::{
     AuthenticateError, MediaItemSnapshot, MediaPerson, MediaServerProvider, PlaybackClientInfo,
-    PlaybackEvent, ServerLibrary, ServerUser, SubtitleDeliveryError,
+    PlaybackEvent, ServerItemPage, ServerItemQuery, ServerLibrary, ServerUser,
+    SubtitleDeliveryError,
 };
 
 use crate::subtitle_delivery::SubtitleServiceError;
@@ -32,9 +33,10 @@ use item_metadata::{
 
 mod enrichment;
 mod items;
+mod selection;
 mod user_marks;
 use items::resolve_fallback_item;
-use user_marks::{persist_unplayed_override, resolve_mark_unit, write_favorite_mark};
+use user_marks::{persist_unplayed_override, resolve_mark_unit, unit_played, write_favorite_mark};
 
 pub(crate) fn default_library_cover(kind: MediaKind) -> Result<Vec<u8>, String> {
     const DEFAULT_MOVIE_COVER: &[u8] = include_bytes!("../assets/covers/movie.jpg");
@@ -253,6 +255,34 @@ impl MediaServerProvider for ApiServerProvider {
     ) -> Result<Vec<MediaItemSnapshot>, String> {
         items::list_visible_items(self, user_id, parent_id).await
     }
+    async fn list_visible_items_in_library(
+        &self,
+        user_id: UserId,
+        parent_id: Option<&str>,
+        library_id: &str,
+    ) -> Result<Vec<MediaItemSnapshot>, String> {
+        items::list_visible_items_in_library(self, user_id, parent_id, library_id).await
+    }
+
+    /// 生产路径：轻候选 → 完整筛选/排序/计数 → 只为本页构建重元数据。
+    async fn query_visible_items(
+        &self,
+        user_id: UserId,
+        query: ServerItemQuery,
+    ) -> Result<ServerItemPage, String> {
+        selection::query_visible_items(self, user_id, query).await
+    }
+
+    /// 生产路径：一次候选读 + 每 Media 第一条未看 + 整体分页。
+    async fn next_up_items(
+        &self,
+        user_id: UserId,
+        series_id: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ServerItemPage, String> {
+        selection::next_up_items(self, user_id, series_id, offset, limit).await
+    }
 
     async fn list_resumable_items(
         &self,
@@ -261,12 +291,22 @@ impl MediaServerProvider for ApiServerProvider {
     ) -> Result<Vec<MediaItemSnapshot>, String> {
         let targets = {
             let store = self.state.store.lock();
-            store.user_resumable_units(user_id, limit).unwrap_or_default()
+            store.user_resumable_units(user_id).unwrap_or_default()
         };
         let mut results = Vec::new();
         let mut seen_media = std::collections::HashSet::new();
         for (media_id, season, episode, _pos, _updated) in targets {
-            if !seen_media.insert(media_id) {
+            if seen_media.contains(&media_id) {
+                continue;
+            }
+            if resume_effectively_played(&self.state, user_id, media_id, season, episode) {
+                tracing::debug!(
+                    %user_id,
+                    %media_id,
+                    season,
+                    episode,
+                    "skipping resume candidate overridden by a newer played mark"
+                );
                 continue;
             }
             let s_opt = if season < 0 { None } else { Some(season as u32) };
@@ -291,6 +331,10 @@ impl MediaServerProvider for ApiServerProvider {
             let snapshot = found
                 .map(|(row, media)| items::fallback_snapshot(&self.state, user_id, row, media, false));
             if let Some(sn) = snapshot {
+                if sn.played {
+                    continue;
+                }
+                seen_media.insert(media_id);
                 results.push(sn);
                 if results.len() >= limit {
                     break;
@@ -641,4 +685,15 @@ impl MediaServerProvider for ApiServerProvider {
     ) -> Result<(), String> {
         playback::report_event(self, user_id, id, position_ms, paused, client, event, identity)
     }
+}
+
+fn resume_effectively_played(
+    state: &ApiState,
+    user_id: UserId,
+    media_id: domain::MediaId,
+    season: i32,
+    episode: i32,
+) -> bool {
+    let store = state.store.lock();
+    unit_played(&store, user_id, media_id, season, episode)
 }

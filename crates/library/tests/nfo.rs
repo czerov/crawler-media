@@ -55,6 +55,7 @@ fn write_then_read_round_trips() {
         title: "The Matrix".into(),
         year: Some(1999),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("603".into()),
         douban_id: None,
         tvdb_id: None,

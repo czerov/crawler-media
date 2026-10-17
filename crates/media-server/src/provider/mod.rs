@@ -2,6 +2,10 @@ use domain::{LedgerRow, Media, MediaKind, UserId};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub mod query;
+
+pub use query::{ServerItemPage, ServerItemQuery};
+
 #[derive(Clone, Debug)]
 pub struct ServerLibrary {
     pub id: String,
@@ -241,6 +245,43 @@ pub trait MediaServerProvider: Send + Sync + 'static {
         user_id: UserId,
         parent_id: Option<&str>,
     ) -> Result<Vec<MediaItemSnapshot>, String>;
+    /// Lists items visible to the user and owned by the requested library.
+    /// Providers without library-aware filtering retain their existing listing behavior.
+    async fn list_visible_items_in_library(
+        &self,
+        user_id: UserId,
+        parent_id: Option<&str>,
+        _library_id: &str,
+    ) -> Result<Vec<MediaItemSnapshot>, String> {
+        self.list_visible_items(user_id, parent_id).await
+    }
+
+    /// Typed 条目查询：筛选/排序/计数在**选择页之前**完整执行，返回的一页条目
+    /// 必须已经带上该页所需的全部 metadata（tracks/chapters/NFO 细节）。
+    ///
+    /// 默认实现按旧方法等价过滤，**不承诺有界**（分集展开仍是逐 series 查询）；
+    /// 生产 provider 必须覆盖它，用轻候选先选页、再只为该页构建重元数据。
+    async fn query_visible_items(
+        &self,
+        user_id: UserId,
+        query: ServerItemQuery,
+    ) -> Result<ServerItemPage, String> {
+        query::legacy_select(self, user_id, query).await
+    }
+
+    /// NextUp：一次候选读 + 按 Media 分组选第一条未看，再整体分页。
+    ///
+    /// 默认实现用一次 `list_visible_items` 做聚合；旧式（只返回 series 级快照）
+    /// provider 会退回逐 series 查询，因此**不承诺有界**。生产 provider 覆盖它。
+    async fn next_up_items(
+        &self,
+        user_id: UserId,
+        series_id: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ServerItemPage, String> {
+        query::legacy_next_up(self, user_id, series_id, offset, limit).await
+    }
 
     async fn list_resumable_items(
         &self,

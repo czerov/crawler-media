@@ -200,6 +200,7 @@ fn new_dirty_during_build_is_not_swallowed() {
         expected_dirty_token: Some(1),
         files: vec![],
         media: vec![],
+        candidates: vec![],
     };
 
     // Before publish commits, a new change arrives and increments dirty_token to 2!
@@ -223,7 +224,9 @@ fn stale_library_dependencies_are_evicted_before_invalidation() {
     let removed_library_id = "removed-library";
     let deps = Arc::new(Mutex::new(ProjectionDependencies::new()));
     let consumer = ChangeConsumer::new(deps.clone());
-    consumer.hydrate_ready_dependencies(&store).unwrap();
+    consumer
+        .hydrate_ready_dependencies(&store, &api::browse_projection::changes::HydrationCounters::default())
+        .unwrap();
     deps.lock().record_library(
         removed_library_id,
         [MediaId::new()],
@@ -231,7 +234,9 @@ fn stale_library_dependencies_are_evicted_before_invalidation() {
         ["/removed/library/file.mkv".to_string()],
         ["tmdb:/movie/42".to_string()],
     );
-    consumer.hydrate_ready_dependencies(&store).unwrap();
+    consumer
+        .hydrate_ready_dependencies(&store, &api::browse_projection::changes::HydrationCounters::default())
+        .unwrap();
 
     store
         // 台账键与记录的依赖键必须同形（journal key = `source:cache_key`），否则
@@ -288,9 +293,42 @@ fn acknowledged_coalescing_sentinel_is_pruned_after_interrupted_acknowledgement(
         .browse_changes(BrowseChangeSource::Catalog, store.browse_change_cursor(BrowseChangeSource::Catalog).unwrap(), 10)
         .unwrap()
         .is_empty());
-    consumer
+    let mut replay_budget = api::browse_projection::changes::MAX_EVENTS_PER_ROUND;
+    let replay = consumer
+        .poll_source_budgeted(
+            &store,
+            &ownership,
+            BrowseChangeSource::Catalog,
+            &mut replay_budget,
+        )
+        .unwrap();
+    assert_eq!(replay, (1, true), "replay must consume exactly one budget unit");
+    assert_eq!(
+        replay_budget,
+        api::browse_projection::changes::MAX_EVENTS_PER_ROUND - 1,
+        "replay must decrement the caller-shared budget exactly once",
+    );
+    let after_replay = store.browse_projection_head(&library_id).unwrap().unwrap();
+    assert!(
+        after_replay.dirty_token > baseline.dirty_token,
+        "replayed sentinel must invalidate the affected library before any later event",
+    );
+    assert!(store
+        .browse_changes(BrowseChangeSource::Catalog, sentinel.seq - 1, 1)
+        .unwrap()
+        .is_empty(), "replay must prune the acknowledged coalescing sentinel");
+    store
+        .put_catalog_cache("tmdb", "/movie/1000", "{}", 10_001, None)
+        .unwrap();
+    let after_replay = consumer
         .poll_source(&store, &ownership, BrowseChangeSource::Catalog)
         .unwrap();
+    assert_eq!(after_replay, (1, true), "a later catalog change must be consumable");
     let updated = store.browse_projection_head(&library_id).unwrap().unwrap();
     assert!(updated.dirty_token > baseline.dirty_token);
+
+    let idle = consumer
+        .poll_source(&store, &ownership, BrowseChangeSource::Catalog)
+        .unwrap();
+    assert_eq!(idle, (0, true), "an idle poll must process no events");
 }

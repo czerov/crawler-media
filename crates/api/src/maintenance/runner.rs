@@ -17,6 +17,7 @@ use jobs::{Job, JobStatus};
 use super::database::{
     DatabaseName, MaintenanceContext, database_targets, missing_optional_targets,
 };
+use super::data_retention::run_data_retention;
 use super::policy::{
     BATCH_SIZE, DatabaseMaintenancePolicy, MAX_BATCHES, MAX_BATCH_BUDGET, MaintenancePolicy,
 };
@@ -45,6 +46,7 @@ pub fn run(state: &ApiState, job: &Job) -> Result<(), String> {
         MaintenancePolicy::Database(policy) => policy.version,
         MaintenancePolicy::Jobs(policy) => policy.version,
         MaintenancePolicy::PlaybackHistory(policy) => policy.version,
+        MaintenancePolicy::DataRetention(policy) => policy.version,
     };
     let mut report = MaintenanceReport::new(job.kind, version);
     tracing::info!(job_id = %job.id, kind = job.kind.as_str(), "维护任务开始执行");
@@ -83,6 +85,9 @@ pub fn run(state: &ApiState, job: &Job) -> Result<(), String> {
                     .map(BatchCounts::from_playback)
                     .map_err(|error| error.to_string())
             })
+        }
+        MaintenancePolicy::DataRetention(policy) => {
+            run_data_retention(state, job, policy, now, &check_stop, &mut report)
         }
     };
     report.elapsed_ms = elapsed_ms(started);

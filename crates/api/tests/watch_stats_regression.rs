@@ -55,6 +55,7 @@ fn media(title: &str) -> Media {
         title: title.into(),
         year: Some(1999),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

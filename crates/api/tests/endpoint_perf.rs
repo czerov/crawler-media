@@ -125,6 +125,7 @@ fn seed_media(
         title: format!("Perf {index:06}"),
         year: Some(2000 + (index % 25) as u16),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some(format!("{}", 100_000 + index)),
         douban_id: None,
         tvdb_id: None,

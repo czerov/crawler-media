@@ -56,6 +56,19 @@ pub enum DatabaseOutcome {
     Failed,
 }
 
+/// DB-05：单类历史的批报告。`incomplete` 表示该类窗口外仍有未检视超龄行，
+/// 不是剩余总数的精确计数。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DataRetentionClassReport {
+    pub class: String,
+    pub cutoff_ms: i64,
+    pub examined: usize,
+    pub deleted: usize,
+    pub protected: usize,
+    pub incomplete: bool,
+    pub resume_after: Option<store::DataRetentionCursor>,
+}
+
 /// 一轮维护执行的汇总报告（写入 `job.progress`）。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MaintenanceReport {
@@ -72,6 +85,18 @@ pub struct MaintenanceReport {
     pub protected_is_lower_bound: bool,
     pub batches: usize,
     pub budget_exhausted: bool,
+    /// DB-05：分类历史保留本轮检视的行数（窗口内，含保护行）。
+    #[serde(default)]
+    pub examined: usize,
+    /// DB-05：至少一个类别窗口外仍有未检视超龄行。
+    #[serde(default)]
+    pub incomplete: bool,
+    /// 与 `incomplete` 同义的显式 remaining 信号：本轮预算不足，剩余工作留到下一轮。
+    #[serde(default)]
+    pub remaining: bool,
+    /// DB-05：逐类别的 examined/deleted/protected/incomplete 与游标。
+    #[serde(default)]
+    pub classes: Vec<DataRetentionClassReport>,
     pub elapsed_ms: u64,
     /// 仅数据库维护非空：每库报告。
     pub databases: Vec<DatabaseReport>,
@@ -93,6 +118,10 @@ impl MaintenanceReport {
             protected_is_lower_bound: false,
             batches: 0,
             budget_exhausted: false,
+            examined: 0,
+            incomplete: false,
+            remaining: false,
+            classes: Vec::new(),
             elapsed_ms: 0,
             databases: Vec::new(),
             note: None,

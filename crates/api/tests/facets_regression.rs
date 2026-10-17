@@ -98,6 +98,7 @@ fn seed_movie(
             title: title.into(),
             year,
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: None,
             douban_id: None,
             tvdb_id: None,

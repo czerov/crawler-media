@@ -70,9 +70,32 @@ pub struct ApiState {
     pub browser: Arc<indexer::Browser>,
     /// 异步媒体探测队列（streamdetails + 声纹指纹后台采集）。
     pub probe: Arc<crate::probe_manager::ProbeManager>,
+    /// 持久章节帧义务的有界派发服务（2 进程 / 64 ID 窗口）。
+    pub(crate) chapter_frames: Arc<crate::chapter_frame_service::ChapterFrameService>,
     /// 测试 seam：gallery 实际展开图片 JSON 的组数（生产只读计数，无副作用）。
     /// 用来证明「先按图片存在性剔除空组、再分页」后只渲染本页图片集合。
     pub(crate) gallery_expansions: Arc<std::sync::atomic::AtomicUsize>,
+    /// Jellyfin 选择的候选条数（每次选择每行记一次）：证明一次请求只做一遍
+    /// 候选遍历，而不是每个 series 重读整库。
+    pub(crate) jellyfin_candidates: Arc<std::sync::atomic::AtomicUsize>,
+    /// Jellyfin 选择里真正构建了重元数据（tracks/chapters/NFO/stat）的条目数：
+    /// 证明只有选中的那一页被 enrich。
+    pub(crate) jellyfin_heavy_items: Arc<std::sync::atomic::AtomicUsize>,
+    /// 测试 seam：浏览请求真正解码的投影 file facts 行数（生产只读计数，无副作用）。
+    /// 计数发生在**读取/解析处**，包含随后被丢弃或解析失败的行，以及依赖覆盖的
+    /// 回退重读；热页只应解码选中 Media 的 facts。
+    pub(crate) browse_page_decoded_files: Arc<std::sync::atomic::AtomicUsize>,
+    /// 测试 seam：浏览请求真正解码的投影 media facts 行数（同上口径）。
+    pub(crate) browse_page_decoded_media: Arc<std::sync::atomic::AtomicUsize>,
+    /// 测试 seam：选页读过的轻候选 JSON 行数（常用排序的 SQL 分页应为 0）。
+    pub(crate) browse_page_candidate_rows: Arc<std::sync::atomic::AtomicUsize>,
+    /// 测试 seam：投影依赖覆盖读过的轻量行数（列读 + 候选行；重启后的首个小页
+    /// 只应产生这一项成本，不应解码整份 facts）。
+    pub(crate) browse_page_dependency_rows: Arc<std::sync::atomic::AtomicUsize>,
+    /// 测试 seam：统计计算在计划收集与 totals 读取之间的屏障（生产为 `None`）。
+    pub statistics_phase_barrier: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// 测试 seam：统计路径执行的用户 role 查询次数（生产只读计数）。
+    pub(crate) statistics_role_lookups: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn apply_admin_bootstrap(
@@ -216,6 +239,11 @@ impl ApiState {
         let probe = Arc::new(crate::probe_manager::ProbeManager::new(store.clone()));
         probe.set_library_registry(library_work.clone());
         let startup_browser = crate::runtime_browser::startup_browser(store.clone());
+        let chapter_frames = Arc::new(crate::chapter_frame_service::ChapterFrameService::new(
+            store.clone(),
+            library_work.clone(),
+        ));
+        probe.set_chapter_frames(chapter_frames.clone());
         let state = Self {
             store: store.clone(),
             password_login: Arc::new(crate::password_login::PasswordLogin::new(
@@ -259,7 +287,16 @@ impl ApiState {
             obscura: Arc::new(crate::obscura_manager::ObscuraManager::new(&data_dir)),
             browser: Arc::new(startup_browser.0),
             probe,
+            chapter_frames,
             gallery_expansions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            jellyfin_candidates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            jellyfin_heavy_items: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            browse_page_decoded_files: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            browse_page_decoded_media: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            browse_page_candidate_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            browse_page_dependency_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            statistics_phase_barrier: None,
+            statistics_role_lookups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if let Some(error) = startup_browser.1 {
             state.obscura.set_last_error(Some(error));
@@ -269,6 +306,7 @@ impl ApiState {
             crate::library_lifecycle::resume_library_removals(&state)
                 .map_err(std::io::Error::other)?;
             state.probe.try_start_workers();
+            state.chapter_frames.start();
             crate::scan_probe_dispatch::start_dispatcher(state.clone());
             // 已访问 Library 的投影周期刷新（外部 NFO/图片修改 ≤60 秒可见）。
             state.projection.clone().start_periodic_refresh(state.clone());
@@ -294,6 +332,25 @@ impl ApiState {
     ) -> Self {
         self.library_files = files;
         self
+    }
+    /// Replace the chapter frame renderer (tests inject a gated fake; no ffmpeg).
+    pub fn with_chapter_frame_runner(
+        mut self,
+        runner: Arc<dyn crate::chapter_frame_service::ChapterFrameRunner>,
+    ) -> Self {
+        let service = Arc::new(crate::chapter_frame_service::ChapterFrameService::with_runner(
+            self.store.clone(),
+            self.library_work.clone(),
+            runner,
+        ));
+        self.chapter_frames.abort();
+        self.probe.set_chapter_frames(service.clone());
+        self.chapter_frames = service;
+        self
+    }
+
+    pub fn chapter_frames(&self) -> Arc<crate::chapter_frame_service::ChapterFrameService> {
+        self.chapter_frames.clone()
     }
     pub fn with_playback_clock(
         mut self,
@@ -344,6 +401,83 @@ impl ApiState {
     /// gallery 展开计数（每次为一组图片构建 JSON 记 1）。
     pub fn gallery_expansions(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.gallery_expansions.clone()
+    }
+
+    /// 替换 Jellyfin 选择计数 seam（测试注入自有计数器以观察候选/重元数据条数）。
+    pub fn with_jellyfin_work_counters(
+        mut self,
+        candidates: Arc<std::sync::atomic::AtomicUsize>,
+        heavy_items: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.jellyfin_candidates = candidates;
+        self.jellyfin_heavy_items = heavy_items;
+        self
+    }
+
+    /// Jellyfin 选择遍历过的候选条数。
+    pub fn jellyfin_candidates(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.jellyfin_candidates.clone()
+    }
+
+    /// Jellyfin 选择构建过重元数据的条目数。
+    pub fn jellyfin_heavy_items(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.jellyfin_heavy_items.clone()
+    }
+
+    /// 替换浏览页工作量计数 seam（测试注入自有计数器以观察本页解码行数）。
+    pub fn with_browse_page_counters(
+        mut self,
+        decoded_files: Arc<std::sync::atomic::AtomicUsize>,
+        decoded_media: Arc<std::sync::atomic::AtomicUsize>,
+        candidate_rows: Arc<std::sync::atomic::AtomicUsize>,
+        dependency_rows: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.browse_page_decoded_files = decoded_files;
+        self.browse_page_decoded_media = decoded_media;
+        self.browse_page_candidate_rows = candidate_rows;
+        self.browse_page_dependency_rows = dependency_rows;
+        self
+    }
+
+    /// 浏览请求真正解码的投影 file facts 行数。
+    pub fn browse_page_decoded_files(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.browse_page_decoded_files.clone()
+    }
+
+    /// 浏览请求真正解码的投影 media facts 行数。
+    pub fn browse_page_decoded_media(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.browse_page_decoded_media.clone()
+    }
+
+    /// 选页读过的轻候选 JSON 行数。
+    pub fn browse_page_candidate_rows(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.browse_page_candidate_rows.clone()
+    }
+
+    /// 投影依赖覆盖读过的轻量行数。
+    pub fn browse_page_dependency_rows(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.browse_page_dependency_rows.clone()
+    }
+
+    /// 记录本次请求真正解码的投影行数：计数在**读取/解析处**，包含随后被丢弃或
+    /// 解析失败的行（测试 seam；生产只读计数，无副作用）。
+    pub(crate) fn count_decoded(&self, files: usize, media: usize) {
+        self.browse_page_decoded_files
+            .fetch_add(files, std::sync::atomic::Ordering::SeqCst);
+        self.browse_page_decoded_media
+            .fetch_add(media, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 记录选页读过的轻候选 JSON 行数。
+    pub(crate) fn count_candidate_rows(&self, rows: usize) {
+        self.browse_page_candidate_rows
+            .fetch_add(rows, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 记录依赖覆盖读过的轻量行数（file 依赖列 + 候选行）。
+    pub(crate) fn count_dependency_rows(&self, rows: usize) {
+        self.browse_page_dependency_rows
+            .fetch_add(rows, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 替换 notify 发送实现（测试注入阻塞实现以验证预算准入）。

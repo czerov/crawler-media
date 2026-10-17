@@ -504,6 +504,7 @@ fn tv_media() -> Media {
         title: "九门".into(),
         year: Some(2026),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("123".into()),
         douban_id: None,
         tvdb_id: None,

@@ -116,6 +116,7 @@ fn media_of(name: &'static str, kind: domain::MediaKind, tmdb: &str) -> domain::
         title: name.into(),
         year: Some(2020),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some(tmdb.into()),
         douban_id: None,
         tvdb_id: None,

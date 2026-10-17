@@ -7,34 +7,55 @@ pub(super) fn unit_played(
     season: i32,
     episode: i32,
 ) -> bool {
-    let episode_unit = match store.unit_state(user_id, media_id, season, episode) {
-        Ok(unit) => unit,
-        Err(error) => {
-            tracing::warn!(%error, %user_id, %media_id, season, episode, "failed to read Jellyfin played mark");
-            None
-        }
-    };
-    let episode_played = episode_unit.as_ref().is_some_and(|unit| unit.played);
-    if episode_played {
-        return true;
-    }
-    let episode_updated_at = episode_unit.as_ref().map(|unit| unit.updated_at);
-    let mut latest_broader: Option<store::UnitState> = None;
-    let broader_units = [
+    let mut units: [Option<crate::store::UnitState>; 3] = [None, None, None];
+    let keys = [
+        (season, episode),
         (season, crate::store::UNIT_WHOLE),
         (crate::store::UNIT_WHOLE, crate::store::UNIT_WHOLE),
     ];
-    let count = usize::from(season >= 0) + 1;
-    for (unit_season, unit_episode) in broader_units.into_iter().take(count) {
+    for (index, (unit_season, unit_episode)) in keys.into_iter().enumerate() {
+        if index > 0 && (season < 0 || episode < 0) {
+            continue;
+        }
         match store.unit_state(user_id, media_id, unit_season, unit_episode) {
-            Ok(Some(state)) if latest_broader.as_ref().is_none_or(|current| state.updated_at > current.updated_at) => latest_broader = Some(state),
-            Ok(Some(_)) | Ok(None) => {}
+            Ok(Some(state)) => units[index] = Some(state),
+            Ok(None) => {}
             Err(error) => tracing::warn!(%error, %user_id, %media_id, season = unit_season, episode = unit_episode, "failed to read Jellyfin played mark"),
         }
     }
-    latest_broader.is_some_and(|unit| {
-        unit.played && episode_updated_at.is_none_or(|updated_at| unit.updated_at > updated_at)
-    })
+    resolve_effective_played(
+        units[0].as_ref().map(|unit| (unit, unit.updated_at)),
+        units[1].as_ref().map(|unit| (unit, unit.updated_at)),
+        units[2].as_ref().map(|unit| (unit, unit.updated_at)),
+    )
+}
+
+fn carries_playback_authority(state: &crate::store::UnitState) -> bool {
+    // A favourite-only insert has no playback facts. A genuine historical
+    // played assertion can still have `updated_at = 0` and must count.
+    state.updated_at != 0
+        || state.played
+        || state.position_ms != 0
+        || state.play_count != 0
+        || state.duration_ms.is_some()
+        || state.audio_track.is_some()
+        || state.subtitle_track.is_some()
+}
+
+pub(super) fn resolve_effective_played(
+    episode_unit: Option<(&crate::store::UnitState, i64)>,
+    season_unit: Option<(&crate::store::UnitState, i64)>,
+    show_unit: Option<(&crate::store::UnitState, i64)>,
+) -> bool {
+    [episode_unit, season_unit, show_unit]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(specificity, unit)| {
+            unit.filter(|(state, _)| carries_playback_authority(state))
+                .map(|(state, updated_at)| (updated_at, 2 - specificity, state.played))
+        })
+        .max_by_key(|(updated_at, specificity, _)| (*updated_at, *specificity))
+        .is_some_and(|(_, _, played)| played)
 }
 pub(super) fn item_is_played(
     store: &crate::Store,
@@ -115,38 +136,12 @@ pub(super) fn write_favorite_mark(
     favorite: bool,
     now: i64,
 ) -> Result<(), String> {
-    let existing = store
-        .unit_state(user_id, media_id, season, episode)
-        .map_err(|error| {
-            tracing::error!(%error, %user_id, %media_id, season, episode, "failed to read Jellyfin favorite target");
-            error.to_string()
-        })?;
-    let played = existing
-        .as_ref()
-        .map(|state| state.played)
-        .unwrap_or_else(|| unit_played(store, user_id, media_id, season, episode));
     store
-        .upsert_unit(
-            user_id,
-            media_id,
-            season,
-            episode,
-            existing.as_ref().map(|state| state.position_ms).unwrap_or(0),
-            Some(played),
-            Some(favorite),
-            existing.as_ref().and_then(|state| state.duration_ms),
-            existing.as_ref().and_then(|state| state.audio_track.as_deref()),
-            existing
-                .as_ref()
-                .and_then(|state| state.subtitle_track.as_deref()),
-            false,
-            now,
-        )
+        .set_unit_favorite(user_id, media_id, season, episode, favorite, now)
         .map_err(|error| {
             tracing::error!(%error, %user_id, %media_id, season, episode, "failed to update Jellyfin favorite mark");
             error.to_string()
         })
-        .map(|_| ())
 }
 
 pub(super) fn persist_unplayed_override(

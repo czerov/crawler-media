@@ -144,6 +144,7 @@ async fn default_library_cannot_delete_or_retransfer_orphaned_outside_root() {
         title: "Orphan".into(),
         year: Some(1999),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,
