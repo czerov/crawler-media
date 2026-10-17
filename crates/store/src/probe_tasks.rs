@@ -227,9 +227,25 @@ impl Store {
     }
 
     pub fn recover_probe_jobs(&self) -> Result<Vec<(ProbeJob, Vec<ProbeJobUnit>)>, StoreError> {
-        // Read-only. Requeueing running units here races a live worker: drain
-        // and retry assessment must observe the job the worker is finishing,
-        // not reset it back to queued.
+        // Reconcile the counters of every active job once (D2 contract), but
+        // never requeue a running unit: drain and retry assessment must observe
+        // the job the live worker is finishing, not reset it back to queued.
+        {
+            let tx = self.library.unchecked_transaction()?;
+            let ids: Vec<String> = {
+                let mut statement = tx.prepare(
+                    "SELECT id FROM probe_jobs WHERE status IN ('queued', 'running')
+                     ORDER BY created_at_ms, id",
+                )?;
+                statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for id in &ids {
+                counters::reconcile_counts_in_transaction(&tx, id)?;
+            }
+            tx.commit()?;
+        }
         let mut statement = self.library.prepare(
             "SELECT id, kind, media_id, season, status, total, completed, succeeded,
                     failed, partial, error, created_at_ms, started_at_ms, finished_at_ms
