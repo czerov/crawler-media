@@ -163,6 +163,7 @@ fn insert_media(state: &ApiState, media_id: MediaId, title: &str) {
         title: title.into(),
         year: Some(2024),
         original_title: Some(title.into()),
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

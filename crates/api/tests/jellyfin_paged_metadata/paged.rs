@@ -341,12 +341,46 @@ async fn name_ties_keep_a_stable_order() {
                 &[],
             )
             .unwrap();
+        let media_ids = [
+            "00000000-0000-0000-0000-000000000003",
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+        ];
         let mut expected = Vec::new();
-        for index in 0..3 {
-            let media_id = new_media(&store, "Same title");
+        for (index, id) in media_ids.into_iter().enumerate() {
+            let media_id = MediaId::from_uuid(uuid::Uuid::parse_str(id).unwrap());
+            let media = Media {
+                id: media_id,
+                kind: MediaKind::Tv,
+                title: "Same title".into(),
+                year: Some(2024),
+                original_title: None,
+                aliases: Vec::new(),
+                tmdb_id: None,
+                douban_id: None,
+                tvdb_id: None,
+                bangumi_id: None,
+                anilist_id: None,
+            };
+            store.insert_media(&media).unwrap();
+            let ledger_id = LedgerId::from_uuid(uuid::Uuid::parse_str(&format!("00000000-0000-0000-0000-00000000000{}", 3 - index)).unwrap());
             let show_dir = root.join(format!("same-{index}"));
             std::fs::create_dir_all(&show_dir).unwrap();
-            insert_episode(&store, &show_dir, media_id, 1, 1);
+            let path = show_dir.join("01x01.mkv");
+            std::fs::write(&path, b"episode").unwrap();
+            store.insert_ledger(&LedgerRow {
+                id: ledger_id,
+                media_id,
+                path: path.display().to_string(),
+                season: Some(1),
+                episode: Some(1),
+                resolution: None,
+                codec: None,
+                hdr: None,
+                quality_source: QualitySource::Probe,
+                confidence: Confidence::High,
+                filter_score: None,
+            }).unwrap();
             expected.push(media_id.to_string().replace('-', ""));
         }
         expected.sort();

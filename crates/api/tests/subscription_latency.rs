@@ -105,6 +105,7 @@ fn fixture(
         title: "Test Movie".into(),
         year: Some(2024),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("12345".into()),
         douban_id: None,
         tvdb_id: None,

@@ -23,6 +23,7 @@ async fn items_series_and_season_filters_return_episode_children() {
         title: "Filter Show".into(),
         year: Some(2024),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

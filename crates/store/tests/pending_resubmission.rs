@@ -42,6 +42,7 @@ fn create_sub(store: &Store) -> (SubscribeId, Torrent) {
         title: "Test Movie".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         bangumi_id: None,

@@ -188,6 +188,7 @@ impl RenameFixture {
             title: "Spirit Rangers".into(),
             year: Some(2022),
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: Some("119847".into()),
             douban_id: None,
             tvdb_id: None,

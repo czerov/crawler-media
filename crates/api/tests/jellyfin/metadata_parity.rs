@@ -43,6 +43,7 @@ async fn tvshow_nfo_metadata_reaches_series_and_flat_episode_details() {
         title: "Pantheon".into(),
         year: Some(2022),
         original_title: Some("Pantheon".into()),
+        aliases: Vec::new(),
         tmdb_id: Some("195339".into()),
         douban_id: None,
         tvdb_id: None,

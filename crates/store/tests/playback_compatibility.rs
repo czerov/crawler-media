@@ -38,7 +38,7 @@ fn failed_movie_mark_does_not_hide_legacy_progress() {
     let media = MediaId::new();
     store.insert_media(&domain::Media {
         id: media, kind: domain::MediaKind::Movie, title: "Legacy".into(), year: None,
-        original_title: None, tmdb_id: None, douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None,
+        original_title: None, aliases: Vec::new(), tmdb_id: None, douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None,
     }).unwrap();
     store.upsert_unit(user, media, 0, 0, 45000, Some(false), Some(true), Some(90000), None, None, false, 10).unwrap();
     let db = Connection::open(tmp.path().join("subscribe.db")).unwrap();
@@ -197,7 +197,7 @@ fn retargeted_subscribe_does_not_treat_previous_library_as_owned() {
     let media = domain::MediaId::new();
     store.insert_media(&Media {
         id: media, kind: MediaKind::Movie, title: "Shared".into(), year: None,
-        original_title: None, tmdb_id: None, douban_id: None, tvdb_id: None,
+        original_title: None, aliases: Vec::new(), tmdb_id: None, douban_id: None, tvdb_id: None,
         bangumi_id: None, anilist_id: None,
     }).unwrap();
     let a_root = tmp.path().join("library-a");

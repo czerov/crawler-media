@@ -110,6 +110,7 @@ async fn series_parent_does_not_scan_the_root_ledger() {
     assert_eq!(scans, 0, "剧 parent 不得执行无 WHERE 的根账本扫描，实际 {scans} 次");
 }
 
+
 #[tokio::test]
 async fn person_filter_fails_when_required_catalog_fails() {
     let fixture = tv_fixture(2, 1);

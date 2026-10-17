@@ -36,12 +36,12 @@ fn seed(path: &Path, unrelated: usize) -> (ApiState, domain::UserId, String) {
     std::fs::create_dir_all(&parent_root).unwrap();
     let target = parent_root.join("target.mkv");
     std::fs::write(&target, b"target").unwrap();
-    let media = Media { id: MediaId::new(), kind: MediaKind::Movie, title: "Target".into(), year: Some(2024), original_title: None, tmdb_id: None, douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None };
+    let media = Media { id: MediaId::new(), kind: MediaKind::Movie, title: "Target".into(), year: Some(2024), original_title: None, aliases: Vec::new(), tmdb_id: None, douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None };
     store.insert_media(&media).unwrap();
     let row = LedgerRow { id: LedgerId::new(), media_id: media.id, path: target.display().to_string(), season: None, episode: None, resolution: None, codec: None, hdr: None, quality_source: QualitySource::Probe, confidence: Confidence::High, filter_score: None };
     store.insert_ledger(&row).unwrap();
     for index in 0..unrelated {
-        let outside = Media { id: MediaId::new(), kind: MediaKind::Movie, title: format!("Outside {index}"), year: None, original_title: None, tmdb_id: None, douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None };
+        let outside = Media { id: MediaId::new(), kind: MediaKind::Movie, title: format!("Outside {index}"), year: None, original_title: None, aliases: Vec::new(), tmdb_id: None, douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None };
         store.insert_media(&outside).unwrap();
         store.insert_ledger(&LedgerRow { id: LedgerId::new(), media_id: outside.id, path: format!("{}/outside/unrelated-{index}.mkv", path.display()), season: None, episode: None, resolution: None, codec: None, hdr: None, quality_source: QualitySource::Probe, confidence: Confidence::High, filter_score: None }).unwrap();
     }

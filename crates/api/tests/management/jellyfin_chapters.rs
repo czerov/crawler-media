@@ -41,6 +41,7 @@ async fn jellyfin_playback_info_and_items_include_chapters_with_markers() {
         title: "葬送的芙莉莲".into(),
         year: Some(2023),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("12345".into()),
         douban_id: None,
         tvdb_id: None,

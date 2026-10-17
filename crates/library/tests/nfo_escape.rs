@@ -14,6 +14,7 @@ fn nfo_escapes_xml_special_chars_on_round_trip() {
         title: "Law & Order <Special> \"Quotes\" 'Single'".into(),
         year: Some(1990),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("1234".into()),
         douban_id: None,
         tvdb_id: None,

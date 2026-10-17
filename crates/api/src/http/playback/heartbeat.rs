@@ -374,10 +374,10 @@ mod tests {
         let library = store.list_libraries().unwrap().into_iter()
             .find(|library| library.kind == domain::MediaKind::Movie).unwrap();
         let provisional = domain::Media { id: domain::MediaId::new(), kind: domain::MediaKind::Movie,
-            title: "provisional".into(), year: None, original_title: None, tmdb_id: None,
+            title: "provisional".into(), year: None, original_title: None, aliases: Vec::new(), tmdb_id: None,
             douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None };
         let canonical = domain::Media { id: domain::MediaId::new(), kind: domain::MediaKind::Movie,
-            title: "canonical".into(), year: None, original_title: None, tmdb_id: Some("123".into()),
+            title: "canonical".into(), year: None, original_title: None, aliases: Vec::new(), tmdb_id: Some("123".into()),
             douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None };
         store.insert_media(&provisional).unwrap();
         store.insert_media(&canonical).unwrap();

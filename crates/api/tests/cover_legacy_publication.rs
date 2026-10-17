@@ -83,6 +83,7 @@ async fn legacy_cover_upgrade_failure_preserves_existing_legacy_file() {
         title: "Test Movie".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

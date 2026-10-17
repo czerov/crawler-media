@@ -10,6 +10,7 @@ fn movie() -> Media {
         title: "The Matrix".into(),
         year: Some(1999),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,
@@ -25,6 +26,7 @@ fn tv() -> Media {
         title: "The Expanse".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,
@@ -130,6 +132,7 @@ fn unknown_placeholder_is_a_config_error() {
 fn extended_tokens_render_and_shrink() {
     let media = Media {
         original_title: Some("The Matrix".into()),
+        aliases: Vec::new(),
         tmdb_id: Some("603".into()),
         ..movie()
     };

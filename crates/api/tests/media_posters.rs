@@ -93,6 +93,7 @@ async fn media_poster_route_serves_public_bytes_and_caches_on_disk() {
         title: "Matrix".into(),
         year: Some(1999),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("valid".into()),
         douban_id: None,
         tvdb_id: None,

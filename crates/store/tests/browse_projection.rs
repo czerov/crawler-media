@@ -39,6 +39,7 @@ fn read_revisions_increments_on_dml_changes() {
         title: "Test".into(),
         year: Some(2024),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

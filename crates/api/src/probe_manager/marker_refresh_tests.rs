@@ -11,6 +11,7 @@ fn season_refresh_keeps_old_markers_until_success_then_clears_empty_result() {
             title: "万神殿".into(),
             year: None,
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: None,
             douban_id: None,
             tvdb_id: None,

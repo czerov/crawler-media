@@ -47,6 +47,7 @@ pub async fn claim_unidentified(
         title: body.title.trim().to_string(),
         year: body.year,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: body.tmdb_id.filter(|id| !id.is_empty()),
         douban_id: None,
         tvdb_id: None,

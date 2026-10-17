@@ -21,7 +21,7 @@ fn state(tmp: &tempfile::TempDir) -> ApiState {
 }
 fn media() -> Media {
     Media { id: MediaId::new(), kind: MediaKind::Tv, title: "Review".into(), year: Some(2026),
-        original_title: None, tmdb_id: None, douban_id: None, tvdb_id: None,
+        original_title: None, aliases: Vec::new(), tmdb_id: None, douban_id: None, tvdb_id: None,
         bangumi_id: None, anilist_id: None }
 }
 fn row(media: &Media, tmp: &tempfile::TempDir, name: &str, episode: u32) -> LedgerRow {

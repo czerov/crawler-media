@@ -21,6 +21,7 @@ fn movie(id: MediaId, title: &str, year: Option<u16>) -> Media {
         title: title.to_string(),
         year,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

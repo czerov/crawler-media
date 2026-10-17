@@ -11,6 +11,7 @@ fn media(kind: MediaKind, title: &str, tmdb_id: Option<&str>) -> Media {
         title: title.into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: tmdb_id.map(str::to_string),
         douban_id: None,
         tvdb_id: None,

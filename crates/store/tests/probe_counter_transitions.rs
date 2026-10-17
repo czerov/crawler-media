@@ -166,6 +166,7 @@ fn retiring_a_partial_unit_keeps_the_job_counters_honest() {
         title: "Target".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

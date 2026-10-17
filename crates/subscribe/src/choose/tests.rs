@@ -8,6 +8,7 @@ fn media(title: &str, original: Option<&str>) -> Media {
         title: title.into(),
         year: None,
         original_title: original.map(str::to_string),
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

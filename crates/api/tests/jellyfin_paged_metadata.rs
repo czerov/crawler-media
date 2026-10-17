@@ -117,6 +117,7 @@ fn new_media(store: &Store, title: &str) -> MediaId {
         title: title.into(),
         year: Some(2024),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

@@ -292,12 +292,8 @@ async fn jellyfin_selection_records_candidate_and_heavy_counts() {
     .await;
     let scans = fixture.state.store().lock().root_ledger_scans();
     assert_eq!(scoped["TotalRecordCount"], 10);
-    assert_eq!(scans, 0, "整库读后再过滤仍会记根账本扫描，实际 {scans}");
-    assert_eq!(
-        candidates.load(Ordering::SeqCst) - before,
-        10,
-        "剧作用域把媒体交集下推到 SQL：只读这部剧的 10 行，而不是整库 1000 行"
-    );
+    assert_eq!(scans, 0, "cross-thread series selection must not root-scan ledger: {scans}");
+    assert_eq!(candidates.load(Ordering::SeqCst) - before, 10);
     assert_eq!(heavy.load(Ordering::SeqCst), 2, "第二次请求仍然只 enrich 本页");
 }
 

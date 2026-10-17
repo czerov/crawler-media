@@ -254,7 +254,7 @@ fn canonical_media(kind: MediaKind) -> Media {
         kind,
         title: "旧中文名称".into(),
         year: Some(2022),
-        original_title: None,
+        original_title: None, aliases: Vec::new(),
         tmdb_id: Some("207890".into()),
         douban_id: None,
         tvdb_id: None,
@@ -562,7 +562,7 @@ fn online_identity_rebind_succeeds_when_reimported_library_reuses_removed_root()
             let hit = media::CatalogHit {
                 media: Media {
                     id: MediaId::new(), kind: MediaKind::Movie, title: "English Name".into(),
-                    year: Some(2025), original_title: None, tmdb_id: Some("207890".into()),
+                    year: Some(2025), original_title: None, aliases: Vec::new(), tmdb_id: Some("207890".into()),
                     douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None,
                 },
                 poster_path: None, backdrop_path: None, rating: None, overview: None,

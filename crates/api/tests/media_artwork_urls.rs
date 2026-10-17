@@ -93,6 +93,7 @@ fn media(kind: MediaKind, title: &str, tmdb_id: &str) -> Media {
         title: title.into(),
         year: Some(2022),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some(tmdb_id.into()),
         douban_id: None,
         tvdb_id: None,

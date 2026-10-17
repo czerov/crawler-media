@@ -3,7 +3,7 @@ use store::Store;
 
 fn media() -> Media {
     Media { id: MediaId::new(), kind: MediaKind::Tv, title: "Example".into(),
-        year: Some(2022), original_title: None, tmdb_id: Some("123".into()),
+        year: Some(2022), original_title: None, aliases: Vec::new(), tmdb_id: Some("123".into()),
         douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None }
 }
 

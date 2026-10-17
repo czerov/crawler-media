@@ -19,6 +19,7 @@ fn movie_with_subtitle_tracks(tmp: &tempfile::TempDir) -> (domain::Media, domain
             title: "TestFilm".into(),
             year: Some(2025),
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: Some("77777".into()),
             douban_id: None,
             tvdb_id: None,
