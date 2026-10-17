@@ -182,6 +182,7 @@ async fn series_scoped_selection_reads_only_that_series_candidates() {
 
     let show = media_id_for_title(&fixture.state, "Show000");
     fixture.files.reset();
+    fixture.state.store().lock().reset_root_ledger_scans();
     let scoped = get_json(
         &app,
         &format!(
@@ -190,12 +191,9 @@ async fn series_scoped_selection_reads_only_that_series_candidates() {
         ),
     )
     .await;
+    let scans = fixture.state.store().lock().root_ledger_scans();
     assert_eq!(scoped["TotalRecordCount"], 10, "只列这部剧的分集：{scoped}");
-    assert!(
-        fixture.files.metadata() <= 2,
-        "剧作用域只读这部剧的候选，实际 stat {}",
-        fixture.files.metadata()
-    );
+    assert_eq!(scans, 0, "剧作用域不得扫无 WHERE 的根账本，实际 {scans}");
     assert_eq!(fixture.files.subtitles(), 1);
 }
 
@@ -224,19 +222,36 @@ async fn read_failure_never_becomes_a_silently_empty_page() {
     );
     assert_eq!(items(&listing).len(), 1);
 
-    // 读本身失败时必须是错误响应，而不是「更小的一页」。
-    let (broken_status, _) = get(
-        &app,
+    let heavy_fixture = tv_fixture(1, 2);
+    let heavy_app = router(heavy_fixture.state.clone());
+    let failing = {
+        let store = heavy_fixture.state.store();
+        let store = store.lock();
+        store.list_ledger().unwrap().into_iter().next().expect("row").id
+    };
+    let conn = rusqlite::Connection::open(
+        heavy_fixture.dir.path().join("data/library.db"),
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO file_meta (ledger_id, audio_json, subtitle_json, chapters_json)
+         VALUES (?1, '[]', '[]', x'0102')",
+        [failing.to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    let (broken_status, broken) = get(
+        &heavy_app,
         &format!(
-            "/Items?ParentId={}&Recursive=true&IncludeItemTypes=Episode",
-            fixture.library_id
+            "/Items?ParentId={}&Recursive=true&IncludeItemTypes=Episode&Limit=2",
+            heavy_fixture.library_id
         ),
     )
     .await;
     assert_eq!(
         broken_status,
         StatusCode::INTERNAL_SERVER_ERROR,
-        "读取失败必须报错"
+        "重元数据读取失败必须报错：{broken}"
     );
 }
 
@@ -266,6 +281,7 @@ async fn jellyfin_selection_records_candidate_and_heavy_counts() {
 
     let show = media_id_for_title(&fixture.state, "Show000");
     let before = candidates.load(Ordering::SeqCst);
+    fixture.state.store().lock().reset_root_ledger_scans();
     let scoped = get_json(
         &app,
         &format!(
@@ -274,7 +290,9 @@ async fn jellyfin_selection_records_candidate_and_heavy_counts() {
         ),
     )
     .await;
+    let scans = fixture.state.store().lock().root_ledger_scans();
     assert_eq!(scoped["TotalRecordCount"], 10);
+    assert_eq!(scans, 0, "整库读后再过滤仍会记根账本扫描，实际 {scans}");
     assert_eq!(
         candidates.load(Ordering::SeqCst) - before,
         10,

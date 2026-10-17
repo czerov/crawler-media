@@ -61,6 +61,7 @@ async fn next_up_pages_after_aggregating_every_series() {
     assert_eq!(paged["TotalRecordCount"], 5, "total 是聚合后的完整条数");
     assert_eq!(items(&paged).len(), 1);
     assert_eq!(items(&paged)[0]["Id"], items(&all)[4]["Id"]);
+    assert_eq!(items(&paged)[0]["SeriesName"], items(&all)[4]["SeriesName"]);
     assert_eq!(
         fixture.files.subtitles(),
         6,

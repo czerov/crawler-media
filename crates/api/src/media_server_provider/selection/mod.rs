@@ -20,7 +20,7 @@ use media_server::provider::query::{
 };
 use media_server::provider::{MediaItemSnapshot, ServerItemPage, ServerItemQuery};
 
-use super::enrichment::catalog_merge;
+
 use super::item_metadata;
 use super::items::with_date_created;
 use super::*;
@@ -85,6 +85,7 @@ fn select_items_blocking(
     let (scope, mut items) = {
         let store = state.store.lock();
         let scope = read_scope(&store, user_id, &query)?;
+        count_candidates(state, scope.rows_read);
         let items = if scope.unresolved {
             Vec::new()
         } else {
@@ -95,7 +96,6 @@ fn select_items_blocking(
     if scope.unresolved {
         return Ok(ServerItemPage::default());
     }
-    count_candidates(state, items.len());
     // 复杂 NFO 过滤的冷启动成本是线性的（每条候选一次 NFO 读）：显式记录，不假装
     // 全部落在 SQL seek 上。
     if needs_filter_facts(&query, scope.unknown_parent) {
@@ -114,12 +114,11 @@ fn select_items_blocking(
         }
     }
     if query.person_ids.is_some() {
-        // 轻筛字段必须完整后选页：person 过滤不允许「选页后再 enrich 再筛」。
+        // 轻筛字段必须完整后选页：person 过滤不允许「选页后再 enrich 再筛」，
+        // catalog 失败也不能当成「这个人没出现」从而缩成更小的一页。探测与
+        // person 成员无关，只在选中的页上、锁外安排。
         for item in &mut items {
-            if !item.snapshot.is_series {
-                crate::http::library::ensure_probe_enqueued(state, &item.snapshot.row);
-            }
-            let merge = catalog_merge(state, &item.snapshot);
+            let merge = super::enrichment::catalog_merge_required(state, &item.snapshot)?;
             if let Some(merge) = merge.as_ref() {
                 let metadata = std::mem::take(&mut item.snapshot.metadata);
                 item.snapshot.metadata = merge.apply(metadata, &item.snapshot.media);
@@ -178,9 +177,10 @@ fn select_items_blocking(
     let selected: Vec<LightItem> = kept.into_iter().skip(query.offset).take(query.limit).collect();
     let mut page_items = Vec::with_capacity(selected.len());
     for item in selected {
-        page_items.push(heavy_snapshot(state, user_id, item)?);
+        let snapshot = heavy_snapshot(state, user_id, item)?;
+        count_heavy(state, 1);
+        page_items.push(snapshot);
     }
-    count_heavy(state, page_items.len());
     Ok(ServerItemPage {
         items: page_items,
         total,
@@ -198,6 +198,7 @@ fn next_up_blocking(
     let (scope, items) = {
         let store = state.store.lock();
         let scope = read_scope(&store, user_id, &query)?;
+        count_candidates(state, scope.rows_read);
         let items = if scope.unresolved {
             Vec::new()
         } else {
@@ -208,7 +209,6 @@ fn next_up_blocking(
     if scope.unresolved {
         return Ok(ServerItemPage::default());
     }
-    count_candidates(state, items.len());
     // 一次聚合：候选按 Media 分组（保持候选顺序），每个 Media 取 (季, 集) 最小的
     // 未看条目，再整体分页。显式给了 SeriesId 时按旧语义允许任意 Media（含电影）。
     let restrict_kind = series_id.is_none();
@@ -243,8 +243,8 @@ fn next_up_blocking(
     let mut page_items = Vec::with_capacity(selected.len());
     for item in selected {
         page_items.push(heavy_snapshot(state, user_id, item)?);
+        count_heavy(state, 1);
     }
-    count_heavy(state, page_items.len());
     Ok(ServerItemPage {
         items: page_items,
         total,
@@ -266,7 +266,7 @@ fn next_up_query(series_id: Option<&str>) -> ServerItemQuery {
 /// 本页重元数据：tracks/chapters/intro-outro/NFO/stat/外部字幕都在这里。
 fn heavy_snapshot(
     state: &ApiState,
-    user_id: UserId,
+    _user_id: UserId,
     item: LightItem,
 ) -> Result<MediaItemSnapshot, String> {
     let browse = state.browse_files.as_ref();
@@ -276,6 +276,8 @@ fn heavy_snapshot(
         stat_paths,
         catalog,
         date_created,
+        unit,
+        whole_unit,
     } = item;
     let MediaItemSnapshot {
         row,
@@ -290,7 +292,7 @@ fn heavy_snapshot(
     } = snapshot;
     let (facts, chapters, marker) = {
         let store = state.store.lock();
-        let (unit, whole_unit) = item_metadata::row_units(&store, user_id, &row, is_series);
+        // 过滤、计数和返回的 UserData 必须来自同一次单元观察，不能在这里重读。
         let facts = item_metadata::item_db_facts(
             &store,
             &row,
@@ -311,6 +313,10 @@ fn heavy_snapshot(
         item_metadata::item_metadata(facts, browse, &row, &media, is_series, child_counts);
     if let Some(catalog) = catalog.as_ref() {
         metadata = catalog.apply(metadata, &media);
+    }
+    if !is_series {
+        // 探测不能改变 person 成员或计数，只为已经选中的页安排，且不持有 Store 锁。
+        crate::http::library::ensure_probe_enqueued(state, &row);
     }
     let date_created =
         date_created.or_else(|| paths_date_created(browse, is_series, &stat_paths));

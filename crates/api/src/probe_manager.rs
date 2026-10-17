@@ -77,6 +77,9 @@ pub struct ProbeManager {
     pub(crate) recovered_marker_refreshes: Mutex<Vec<(crate::store::ProbeJob, ProbeUnit)>>,
     clock: Mutex<Arc<dyn clock::ProbeClock>>,
     pub comparison_runs: std::sync::atomic::AtomicUsize,
+    /// Times `request_probe` assessed a row. Selection must not assess rows
+    /// that are not on the selected page.
+    pub assessments: AtomicUsize,
 }
 
 impl ProbeManager {
@@ -120,6 +123,7 @@ impl ProbeManager {
             recovered_marker_refreshes: Mutex::new(Vec::new()),
             clock: Mutex::new(Arc::new(clock::SystemClock)),
             comparison_runs: std::sync::atomic::AtomicUsize::new(0),
+            assessments: AtomicUsize::new(0),
         };
         manager.recover_pending_jobs();
         manager
@@ -139,6 +143,7 @@ impl ProbeManager {
         origin: policy::ProbeRequestOrigin,
     ) -> Result<policy::ProbeRequestResult, store::StoreError> {
         let now_ms = self.clock.lock().now_ms();
+        self.assessments.fetch_add(1, Ordering::SeqCst);
         let need = policy::assess_probe_need(&self.store.lock(), row, origin, now_ms);
         if !matches!(need.retry, policy::ProbeRequestResult::Complete) {
             return Ok(need.retry);

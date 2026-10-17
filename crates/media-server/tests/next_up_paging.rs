@@ -267,6 +267,12 @@ async fn next_up_does_not_rescan_for_each_series() {
     assert_eq!(body["TotalRecordCount"], SERIES);
     assert_eq!(body["Items"].as_array().map(Vec::len), Some(1));
     assert_eq!(
+        body["Items"][0]["ParentId"],
+        series_media_id(0).to_string().replace('-', ""),
+        "Limit=1 必须是聚合后的第一条，而不是任意一条"
+    );
+    assert_eq!(body["Items"][0]["IndexNumber"], 1);
+    assert_eq!(
         provider.list_calls(),
         1,
         "一次聚合只能有一次列表读（旧实现为每个 series 再查一次：{} 次）",
@@ -302,6 +308,14 @@ async fn next_up_pages_after_aggregating_every_series() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["TotalRecordCount"], SERIES, "total 是聚合后的完整条数");
     assert_eq!(body["Items"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        body["Items"][0]["ParentId"],
+        series_media_id(48).to_string().replace('-', "")
+    );
+    assert_eq!(
+        body["Items"][1]["ParentId"],
+        series_media_id(49).to_string().replace('-', "")
+    );
     let (status, beyond) = get(provider.clone(), "/Shows/NextUp?StartIndex=500").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(beyond["Items"].as_array().map(Vec::len), Some(0));

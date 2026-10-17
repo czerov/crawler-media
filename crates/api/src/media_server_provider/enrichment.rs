@@ -19,8 +19,27 @@ impl CatalogMerge {
 }
 
 /// 锁外同步取载荷：catalog 缓存/网络都在这里，调用方不得持有 Store 锁。
+///
+/// 单条目 enrich 把读取失败当成「没有 catalog」：那只影响可选字段。选择路径在
+/// person 过滤需要这份事实时必须用 [`catalog_merge_required`]，失败要向上抛。
 pub(super) fn catalog_merge(state: &ApiState, snapshot: &MediaItemSnapshot) -> Option<CatalogMerge> {
-    let tmdb_id = snapshot.media.tmdb_id.clone()?;
+    match catalog_merge_required(state, snapshot) {
+        Ok(merge) => merge,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load optional catalog metadata for Jellyfin item");
+            None
+        }
+    }
+}
+
+/// 选择路径用：catalog 读取失败是错误，不是「这个人没出现」。
+pub(super) fn catalog_merge_required(
+    state: &ApiState,
+    snapshot: &MediaItemSnapshot,
+) -> Result<Option<CatalogMerge>, String> {
+    let Some(tmdb_id) = snapshot.media.tmdb_id.clone() else {
+        return Ok(None);
+    };
     let metadata = match crate::scrape_metadata::fetch_tmdb_metadata(
         state,
         snapshot.media.kind,
@@ -29,18 +48,18 @@ pub(super) fn catalog_merge(state: &ApiState, snapshot: &MediaItemSnapshot) -> O
         Ok(Some(metadata)) => metadata,
         Ok(None) => {
             tracing::debug!(%tmdb_id, "catalog returned no metadata for Jellyfin item");
-            return None;
+            return Ok(None);
         }
         Err(error) => {
             tracing::warn!(%error, %tmdb_id, "failed to load catalog metadata for Jellyfin item");
-            return None;
+            return Err(error);
         }
     };
     let episode = (!snapshot.is_series && snapshot.media.kind == MediaKind::Tv)
         .then(|| snapshot.row.season.zip(snapshot.row.episode))
         .flatten()
         .and_then(|(season, episode)| catalog_episode(state, &tmdb_id, season, episode));
-    Some(CatalogMerge { metadata, episode })
+    Ok(Some(CatalogMerge { metadata, episode }))
 }
 
 impl ApiServerProvider {

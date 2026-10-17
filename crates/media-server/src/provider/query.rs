@@ -414,8 +414,7 @@ pub fn sort_snapshots<T>(
     rows.sort_by(|left, right| {
         let left = snapshot(left);
         let right = snapshot(right);
-        let ordering = keys
-            .iter()
+        keys.iter()
             .enumerate()
             .map(|(index, key)| {
                 let ordering = match key.to_ascii_lowercase().as_str() {
@@ -441,8 +440,7 @@ pub fn sort_snapshots<T>(
                 }
             })
             .find(|ordering| *ordering != std::cmp::Ordering::Equal)
-            .unwrap_or_else(|| left.row.id.to_string().cmp(&right.row.id.to_string()));
-        ordering
+            .unwrap_or_else(|| left.media.id.to_string().cmp(&right.media.id.to_string()))
     });
 }
 
@@ -556,14 +554,38 @@ pub async fn legacy_select(
         _ => None,
     };
     let mut rows = provider.list_visible_items(user, parent_id_for_provider).await?;
-    // folder 归属必须先于折叠：折叠后的代表行属于哪个 root 不能决定整个 series
-    // 是否属于该 folder。
-    if let ParentScope::Folder(root) = &scope {
-        rows.retain(|item| Path::new(&item.row.path).starts_with(root));
-    }
     let wants_episodes = query.wants_episodes();
     let wants_series = query.wants_series();
-    if wants_episodes && rows.iter().any(|row| row.is_series) {
+    // folder 归属必须先于折叠：代表行在别的根下不能决定整个 series 是否属于
+    // 这个 folder。先取未折叠的分集，再用 folder 内的行重建剧快照。
+    if let ParentScope::Folder(root) = &scope {
+        if wants_episodes && rows.iter().any(|row| row.is_series) {
+            let mut expanded = Vec::new();
+            for item in rows {
+                if item.is_series {
+                    let series_id = item.media.id.to_string().replace('-', "");
+                    let episodes = provider.list_visible_items(user, Some(&series_id)).await?;
+                    let in_folder: Vec<MediaItemSnapshot> = episodes
+                        .into_iter()
+                        .filter(|episode| Path::new(&episode.row.path).starts_with(root))
+                        .collect();
+                    if wants_series {
+                        if let Some(representative) = in_folder.first() {
+                            let mut series = item;
+                            series.row = representative.row.clone();
+                            expanded.push(series);
+                        }
+                    }
+                    expanded.extend(in_folder);
+                } else if Path::new(&item.row.path).starts_with(root) {
+                    expanded.push(item);
+                }
+            }
+            rows = expanded;
+        } else {
+            rows.retain(|item| Path::new(&item.row.path).starts_with(root));
+        }
+    } else if wants_episodes && rows.iter().any(|row| row.is_series) {
         let mut expanded = Vec::new();
         for item in rows {
             if item.is_series {
@@ -585,10 +607,6 @@ pub async fn legacy_select(
             }
         }
         rows = expanded;
-        // 展开读的是整季（不一定限于 folder），所以 folder 前缀要再收一次。
-        if let ParentScope::Folder(root) = &scope {
-            rows.retain(|item| Path::new(&item.row.path).starts_with(root));
-        }
     }
     let genre_target = if needs_items {
         match classify_genre_or_studio(parent.unwrap_or_default(), &rows) {
@@ -635,17 +653,25 @@ pub async fn legacy_next_up(
     let candidates = provider
         .list_visible_items(user, requested.as_deref())
         .await?;
+    // 显式 SeriesId 与生产路径一致：不限制种类（电影也能返回）。缺省才只要 TV。
+    let restrict_kind = series_id.is_none();
     let mut episodes: Vec<MediaItemSnapshot> = candidates
         .iter()
-        .filter(|item| !item.is_series && item.media.kind == MediaKind::Tv)
+        .filter(|item| {
+            !item.is_series && (!restrict_kind || item.media.kind == MediaKind::Tv)
+        })
         .cloned()
         .collect();
-    if episodes.is_empty() && candidates.iter().any(|item| item.is_series) {
-        // 旧式 provider：只有 series 级快照，逐 series 取分集（无界，见文档）。
-        for show in candidates.iter().filter(|item| item.is_series) {
-            let series_id = show.media.id.to_string().replace('-', "");
-            episodes.extend(provider.list_visible_items(user, Some(&series_id)).await?);
+    let expanded_media: HashSet<domain::MediaId> =
+        episodes.iter().map(|item| item.media.id).collect();
+    // 混合粒度：已有分集的 Media 不再展开，缺分集的折叠剧各自展开。
+    for show in candidates.iter().filter(|item| item.is_series) {
+        if expanded_media.contains(&show.media.id) {
+            continue;
         }
+        let series_id = show.media.id.to_string().replace('-', "");
+        let expanded = provider.list_visible_items(user, Some(&series_id)).await?;
+        episodes.extend(expanded.into_iter().filter(|item| !item.is_series));
     }
     Ok(first_unwatched_per_media(episodes, offset, limit))
 }
@@ -704,6 +730,9 @@ mod tests {
         assert!(query.wants_series());
         query.include_item_types = Some("Movie".into());
         query.series_id = None;
+        query.season_id = Some("season-1".into());
+        assert!(query.wants_episodes(), "SeasonId 就是列分集");
+        query.season_id = None;
         assert!(!query.wants_episodes());
         assert!(!query.wants_series());
     }

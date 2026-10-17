@@ -78,6 +78,11 @@ pub struct ApiState {
     /// Jellyfin 选择里真正构建了重元数据（tracks/chapters/NFO/stat）的条目数：
     /// 证明只有选中的那一页被 enrich。
     pub(crate) jellyfin_heavy_items: Arc<std::sync::atomic::AtomicUsize>,
+    /// 测试 seam：浏览请求真正解码的投影 file facts 行数（生产只读计数，无副作用）。
+    /// 用来证明热页只解码选中 Media 的 facts，而不是整库。
+    pub(crate) browse_page_decoded_files: Arc<std::sync::atomic::AtomicUsize>,
+    /// 测试 seam：浏览请求真正解码的投影 media facts 行数。
+    pub(crate) browse_page_decoded_media: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn apply_admin_bootstrap(
@@ -265,6 +270,8 @@ impl ApiState {
             gallery_expansions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             jellyfin_candidates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             jellyfin_heavy_items: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            browse_page_decoded_files: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            browse_page_decoded_media: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             crate::library_lifecycle::resume_library_removals(&state)
@@ -361,6 +368,27 @@ impl ApiState {
     /// Jellyfin 选择构建过重元数据的条目数。
     pub fn jellyfin_heavy_items(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.jellyfin_heavy_items.clone()
+    }
+
+    /// 替换浏览页工作量计数 seam（测试注入自有计数器以观察本页解码行数）。
+    pub fn with_browse_page_counters(
+        mut self,
+        decoded_files: Arc<std::sync::atomic::AtomicUsize>,
+        decoded_media: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.browse_page_decoded_files = decoded_files;
+        self.browse_page_decoded_media = decoded_media;
+        self
+    }
+
+    /// 浏览请求真正解码的投影 file facts 行数。
+    pub fn browse_page_decoded_files(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.browse_page_decoded_files.clone()
+    }
+
+    /// 浏览请求真正解码的投影 media facts 行数。
+    pub fn browse_page_decoded_media(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.browse_page_decoded_media.clone()
     }
 
     /// 替换 notify 发送实现（测试注入阻塞实现以验证预算准入）。

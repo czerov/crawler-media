@@ -242,4 +242,6 @@ mod paged;
 mod scope;
 #[path = "jellyfin_paged_metadata/next_up.rs"]
 mod next_up;
+#[path = "jellyfin_paged_metadata/audit.rs"]
+mod audit;
 

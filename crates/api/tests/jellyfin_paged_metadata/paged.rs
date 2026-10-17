@@ -57,12 +57,10 @@ async fn corrupted_heavy_facts_outside_the_page_do_not_fail_the_page() {
             .into_iter()
             .find(|row| row.path.contains("Show000"))
             .expect("Show000 row");
-        store
-            .put_file_meta(&row.id.to_string(), &library::Tracks::default())
-            .unwrap();
         let conn = rusqlite::Connection::open(fixture.dir.path().join("data/library.db")).unwrap();
         conn.execute(
-            "UPDATE file_meta SET chapters_json = '{ not json', audio_json = 'nope' WHERE ledger_id = ?1",
+            "INSERT INTO file_meta (ledger_id, audio_json, subtitle_json, chapters_json)
+             VALUES (?1, '[]', '[]', x'0102')",
             [row.id.to_string()],
         )
         .unwrap();
@@ -79,6 +77,15 @@ async fn corrupted_heavy_facts_outside_the_page_do_not_fail_the_page() {
     .await;
     assert_eq!(listing["TotalRecordCount"], 4);
     assert_eq!(items(&listing)[0]["Name"], "Show003");
+    let (status, body) = get(
+        &app,
+        &format!(
+            "/Items?ParentId={}&Recursive=true&IncludeItemTypes=Series&SortBy=SortName&SortOrder=Ascending&Limit=1",
+            fixture.library_id
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "选中损坏行必须失败：{body}");
 }
 
 /// SCOPE-6-01：库作用域 + `SeriesId` 就是「列这部剧的分集」，与 `IncludeItemTypes`
@@ -215,8 +222,10 @@ async fn unknown_parent_returns_an_empty_page() {
     let app = router(fixture.state.clone());
     let unknown = get_json(&app, "/Items?ParentId=does-not-exist&Recursive=true").await;
     assert_eq!(unknown["TotalRecordCount"], 0, "{unknown}");
+    assert!(items(&unknown).is_empty(), "{unknown}");
     let movie_shaped = get_json(&app, &format!("/Items?ParentId={}", MediaId::new())).await;
     assert_eq!(movie_shaped["TotalRecordCount"], 0, "{movie_shaped}");
+    assert!(items(&movie_shaped).is_empty(), "{movie_shaped}");
     let unknown_folder = get_json(
         &app,
         &format!(
@@ -226,6 +235,7 @@ async fn unknown_parent_returns_an_empty_page() {
     )
     .await;
     assert_eq!(unknown_folder["TotalRecordCount"], 0, "{unknown_folder}");
+    assert!(items(&unknown_folder).is_empty(), "{unknown_folder}");
 }
 
 /// 最新列表：缺省只排不筛（已看完沉底），显式 `IsPlayed` 才严格筛。
@@ -253,6 +263,14 @@ async fn latest_items_keeps_played_last_by_default_and_filters_when_asked() {
     let latest = get_json(&app, "/Users/me/Items/Latest").await;
     let listed = latest.as_array().expect("latest array");
     assert_eq!(listed.len(), 3);
+    let ids: Vec<&str> = listed.iter().map(|item| item["Id"].as_str().unwrap()).collect();
+    let unique = {
+        let mut copy = ids.clone();
+        copy.sort_unstable();
+        copy.dedup();
+        copy.len()
+    };
+    assert_eq!(unique, ids.len(), "最新列表不得重复：{ids:?}");
     assert_eq!(
         listed.last().unwrap()["Id"],
         first_show.to_string().replace('-', ""),
@@ -323,15 +341,19 @@ async fn name_ties_keep_a_stable_order() {
                 &[],
             )
             .unwrap();
+        let mut expected = Vec::new();
         for index in 0..3 {
             let media_id = new_media(&store, "Same title");
             let show_dir = root.join(format!("same-{index}"));
             std::fs::create_dir_all(&show_dir).unwrap();
             insert_episode(&store, &show_dir, media_id, 1, 1);
+            expected.push(media_id.to_string().replace('-', ""));
         }
-        library.id
+        expected.sort();
+        (library.id, expected)
     };
     let app = router(state);
+    let (library_id, expected) = library_id;
     let first = get_json(
         &app,
         &format!(
@@ -339,15 +361,6 @@ async fn name_ties_keep_a_stable_order() {
         ),
     )
     .await;
-    let again = get_json(
-        &app,
-        &format!(
-            "/Items?ParentId={library_id}&Recursive=true&IncludeItemTypes=Series&SortBy=SortName&Limit=2"
-        ),
-    )
-    .await;
-    assert_eq!(first, again, "同名 ties 必须稳定");
-    assert_eq!(first["TotalRecordCount"], 3);
     let rest = get_json(
         &app,
         &format!(
@@ -355,12 +368,13 @@ async fn name_ties_keep_a_stable_order() {
         ),
     )
     .await;
-    let mut ids: Vec<String> = items(&first)
+    let ids: Vec<String> = items(&first)
         .iter()
         .chain(items(&rest).iter())
         .map(|item| item["Id"].as_str().unwrap().to_string())
         .collect();
-    ids.sort();
-    ids.dedup();
-    assert_eq!(ids.len(), 3, "分页不得重复或漏条目");
+    assert_eq!(
+        ids, expected,
+        "同名次序必须是 ledger id 升序；去掉 tie-break 或先排序再断言都会放过错误实现"
+    );
 }

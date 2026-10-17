@@ -27,6 +27,8 @@ pub(super) struct ScopedRead {
     pub(super) unresolved: bool,
     /// parent 既不是库/剧/folder：要靠 item metadata 判 genre/studio。
     pub(super) unknown_parent: bool,
+    /// SQL 实际返回、进入作用域的行数（折叠前）。与逻辑候选条数分开记。
+    pub(super) rows_read: usize,
 }
 
 pub(super) fn read_scope(
@@ -45,9 +47,15 @@ pub(super) fn read_scope(
     } else {
         None
     };
+    // 认不出的 folder（含不可见根）必须在媒体分支之前拒绝：否则 SeriesId 会带着
+    // folder_root=None 走 ledger_for_media，in_scope_folder 把 None 当成不限制。
+    if is_folder_id && folder.is_none() {
+        return Ok(unresolved_scope(ownership, is_admin, user_id));
+    }
     // Series 判定与 `resolve_parent_scope` 一致：parent 本身是可见的 TV Media。
+    // 只读这个 Media 的行和它的归属，不扫根账本。
     let series_parent = match (parent, library, folder.as_ref()) {
-        (Some(id), None, None) if !is_folder_id => series_media_id(store, user_id, id)?,
+        (Some(id), None, None) if !is_folder_id => series_media_id(store, user_id, id, &ownership, is_admin)?,
         _ => None,
     };
     // 媒体交集（`SeriesId` / 剧 parent）直接下推到 SQL；库与 folder 只是附加归属约束。
@@ -108,6 +116,8 @@ pub(super) fn read_scope(
             None,
         )
     };
+
+    let rows_read = rows.len();
     let ids: Vec<MediaId> = rows.iter().map(|row| row.media_id).collect();
     let media = store.media_batch(&ids).map_err(|error| error.to_string())?;
     let units = store
@@ -127,6 +137,7 @@ pub(super) fn read_scope(
         media_scoped: media_scope.is_some(),
         unresolved: false,
         unknown_parent,
+        rows_read,
     })
 }
 
@@ -147,6 +158,7 @@ pub(super) fn unresolved_scope(
         media_scoped: false,
         unresolved: true,
         unknown_parent: false,
+        rows_read: 0,
     }
 }
 
@@ -182,22 +194,45 @@ fn folder_root_in(parent: &str, libraries: &[crate::store::Library]) -> Option<P
 }
 
 /// parent 是可见的 TV Media 本身（`resolve_single_item` 的 `is_series` 口径）。
+///
+/// 只解析这个 id、读它的 media 和索引化的 ledger 行，再用已经加载的 ownership
+/// 快照判可见性。绝不调用会 `list_ledger()` 的通用解析器。
 fn series_media_id(
     store: &crate::Store,
     user_id: UserId,
     id: &str,
+    ownership: &store::LibraryOwnership,
+    is_admin: bool,
 ) -> Result<Option<MediaId>, String> {
-    let Some(row) = crate::http::media_visibility::resolve_visible_row(store, id, Some(user_id))
-    else {
+    let Some(media_id) = id.parse::<MediaId>().ok() else {
         return Ok(None);
     };
-    let Some(media) = store.get_media(row.media_id).map_err(|error| error.to_string())? else {
+    let Some(media) = store.get_media(media_id).map_err(|error| error.to_string())? else {
         return Ok(None);
     };
+    if media.kind != MediaKind::Tv {
+        return Ok(None);
+    }
     let compact = id.replace('-', "");
-    let is_series = media.kind == MediaKind::Tv
-        && (compact == media.id.to_string().replace('-', "") || id == media.id.to_string());
-    Ok(is_series.then_some(media.id))
+    let media_compact = media.id.to_string().replace('-', "");
+    if compact != media_compact && id != media.id.to_string() {
+        return Ok(None);
+    }
+    let rows = store
+        .ledger_for_media(media.id)
+        .map_err(|error| error.to_string())?;
+    let visible = rows.iter().any(|row| {
+        let Some(owner) = ownership.owner(Path::new(&row.path), media.kind) else {
+            return false;
+        };
+        ownership.accepts_work(&owner.id)
+            && if is_admin {
+                owner.admin_visible
+            } else {
+                owner.access_mode == "everyone" || owner.member_ids.contains(&user_id)
+            }
+    });
+    Ok(visible.then_some(media.id))
 }
 
 pub(super) fn in_scope_folder(scope: &ScopedRead, row: &LedgerRow) -> bool {

@@ -22,9 +22,13 @@ pub(super) struct LightItem {
     /// 非 series：DateCreated 用这条路径 stat；series：这些行取 ingest 最大值。
     pub(super) stat_paths: Vec<String>,
     /// person 过滤用到的 catalog 载荷：本页重建 metadata 时按同一份载荷重放。
-    pub(super) catalog: Option<super::enrichment::CatalogMerge>,
+    pub(super) catalog: Option<super::super::enrichment::CatalogMerge>,
     /// 已为排序算出的 DateCreated，避免本页再 stat 一次。
     pub(super) date_created: Option<SystemTime>,
+    /// 过滤时观察到的本行单元与（series）整片单元。重元数据必须用同一份，
+    /// 不能再读一次 favourite，否则 `IsFavorite=true` 会返回 `IsFavorite=false`。
+    pub(super) unit: Option<crate::store::PlaybackUnitSnapshot>,
+    pub(super) whole_unit: Option<crate::store::PlaybackUnitSnapshot>,
 }
 
 /// 折叠/展开都在同一份候选上完成：folder 归属先定，再决定剧条目与分集条目。
@@ -159,19 +163,19 @@ pub(super) fn light_item(
         .episode
         .map(|value| value as i32)
         .unwrap_or(crate::store::UNIT_WHOLE);
-    let unit = find_unit(units, row.media_id, season, episode);
+    let unit = find_unit(units, row.media_id, season, episode).cloned();
     let (played, play_count, unplayed_item_count) =
         unit_counts_from_snapshot(units, row, media, is_series, show_episodes);
-    let favorite_unit = if is_series {
+    let whole_unit = is_series.then(|| {
         find_unit(
             units,
             row.media_id,
             crate::store::UNIT_WHOLE,
             crate::store::UNIT_WHOLE,
         )
-    } else {
-        unit
-    };
+        .cloned()
+    }).flatten();
+    let favorite_unit = if is_series { whole_unit.as_ref() } else { unit.as_ref() };
     LightItem {
         snapshot: MediaItemSnapshot {
             row: row.clone(),
@@ -179,7 +183,8 @@ pub(super) fn light_item(
             ticks: if is_series {
                 0
             } else {
-                unit.map(|unit| unit.state.position_ms.saturating_mul(10_000))
+                unit.as_ref()
+                    .map(|unit| unit.state.position_ms.saturating_mul(10_000))
                     .unwrap_or(0)
             },
             play_count,
@@ -201,6 +206,8 @@ pub(super) fn light_item(
         stat_paths: vec![row.path.clone()],
         catalog: None,
         date_created: None,
+        unit,
+        whole_unit,
     }
 }
 
