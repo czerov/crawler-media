@@ -25,6 +25,10 @@ export interface LibraryStats {
   file_count: number;
   total_size_bytes: number;
   strm_file_count?: number;
+  /** 投影最后一次真实发布时间（毫秒）；0 = 从未刷新过。 */
+  refreshed_at_ms?: number;
+  /** 体积不是当前 scope 的最新事实（正在重建/投影落后）时为 true。 */
+  stale?: boolean;
 }
 
 /** 媒体库（自契约 Library 的投影；组件引用名保持旧名 MediaLibrary）。 */
@@ -940,7 +944,10 @@ function libraryFrom(raw: unknown): MediaLibrary {
     stats: {
       item_count: num(stats.item_count),
       file_count: num(stats.file_count),
+      strm_file_count: num(stats.strm_file_count),
       total_size_bytes: num(stats.total_size_bytes),
+      refreshed_at_ms: num(stats.refreshed_at_ms),
+      stale: stats.stale == null ? false : bool(stats.stale),
     },
   };
 }

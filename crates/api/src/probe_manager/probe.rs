@@ -279,12 +279,10 @@ async fn probe_adaptive_season(
                     }
                     tracing::error!(error = %e, "自适应整季标记替换失败");
                 } else {
-                    let registry = mgr.library_work.lock().clone();
-                    if let Some(registry) = registry {
+                    if let Some(service) = mgr.chapter_frames() {
                         crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
                             &chapter_updates_clone,
-                            &mgr.store,
-                            &registry,
+                            &service,
                         );
                     }
                     tracing::info!(

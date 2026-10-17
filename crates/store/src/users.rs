@@ -106,6 +106,7 @@ impl Store {
 
     /// "admin" | "member" — defaults to member for rows without a role.
     pub fn user_role(&self, id: UserId) -> Result<String, StoreError> {
+        self.role_lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self
             .app
             .query_row(

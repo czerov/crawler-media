@@ -10,6 +10,7 @@ fn movie() -> Media {
         title: "The Matrix".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("603".into()),
         douban_id: None,
         tvdb_id: None,

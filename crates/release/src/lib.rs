@@ -213,13 +213,15 @@ fn scan_tokens_for_season_episode(tokens: &[String]) -> (Option<u32>, Option<u32
         // 2. Episode xx
         if last_was_episode_word {
             last_was_episode_word = false;
-            if let Ok(e) = token.parse::<u32>() {
-                if episode.is_none() {
-                    episode = Some(e);
-                    if season.is_none() {
-                        season = Some(1);
+            if plausible_episode(token) {
+                if let Ok(e) = token.parse::<u32>() {
+                    if episode.is_none() {
+                        episode = Some(e);
+                        if season.is_none() {
+                            season = Some(1);
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
         }
@@ -293,8 +295,15 @@ fn scan_tokens_for_season_episode(tokens: &[String]) -> (Option<u32>, Option<u32
 fn parse_ep_numbers(ep_part: &str) -> (Option<u32>, Option<u32>) {
     let digits: Vec<&str> = ep_part
         .split(|c: char| !c.is_ascii_digit())
-        .filter(|s| !s.is_empty())
+        .filter(|text| plausible_episode(text))
         .collect();
+    if digits.is_empty() {
+        if let Some(token) = ep_part.split(|c: char| !c.is_ascii_digit()).find(|text| {
+            text.len() == 8 && boundary::is_calendar_date_text(text)
+        }) {
+            boundary::reject_date_token(token);
+        }
+    }
     match digits.as_slice() {
         [from] => (from.parse().ok(), None),
         [from, to] => {

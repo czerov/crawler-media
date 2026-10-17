@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use store::{ProjectionSnapshot, ReadRevisions};
+use store::{ProjectionHead, ProjectionSnapshot, ReadRevisions};
 use tokio::sync::broadcast;
 
 use crate::blocking_budget::{BlockingBudget, BlockingError};
@@ -47,6 +47,9 @@ const PROJECTION_BUILD_CAPACITY: usize = 2;
 /// follower 确定性地放进「终态已发布、条目尚未移除」的窗口，验证 follower 重放
 /// 真实终态而不是伪造 `Cancelled`/`Timeout`。
 pub type PublishBarrier = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// 测试 seam：head 批准之后、按页读取之前的屏障（生产为 `None`）。
+pub type PageApprovalBarrier = Arc<dyn Fn(&ApiState, &str) + Send + Sync>;
 
 #[derive(Debug)]
 pub enum ProjectionError {
@@ -219,6 +222,8 @@ pub struct ProjectionService {
     disabled: bool,
     /// 测试 seam：终态发布后、条目移除前的屏障（生产为 `None`）。
     publish_barrier: Option<PublishBarrier>,
+    /// 测试 seam：head 批准后、按页读取前的屏障（生产为 `None`）。
+    page_approval_barrier: Option<PageApprovalBarrier>,
     deps: Arc<Mutex<ProjectionDependencies>>,
     consumer: Arc<ChangeConsumer>,
 }
@@ -242,6 +247,7 @@ impl ProjectionService {
             deadline: PROJECTION_DEADLINE,
             disabled: false,
             publish_barrier: None,
+            page_approval_barrier: None,
             deps,
             consumer,
         }
@@ -273,6 +279,20 @@ impl ProjectionService {
     pub fn with_publish_barrier(mut self, barrier: PublishBarrier) -> Self {
         self.publish_barrier = Some(barrier);
         self
+    }
+
+    /// 注入「head 批准后、按页读取前」的屏障（测试 seam）：用来确定性地复现
+    /// 「批准与按页读取之间本库被标脏/换代」的竞态。生产为 `None`。
+    pub fn with_page_approval_barrier(mut self, barrier: PageApprovalBarrier) -> Self {
+        self.page_approval_barrier = Some(barrier);
+        self
+    }
+
+    /// 生产为 `None` → no-op；测试用它插入并发变更。
+    pub fn run_page_approval_barrier(&self, state: &ApiState, library_id: &str) {
+        if let Some(barrier) = &self.page_approval_barrier {
+            barrier(state, library_id);
+        }
     }
 
     /// Mark a library projection as dirty.
@@ -588,8 +608,53 @@ impl ProjectionService {
         state: &ApiState,
         library_id: &str,
     ) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
-        // A ready projection is usable only after this request has consumed a bounded
-        // amount of pending journal work. Incomplete sources force the build path.
+        if !self.journal_ready(state, library_id).await? {
+            return Ok(None);
+        }
+        self.load_snapshot(state, library_id).await
+    }
+
+    /// 只读 head 的新鲜度检查（A4 热页）：与 [`Self::ensure`] 同一套 journal 消费、
+    /// 脏标记与 scope 判定，但**不装载整份投影行**。
+    ///
+    /// `Ok(Some(head))` 表示当前 ready 代可直接按页读 facts；`Ok(None)`（脏/scope
+    /// 变化）与 `Err`（容量/超时/取消）一律交回调用方走 `ensure`，不静默降级。
+    pub async fn fresh_head(
+        &self,
+        state: &ApiState,
+        library_id: &str,
+    ) -> Result<Option<ProjectionHead>, ProjectionError> {
+        if self.disabled {
+            return Err(ProjectionError::Failed("browse projection disabled".into()));
+        }
+        self.visited.lock().insert(library_id.to_string());
+        if !self.journal_ready(state, library_id).await? {
+            return Ok(None);
+        }
+        let budget = state.http_work.clone();
+        let state = state.clone();
+        let library_id = library_id.to_string();
+        match budget
+            .run(
+                crate::http::library::selection::BROWSE_DEADLINE,
+                move || fresh_head_inner(&state, &library_id),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(budget_error(error)),
+        }
+    }
+
+    /// journal 消费 + 脏标记判定：整份快照与只读 head 两条新鲜度检查共用。
+    ///
+    /// A ready projection is usable only after this request has consumed a bounded
+    /// amount of pending journal work. Incomplete sources force the build path.
+    pub(crate) async fn journal_ready(
+        &self,
+        state: &ApiState,
+        library_id: &str,
+    ) -> Result<bool, ProjectionError> {
         let budget = state.http_work.clone();
         let consumer = self.consumer.clone();
         let state_for_poll = state.clone();
@@ -606,62 +671,71 @@ impl ProjectionService {
                 },
             )
             .await
-            .map_err(|error| match error {
-                BlockingError::Busy => ProjectionError::Busy,
-                BlockingError::Timeout => ProjectionError::Timeout,
-                BlockingError::Worker(message) => ProjectionError::Failed(message),
-            })??;
+            .map_err(budget_error)??;
         if !sources_complete {
             tracing::debug!(library_id = %library_id, "浏览投影等待 journal 完整消费");
             return Err(ProjectionError::Busy);
         }
-        if self.dirty_libraries.lock().contains_key(library_id) {
-            return Ok(None);
-        }
+        Ok(!self.dirty_libraries.lock().contains_key(library_id))
+    }
+
+    /// 锁内装载整份投影行（facets/item-index/回退路径仍需要它）。
+    ///
+    /// 与只读 head 同一套 ready/scope 判定：scope 变了就不能把旧投影交给调用方
+    /// （A4-02 恢复的检查），否则回退路径会返回过期 scope 的事实。
+    async fn load_snapshot(
+        &self,
+        state: &ApiState,
+        library_id: &str,
+    ) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
         let budget = state.http_work.clone();
         let state = state.clone();
         let library_id = library_id.to_string();
         match budget
             .run(
                 crate::http::library::selection::BROWSE_DEADLINE,
-                move || fresh_snapshot_inner(&state, &library_id),
+                move || {
+                    let store = state.store.lock();
+                    if store
+                        .fresh_head_locked(&library_id)
+                        .map_err(|error| ProjectionError::Failed(error.to_string()))?
+                        .is_none()
+                    {
+                        return Ok(None);
+                    }
+                    store
+                        .browse_projection(&library_id)
+                        .map_err(|error| ProjectionError::Failed(error.to_string()))
+                },
             )
             .await
         {
             Ok(result) => result,
-            Err(BlockingError::Busy) => Err(ProjectionError::Busy),
-            Err(BlockingError::Timeout) => Err(ProjectionError::Timeout),
-            Err(BlockingError::Worker(message)) => Err(ProjectionError::Failed(message)),
+            Err(error) => Err(budget_error(error)),
         }
     }
 }
 
-/// 锁内读当前 scope 指纹 / 投影状态，仅依据 per-library dirty_token 与 state='ready'
-/// 判定普通新鲜度（D3-01 / D3-02），全局 revisions 仅保留在发布时的回退检查中。
-fn fresh_snapshot_inner(
+fn budget_error(error: BlockingError) -> ProjectionError {
+    match error {
+        BlockingError::Busy => ProjectionError::Busy,
+        BlockingError::Timeout => ProjectionError::Timeout,
+        BlockingError::Worker(message) => ProjectionError::Failed(message),
+    }
+}
+
+/// 锁内只读 head：仅依据 per-library scope 指纹、`state='ready'` 与 dirty_token
+/// 判定普通新鲜度（D3-01 / D3-02），不装载投影行。
+///
+/// 判定与「批准后复核」共用 store 的同一个实现，避免两处口径分叉。
+fn fresh_head_inner(
     state: &ApiState,
     library_id: &str,
-) -> Result<Option<ProjectionSnapshot>, ProjectionError> {
-    let current = {
-        let store = state.store.lock();
-        let scope_signature = store
-            .get_library(library_id)
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?
-            .map(|library| builder::scope_signature(&library));
-        let head = store
-            .browse_projection_head(library_id)
-            .map_err(|e| ProjectionError::Failed(e.to_string()))?;
-        let snapshot = match head {
-            Some(h) if h.ready && Some(h.scope_signature.as_str()) == scope_signature.as_deref() => {
-                store
-                    .browse_projection(library_id)
-                    .map_err(|e| ProjectionError::Failed(e.to_string()))?
-            }
-            _ => None,
-        };
-        snapshot
-    };
-    Ok(current)
+) -> Result<Option<ProjectionHead>, ProjectionError> {
+    let store = state.store.lock();
+    store
+        .fresh_head_locked(library_id)
+        .map_err(|error| ProjectionError::Failed(error.to_string()))
 }
 
 fn poll_changes_inner(
@@ -670,7 +744,7 @@ fn poll_changes_inner(
 ) -> Result<bool, ProjectionError> {
     let store = state.store.lock();
     consumer
-        .hydrate_ready_dependencies(&store)
+        .hydrate_ready_dependencies(&store, &changes::HydrationCounters::from_state(state))
         .map_err(|error| ProjectionError::Failed(error.to_string()))?;
     let ownership = store
         .library_ownership()

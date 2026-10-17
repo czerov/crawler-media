@@ -253,6 +253,7 @@ fn incoming_media(media_kind: MediaKind, media_input: MediaInput) -> Media {
         title: media_input.title,
         year: media_input.year,
         original_title: media_input.original_title.filter(|t| !t.is_empty()),
+        aliases: Vec::new(),
         tmdb_id: media_input.tmdb_id.filter(|id| !id.is_empty()),
         douban_id: media_input.douban_id.filter(|id| !id.is_empty()),
         tvdb_id: media_input.tvdb_id.filter(|id| !id.is_empty()),

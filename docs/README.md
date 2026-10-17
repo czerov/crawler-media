@@ -11,6 +11,7 @@
 5. API 约定：[self](<api-contracts/self.md>)；完整现行路由读 [后端](<../crates/api/src/http/mod.rs>) 与前端 API 模块，文档不复制动态路由表。
 6. 部署与默认清理警告：[deploy](<deploy.md>)；UI／设备验收清单：[system regression](<testing/system-regression-cases.md>)，**清单不是执行结果**。
 7. 最近一轮三批优化的验收结果：[batched performance acceptance](<audits/2026-10-13-batched-performance/acceptance.md>)。
+8. **当前数据库全量字典：** [数据库设计与查询关系总览](<database/README.md>)，下分 6 个 DB 的全部表、字段、约束、索引；明确区分真实 JOIN、跨文件应用拼接与待评审设计。
 
 ## 文档保留规则
 

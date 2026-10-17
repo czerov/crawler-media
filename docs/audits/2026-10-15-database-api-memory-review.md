@@ -236,6 +236,30 @@ cargo test -p api --lib probe_manager::tests::marker_refresh_lifecycle::tmp_repr
 
 生产规模盘点、release 前后接口矩阵、heap/RSS 长稳、慢 NAS 故障注入、真实 ffmpeg 大批量、VidHub/Infuse 设备验证均未做。计划目标是验收门，不是结果。
 
+### 7.5 X1 closure evidence (2026-10-17)
+
+Additive status evidence only; original experiments above are unchanged. No X1 commit SHA was observed (uncommitted working tree). See [acceptance matrix](<../benchmarks/2026-10-15-performance-resource-acceptance.md>) for the complete per-ID matrix.
+
+| ID | Status | Closure evidence |
+|---|---|---|
+| DB-01 | partial | Prior synthetic VM evidence retained; no new bundled SQLite release measurement. |
+| DB-02 | partial | Prior synthetic VM evidence retained; no new release measurement. |
+| DB-03 | open | No slow-mount/lock regression exercised. |
+| DB-04 | open | No cross-library invalidation/crash regression exercised. |
+| DB-05 | open | No production retention run or cleanup authorization. |
+| DB-06 | partial | Prior synthetic VM evidence retained; no new release measurement. |
+| DB-07 | design-gated | Default-library ownership remains an unapproved design gate. |
+| API-01 | partial | Prior scoped regression coverage exists; no new release-scale sample. |
+| API-02 | open | Temp fixture auth characterization only; slow-I/O and heartbeat availability not established. |
+| API-03 | partial | Existing scale regression not rerun in X1. |
+| API-04 | partial | Existing page-work regression not rerun in X1. |
+| API-05 | partial | Existing up-next regression not rerun in X1. |
+| MEM-01 | partial | Prior fake-fetcher evidence retained; not rerun in X1. |
+| MEM-02 | open | No new cache-capacity/eviction evidence. |
+| MEM-03 | open | R3 pending; task drain assertion ignored without public lifecycle seam. |
+| MEM-04 | open | R4 pending; queue recovery/drain assertion ignored without public seam. |
+| MEM-05 | partial | `pnpm -C web test` (791 passed) and `pnpm -C web typecheck` (exit 0) passed. |
+
 ## 8. 文档与授权边界
 
 - [修复设计与硬约束](<../superpowers/specs/2026-10-15-performance-resource-remediation.md>)。

@@ -29,6 +29,7 @@ fn make_movie_fixtures() -> (Media, domain::Subscribe, domain::Filter, Torrent) 
         title: "Movie".into(),
         year: Some(1999),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         bangumi_id: None,

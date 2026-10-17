@@ -40,6 +40,7 @@ async fn concurrent_manual_refresh_returns_same_active_job() {
         title: "Test TV Refresh".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

@@ -8,11 +8,9 @@ use serde_json::{Value, json};
 
 use crate::auth::AuthUser;
 use crate::dto::item_dto_json;
+use crate::provider::query;
 
-use super::item_filters::{self, filter_items};
-use super::parent_scope::{
-    ParentScope, classify_genre_or_studio, library_parent, require_user_path, resolve_parent_scope,
-};
+use super::parent_scope::require_user_path;
 use super::{AppState, ItemsQuery, UserItemPath, UserPath, item_id_for_user};
 
 pub(super) async fn items(
@@ -28,38 +26,20 @@ pub(super) async fn items(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let parent = query.parent_id.as_deref();
-    let series = query.series_id.as_deref();
-    let scope =
-        resolve_parent_scope(state.provider.as_ref(), user.id, parent, series, &libraries).await?;
-    // Genre / Studio 只能靠 item metadata 判断（既有行为是在拿到 items 之后判定），
-    // 所以这里先按廉价分类取 items，稍后再升级 scope。
-    let needs_items = matches!(scope, ParentScope::Unknown);
-    let parent_id_for_provider = match &scope {
-        ParentScope::Library(id) | ParentScope::Series(id) => Some(id.as_str()),
-        _ => None,
-    };
-    let mut rows = state
-        .provider
-        .list_visible_items(user.id, parent_id_for_provider)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let is_library_parent = matches!(scope, ParentScope::Library(_));
-    let is_folder_id = parent.map(|pid| pid.starts_with("folder_")).unwrap_or(false);
-    let wants_episodes = query
-        .include_item_types
-        .as_deref()
-        .map(|types| types.split(',').any(|t| t.trim().eq_ignore_ascii_case("Episode")))
-        .unwrap_or(false);
-    let is_folder_query = query.is_folder.unwrap_or(false);
     let recursive = query.recursive.unwrap_or(true);
+    let is_folder_query = query.is_folder.unwrap_or(false);
+    let is_library_parent = parent
+        .map(|parent_id| libraries.iter().any(|library| library.id == parent_id))
+        .unwrap_or(false);
+    // 库根 + 非递归/IsFolder：仍然是 root 目录列表，保持既有协议行为。
     if is_library_parent && (!recursive || is_folder_query) {
-        if let Some(lib_id) = query.parent_id.as_deref() {
-            if let Some(target_lib) = libraries.iter().find(|l| l.id == lib_id) {
+        if let Some(lib_id) = parent {
+            if let Some(target_lib) = libraries.iter().find(|library| library.id == lib_id) {
                 let mut folder_items: Vec<Value> = Vec::new();
                 let server_id = state.provider.server_id();
                 for root in &target_lib.root_paths {
                     let folder_name = root.file_name().and_then(|n| n.to_str()).unwrap_or("folder");
-                    let folder_id = format!("folder_{}", uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, root.to_string_lossy().as_bytes()).simple());
+                    let folder_id = crate::provider::query::folder_id_for_root(root);
                     folder_items.push(json!({
                         "Name": folder_name,
                         "ServerId": server_id,
@@ -78,96 +58,18 @@ pub(super) async fn items(
             }
         }
     }
-    if is_folder_id {
-        if let Some(target_folder_id) = query.parent_id.as_deref() {
-            rows.retain(|item| match &scope {
-                // scope 已经解析出该 folder_ id 对应的库根。
-                ParentScope::Folder(root) => {
-                    std::path::Path::new(&item.row.path).starts_with(root)
-                }
-                // folder_ + SeriesId 的既有组合：provider 收到的是 folder id，
-                // 这里按原逻辑兜底（结果同样是空）。
-                _ => folder_id_matches(&libraries, &target_folder_id, &item.row.path),
-            });
-        }
-    }
-    if wants_episodes && rows.iter().any(|r| r.is_series) {
-        let mut expanded = Vec::new();
-        for item in rows {
-            if item.is_series {
-                let series_id = item.media.id.to_string().replace('-', "");
-                let episodes = if is_library_parent {
-                    let Some(library_id) = query.parent_id.as_deref() else { continue };
-                    state.provider.list_visible_items_in_library(user.id, Some(&series_id), library_id).await
-                } else {
-                    state.provider.list_visible_items(user.id, Some(&series_id)).await
-                };
-                if let Ok(episodes) = episodes {
-                    expanded.extend(episodes);
-                }
-            } else {
-                expanded.push(item);
-            }
-        }
-        rows = expanded;
-    }
-    // genre/studio 判定保持既有位置（folder 过滤与分集展开之后）。认不出 genre/studio
-    // 的 parent 一律返回空集合，绝不退化成整库。
-    let genre_target = if needs_items {
-        match classify_genre_or_studio(parent.unwrap_or_default(), &rows) {
-            ParentScope::Genre(id) | ParentScope::Studio(id) => Some(id),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    if let Some(target_id) = genre_target {
-        rows.retain(|item| {
-            item.metadata.genres.iter().any(|g| {
-                let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).hyphenated().to_string();
-                let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, g.as_bytes()).simple().to_string();
-                target_id.eq_ignore_ascii_case(&u) || target_id.eq_ignore_ascii_case(&s) || g.eq_ignore_ascii_case(&target_id)
-            }) || item.metadata.studios.iter().any(|st| {
-                let u = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).hyphenated().to_string();
-                let s = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, st.as_bytes()).simple().to_string();
-                target_id.eq_ignore_ascii_case(&u) || target_id.eq_ignore_ascii_case(&s) || st.eq_ignore_ascii_case(&target_id)
-            })
-        });
-    } else if needs_items {
-        return Ok(Json(json!({ "Items": [], "TotalRecordCount": 0 })));
-    }
-    if query.person_ids.is_some() {
-        let mut enriched = Vec::with_capacity(rows.len());
-        for row in rows {
-            enriched.push(state.provider.enrich_visible_item(row).await);
-        }
-        rows = enriched;
-    }
-    let rows = filter_items(rows, &query);
-    let episodes_only = !rows.is_empty()
-        && rows
-            .iter()
-            .all(|item| item.media.kind == domain::MediaKind::Tv && !item.is_series);
-    let (default_sort, default_order) = if episodes_only {
-        ("ParentIndexNumber,IndexNumber", "Ascending")
-    } else {
-        ("DateCreated,SortName", "Descending")
-    };
-    let rows = item_filters::sort_items(
-        rows,
-        query.sort_by.as_deref().unwrap_or(default_sort),
-        query.sort_order.as_deref().unwrap_or(default_order),
-    );
-    let total = rows.len();
-    let start_index = query.start_index.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).clamp(1, 200);
-    let listed: Vec<Value> = rows
-        .into_iter()
-        .skip(start_index)
-        .take(limit)
-        .map(item_dto_json)
-        .collect();
-    Ok(Json(json!({ "Items": listed, "TotalRecordCount": total })))
+    // 选择（过滤/排序/计数/取页）与分页重元数据都由 provider 完成：读取失败必须
+    // 变成错误响应，绝不能被吞成「更小的一页」。
+    let page = state
+        .provider
+        .query_visible_items(user.id, query.to_server_query())
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, user_id = %user.id, "Jellyfin 条目选择失败");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let listed: Vec<Value> = page.items.into_iter().map(item_dto_json).collect();
+    Ok(Json(json!({ "Items": listed, "TotalRecordCount": page.total })))
 }
 pub(super) async fn resume_items(
     State(state): State<AppState>,
@@ -178,23 +80,17 @@ pub(super) async fn resume_items(
     require_user_path(state.provider.as_ref(), user.id, path.user_id.as_deref()).await?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let mut rows = if query.parent_id.is_none() {
-        state.provider.list_resumable_items(user.id, limit).await.unwrap_or_default()
+        state.provider.list_resumable_items(user.id, usize::MAX).await.unwrap_or_default()
     } else {
         let root_rows = state
             .provider
             .list_visible_items(user.id, query.parent_id.as_deref())
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let mut filtered = Vec::new();
-        for item in root_rows {
-            if item.ticks > 0 && !item.played {
-                filtered.push(item);
-                if filtered.len() >= limit {
-                    break;
-                }
-            }
-        }
-        filtered
+        root_rows
+            .into_iter()
+            .filter(|item| item.ticks > 0 && !item.played)
+            .collect()
     };
     let total = rows.len();
     let start_index = query.start_index.unwrap_or(0);
@@ -223,8 +119,9 @@ pub(super) async fn latest_items(
     // 没看完的在前、已看完的沉底，段内仍是入库时间倒序。
     // Jellyfin 在缺省位置会因为 HidePlayedInLatest 直接把已看完的藏掉，全看过的库
     // 更是连入口都没有；我们改成排到最后，客户端那一行于是永远有内容。
-    let rows = item_filters::filter_items_except_played(rows, &query);
-    let rows = item_filters::sort_items(rows, "DateCreated,SortName", "Descending");
+    let server_query = query.to_server_query();
+    let rows = query::filter_items_except_played(rows, &server_query);
+    let rows = query::sort_items(rows, "DateCreated,SortName", "Descending");
     let rows = match query.is_played {
         Some(played) => rows
             .into_iter()
@@ -252,7 +149,7 @@ pub(super) async fn genres(
         .list_visible_libraries(user.id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let parent_id = library_parent(query.parent_id.as_deref(), &libraries);
+    let parent_id = query::library_parent(query.parent_id.as_deref(), &libraries);
     let items = state
         .provider
         .list_visible_items(user.id, parent_id)
@@ -317,7 +214,7 @@ pub(super) async fn studios(
         .list_visible_libraries(user.id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let parent_id = library_parent(query.parent_id.as_deref(), &libraries);
+    let parent_id = query::library_parent(query.parent_id.as_deref(), &libraries);
     let items = state
         .provider
         .list_visible_items(user.id, parent_id)
@@ -442,22 +339,4 @@ pub(super) async fn item_by_id(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(item_dto_json(snapshot)))
-}
-
-/// `folder_<uuid5(root)>` 形式的历史兜底匹配（folder_ + SeriesId 组合走这条路径）。
-fn folder_id_matches(
-    libraries: &[crate::provider::ServerLibrary],
-    target: &str,
-    path: &str,
-) -> bool {
-    libraries.iter().any(|lib| {
-        lib.root_paths.iter().any(|root| {
-            let f_id = format!(
-                "folder_{}",
-                uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, root.to_string_lossy().as_bytes())
-                    .simple()
-            );
-            f_id == target && std::path::Path::new(path).starts_with(root)
-        })
-    })
 }

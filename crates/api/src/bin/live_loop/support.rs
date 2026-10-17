@@ -64,6 +64,7 @@ pub fn subscribe_bundle() -> (Media, Filter, Subscribe) {
         title: "The Long Watch".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

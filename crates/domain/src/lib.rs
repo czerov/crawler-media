@@ -88,6 +88,8 @@ pub struct Media {
     pub title: String,
     pub year: Option<u16>,
     pub original_title: Option<String>,
+    /// 来自目录的其他译名。搜索前还会再过门槛，这里按详情顺序原样保存。
+    pub aliases: Vec<String>,
     pub tmdb_id: Option<String>,
     pub douban_id: Option<String>,
     pub tvdb_id: Option<String>,

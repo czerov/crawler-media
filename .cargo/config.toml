@@ -1,0 +1,11 @@
+# Build-speed settings for this workspace.
+#
+# Debuginfo is the dominant cost of compiling and linking the ~290 test
+# binaries in this repo (and the bulk of the target directory's size), while
+# tests rarely need it. Set `RUST_PROFILE_DEBUG=1` locally if you need a
+# debugger session.
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

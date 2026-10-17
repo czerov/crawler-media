@@ -40,6 +40,7 @@ async fn force_refresh_item_chapters_keeps_old_result_until_background_replaceme
         title: "葬送的芙莉莲".into(),
         year: Some(2023),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("12345".into()),
         douban_id: None,
         tvdb_id: None,

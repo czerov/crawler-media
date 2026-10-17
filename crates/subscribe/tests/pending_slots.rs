@@ -10,6 +10,7 @@ fn media() -> domain::Media {
         title: "Test Show".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         bangumi_id: None,

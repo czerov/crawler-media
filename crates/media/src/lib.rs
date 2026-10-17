@@ -17,6 +17,7 @@ pub use bangumi::Bangumi;
 pub use cache::DEFAULT_TTL_SECS;
 pub use client::{CatalogGet, Tmdb, TmdbError};
 pub use douban::Douban;
+pub use parse::details;
 pub use parse::episode_stills;
 pub use parse::{
     CastRow, CatalogHit, CountryRow, EpisodeMeta, ImageCandidate, Images, ItemMeta, LanguageRow,

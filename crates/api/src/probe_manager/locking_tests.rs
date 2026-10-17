@@ -67,13 +67,13 @@ fn deleted_probe_cancellation_and_detail_enqueue_remain_responsive() {
             for _ in 0..1000 {
                 let request = unit();
                 assert!(manager.enqueue(request));
-                let queued = manager.metadata_rx.blocking_lock().try_recv().unwrap();
+                let queued = manager.take_queued_for_test().unwrap();
                 barrier.wait();
                 if cancel {
                     manager.cancel_unit(&queued, "file_deleted");
                 } else {
                     assert!(manager.enqueue(unit()));
-                    let extra = manager.metadata_rx.blocking_lock().try_recv().unwrap();
+                    let extra = manager.take_queued_for_test().unwrap();
                     manager.finish(&extra, true);
                     manager.finish(&queued, true);
                 }

@@ -108,6 +108,14 @@ fn maintenance_summary(def: &jobs::JobDef) -> Option<Value> {
             "retention_days": policy.retention_days,
             "dry_run": policy.dry_run,
         }),
+        Ok(MaintenancePolicy::DataRetention(policy)) => json!({
+            "kind": def.kind.as_str(),
+            "version": policy.version,
+            "dry_run": policy.dry_run,
+            "qoe_days": policy.qoe_days,
+            "transient_cache_days": policy.transient_cache_days,
+            "probe_days": policy.probe_days,
+        }),
         Err(message) => {
             // payload 坏了要显式暴露，不能假装是默认策略。
             tracing::error!(

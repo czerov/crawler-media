@@ -13,12 +13,13 @@
 | database_maintenance | true | 21600s | `{version:1,vacuum_enabled:false}` |
 | jobs_retention | true | 86400s | `{version:1,retention_days:90,dry_run:false}` |
 | playback_history_retention | **false** | 86400s | `{version:1,retention_days:90,dry_run:false}` |
+| data_retention（DB-05） | **false** | 86400s | `{version:1,dry_run:true,qoe_days:90,transient_cache_days:90,probe_days:90}` |
 
 已有定义以 kind＋concurrency_key 命中即保留，不因重启覆盖用户配置。关闭仍保留 schedule，现有定时任务页可见。调度只支持 Interval，未实现 cron／固定凌晨时间。
 
 **升级警告：首个默认开启任务可能立即入队，不等满一个周期；Jobs 历史超过90天可能在首次后台执行时清理。** DELETE 不可撤销，恢复依赖一致备份；本轮文档整理没有运行真实清理。
 
-首期不自动删 fanart/catalog/subtitle cache、probe/fingerprint、playback_metrics、封面版本文件。TTL 是 freshness，不等于可删期限；过期 catalog 仍承担 stale-if-error。
+`data_retention` 是独立、默认关闭且默认 dry_run 的类别：QoE 只删 `playback_metrics`；catalog 只删 URL path 白名单内的 transient search/discover/trending 缓存（详情/未知 key 仍承担 stale-if-error）；Probe 只删终态 job，每 scope 保留最新 3 条并保护 sample 引用。fanart/subtitle cache、fingerprint samples/models/model_members、封面版本文件本轮仍不自动删除。TTL 是 freshness，不等于可删期限。
 
 ## 2. 数据与输入合同
 

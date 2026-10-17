@@ -186,18 +186,18 @@ fn list_visible_items_blocking(
     Ok(visible)
 }
 
-type UnitIndex<'a> = HashMap<(domain::MediaId, i32, i32), &'a crate::store::PlaybackUnitSnapshot>;
+pub(super) type UnitIndex<'a> = HashMap<(domain::MediaId, i32, i32), &'a crate::store::PlaybackUnitSnapshot>;
 
 /// 一次索引：`find_unit` 的线性扫描在剧集聚合里是 O(集数 × 单元数)。
-fn unit_index(units: &[crate::store::PlaybackUnitSnapshot]) -> UnitIndex<'_> {
+pub(super) fn unit_index(units: &[crate::store::PlaybackUnitSnapshot]) -> UnitIndex<'_> {
     units.iter().map(|unit| ((unit.media_id, unit.season, unit.episode), unit)).collect()
 }
 
-fn find_unit<'a>(units: &UnitIndex<'a>, media_id: domain::MediaId, season: i32, episode: i32) -> Option<&'a crate::store::PlaybackUnitSnapshot> {
+pub(super) fn find_unit<'a>(units: &UnitIndex<'a>, media_id: domain::MediaId, season: i32, episode: i32) -> Option<&'a crate::store::PlaybackUnitSnapshot> {
     units.get(&(media_id, season, episode)).copied()
 }
 
-fn effective_played(
+pub(super) fn effective_played(
     units: &UnitIndex<'_>,
     media_id: domain::MediaId,
     season: i32,
@@ -210,7 +210,7 @@ fn effective_played(
             .map(|unit| (&unit.state, unit.state.updated_at)),
     )
 }
-fn unit_counts_from_snapshot(
+pub(super) fn unit_counts_from_snapshot(
     units: &UnitIndex<'_>, row: &domain::LedgerRow, media: &domain::Media,
     is_series: bool, show_episodes: &HashMap<domain::MediaId, HashSet<(u32, u32)>>,
 ) -> (bool, i64, Option<usize>) {
@@ -393,7 +393,7 @@ fn playback_ticks(
 }
 
 /// 锁外：把「可见行的 ingest 时间」按 Media 取最大值。
-fn latest_ingest_by_media(
+pub(super) fn latest_ingest_by_media(
     browse: &dyn crate::browse_file_read::BrowseFileRead,
     paths: &[(domain::MediaId, String)],
 ) -> HashMap<domain::MediaId, SystemTime> {
@@ -410,7 +410,7 @@ fn latest_ingest_by_media(
     latest
 }
 
-fn file_date_created(
+pub(super) fn file_date_created(
     browse: &dyn crate::browse_file_read::BrowseFileRead,
     path: &str,
 ) -> Option<SystemTime> {
@@ -434,7 +434,7 @@ fn file_date_created(
     }
 }
 
-fn with_date_created(
+pub(super) fn with_date_created(
     mut metadata: media_server::provider::MediaItemMetadata,
     date_created: Option<SystemTime>,
 ) -> media_server::provider::MediaItemMetadata {
@@ -462,6 +462,7 @@ mod tests {
                 position_ms: 0,
                 played,
                 favorite: false,
+                favorite_at: 0,
                 duration_ms: None,
                 audio_track: None,
                 subtitle_track: None,
@@ -478,6 +479,7 @@ mod tests {
             title: "Show".into(),
             year: None,
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: None,
             douban_id: None,
             tvdb_id: None,

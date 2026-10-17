@@ -246,6 +246,10 @@ pub(crate) async fn preview_maintenance(
                         "note": "只读预览：只统计保留窗口外的播放历史行数，不返回任何播放明细，也不删除。",
                     }))
                 }
+                MaintenancePolicy::DataRetention(policy) => {
+                    preview_data_retention(&state_for_blocking, now, policy)
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "job.preview_failed", e))
+                }
                 MaintenancePolicy::Database(policy) => Ok(json!({
                     "kind": def.kind.as_str(),
                     "policy_version": policy.version,
@@ -272,6 +276,63 @@ pub(crate) async fn preview_maintenance(
             err(StatusCode::INTERNAL_SERVER_ERROR, "job.preview_failed", &msg)
         }
     }
+}
+
+/// DB-05 预览：每个类别只读检视一个窗口，`dry_run` 保证零写入，不写游标。
+/// 计数是窗口下界，不冒充全量精确规模。
+fn preview_data_retention(
+    state: &ApiState,
+    now: i64,
+    policy: &crate::maintenance::DataRetentionPolicy,
+) -> Result<Value, String> {
+    use crate::maintenance::{DATA_RETENTION_CLASSES, cutoff_ms_for_days};
+
+    let mut examined = 0usize;
+    let mut protected = 0usize;
+    let mut incomplete = false;
+    let mut classes = Vec::new();
+    for class in DATA_RETENTION_CLASSES {
+        let days = match class {
+            store::RetentionClass::Qoe => policy.qoe_days,
+            store::RetentionClass::TransientCatalog => policy.transient_cache_days,
+            store::RetentionClass::ProbeHistory => policy.probe_days,
+        };
+        let requested = cutoff_ms_for_days(now, days)?;
+        // 预览与下一轮实跑同口径：读取已持久化游标（只读，不写回）。
+        let (cutoff, cursor) = crate::maintenance::load_cursor(state, class, requested);
+        let batch = {
+            let store = state.store.lock();
+            store
+                .prune_data_history(class, cutoff, cursor.as_ref(), BATCH_SIZE, true)
+                .map_err(|error| error.to_string())?
+        };
+        let candidates = batch.examined.saturating_sub(batch.protected);
+        examined += batch.examined;
+        protected += batch.protected;
+        incomplete |= batch.incomplete;
+        classes.push(json!({
+            "class": class.as_str(),
+            "cutoff_ms": cutoff,
+            "examined": batch.examined,
+            "candidates": candidates,
+            "protected": batch.protected,
+            "incomplete": batch.incomplete,
+            "resume_after": batch.resume_after,
+        }));
+    }
+    Ok(json!({
+        "kind": "data_retention",
+        "policy_version": policy.version,
+        "dry_run": policy.dry_run,
+        "examined": examined,
+        "scanned": examined,
+        "candidates": examined.saturating_sub(protected),
+        "protected": protected,
+        "incomplete": incomplete,
+        "truncated": incomplete,
+        "classes": classes,
+        "note": "只读预览：每个类别只检视一个窗口（含保护行），不写游标、不执行任何删除。",
+    }))
 }
 
 fn cutoff(now: i64, retention_days: u32) -> Result<i64, String> {

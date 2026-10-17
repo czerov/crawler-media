@@ -36,7 +36,7 @@ fn fixture(root: &std::path::Path) -> (ApiState, String, MediaId) {
     let library = store.create_library(MediaKind::Movie, "Extra", &[directory.to_str().unwrap()],
         "everyone", true, &[]).unwrap();
     let media = Media { id: MediaId::new(), kind: MediaKind::Movie, title: "Original".into(),
-        year: None, original_title: None, tmdb_id: None, douban_id: None, tvdb_id: None,
+        year: None, original_title: None, aliases: Vec::new(), tmdb_id: None, douban_id: None, tvdb_id: None,
         bangumi_id: None, anilist_id: None };
     store.insert_media(&media).unwrap();
     store.insert_ledger(&LedgerRow { id: LedgerId::new(), media_id: media.id,

@@ -203,6 +203,7 @@ fn insert_tv_subscribe(store: &Store, user_id: UserId, title: &str, tmdb_id: &st
             title: title.into(),
             year: Some(2026),
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: Some(tmdb_id.into()),
             douban_id: None,
             tvdb_id: None,

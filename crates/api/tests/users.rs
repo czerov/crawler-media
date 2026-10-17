@@ -168,6 +168,7 @@ fn playback_progress_is_isolated_per_user() {
         title: "The Matrix".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("603".into()),
         douban_id: None,
         tvdb_id: None,

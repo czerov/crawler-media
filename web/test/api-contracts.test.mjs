@@ -48,6 +48,7 @@ test("downloader path maps preserve UI local/remote direction both ways", async 
 });
 
 test("downloader limits endpoints preserve instance id parameter", async () => {
+
   const api = await readWeb("lib/api/downloaders.ts");
   assert.match(
     api,
@@ -60,6 +61,7 @@ test("downloader limits endpoints preserve instance id parameter", async () => {
     "设置下载器限制必须传递实例 id",
   );
 });
+
 
 test("both manual Torrent delivery paths include the Site torrent id", async () => {
   const [direct, subscribed] = await Promise.all([

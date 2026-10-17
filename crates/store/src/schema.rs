@@ -2,21 +2,24 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::StoreError;
 
+mod chapter_frame_tasks;
 mod fingerprint;
 mod library_deletion;
 mod probe_state;
 mod tables;
 mod browse_changes;
+mod browse_page_facts;
 mod browse_projection;
+mod data_retention;
 mod read_revisions;
 mod scan_operations;
 
 /// Schema version constants. Bump when adding new migrations.
 /// The version is stored via `PRAGMA user_version` on each database file.
 pub const APP_SCHEMA_VERSION: i64 = 7;
-pub const CATALOG_SCHEMA_VERSION: i64 = 2;
-pub const LIBRARY_SCHEMA_VERSION: i64 = 14;
-pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 5;
+pub const CATALOG_SCHEMA_VERSION: i64 = 3;
+pub const LIBRARY_SCHEMA_VERSION: i64 = 17;
+pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 8;
 
 /// Read the current schema version from a database file.
 ///
@@ -71,6 +74,7 @@ pub fn migrate_app(conn: &Connection) -> Result<(), StoreError> {
     // 永远跑不到它。这里改成每次打开都做一次幂等对账：按定义只删「removal 已成功且
     // Library 行已不存在」的键，重复执行安全，对 v7 老库也不是空操作。
     crate::library_deletion::repair_removed_library_settings(conn)?;
+    ensure_column(conn, "media", "aliases_json", "TEXT NOT NULL DEFAULT '[]'")?;
     ensure_column(conn, "downloaders", "path_maps", "TEXT")?;
     // downloaders.enabled：停用的下载器不参与自动投递（手动提交仍可用）。
     ensure_column(conn, "downloaders", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
@@ -242,6 +246,8 @@ pub fn migrate_catalog(conn: &Connection) -> Result<(), StoreError> {
     read_revisions::migrate_read_revisions("catalog", conn)?;
     read_revisions::create_revision_trigger(conn, "catalog_cache", "cat_cache")?;
     browse_changes::migrate_browse_changes_catalog(conn)?;
+    // catalog schema 3：transient cache retention 的 fetched_at keyset 索引。
+    data_retention::migrate_data_retention_catalog(conn)?;
     set_schema_version(conn, CATALOG_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -292,7 +298,29 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
             ON ledger_probe_obligations(created_at_ms, ledger_id);",
     )?;
     scan_operations::migrate_scan_operations(conn)?;
+    chapter_frame_tasks::migrate_chapter_frame_tasks(conn)?;
     browse_projection::migrate_browse_projection(conn)?;
+    // library schema 15：browse_media 的 SQL 排序键列与索引（A4 浏览页）。
+    browse_page_facts::migrate_browse_page_facts(conn)?;
+    // library schema 16：probe 终态/scope/attempt 关联索引（DB-05）。
+    data_retention::migrate_data_retention_library(conn)?;
+    // library schema 17：probe 派发 stage 的有界窗口索引。旧库补列后建索引，
+    // 两者都幂等，重启不会重扫全表以外的工作。
+    ensure_column(
+        conn,
+        "probe_job_units",
+        "stage",
+        "TEXT NOT NULL DEFAULT 'metadata'",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS probe_job_units_dispatch_idx
+             ON probe_job_units(stage, status, job_id)
+             WHERE status = 'queued';",
+    )?;
+    if previous < 15 {
+        // 旧代的投影没有候选 JSON：标脏让下一次请求重建，而不是永久回退全量读取。
+        browse_page_facts::invalidate_legacy_projections(conn)?;
+    }
     // library schema 10：一次性清理指向已删除台账行的探测工作项，并把因此
     // 空掉的活动任务收尾，避免旧库残留悬空 ledger 引用。
     if previous < 10 {
@@ -386,6 +414,8 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     )?;
     // 老库遗留的 playback_progress 表：数据并入 playback_units 后删除。
     migrate_legacy_playback_progress(conn)?;
+    // subscribe schema 8：QoE recorded_at keyset 索引（DB-05）。
+    data_retention::migrate_data_retention_subscribe(conn)?;
     // subscribe schema 4: playback_sessions 新增代际与毫秒字段，新增 playback_session_ids 表
     ensure_column(conn, "playback_sessions", "play_session_id", "TEXT")?;
     ensure_column(
@@ -412,6 +442,25 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     )?;
     read_revisions::migrate_read_revisions("subscribe", conn)?;
     read_revisions::create_revision_trigger(conn, "playback_units", "sub_units")?;
+    // subscribe schema 6: favourite activity has its own clock so a favourite
+    // write cannot reorder played marks or invent a viewing timestamp.
+    // Databases that already have that clock keep a zero as unknown time.
+    // Only a database that predates the column, or is receiving it now, gets
+    // the one-time backfill from the playback clock.
+    let previous = read_schema_version(conn)?;
+    let favorite_at_existed = has_column(conn, "playback_units", "favorite_at")?;
+    ensure_column(
+        conn,
+        "playback_units",
+        "favorite_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    if previous < 6 || !favorite_at_existed {
+        conn.execute_batch(
+            "UPDATE playback_units SET favorite_at = updated_at
+             WHERE favorite != 0 AND favorite_at = 0 AND updated_at != 0;",
+        )?;
+    }
     set_schema_version(conn, SUBSCRIBE_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -587,4 +636,4 @@ fn seed_libraries(app: &Connection) -> Result<(), StoreError> {
 }
 
 pub const MEDIA_COLS: &str =
-    "id, kind, title, year, original_title, tmdb_id, douban_id, tvdb_id, bangumi_id, anilist_id";
+    "id, kind, title, year, original_title, tmdb_id, douban_id, tvdb_id, bangumi_id, anilist_id, aliases_json";

@@ -49,6 +49,10 @@ export interface MaintenanceSummary {
   /** 保留类任务（任务历史 / 播放历史清理）。 */
   retention_days?: number;
   dry_run?: boolean;
+  /** DB-05 分类历史保留：三个独立窗口。 */
+  qoe_days?: number;
+  transient_cache_days?: number;
+  probe_days?: number;
   /** 数据库维护。 */
   vacuum_enabled?: boolean;
   /** payload 损坏时后端显式标记，不假装是默认策略。 */
@@ -67,6 +71,18 @@ export interface MaintenancePreview {
   protected: number;
   protected_truncated?: boolean;
   truncated: boolean;
+  /** DB-05：分类历史保留的窗口检视行数。 */
+  examined?: number;
+  incomplete?: boolean;
+  classes?: Array<{
+    class: string;
+    cutoff_ms?: number;
+    examined?: number;
+    candidates?: number;
+    protected?: number;
+    incomplete?: boolean;
+    resume_after?: { at_ms: number; id: string } | null;
+  }>;
   note?: string;
 }
 
@@ -83,6 +99,19 @@ export interface MaintenanceReport {
   protected_is_lower_bound?: boolean;
   batches?: number;
   budget_exhausted?: boolean;
+  /** DB-05：分类历史保留的窗口检视/剩余信号。 */
+  examined?: number;
+  incomplete?: boolean;
+  remaining?: boolean;
+  classes?: Array<{
+    class: string;
+    cutoff_ms?: number;
+    examined?: number;
+    deleted?: number;
+    protected?: number;
+    incomplete?: boolean;
+    resume_after?: { at_ms: number; id: string } | null;
+  }>;
   elapsed_ms?: number;
   databases?: Array<{ skip_reason?: string | null } & Record<string, unknown>>;
   note?: string | null;
@@ -92,6 +121,7 @@ const MAINTENANCE_KINDS = new Set([
   "database_maintenance",
   "jobs_retention",
   "playback_history_retention",
+  "data_retention",
 ]);
 
 /** 是否是 DB8 维护任务（维护 def 才有参数抽屉与预览）。 */

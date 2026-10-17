@@ -32,6 +32,17 @@ where
     })
 }
 
+fn aliases_from_json(raw: Option<String>) -> Vec<String> {
+    let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+pub(super) fn aliases_json(aliases: &[String]) -> String {
+    serde_json::to_string(aliases).unwrap_or_else(|_| "[]".to_string())
+}
+
 pub(super) fn map_media(row: &rusqlite::Row<'_>) -> rusqlite::Result<Media> {
     let kind: String = row.get(1)?;
     Ok(Media {
@@ -40,6 +51,7 @@ pub(super) fn map_media(row: &rusqlite::Row<'_>) -> rusqlite::Result<Media> {
         title: row.get(2)?,
         year: row.get::<_, Option<i64>>(3)?.map(|v| v as u16),
         original_title: row.get(4)?,
+        aliases: aliases_from_json(row.get(10)?),
         tmdb_id: row.get(5)?,
         douban_id: row.get(6)?,
         tvdb_id: row.get(7)?,

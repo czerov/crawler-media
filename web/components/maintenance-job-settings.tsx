@@ -14,6 +14,7 @@ const MIN_RETENTION_DAYS = 1;
 const MAX_RETENTION_DAYS = 36500;
 
 const RETENTION_KINDS = new Set(["jobs_retention", "playback_history_retention"]);
+const DATA_RETENTION_KIND = "data_retention";
 
 function readNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -44,13 +45,20 @@ export function MaintenanceJobSettings({
   onError?: (message: string) => void;
 }) {
   const isRetention = RETENTION_KINDS.has(job.kind);
+  const isDataRetention = job.kind === DATA_RETENTION_KIND;
   const isDatabase = job.kind === "database_maintenance";
   const summary = job.maintenance;
 
   const [retentionDays, setRetentionDays] = useState(
     readNumber(summary?.retention_days, 90),
   );
-  const [dryRun, setDryRun] = useState(readBool(summary?.dry_run, false));
+  const [qoeDays, setQoeDays] = useState(readNumber(summary?.qoe_days, 90));
+  const [transientCacheDays, setTransientCacheDays] = useState(
+    readNumber(summary?.transient_cache_days, 90),
+  );
+  const [probeDays, setProbeDays] = useState(readNumber(summary?.probe_days, 90));
+  // DB-05：新类别默认 dry_run；旧类别保持原默认（false）。
+  const [dryRun, setDryRun] = useState(readBool(summary?.dry_run, isDataRetention));
   const [vacuumEnabled, setVacuumEnabled] = useState(
     readBool(summary?.vacuum_enabled, false),
   );
@@ -61,14 +69,35 @@ export function MaintenanceJobSettings({
   // 服务端刷新后（保存成功 / 定时轮询）同步回真实值。
   useEffect(() => {
     setRetentionDays(readNumber(summary?.retention_days, 90));
-    setDryRun(readBool(summary?.dry_run, false));
+    setQoeDays(readNumber(summary?.qoe_days, 90));
+    setTransientCacheDays(readNumber(summary?.transient_cache_days, 90));
+    setProbeDays(readNumber(summary?.probe_days, 90));
+    setDryRun(readBool(summary?.dry_run, isDataRetention));
     setVacuumEnabled(readBool(summary?.vacuum_enabled, false));
     setPreview(null);
-  }, [job.id, summary?.retention_days, summary?.dry_run, summary?.vacuum_enabled]);
+  }, [
+    job.id,
+    isDataRetention,
+    summary?.retention_days,
+    summary?.qoe_days,
+    summary?.transient_cache_days,
+    summary?.probe_days,
+    summary?.dry_run,
+    summary?.vacuum_enabled,
+  ]);
 
   const draftPayload = (): Record<string, unknown> => {
     if (isDatabase) {
       return { version: summary?.version ?? 1, vacuum_enabled: vacuumEnabled };
+    }
+    if (isDataRetention) {
+      return {
+        version: summary?.version ?? 1,
+        dry_run: dryRun,
+        qoe_days: qoeDays,
+        transient_cache_days: transientCacheDays,
+        probe_days: probeDays,
+      };
     }
     return { version: summary?.version ?? 1, retention_days: retentionDays, dry_run: dryRun };
   };
@@ -98,8 +127,11 @@ export function MaintenanceJobSettings({
     else alert(message);
   };
 
-  const retentionInvalid =
-    isRetention && (retentionDays < MIN_RETENTION_DAYS || retentionDays > MAX_RETENTION_DAYS);
+  const daysInvalid = (days: number) =>
+    days < MIN_RETENTION_DAYS || days > MAX_RETENTION_DAYS;
+  const retentionInvalid = isDataRetention
+    ? [qoeDays, transientCacheDays, probeDays].some(daysInvalid)
+    : isRetention && daysInvalid(retentionDays);
 
   const handleSave = async () => {
     if (retentionInvalid) {
@@ -141,6 +173,81 @@ export function MaintenanceJobSettings({
         <div className="rounded bg-red-500/10 p-2 text-red-300 border border-red-500/20">
           该任务的维护配置无法解析，已按拒绝执行处理（不会退回更激进的删除策略）：
           <span className="break-all"> {summary.error}</span>
+        </div>
+      )}
+
+      {isDataRetention && (
+        <div className="space-y-2">
+          <div className="font-semibold text-white/90">分类历史保留</div>
+          <div className="text-white/50">
+            新类别默认关闭且默认试运行（dry_run）：启用前先用预览确认规模；
+            真实删除需要显式关闭试运行并启用任务。
+          </div>
+          {[
+            { label: "QoE 指标", value: qoeDays, set: setQoeDays },
+            { label: "临时 catalog 缓存", value: transientCacheDays, set: setTransientCacheDays },
+            { label: "Probe 终态历史", value: probeDays, set: setProbeDays },
+          ].map((field) => (
+            <label key={field.label} className="flex flex-wrap items-center gap-2 text-white/70">
+              {field.label}保留天数:
+              <input
+                type="number"
+                min={MIN_RETENTION_DAYS}
+                max={MAX_RETENTION_DAYS}
+                value={field.value}
+                onChange={(e) => field.set(parseInt(e.target.value, 10) || 0)}
+                className="w-24 rounded border border-white/20 bg-black/40 px-2 py-1 text-xs text-white"
+              />
+            </label>
+          ))}
+          <div className="text-white/40">
+            范围 {MIN_RETENTION_DAYS}..{MAX_RETENTION_DAYS} 天；永久保留请关闭任务。
+            QoE 只删指标，不动进度/会话/日志；详情与未知 catalog key 始终保护；
+            Probe 每个 scope 至少保留最新 3 条（时间并列全部保留）。
+          </div>
+          <label className="flex items-center gap-2 text-white/70">
+            <input
+              type="checkbox"
+              checked={dryRun}
+              onChange={(e) => setDryRun(e.target.checked)}
+            />
+            试运行（dry_run）：只统计不删除
+          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handlePreview}
+              disabled={previewing}
+              className="rounded bg-white/10 hover:bg-white/20 px-3 py-1 text-xs text-white transition disabled:opacity-50"
+            >
+              {previewing ? "预览中..." : "预览候选"}
+            </button>
+            {preview && (
+              <span className="text-white/70">
+                检视 {preview.examined ?? preview.scanned} · 候选 {preview.candidates} · 保护{" "}
+                {preview.protected} ·{" "}
+                {preview.incomplete
+                  ? "窗口外仍有剩余（计数为下界，非精确总量）"
+                  : "预览窗口"}
+              </span>
+            )}
+          </div>
+          {preview?.classes && (
+            <div className="space-y-1 text-white/60">
+              {preview.classes.map((entry) => (
+                <div key={entry.class}>
+                  {entry.class}: 检视 {entry.examined ?? 0} · 候选 {entry.candidates ?? 0} · 保护{" "}
+                  {entry.protected ?? 0}
+                  {entry.incomplete ? " · 还有剩余" : ""}
+                </div>
+              ))}
+            </div>
+          )}
+          {preview?.note && <div className="text-white/40">{preview.note}</div>}
+          <div className="rounded border border-amber-500/20 bg-amber-500/10 p-2 text-amber-200/90 leading-relaxed">
+            删除不可撤销，只能从备份恢复；关闭任务只阻止后续批次，不会恢复已删除的数据。
+            samples/models/model_members 本轮不删除。生产启用仍需用户显式确认。
+          </div>
         </div>
       )}
 

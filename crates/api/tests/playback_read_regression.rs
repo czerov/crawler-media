@@ -99,6 +99,7 @@ fn seed_media(store: &Store, title: &str, year: Option<u16>) -> MediaId {
         title: title.into(),
         year,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,
@@ -269,6 +270,105 @@ async fn favorites_sort_matches_existing_keys() {
     assert_eq!(years, vec![2019, 2021, 2022, 2024], "{by_year}");
     assert_eq!(by_year["total"], 4);
     let _ = (beta, gamma);
+}
+
+#[tokio::test]
+async fn newest_favorite_leads_without_reordering_played_marks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = make_state(tmp.path());
+    let app = router(state.clone());
+    let store = state.store();
+    let library = seed_library(&store.lock(), tmp.path(), "recent-favorites");
+    let (member, token) = seed_member(&store.lock(), "dana");
+    let (older, newer) = {
+        let guard = store.lock();
+        let older = seed_media(&guard, "Older favorite", Some(2020));
+        let newer = seed_media(&guard, "Newer favorite", Some(2021));
+        add_ledger(&guard, older, &library, "older");
+        add_ledger(&guard, newer, &library, "newer");
+        guard
+            .upsert_unit(member, older, -1, -1, 0, Some(true), Some(true), None, None, None, false, 10)
+            .unwrap();
+        guard
+            .upsert_unit(member, newer, -1, -1, 0, Some(true), Some(false), None, None, None, false, 50)
+            .unwrap();
+        guard
+            .set_unit_marks(member, newer, -1, -1, None, Some(true), 80)
+            .unwrap();
+        (older, newer)
+    };
+
+    let favorites = get(&app, "/api/v1/playback/favorites?limit=10", &token).await;
+    let ids: Vec<&str> = favorites["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["media_item_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids[0], newer.to_string(), "new favourite must lead: {favorites}");
+    let gallery = get(&app, "/api/v1/playback/favorites/gallery?limit=10", &token).await;
+    assert_eq!(gallery[0]["media_item_id"], newer.to_string(), "{gallery}");
+    let played = store.lock().user_active_media_ids(member).unwrap();
+    assert_eq!(played[0].0, newer);
+    assert_eq!(played[0].1, 50, "favourite activity must not reorder played marks");
+    let _ = older;
+}
+
+#[tokio::test]
+async fn playing_an_old_favorite_does_not_move_it_ahead_of_a_newer_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = make_state(tmp.path());
+    let app = router(state.clone());
+    let store = state.store();
+    let library = seed_library(&store.lock(), tmp.path(), "stable-favorites");
+    let (member, token) = seed_member(&store.lock(), "erin");
+    let (historical, recent) = {
+        let guard = store.lock();
+        let historical = seed_media(&guard, "Historical favorite", Some(2018));
+        let recent = seed_media(&guard, "Recent favorite", Some(2024));
+        add_ledger(&guard, historical, &library, "historical");
+        add_ledger(&guard, recent, &library, "recent");
+        guard
+            .upsert_unit(member, historical, -1, -1, 0, Some(false), Some(true), None, None, None, false, 10)
+            .unwrap();
+        guard
+            .set_unit_marks(member, recent, -1, -1, None, Some(true), 50)
+            .unwrap();
+        (historical, recent)
+    };
+    // Pre-clock favourite: the activity time was never recorded. Playback then
+    // advances the viewing clock without a new favourite write.
+    {
+        let conn = rusqlite::Connection::open(tmp.path().join("data/subscribe.db")).unwrap();
+        conn.execute(
+            "UPDATE playback_units SET favorite_at = 0, updated_at = 200, position_ms = 90000
+             WHERE user_id = ?1 AND media_id = ?2",
+            rusqlite::params![member.to_string(), historical.to_string()],
+        )
+        .unwrap();
+    }
+
+    let favorites = get(&app, "/api/v1/playback/favorites?limit=10", &token).await;
+    let ids: Vec<&str> = favorites["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["media_item_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids[0], recent.to_string(), "playback must not promote an old favourite: {favorites}");
+    let gallery = get(&app, "/api/v1/playback/favorites/gallery?limit=10", &token).await;
+    assert_eq!(gallery[0]["media_item_id"], recent.to_string(), "{gallery}");
+
+    drop(store);
+    drop(state);
+    let reopened = Store::open(tmp.path().join("data")).unwrap();
+    let rows = reopened.favorite_rows(member).unwrap();
+    assert_eq!(rows[0].0, recent, "reopening must not capture playback as favourite time: {rows:?}");
+    assert_eq!(
+        reopened.unit_state(member, historical, -1, -1).unwrap().unwrap().favorite_at,
+        0,
+        "an unknown historical favourite time must stay unknown"
+    );
 }
 
 #[tokio::test]

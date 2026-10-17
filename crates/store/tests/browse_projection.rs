@@ -39,6 +39,7 @@ fn read_revisions_increments_on_dml_changes() {
         title: "Test".into(),
         year: Some(2024),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,
@@ -94,6 +95,7 @@ fn projection_publication_and_retrieval() {
         files: vec![BrowseFileFacts {
             ledger_id,
             media_id,
+            path: "/movies/m1.mkv".into(),
             facts: serde_json::json!({ "size": 1024, "version": 1 }),
         }],
         media: vec![BrowseMediaFacts {
@@ -102,6 +104,7 @@ fn projection_publication_and_retrieval() {
             year: Some(2024),
             facts: serde_json::json!({ "poster": true }),
         }],
+        candidates: vec![],
     };
 
     let published = store.publish_browse_projection(&build).unwrap();

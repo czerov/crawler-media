@@ -5,6 +5,7 @@
 //! **不参与生产路径**。
 
 use super::*;
+use super::super::selection::{LightFacts, metadata::BrowseMetadata};
 
 /// 朴素参照实现（等价性测试用）：每个候选值都解析一次 filter 并全量匹配。
 fn dimension_values_naive(
@@ -121,21 +122,31 @@ fn selection(
             filter_score: None,
         })
         .collect();
-    let mut item = LibrarySelection {
-        media: Media {
-            id: media_id,
-            kind: MediaKind::Movie,
-            title: format!("Fixture {index}"),
-            year,
-            original_title: None,
-            tmdb_id: None,
-            douban_id: None,
-            tvdb_id: None,
-            bangumi_id: None,
-            anilist_id: None,
-        },
+    let media = Media {
+        id: media_id,
+        kind: MediaKind::Movie,
+        title: format!("Fixture {index}"),
+        year,
+        original_title: None,
+        aliases: Vec::new(),
+        tmdb_id: None,
+        douban_id: None,
+        tvdb_id: None,
+        bangumi_id: None,
+        anilist_id: None,
+    };
+    let mut metadata = BrowseMetadata::default();
+    metadata.genres = genres.iter().map(|value| (*value).to_string()).collect();
+    metadata.countries = countries.iter().map(|value| (*value).to_string()).collect();
+    metadata.rating = rating;
+    metadata.runtime = runtime;
+    metadata.language = language.map(str::to_string);
+    metadata.scraped = scraped;
+    LibrarySelection {
+        light: LightFacts::from_rows(&media, &metadata, &rows),
+        media,
         rows,
-        metadata: Default::default(),
+        metadata,
         favorite,
         played,
         seen,
@@ -143,14 +154,7 @@ fn selection(
         added_at: None,
         size_bytes: None,
         last_played_at: None,
-    };
-    item.metadata.genres = genres.iter().map(|value| (*value).to_string()).collect();
-    item.metadata.countries = countries.iter().map(|value| (*value).to_string()).collect();
-    item.metadata.rating = rating;
-    item.metadata.runtime = runtime;
-    item.metadata.language = language.map(str::to_string);
-    item.metadata.scraped = scraped;
-    item
+    }
 }
 
 /// 覆盖每个维度，含大小写不敏感的 country/language 变体与多值维度。

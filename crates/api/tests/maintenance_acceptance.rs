@@ -39,11 +39,11 @@ fn maintenance_defs(state: &ApiState) -> Vec<jobs::JobDef> {
 }
 
 #[test]
-fn fresh_state_registers_the_three_maintenance_defs_with_documented_defaults() {
+fn fresh_state_registers_the_four_maintenance_defs_with_documented_defaults() {
     let tmp = tempfile::tempdir().unwrap();
     let state = real_state(tmp.path());
     let defs = maintenance_defs(&state);
-    assert_eq!(defs.len(), 3, "启动时应注册三个维护任务: {defs:?}");
+    assert_eq!(defs.len(), 4, "启动时应注册四个维护任务: {defs:?}");
 
     let by_kind = |kind: JobKind| defs.iter().find(|def| def.kind == kind).unwrap();
 
@@ -79,6 +79,25 @@ fn fresh_state_registers_the_three_maintenance_defs_with_documented_defaults() {
     assert!(
         playback.schedule.is_some(),
         "关闭的任务仍保留非空 schedule，现有定时任务页才看得到"
+    );
+
+    let data = by_kind(JobKind::DataRetention);
+    assert!(!data.enabled, "分类历史保留默认关闭，生产启用需用户显式确认");
+    assert_eq!(
+        data.schedule,
+        Some(Schedule::Interval { secs: 86_400 }),
+        "默认每天"
+    );
+    assert_eq!(
+        MaintenancePolicy::parse(data.kind, &data.payload).unwrap(),
+        MaintenancePolicy::DataRetention(api::maintenance::DataRetentionPolicy {
+            version: 1,
+            dry_run: true,
+            qoe_days: 90,
+            transient_cache_days: 90,
+            probe_days: 90,
+        }),
+        "新类别默认 dry_run + 90 天窗口"
     );
 }
 
@@ -152,7 +171,7 @@ fn user_changes_survive_a_restart() {
     );
     assert_eq!(
         maintenance_defs(&restarted).len(),
-        3,
+        4,
         "重启后 seed 不得产生重复 def"
     );
 }

@@ -30,6 +30,18 @@ pub(super) fn unit_played(
     )
 }
 
+fn carries_playback_authority(state: &crate::store::UnitState) -> bool {
+    // A favourite-only insert has no playback facts. A genuine historical
+    // played assertion can still have `updated_at = 0` and must count.
+    state.updated_at != 0
+        || state.played
+        || state.position_ms != 0
+        || state.play_count != 0
+        || state.duration_ms.is_some()
+        || state.audio_track.is_some()
+        || state.subtitle_track.is_some()
+}
+
 pub(super) fn resolve_effective_played(
     episode_unit: Option<(&crate::store::UnitState, i64)>,
     season_unit: Option<(&crate::store::UnitState, i64)>,
@@ -38,7 +50,10 @@ pub(super) fn resolve_effective_played(
     [episode_unit, season_unit, show_unit]
         .into_iter()
         .enumerate()
-        .filter_map(|(specificity, unit)| unit.map(|(state, updated_at)| (updated_at, 2 - specificity, state.played)))
+        .filter_map(|(specificity, unit)| {
+            unit.filter(|(state, _)| carries_playback_authority(state))
+                .map(|(state, updated_at)| (updated_at, 2 - specificity, state.played))
+        })
         .max_by_key(|(updated_at, specificity, _)| (*updated_at, *specificity))
         .is_some_and(|(_, _, played)| played)
 }
@@ -119,15 +134,10 @@ pub(super) fn write_favorite_mark(
     season: i32,
     episode: i32,
     favorite: bool,
-    _now: i64,
+    now: i64,
 ) -> Result<(), String> {
-    let played = store
-        .unit_state(user_id, media_id, season, episode)
-        .map_err(|error| error.to_string())?
-        .map(|state| state.played)
-        .unwrap_or_else(|| unit_played(store, user_id, media_id, season, episode));
     store
-        .set_unit_favorite(user_id, media_id, season, episode, favorite, played)
+        .set_unit_favorite(user_id, media_id, season, episode, favorite, now)
         .map_err(|error| {
             tracing::error!(%error, %user_id, %media_id, season, episode, "failed to update Jellyfin favorite mark");
             error.to_string()

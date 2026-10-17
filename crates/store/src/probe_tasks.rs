@@ -35,6 +35,8 @@ pub struct ProbeJobUnit {
     pub sampling_plan_json: Option<String>,
     pub detection_outcome_json: Option<String>,
     pub reuse_media_info_cache: bool,
+    /// Bounded dispatch window this unit belongs to; persisted, never guessed.
+    pub stage: super::ProbeDispatchStage,
 }
 
 pub struct ProbeJobUnitSpec<'a> {
@@ -97,8 +99,8 @@ impl Store {
                 "INSERT INTO probe_job_units (
                      job_id, ledger_id, kind, force_fingerprint,
                      reuse_fingerprint_cache, overwrite_markers, status,
-                     reuse_media_info_cache
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7)",
+                     reuse_media_info_cache, stage
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8)",
                 params![
                     id,
                     unit.ledger_id,
@@ -107,6 +109,7 @@ impl Store {
                     unit.reuse_fingerprint_cache,
                     unit.overwrite_markers,
                     unit.reuse_media_info_cache,
+                    super::ProbeDispatchStage::for_job_kind(kind).as_str(),
                 ],
             ) {
                 if is_constraint(&error) {
@@ -118,7 +121,12 @@ impl Store {
         tx.commit()?;
         Ok(true)
     }
-    pub fn recover_probe_jobs(&self) -> Result<Vec<(ProbeJob, Vec<ProbeJobUnit>)>, StoreError> {
+    /// Requeue interrupted units and reconcile counters without loading work.
+    ///
+    /// Startup must not materialize every pending unit: the bounded dispatch
+    /// windows decide what runs next, and the SQL here only repairs durable
+    /// status/counters for active jobs.
+    pub fn reset_running_probe_units(&self) -> Result<(), StoreError> {
         let tx = self.library.unchecked_transaction()?;
         tx.execute(
             "UPDATE probe_job_units SET status = 'queued'
@@ -135,14 +143,109 @@ impl Store {
              )",
             [],
         )?;
-        let mut statement = tx.prepare("SELECT id FROM probe_jobs WHERE status IN ('queued','running')")?;
-        let ids = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        for id in &ids {
-            counters::reconcile_counts_in_transaction(&tx, id)?;
-        }
+        tx.execute(
+            "UPDATE probe_jobs SET
+                 completed=(SELECT COUNT(*) FROM probe_job_units WHERE job_id=probe_jobs.id
+                     AND status IN ('succeeded','failed','cancelled','partial')),
+                 succeeded=(SELECT COUNT(*) FROM probe_job_units WHERE job_id=probe_jobs.id
+                     AND status='succeeded'),
+                 failed=(SELECT COUNT(*) FROM probe_job_units WHERE job_id=probe_jobs.id
+                     AND status='failed'),
+                 partial=(SELECT COUNT(*) FROM probe_job_units WHERE job_id=probe_jobs.id
+                     AND status='partial')
+             WHERE status IN ('queued','running')",
+            [],
+        )?;
         tx.commit()?;
+        Ok(())
+    }
 
+    /// Active jobs of one kind with their units. Marker refreshes are rare
+    /// enough to inspect whole; this is not used for ordinary backlog jobs.
+    pub fn active_probe_jobs_by_kind(
+        &self,
+        kind: &str,
+    ) -> Result<Vec<(ProbeJob, Vec<ProbeJobUnit>)>, StoreError> {
+        let mut statement = self.library.prepare(
+            "SELECT id, kind, media_id, season, status, total, completed, succeeded,
+                    failed, partial, error, created_at_ms, started_at_ms, finished_at_ms
+             FROM probe_jobs WHERE status IN ('queued', 'running') AND kind = ?1
+             ORDER BY created_at_ms, id",
+        )?;
+        let jobs = statement
+            .query_map([kind], map_probe_job)?
+            .collect::<Result<Vec<_>, _>>()?;
+        jobs.into_iter()
+            .map(|job| {
+                let units = self.probe_job_units(&job.id)?;
+                Ok((job, units))
+            })
+            .collect()
+    }
+
+    /// Active non-marker jobs whose units are all terminal.
+    pub fn active_completed_probe_jobs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ProbeJob>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.library.prepare(
+            "SELECT id, kind, media_id, season, status, total, completed, succeeded,
+                    failed, partial, error, created_at_ms, started_at_ms, finished_at_ms
+             FROM probe_jobs
+             WHERE status IN ('queued', 'running') AND completed >= total
+               AND kind != 'marker_refresh'
+             ORDER BY created_at_ms, id LIMIT ?1",
+        )?;
+        let jobs = statement
+            .query_map([limit as i64], map_probe_job)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
+    /// A bounded window of active unit references for removed-library repair.
+    pub fn active_probe_unit_refs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.library.prepare(
+            "SELECT u.job_id, u.ledger_id
+             FROM probe_job_units u
+             JOIN probe_jobs j ON j.id = u.job_id
+             WHERE u.status = 'queued' AND j.status IN ('queued', 'running')
+             ORDER BY u.rowid LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn recover_probe_jobs(&self) -> Result<Vec<(ProbeJob, Vec<ProbeJobUnit>)>, StoreError> {
+        // Reconcile the counters of every active job once (D2 contract), but
+        // never requeue a running unit: drain and retry assessment must observe
+        // the job the live worker is finishing, not reset it back to queued.
+        {
+            let tx = self.library.unchecked_transaction()?;
+            let ids: Vec<String> = {
+                let mut statement = tx.prepare(
+                    "SELECT id FROM probe_jobs WHERE status IN ('queued', 'running')
+                     ORDER BY created_at_ms, id",
+                )?;
+                statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for id in &ids {
+                counters::reconcile_counts_in_transaction(&tx, id)?;
+            }
+            tx.commit()?;
+        }
         let mut statement = self.library.prepare(
             "SELECT id, kind, media_id, season, status, total, completed, succeeded,
                     failed, partial, error, created_at_ms, started_at_ms, finished_at_ms
@@ -156,11 +259,12 @@ impl Store {
         }).collect()
     }
 
+
     pub fn probe_job_units(&self, job_id: &str) -> Result<Vec<ProbeJobUnit>, StoreError> {
         let mut statement = self.library.prepare(
             "SELECT job_id, ledger_id, kind, force_fingerprint,
                     reuse_fingerprint_cache, overwrite_markers, status, error,
-                    sampling_plan_json, detection_outcome_json, reuse_media_info_cache
+                    sampling_plan_json, detection_outcome_json, reuse_media_info_cache, stage
              FROM probe_job_units WHERE job_id = ?1 ORDER BY rowid",
         )?;
         let rows = statement.query_map([job_id], |row| {
@@ -176,6 +280,11 @@ impl Store {
                 sampling_plan_json: row.get(8)?,
                 detection_outcome_json: row.get(9)?,
                 reuse_media_info_cache: row.get::<_, i64>(10).unwrap_or(0) != 0,
+                stage: row
+                    .get::<_, String>(11)
+                    .ok()
+                    .and_then(|value| super::ProbeDispatchStage::from_str(&value))
+                    .unwrap_or(super::ProbeDispatchStage::Metadata),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -418,7 +527,7 @@ impl Store {
             .query_row(
                 "SELECT job_id, ledger_id, kind, force_fingerprint,
                         reuse_fingerprint_cache, overwrite_markers, status, error,
-                        sampling_plan_json, detection_outcome_json, reuse_media_info_cache
+                        sampling_plan_json, detection_outcome_json, reuse_media_info_cache, stage
                  FROM probe_job_units WHERE ledger_id = ?1 AND status IN ('queued', 'running')
                  ORDER BY rowid DESC LIMIT 1",
                 [ledger_id],
@@ -435,6 +544,11 @@ impl Store {
                         sampling_plan_json: row.get(8)?,
                         detection_outcome_json: row.get(9)?,
                         reuse_media_info_cache: row.get::<_, i64>(10).unwrap_or(0) != 0,
+                        stage: row
+                            .get::<_, String>(11)
+                            .ok()
+                            .and_then(|value| super::ProbeDispatchStage::from_str(&value))
+                            .unwrap_or(super::ProbeDispatchStage::Metadata),
                     })
                 },
             )

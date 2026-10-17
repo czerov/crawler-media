@@ -145,6 +145,7 @@ fn to_hit(hit: SearchHit) -> Result<CatalogHit, TmdbError> {
             title,
             year: hit.season_year,
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: None,
             douban_id: None,
             tvdb_id: None,

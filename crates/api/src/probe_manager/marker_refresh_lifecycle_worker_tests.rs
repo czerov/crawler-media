@@ -97,20 +97,8 @@ async fn window2_execution_handover_freeze_prevents_publication() {
         .unwrap()
         .id;
 
-    let first = harness
-        .manager
-        .metadata_rx
-        .try_lock()
-        .unwrap()
-        .try_recv()
-        .unwrap();
-    let _second = harness
-        .manager
-        .metadata_rx
-        .try_lock()
-        .unwrap()
-        .try_recv()
-        .unwrap();
+    let first = harness.manager.take_queued_for_test().unwrap();
+    let _second = harness.manager.take_queued_for_test().unwrap();
 
     let work = probe::FingerprintWork {
         unit: first,

@@ -56,6 +56,7 @@ fn create_sample_media(media_id: MediaId) -> Media {
         title: "Test Show".into(),
         year: Some(2024),
         original_title: Some("Test Show".into()),
+        aliases: Vec::new(),
         tmdb_id: Some("12345".into()),
         douban_id: None,
         tvdb_id: None,

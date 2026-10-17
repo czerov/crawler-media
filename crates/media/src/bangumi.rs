@@ -111,6 +111,7 @@ fn to_hit(kind: MediaKind, hit: SearchHit) -> Result<CatalogHit, TmdbError> {
             title,
             year,
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: None,
             douban_id: None,
             tvdb_id: None,

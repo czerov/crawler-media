@@ -313,6 +313,7 @@ fn preview_entry_dir(
         title: body.title.clone().unwrap_or_else(|| "未知片名".into()),
         year: body.year,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: body.tmdb_id.clone(),
         douban_id: None,
         tvdb_id: None,

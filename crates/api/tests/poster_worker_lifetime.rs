@@ -148,6 +148,7 @@ fn insert_media(store: &Store, tmdb_id: &str) -> MediaId {
         title: format!("Movie {tmdb_id}"),
         year: Some(2024),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some(tmdb_id.into()),
         douban_id: None,
         tvdb_id: None,

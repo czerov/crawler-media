@@ -402,7 +402,12 @@ fn fetch_torrents(
     let (torrents, keywords, succeeded) = match context.subscribe.fetch_mode {
         FetchMode::Search => {
             let (torrents, keywords, succeeded, search_failures) =
-                crate::worker::search_torrents_for_media(state, &context.sites, &context.media);
+                crate::worker::search_torrents_for_subscribe(
+                    state,
+                    &context.sites,
+                    &context.media,
+                    &context.subscribe.coverage,
+                );
             failures.extend(search_failures);
             (torrents, keywords, succeeded)
         }
@@ -418,7 +423,12 @@ fn fetch_torrents(
         }
         FetchMode::Both => {
             let (mut merged, keywords, search_succeeded, mut search_failures) =
-                crate::worker::search_torrents_for_media(state, &context.sites, &context.media);
+                crate::worker::search_torrents_for_subscribe(
+                    state,
+                    &context.sites,
+                    &context.media,
+                    &context.subscribe.coverage,
+                );
             let rss = state.indexer.rss(&context.sites);
             let rss_succeeded = crate::worker::report_site_failures(
                 &rss,

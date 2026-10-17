@@ -29,6 +29,7 @@ fn tv_fixtures() -> (Media, domain::Subscribe, domain::Filter, Torrent) {
         title: "Test Show".into(),
         year: Some(2023),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("12345".into()),
         douban_id: None,
         tvdb_id: None,

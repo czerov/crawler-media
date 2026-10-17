@@ -174,7 +174,7 @@ async fn legacy_wash_cut_keeps_old_file_if_replacement_ledger_write_fails() {
 #[test]
 fn season_pack_accepts_bare_sxxexx_episode_names() {
     let media = Media { id: MediaId::new(), kind: MediaKind::Tv, title: "Test Show".into(),
-        year: None, original_title: None, tmdb_id: None, douban_id: None,
+        year: None, original_title: None, aliases: Vec::new(), tmdb_id: None, douban_id: None,
         tvdb_id: None, bangumi_id: None, anilist_id: None };
     let sub = Subscribe { id: SubscribeId::new(), user_id: UserId::new(), media_id: media.id,
         coverage: Coverage::Tv { season: 1, episode_from: 1, episode_to: Some(2) },

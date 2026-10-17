@@ -77,6 +77,7 @@ async fn parent_verify_and_prune_do_not_touch_nested_library() {
             kind: MediaKind::Movie,
             title: "Child".into(),
             original_title: None,
+            aliases: Vec::new(),
             year: None,
             tmdb_id: None,
             douban_id: None,

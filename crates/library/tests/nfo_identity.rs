@@ -8,6 +8,7 @@ fn media() -> Media {
         title: "fixture".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

@@ -130,6 +130,7 @@ fn seed(state: &ApiState, root: &Path) -> domain::UserId {
         title: "Off Lock".into(),
         year: Some(2024),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

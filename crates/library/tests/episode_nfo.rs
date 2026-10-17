@@ -13,6 +13,7 @@ fn write_and_read_episode_nfo_with_plot() {
         title: "一瓯春".into(),
         year: Some(2026),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: Some("294990".into()),
         douban_id: None,
         tvdb_id: None,

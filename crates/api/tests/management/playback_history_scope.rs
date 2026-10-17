@@ -51,6 +51,7 @@ fn seed_test_ledger(tmp: &tempfile::TempDir, lib_dir: &std::path::Path) -> domai
             title: "Movie A".into(),
             year: Some(1999),
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: None,
             douban_id: None,
             bangumi_id: None,

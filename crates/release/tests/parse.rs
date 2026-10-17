@@ -169,3 +169,29 @@ fn season_followed_by_resolution_is_not_parsed_as_episode() {
     assert_eq!(r2.episode, None);
     assert_eq!(r2.resolution.as_deref(), Some("480p"));
 }
+
+#[test]
+fn calendar_dates_are_not_episodes() {
+    for raw in [
+        "Chinese Dream Program 20261002 1080p",
+        "Chinese.Dream.Family.20261002.1080p.WEB-DL",
+        "Chinese Dream 2026.10.02 1080p",
+        "Show.Name.E20261002.1080p",
+        "Show.Name.EP20261002.1080p",
+    ] {
+        let release = parse(raw);
+        assert_eq!(release.episode, None, "{raw}");
+        assert_eq!(release.episode_to, None, "{raw}");
+    }
+}
+
+#[test]
+fn ordinary_episode_tokens_still_parse() {
+    let dotted = parse("Show.Name.20261002.E01.1080p");
+    assert_eq!((dotted.season, dotted.episode), (Some(1), Some(1)));
+    let range = parse("The.Long.Watch.2024.S01E03-E04.1080p.WEB-DL");
+    assert_eq!(
+        (range.season, range.episode, range.episode_to),
+        (Some(1), Some(3), Some(4))
+    );
+}

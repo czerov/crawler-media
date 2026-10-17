@@ -31,7 +31,7 @@ fn last_library_and_ambiguous_root_are_protected() {
     let a = store.create_library(MediaKind::Tv, "A", &[root.to_str().unwrap()], "everyone", true, &[]).unwrap();
     store.create_library(MediaKind::Tv, "B", &[root.to_str().unwrap()], "everyone", true, &[]).unwrap();
     let media = domain::Media { id: domain::MediaId::new(), kind: MediaKind::Tv,
-        title: "Example".into(), year: None, original_title: None, tmdb_id: None,
+        title: "Example".into(), year: None, original_title: None, aliases: Vec::new(), tmdb_id: None,
         douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None };
     store.insert_media(&media).unwrap();
     store.insert_ledger(&domain::LedgerRow { id: domain::LedgerId::new(), media_id: media.id,

@@ -667,7 +667,7 @@ mod tests {
         ).unwrap();
         let media = Media {
             id: domain::MediaId::new(), kind: domain::MediaKind::Movie,
-            title: "The Matrix".into(), year: Some(1999), original_title: None,
+            title: "The Matrix".into(), year: Some(1999), original_title: None, aliases: Vec::new(),
             tmdb_id: None, douban_id: None, tvdb_id: None, bangumi_id: None, anilist_id: None,
         };
         let filter = domain::Filter {

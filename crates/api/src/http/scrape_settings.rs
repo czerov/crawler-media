@@ -228,6 +228,7 @@ fn sample_media(kind: MediaKind) -> Media {
         title: "黑客帝国".into(),
         year: Some(1999),
         original_title: Some("The Matrix".into()),
+        aliases: Vec::new(),
         tmdb_id: Some("603".into()),
         douban_id: None,
         tvdb_id: None,

@@ -290,6 +290,7 @@ impl Store {
         &self,
         media_id: domain::MediaId,
     ) -> Result<Vec<LedgerRow>, StoreError> {
+        self.media_ledger_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut stmt = self.library.prepare(
             "SELECT id, media_id, path, season, episode, resolution, codec, hdr,
                     quality_source, confidence, filter_score
@@ -375,7 +376,12 @@ impl Store {
             let source_path: Option<String> = row.get(12).ok();
             Ok((ledger, mode, source_path))
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let collected = rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from);
+        self.root_ledger_scans.fetch_add(
+            (stmt.get_status(rusqlite::StatementStatus::FullscanStep) as usize).max(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        collected
     }
 
     pub fn get_ledger(&self, compact_id: &str) -> Result<Option<LedgerRow>, StoreError> {

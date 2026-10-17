@@ -32,15 +32,15 @@ struct CoverInput {
 /// 一个 Library 在**锁内**收集到的 owned DB 事实。
 ///
 /// 这里刻意不含任何文件系统观察：`stat`/`is_dir`/`is_file` 在锁外（受 blocking
-/// 预算约束）才做，慢挂载不会阻塞共享 Store。
+/// 预算约束）才做，慢挂载不会阻塞共享 Store。统计（计数/体积/刷新状态）也不再
+/// 在这里逐库重算：由 [`crate::library_statistics`] 一次聚合提供。
 pub(crate) struct LibraryFacts {
-    library: Library,
-    rows: Vec<domain::LedgerRow>,
+    pub(crate) library: Library,
     removal: Option<LibraryRemoval>,
     cover: CoverInput,
 }
 
-/// 锁内读取：ledger 行、removal 状态、封面候选路径。全部是 DB 或内存事实。
+/// 锁内读取：removal 状态、封面候选路径。全部是 DB 或内存事实。
 pub(crate) fn library_facts(store: &crate::Store, library: &Library) -> LibraryFacts {
     let cover = CoverInput {
         disabled: matches!(library.cover_path.as_deref(), Some("none") | Some("")),
@@ -54,23 +54,9 @@ pub(crate) fn library_facts(store: &crate::Store, library: &Library) -> LibraryF
     };
     LibraryFacts {
         library: library.clone(),
-        rows: rows_in_library(store, library),
         removal: store.removal_for_library(&library.id).ok().flatten(),
         cover,
     }
-}
-
-fn is_strm(path: &str) -> bool {
-    // 对于 .strm 虚拟指针文件，磁盘只有几十字节的 URL 文本，
-    // 不计入本地物理体积统计（避免 10 部 4K 剧集显示 1 KB 的怪异现象）
-    path.to_lowercase().ends_with(".strm")
-}
-
-fn file_size(path: &str) -> u64 {
-    if is_strm(path) {
-        return 0;
-    }
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 /// 与 `library_cover_path` 同一套只读语义，但路径输入已经在锁内算好。
@@ -87,14 +73,18 @@ fn cover_path_from_input(cover: &CoverInput) -> Option<PathBuf> {
 }
 
 /// 锁外：在 owned 事实之上做文件观察并渲染响应 JSON。
-pub(crate) fn library_json_from_facts(facts: &LibraryFacts) -> Value {
+///
+/// `stats` 由 [`crate::library_statistics`] 一次聚合给出（计数来自台账、体积来自
+/// 投影 facts、刷新状态来自 head）；这里只负责逐 root `is_dir` 与封面 `is_file`。
+pub(crate) fn library_json_from_facts(
+    facts: &LibraryFacts,
+    stats: Option<crate::library_statistics::LibraryStatistics>,
+) -> Value {
+    let stats = stats.unwrap_or(crate::library_statistics::LibraryStatistics {
+        stale: true,
+        ..Default::default()
+    });
     let library = &facts.library;
-    let bytes: u64 = facts.rows.iter().map(|row| file_size(&row.path)).sum();
-    let strm_count = facts.rows.iter().filter(|row| is_strm(&row.path)).count();
-    let mut media_ids = std::collections::HashSet::new();
-    for row in &facts.rows {
-        media_ids.insert(row.media_id);
-    }
     // 根目录被删：库不能假装是「空的」，要在 UI 提示并提供恢复/删除。
     let root_missing = library
         .root_paths
@@ -122,17 +112,21 @@ pub(crate) fn library_json_from_facts(facts: &LibraryFacts) -> Value {
         "auto_series_collections": library.auto_series_collections,
         "cover_url": cover_path_from_input(&facts.cover).map(|_| format!("/libraries/{}/cover", library.id)),
         "stats": {
-            "item_count": media_ids.len() as i64,
-            "file_count": facts.rows.len() as i64,
-            "total_size_bytes": bytes,
-            "strm_file_count": strm_count as i64,
+            "item_count": stats.item_count,
+            "file_count": stats.file_count,
+            "total_size_bytes": stats.total_size_bytes,
+            "strm_file_count": stats.strm_file_count,
+            "refreshed_at_ms": stats.refreshed_at_ms,
+            "stale": stats.stale,
         },
     })
 }
 
-/// 同步版本：库配置的写路径仍在锁内直接渲染（不在本次改动范围内）。
+/// 同步版本：库配置的写路径仍在锁内直接渲染（不在本次改动范围内），统计用
+/// [`crate::library_statistics::statistics_for`] 的同一套口径同步算一次，不构建。
 pub(crate) fn library_json(store: &crate::Store, library: &Library) -> Value {
-    library_json_from_facts(&library_facts(store, library))
+    let stats = crate::library_statistics::statistics_for(store, library);
+    library_json_from_facts(&library_facts(store, library), Some(stats))
 }
 
 /// Emby-style current cover source: latest TV episode wins; movies use their

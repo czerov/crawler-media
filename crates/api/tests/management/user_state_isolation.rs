@@ -69,6 +69,7 @@ fn seed_movie(tmp: &tempfile::TempDir, users: &[domain::UserId]) -> MediaId {
         title: "Shared Movie".into(),
         year: Some(2026),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use domain::{LedgerId, MediaId};
 use parking_lot::Mutex;
@@ -77,13 +78,151 @@ pub struct ChangeConsumer {
     deps: Arc<Mutex<ProjectionDependencies>>,
 }
 
+/// 依赖覆盖的工作量计数：注入真实计数器（请求路径）或空计数器（只读工具/测试）。
+#[derive(Clone, Default)]
+pub struct HydrationCounters {
+    pub decoded_files: Arc<AtomicUsize>,
+    pub decoded_media: Arc<AtomicUsize>,
+    pub dependency_rows: Arc<AtomicUsize>,
+}
+
+impl HydrationCounters {
+    /// 请求路径：与浏览页共享同一组计数。
+    pub fn from_state(state: &ApiState) -> Self {
+        Self {
+            decoded_files: state.browse_page_decoded_files(),
+            decoded_media: state.browse_page_decoded_media(),
+            dependency_rows: state.browse_page_dependency_rows(),
+        }
+    }
+
+    fn count_decoded(&self, files: usize, media: usize) {
+        self.decoded_files.fetch_add(files, Ordering::SeqCst);
+        self.decoded_media.fetch_add(media, Ordering::SeqCst);
+    }
+
+    fn count_dependency_rows(&self, rows: usize) {
+        self.dependency_rows.fetch_add(rows, Ordering::SeqCst);
+    }
+}
+
+/// 一个库的依赖覆盖（轻量读取的结果）。
+struct DependencyCoverage {
+    media_ids: HashSet<MediaId>,
+    ledger_ids: HashSet<LedgerId>,
+    paths: HashSet<String>,
+    catalog_keys: HashSet<String>,
+}
+
+/// 轻量覆盖读取：file 依赖列 + 轻候选；轻候选不可读（旧代投影）时回退重读整份
+/// 投影，并把重读的解码行数计入本次请求工作量。
+fn hydrate_library(
+    store: &Store,
+    library_id: &str,
+    counters: &HydrationCounters,
+) -> Result<Option<DependencyCoverage>, StoreError> {
+    let files = store.browse_file_dependencies(library_id)?;
+    if files.is_empty() {
+        // 空投影（或只有 media 行）：没有依赖可记，也不必重读。
+        return Ok(Some(DependencyCoverage {
+            media_ids: HashSet::new(),
+            ledger_ids: HashSet::new(),
+            paths: HashSet::new(),
+            catalog_keys: HashSet::new(),
+        }));
+    }
+    // 升级前的行没有 path 列值：路径依赖不可用，回退重读拿真实路径（并计数）。
+    if files.iter().any(|file| file.path.is_empty()) {
+        return hydrate_from_snapshot(store, library_id, counters);
+    }
+    let candidates = match store.browse_media_candidates(library_id) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(
+                library_id,
+                %error,
+                "轻候选不可读，依赖覆盖回退重读整份投影"
+            );
+            return hydrate_from_snapshot(store, library_id, counters);
+        }
+    };
+    counters.count_dependency_rows(files.len() + candidates.len());
+    let mut coverage = DependencyCoverage {
+        media_ids: HashSet::new(),
+        ledger_ids: HashSet::new(),
+        paths: HashSet::new(),
+        catalog_keys: HashSet::new(),
+    };
+    for file in files {
+        coverage.media_ids.insert(file.media_id);
+        coverage.ledger_ids.insert(file.ledger_id);
+        coverage.paths.insert(file.path);
+    }
+    for candidate in candidates {
+        let Some(tmdb_id) = candidate.tmdb_id else {
+            continue;
+        };
+        coverage
+            .catalog_keys
+            .insert(format!("tmdb:/{}/{}", candidate.kind.as_str(), tmdb_id));
+    }
+    Ok(Some(coverage))
+}
+
+/// 旧代投影的回退：整份装载并逐行解码（成本计入本次请求的解码计数）。
+fn hydrate_from_snapshot(
+    store: &Store,
+    library_id: &str,
+    counters: &HydrationCounters,
+) -> Result<Option<DependencyCoverage>, StoreError> {
+    let Some(snapshot) = store.browse_projection(library_id)? else {
+        return Ok(None);
+    };
+    counters.count_decoded(snapshot.files.len(), snapshot.media.len());
+    let mut coverage = DependencyCoverage {
+        media_ids: HashSet::new(),
+        ledger_ids: HashSet::new(),
+        paths: HashSet::new(),
+        catalog_keys: HashSet::new(),
+    };
+    for file in snapshot.files {
+        if let Some(facts) = super::facts::FileFacts::from_json(&file.facts) {
+            coverage.media_ids.insert(facts.row.media_id);
+            coverage.ledger_ids.insert(facts.row.id);
+            coverage.paths.insert(facts.row.path);
+        }
+    }
+    for media in snapshot.media {
+        let Some(facts) = media.facts.get("media") else {
+            continue;
+        };
+        let Some(tmdb_id) = facts.get("tmdb_id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let kind = facts.get("kind").and_then(|value| value.as_str()).unwrap_or("movie");
+        coverage
+            .catalog_keys
+            .insert(format!("tmdb:/{kind}/{tmdb_id}"));
+    }
+    Ok(Some(coverage))
+}
+
 impl ChangeConsumer {
     pub fn new(deps: Arc<Mutex<ProjectionDependencies>>) -> Self {
         Self { deps }
     }
 
     /// Load persisted ready projections once their reverse-dependency coverage is absent.
-    pub fn hydrate_ready_dependencies(&self, store: &Store) -> Result<(), StoreError> {
+    ///
+    /// A4-03：覆盖读取走**轻量列/轻候选**——`browse_files` 的 ledger/media/path 列与
+    /// `browse_media` 的轻候选 JSON——不再装载整份投影并逐行解码 file/media facts。
+    /// 只有轻读不可用（旧代投影）时才回退到重读，并把该成本计入本次请求的解码计数，
+    /// 让「重启后的首个小页」的真实工作量可测。
+    pub fn hydrate_ready_dependencies(
+        &self,
+        store: &Store,
+        counters: &HydrationCounters,
+    ) -> Result<(), StoreError> {
         let ownership = store.library_ownership()?;
         let mut dependencies = self.deps.lock();
         let current_ids = ownership
@@ -96,27 +235,17 @@ impl ChangeConsumer {
             if dependencies.catalog_by_library.contains_key(&library.id) {
                 continue;
             }
-            let Some(snapshot) = store.browse_projection(&library.id)? else {
+            let Some(coverage) = hydrate_library(store, &library.id, counters)? else {
                 dependencies.record_library(&library.id, [], [], [], []);
                 continue;
             };
-            let mut media_ids = HashSet::new();
-            let mut ledger_ids = HashSet::new();
-            let mut paths = HashSet::new();
-            for file in snapshot.files {
-                if let Some(facts) = super::facts::FileFacts::from_json(&file.facts) {
-                    media_ids.insert(facts.row.media_id);
-                    ledger_ids.insert(facts.row.id);
-                    paths.insert(facts.row.path);
-                }
-            }
-            let catalog_keys = snapshot.media.iter().filter_map(|media| {
-                let facts = media.facts.get("media")?;
-                let tmdb_id = facts.get("tmdb_id")?.as_str()?;
-                let kind = facts.get("kind")?.as_str().unwrap_or("movie");
-                Some(format!("tmdb:/{kind}/{tmdb_id}"))
-            });
-            dependencies.record_library(&library.id, media_ids, ledger_ids, paths, catalog_keys);
+            dependencies.record_library(
+                &library.id,
+                coverage.media_ids,
+                coverage.ledger_ids,
+                coverage.paths,
+                coverage.catalog_keys,
+            );
         }
         Ok(())
     }

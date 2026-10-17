@@ -91,6 +91,7 @@ impl RefreshHarness {
                 title: "万神殿".into(),
                 year: None,
                 original_title: None,
+                aliases: Vec::new(),
                 tmdb_id: None,
                 douban_id: None,
                 tvdb_id: None,
@@ -226,13 +227,7 @@ fn window1_queued_stage_cancellation_releases_scope() {
     );
     harness.assert_old_markers_intact();
 
-    let first = harness
-        .manager
-        .metadata_rx
-        .try_lock()
-        .unwrap()
-        .try_recv()
-        .unwrap();
+    let first = harness.manager.take_queued_for_test().unwrap();
     assert!(!worker::source_ready(&harness.manager, &first));
     assert!(!harness.manager.seen.lock().contains(&first.row.id.to_string()));
 }
@@ -256,20 +251,8 @@ fn window3_pre_publication_freeze_prevents_late_result() {
         .unwrap()
         .id;
 
-    let first = harness
-        .manager
-        .metadata_rx
-        .try_lock()
-        .unwrap()
-        .try_recv()
-        .unwrap();
-    let second = harness
-        .manager
-        .metadata_rx
-        .try_lock()
-        .unwrap()
-        .try_recv()
-        .unwrap();
+    let first = harness.manager.take_queued_for_test().unwrap();
+    let second = harness.manager.take_queued_for_test().unwrap();
 
     harness.manager.finish(&first, true);
     assert_eq!(
@@ -326,20 +309,8 @@ fn window3_pre_publication_file_deleted_prevents_late_result() {
         .unwrap()
         .id;
 
-    let first = harness
-        .manager
-        .metadata_rx
-        .try_lock()
-        .unwrap()
-        .try_recv()
-        .unwrap();
-    let second = harness
-        .manager
-        .metadata_rx
-        .try_lock()
-        .unwrap()
-        .try_recv()
-        .unwrap();
+    let first = harness.manager.take_queued_for_test().unwrap();
+    let second = harness.manager.take_queued_for_test().unwrap();
 
     harness.manager.finish(&first, true);
 
@@ -554,20 +525,9 @@ fn window6_cross_library_season_refresh_publishes_only_job_members() {
             .job_id
     };
 
-    let first = harness
-        .manager
-        .metadata_rx
-        .try_lock()
-        .unwrap()
-        .try_recv()
-        .unwrap();
-    let second = harness
-        .manager
-        .metadata_rx
-        .try_lock()
-        .unwrap()
-        .try_recv()
-        .unwrap();
+
+    let first = harness.manager.take_queued_for_test().unwrap();
+    let second = harness.manager.take_queued_for_test().unwrap();
     harness.manager.finish(&first, true);
     harness.manager.finish(&second, true);
 

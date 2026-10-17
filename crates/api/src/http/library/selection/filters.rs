@@ -1,6 +1,17 @@
-use super::{LibrarySelection, best_resolution, resolution_rank};
+use super::LibrarySelection;
 use library::WatchTier;
 use std::{cmp::Ordering, collections::HashMap};
+
+/// 无 watch、无过滤、且排序有索引列时可直接用 SQL 分页的顺序。
+///
+/// 其余查询（任何过滤/watch/非常用排序）必须先取整库轻候选完整筛选排序，
+/// 再读本页重事实：选页后过滤会漏项。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexPageOrder {
+    Title,
+    AddedAt,
+    ReleaseDate,
+}
 
 pub(crate) struct LibraryFilter {
     lists: HashMap<String, Vec<String>>,
@@ -131,14 +142,9 @@ impl LibraryFilter {
 
     fn matches_ignoring_watch(&self, item: &LibrarySelection) -> bool {
         let meta = &item.metadata;
-        let provisional = item.media.tmdb_id.is_none()
-            && item.media.douban_id.is_none()
-            && item.media.tvdb_id.is_none()
-            && item.media.bangumi_id.is_none()
-            && item.media.anilist_id.is_none();
         let identity = match self.identity.as_deref() {
-            Some("provisional") => provisional,
-            Some("confirmed") => !provisional,
+            Some("provisional") => item.light.provisional,
+            Some("confirmed") => !item.light.provisional,
             _ => true,
         };
         identity
@@ -170,21 +176,14 @@ impl LibraryFilter {
                 })
             })
             && self.any("res", |res| {
-                item.rows
-                    .iter()
-                    .any(|r| r.resolution.as_deref() == Some(res))
+                item.light.resolutions.iter().any(|r| r.as_str() == res)
             })
             && self.any("stock", |stock| match stock {
                 "missing" => item.missing,
                 "unscraped" => !meta.scraped,
                 _ => false,
             })
-            && self.hdr.is_none_or(|want| {
-                item.rows
-                    .iter()
-                    .any(|r| r.hdr.as_deref().is_some_and(|v| !v.is_empty()))
-                    == want
-            })
+            && self.hdr.is_none_or(|want| item.light.hdr == want)
             && self
                 .rating
                 .is_none_or(|min| meta.rating.is_some_and(|rating| rating >= min))
@@ -206,7 +205,7 @@ impl LibraryFilter {
         };
         let primary = match self.sort.as_str() {
             "added_at" => a.added_at.cmp(&b.added_at),
-            "release_date" | "release_date_asc" => release_date(a).cmp(&release_date(b)),
+            "release_date" | "release_date_asc" => a.light.release_date.cmp(&b.light.release_date),
             "rating" => a
                 .metadata
                 .rating
@@ -222,10 +221,9 @@ impl LibraryFilter {
                 .last_played_at
                 .unwrap_or(0)
                 .cmp(&b.last_played_at.unwrap_or(0)),
-            "resolution" => resolution_rank(best_resolution(&a.rows).unwrap_or(""))
-                .cmp(&resolution_rank(best_resolution(&b.rows).unwrap_or(""))),
+            "resolution" => a.light.resolution_rank.cmp(&b.light.resolution_rank),
             // 稳定的伪随机序：同一 Media 每次落同一位置，翻页/EOF 才不会重复或漏项。
-            "random" => shuffle_key(a).cmp(&shuffle_key(b)),
+            "random" => a.light.shuffle_key.cmp(&b.light.shuffle_key),
             _ => a.media.title.cmp(&b.media.title),
         };
         let primary = if self.desc {
@@ -235,6 +233,34 @@ impl LibraryFilter {
         };
         tier.then(primary)
             .then_with(|| a.media.id.to_string().cmp(&b.media.id.to_string()))
+    }
+
+    /// 无 watch、无过滤且排序有索引列 → 可直接 SQL 分页的顺序。
+    ///
+    /// `sort=release_date_asc` 与 `release_date` 走同一个排序键（`desc` 的默认值
+    /// 不同），因此两者共用 `ReleaseDate`。
+    pub(crate) fn index_page_order(&self) -> Option<IndexPageOrder> {
+        if self.watch.is_some()
+            || self.unwatched_first
+            || self.hdr.is_some()
+            || self.rating.is_some()
+            || self.identity.is_some()
+            || self.lists.values().any(|values| !values.is_empty())
+        {
+            return None;
+        }
+        match self.sort.as_str() {
+            "title" => Some(IndexPageOrder::Title),
+            "added_at" => Some(IndexPageOrder::AddedAt),
+            "release_date" | "release_date_asc" => Some(IndexPageOrder::ReleaseDate),
+            _ => None,
+        }
+    }
+
+    /// 排序方向（`order=asc|desc` 或该排序的默认方向），SQL 索引分页与
+    /// [`Self::compare`] 必须用同一个值。
+    pub(crate) fn descending(&self) -> bool {
+        self.desc
     }
 }
 
@@ -253,22 +279,3 @@ const SORTS: &[&str] = &[
     "probing",
     "random",
 ];
-
-fn shuffle_key(item: &LibrarySelection) -> u64 {
-    // FNV-1a over the stable Media id.
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in item.media.id.to_string().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-fn release_date(item: &LibrarySelection) -> String {
-    item.metadata.release_date.clone().unwrap_or_else(|| {
-        item.media
-            .year
-            .map(|y| format!("{y:04}-01-01"))
-            .unwrap_or_default()
-    })
-}

@@ -8,12 +8,21 @@ mod pending_progress;
 mod browse_projection;
 pub use browse_projection::{
     BrowseFileFacts, BrowseMediaFacts, ProjectionBuild, ProjectionSnapshot, ReadRevisions,
+    library_scope_signature,
 };
 mod browse_changes;
 pub use browse_changes::{BrowseChange, BrowseChangeSource, ProjectionHead};
+mod browse_pages;
+pub use browse_pages::{
+    BROWSE_CANDIDATE_VERSION, BrowseFileDependency, BrowseMediaCandidate, BrowsePageOrder,
+    BrowsePageRequest,
+};
 mod browse_reads;
 mod catalog;
+mod chapter_frame_tasks;
+pub use chapter_frame_tasks::{ChapterFrameTask, ChapterFrameTaskCounts};
 mod collections;
+mod data_retention;
 mod downloaders;
 mod fingerprint_attempts;
 mod fingerprint_cache;
@@ -48,6 +57,8 @@ mod open;
 mod playback;
 mod playback_devices;
 mod probe_tasks;
+mod probe_dispatch;
+pub use probe_dispatch::{ProbeDispatchId, ProbeDispatchSnapshot, ProbeDispatchStage};
 mod roots;
 mod schema;
 mod scanned_ledger;
@@ -66,8 +77,9 @@ mod users;
 pub mod password;
 pub mod probe_state;
 
-pub use browse_reads::PlaybackUnitSnapshot;
+pub use browse_reads::{BrowseFileTotals, PlaybackUnitSnapshot};
 pub use catalog::CatalogCacheRow;
+pub use data_retention::{DataRetentionBatch, DataRetentionCursor, RetentionClass};
 pub use downloaders::DownloaderRow;
 pub use fingerprint_attempts::StoredFingerprintAttempt;
 pub use fingerprint_cache::{FingerprintCacheEntry, MediaInfoCacheVersion};
@@ -178,9 +190,47 @@ pub enum StoreError {
 
 pub struct Store {
     data_dir: PathBuf,
+    /// Times this store's `list_ledger` executed its unfiltered `FROM ledger`
+    /// statement. Per-instance so concurrent tests never share the diagnostic.
+    pub(crate) root_ledger_scans: std::sync::atomic::AtomicUsize,
+    /// Calls to `ledger_for_media` on this store. Selection can load the same
+    /// media twice; the logical candidate count does not show that second read.
+    pub(crate) media_ledger_reads: std::sync::atomic::AtomicUsize,
+    /// Per-store role lookup diagnostic for bounded roster work.
+    pub(crate) role_lookups: std::sync::atomic::AtomicUsize,
     app_path: PathBuf,
     pub(crate) app: Connection,
     pub(crate) catalog: Connection,
     pub(crate) library: Connection,
     pub(crate) subscribe: Connection,
+}
+
+impl Store {
+    /// Times `list_ledger` executed its unfiltered `FROM ledger` statement.
+    ///
+    /// Incremented beside that statement, so filtering the returned rows cannot
+    /// hide the scan. `ledger_for_media` does not increment it.
+    pub fn root_ledger_scans(&self) -> usize {
+        self.root_ledger_scans.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn reset_root_ledger_scans(&self) {
+        self.root_ledger_scans.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Times `ledger_for_media` executed its indexed read.
+    pub fn media_ledger_reads(&self) -> usize {
+        self.media_ledger_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn reset_media_ledger_reads(&self) {
+        self.media_ledger_reads.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn role_lookups(&self) -> usize {
+        self.role_lookups.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn reset_role_lookups(&self) {
+        self.role_lookups.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
 }

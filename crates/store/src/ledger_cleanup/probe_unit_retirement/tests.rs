@@ -19,6 +19,7 @@ fn fixture(store: &Store, root: &std::path::Path) -> (Media, LedgerRow, LedgerRo
         title: "Example".into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,

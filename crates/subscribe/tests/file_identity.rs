@@ -10,6 +10,7 @@ fn test_media(kind: MediaKind, title: &str, year: u16) -> Media {
         title: title.into(),
         year: Some(year),
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         bangumi_id: None,

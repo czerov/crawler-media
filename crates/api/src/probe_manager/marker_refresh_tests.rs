@@ -11,6 +11,7 @@ fn season_refresh_keeps_old_markers_until_success_then_clears_empty_result() {
             title: "万神殿".into(),
             year: None,
             original_title: None,
+            aliases: Vec::new(),
             tmdb_id: None,
             douban_id: None,
             tvdb_id: None,
@@ -57,9 +58,8 @@ fn season_refresh_keeps_old_markers_until_success_then_clears_empty_result() {
         })
         .collect();
     assert_eq!(manager.enqueue_forced_item_refresh(units).unwrap(), 2);
-    let mut rx = manager.metadata_rx.try_lock().unwrap();
-    let first = rx.try_recv().unwrap();
-    let second = rx.try_recv().unwrap();
+    let first = manager.take_queued_for_test().unwrap();
+    let second = manager.take_queued_for_test().unwrap();
     manager.finish(&first, true);
 
     let current = store

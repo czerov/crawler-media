@@ -80,6 +80,36 @@ pub(super) fn item_db_facts(
     ItemDbFacts { resume_state, tracks, is_favorite: favorite.is_some_and(|unit| unit.state.favorite) }
 }
 
+/// 过滤/排序需要的 NFO 公共字段（genre/studio/person/search 命中）。
+///
+/// 只有在查询真的用到这些字段时才读 NFO，所以复杂 NFO 过滤的冷启动成本是
+/// **线性**的（每条候选一次 NFO 读），调用方必须显式记录这份成本，不能假装
+/// 全部落在 SQL seek 上。字段口径与 [`item_metadata`] 完全一致，避免两套语义。
+pub(super) fn filter_facts(
+    row: &domain::LedgerRow,
+    media: &Media,
+    is_series: bool,
+) -> MediaItemMetadata {
+    let nfo = row_nfo_metadata(row, media, is_series);
+    MediaItemMetadata {
+        overview: nfo.as_ref().and_then(|metadata| metadata.plot.clone()),
+        genres: nfo
+            .as_ref()
+            .map(|metadata| metadata.genres.clone())
+            .unwrap_or_default(),
+        studios: nfo
+            .as_ref()
+            .map(|metadata| metadata.studios.clone())
+            .unwrap_or_default(),
+        original_title: nfo
+            .as_ref()
+            .and_then(|metadata| metadata.original_title.clone())
+            .or_else(|| media.original_title.clone()),
+        people: people_from_nfo(nfo.as_ref()),
+        ..Default::default()
+    }
+}
+
 /// 锁外渲染：NFO/stat/外部字幕 IO 都在这里，调用方必须先释放 Store 锁。
 pub(super) fn item_metadata(
     facts: ItemDbFacts,
