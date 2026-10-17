@@ -20,3 +20,15 @@ The measurements grow one database cumulatively. Read time tracks cumulative glo
 3. **Persistent `root_id` facts:** store ownership/root association on ledger rows and update it on path/root changes. This can make lookup direct, but turns derived ownership into persistent row facts with broader migration, update, ambiguity, and recovery obligations; it risks conflating an optimization with authoritative ownership.
 
 Recommendation: approve the derived index design for a separate implementation task, with generation/revision safety and rollback specified above. This design gate makes no approval decision for the user and does not claim DB-07 fixed. ADR-0008 remains authoritative unchanged.
+
+## Approval
+
+Approved for implementation: avoid full-table scans for every library kind and
+add the supporting index rather than changing stored root ids. Implementation
+slices (each with its own migration, tests and fallback):
+
+1. persisted derived table `browse_ledger_owners(ledger_id, library_id, ownership_revision)` plus an ownership revision counter;
+2. batched initial build with a generation swap and crash recovery (a stale/incomplete generation is never used; the reader falls back to the current bounded scan);
+3. reader switch for `ledger_candidates_for_library`, with the default-library fallback preserved and `browse_owned_ledger_ids` returning `None` while the index is not ready;
+4. deletion/transfer keep strict-fresh semantics; rollback stops new dispatch and drains without deleting queued facts.
+

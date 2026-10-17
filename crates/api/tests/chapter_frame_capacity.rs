@@ -103,9 +103,19 @@ impl ChapterFrameRunner for FakeRunner {
 struct Fixture {
     _temp: tempfile::TempDir,
     store: Arc<Mutex<Store>>,
+    registry: Arc<LibraryWorkRegistry>,
     runner: Arc<FakeRunner>,
+    gate: Arc<Gate>,
     service: Arc<ChapterFrameService>,
     rows: Vec<LedgerRow>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // A failed assertion must not leave gated blocking renderers parked:
+        // tokio's blocking pool would keep the test process alive on teardown.
+        self.gate.release();
+    }
 }
 
 impl Fixture {
@@ -164,7 +174,7 @@ impl Fixture {
         let store = Arc::new(Mutex::new(store));
         let registry = Arc::new(LibraryWorkRegistry::default());
         let gate = Arc::new(Gate::new());
-        let runner = Arc::new(FakeRunner::new(gate));
+        let runner = Arc::new(FakeRunner::new(gate.clone()));
         let service = Arc::new(ChapterFrameService::with_runner(
             store.clone(),
             registry.clone(),
@@ -173,7 +183,9 @@ impl Fixture {
         Self {
             _temp: temp,
             store,
+            registry,
             runner,
+            gate,
             service,
             rows,
         }
@@ -242,13 +254,17 @@ impl Fixture {
 
 #[tokio::test]
 async fn chapter_batch_keeps_process_and_queue_limits() {
+    // The plan pins the production numbers; asserting the constants keeps a
+    // later "temporary" widening from silently passing the behavioral checks.
+    assert_eq!(MAX_CHAPTER_PROCESSES, 2, "chapter process bound must stay 2");
+    assert_eq!(DISPATCH_WINDOW, 64, "chapter dispatch window must stay 64");
     let fixture = Fixture::new();
     assert_eq!(fixture.enqueue_all(), FILES);
     fixture.service.start();
     fixture.wait_entered(MAX_CHAPTER_PROCESSES).await;
 
-    assert!(fixture.runner.max_active() <= MAX_CHAPTER_PROCESSES);
-    assert!(fixture.service.pending_memory() <= DISPATCH_WINDOW);
+    assert!(fixture.runner.max_active() <= 2);
+    assert!(fixture.service.pending_memory() <= 64);
 
     fixture.runner.gate.release();
     fixture.drain().await;
@@ -257,13 +273,15 @@ async fn chapter_batch_keeps_process_and_queue_limits() {
     assert_eq!(counts.completed, FILES);
     assert_eq!(counts.failed, 0);
     assert_eq!(fixture.durable_total(), FILES);
-    assert!(fixture.runner.max_active() <= MAX_CHAPTER_PROCESSES);
+    assert!(fixture.runner.max_active() <= 2);
     assert!(fixture.service.published_images() >= FILES * TARGETS.len());
     let _ = fixture.service.shutdown().await;
 }
 
 #[tokio::test]
 async fn chapter_capacity_defers_without_losing_requests() {
+    assert_eq!(MAX_CHAPTER_PROCESSES, 2, "chapter process bound must stay 2");
+    assert_eq!(DISPATCH_WINDOW, 64, "chapter dispatch window must stay 64");
     let fixture = Fixture::new();
     assert_eq!(fixture.enqueue_all(), FILES);
     fixture.service.start();
@@ -271,15 +289,15 @@ async fn chapter_capacity_defers_without_losing_requests() {
 
     // The window is full: the rest stays `queued` in SQLite.
     let gated = fixture.counts();
-    assert_eq!(gated.running, DISPATCH_WINDOW);
-    assert_eq!(gated.queued, FILES - DISPATCH_WINDOW);
-    assert_eq!(fixture.service.pending_memory(), DISPATCH_WINDOW);
+    assert_eq!(gated.running, 64);
+    assert_eq!(gated.queued, FILES - 64);
+    assert_eq!(fixture.service.pending_memory(), 64);
     assert_eq!(fixture.durable_total(), FILES);
 
     // Extra dispatches while full must not widen the window or lose rows.
     for _ in 0..3 {
         assert_eq!(fixture.service.dispatch_once().await.unwrap(), 0);
-        assert!(fixture.service.pending_memory() <= DISPATCH_WINDOW);
+        assert!(fixture.service.pending_memory() <= 64);
         assert_eq!(fixture.durable_total(), FILES);
     }
 
@@ -289,7 +307,7 @@ async fn chapter_capacity_defers_without_losing_requests() {
     let counts = fixture.counts();
     assert_eq!(counts.queued + counts.running + counts.completed, FILES);
     assert_eq!(counts.completed, FILES);
-    assert!(fixture.runner.max_active() <= MAX_CHAPTER_PROCESSES);
+    assert!(fixture.runner.max_active() <= 2);
     let _ = fixture.service.shutdown().await;
 }
 
@@ -320,4 +338,63 @@ async fn superseded_source_publishes_no_late_frames() {
                 .starts_with(".chapter-fake-"))
     );
     let _ = fixture.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn obligations_wait_durably_without_a_runtime() {
+    let fixture = Fixture::new();
+    assert_eq!(fixture.enqueue_all(), FILES);
+
+    // `start()` on a thread without a Tokio runtime must persist-only: no
+    // worker is spawned and no row leaves `queued`.
+    let service = fixture.service.clone();
+    std::thread::spawn(move || service.start())
+        .join()
+        .expect("runtime-less start must return");
+    let counts = fixture.counts();
+    assert_eq!(counts.queued, FILES);
+    assert_eq!(counts.running, 0);
+    assert_eq!(fixture.service.pending_memory(), 0);
+    assert_eq!(fixture.service.published_images(), 0);
+    assert_eq!(fixture.durable_total(), FILES);
+}
+
+struct PanicRunner;
+
+impl ChapterFrameRunner for PanicRunner {
+    fn render(
+        &self,
+        _request: &ChapterFrameRequest,
+        _control: &WorkControl,
+    ) -> Result<Vec<ChapterFrameStaged>, String> {
+        panic!("renderer panicked");
+    }
+}
+
+#[tokio::test]
+async fn panicking_runner_is_acked_as_failed() {
+    let fixture = Fixture::new();
+    let service = Arc::new(ChapterFrameService::with_runner(
+        fixture.store.clone(),
+        fixture.registry.clone(),
+        Arc::new(PanicRunner),
+    ));
+    let row = &fixture.rows[0];
+    assert!(service
+        .enqueue_ledger(&row.id.to_string(), TARGETS.to_vec())
+        .unwrap());
+    service.start();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let counts = fixture.counts();
+            if counts.queued == 0 && counts.running == 0 && counts.failed == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("panicking renderer must still ack its obligation");
+    assert_eq!(fixture.counts().failed, 1);
+    let _ = service.shutdown().await;
 }
