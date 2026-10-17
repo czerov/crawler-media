@@ -21,6 +21,17 @@ pub struct PlaybackUnitSnapshot {
     pub state: UnitState,
 }
 
+/// 一个 Library 的投影 file facts 汇总（一次 SQL 聚合，零 JSON 解码）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BrowseFileTotals {
+    /// `browse_files` 行数：该库当前拥有的台账文件数。
+    pub file_count: u64,
+    /// 物理体积合计；`.strm` 指针文件记 0（与 Library 统计既有口径一致）。
+    pub total_size_bytes: u64,
+    /// `.strm` 指针文件数。
+    pub strm_file_count: u64,
+}
+
 pub(super) const MEDIA_BATCH_CHUNK: usize = 500;
 
 impl Store {
@@ -300,6 +311,49 @@ impl Store {
         }
         Ok(missing)
     }
+
+    /// 一个 Library 的投影 file facts 汇总：行数、物理体积、`.strm` 指针数。
+    ///
+    /// 一次 SQL 聚合，不解码整库 facts JSON，也不碰文件系统；体积口径与旧逐文件
+    /// `stat` 一致（`.strm` 只有几十字节 URL 文本，记 0）。任何一行的 facts JSON
+    /// 不是 `facts_version`（升级前的旧代或损坏行）时返回 `None`：调用方据此判定
+    /// 投影过旧并重建，而不是把 0 当成「空库」。
+    pub fn browse_file_totals(
+        &self,
+        library_id: &str,
+        facts_version: u64,
+    ) -> Result<Option<BrowseFileTotals>, StoreError> {
+        let mut stmt = self.library.prepare(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN json_valid(facts_json)
+                                       AND json_extract(facts_json, '$.version') = ?2
+                                      THEN 0 ELSE 1 END), 0),
+                    COALESCE(SUM(CASE WHEN json_valid(facts_json)
+                                       AND json_extract(facts_json, '$.version') = ?2
+                                       AND lower(COALESCE(json_extract(facts_json, '$.path'), ''))
+                                           LIKE '%.strm'
+                                      THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN json_valid(facts_json)
+                                       AND json_extract(facts_json, '$.version') = ?2
+                                       AND lower(COALESCE(json_extract(facts_json, '$.path'), ''))
+                                           NOT LIKE '%.strm'
+                                      THEN COALESCE(json_extract(facts_json, '$.size'), 0)
+                                      ELSE 0 END), 0)
+             FROM browse_files WHERE library_id = ?1",
+        )?;
+        let (file_count, foreign, strm, size): (i64, i64, i64, i64) = stmt.query_row(
+            params![library_id, facts_version as i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if foreign > 0 {
+            return Ok(None);
+        }
+        Ok(Some(BrowseFileTotals {
+            file_count: file_count.max(0) as u64,
+            total_size_bytes: size.max(0) as u64,
+            strm_file_count: strm.max(0) as u64,
+        }))
+    }
 }
 
 /// Separator spellings, other than a single `/`, that `Path::components()`
@@ -441,6 +495,60 @@ mod tests {
                 filter_score: None,
             })
             .unwrap();
+    }
+
+    /// 整库 facts 汇总：一次 SQL 聚合、`.strm` 记 0、版本不符返回 `None`。
+    #[test]
+    fn browse_file_totals_zeroes_strm_and_rejects_old_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("data")).unwrap();
+        let library = store
+            .default_library(MediaKind::Movie)
+            .unwrap()
+            .expect("seeded default movie library");
+        let media_id = MediaId::new();
+        let file = |path: &str, size: u64| crate::BrowseFileFacts {
+            ledger_id: LedgerId::new(),
+            media_id,
+            path: path.to_owned(),
+            facts: serde_json::json!({
+                "version": 3,
+                "path": path,
+                "size": size,
+                "missing": false,
+            }),
+        };
+        let scope = format!(
+            "{}|{}",
+            library.kind.as_str(),
+            library
+                .root_paths
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\u{1f}")
+        );
+        let build = crate::ProjectionBuild {
+            library_id: library.id.clone(),
+            generation: 1,
+            scope_signature: scope,
+            revisions: store.read_revisions().unwrap(),
+            expected_dirty_token: None,
+            files: vec![file("/movies/a.mkv", 10), file("/movies/b.strm", 7)],
+            media: Vec::new(),
+            candidates: Vec::new(),
+        };
+        assert!(store.publish_browse_projection(&build).unwrap());
+
+        let totals = store
+            .browse_file_totals(&library.id, 3)
+            .unwrap()
+            .expect("current facts");
+        assert_eq!(totals.file_count, 2);
+        assert_eq!(totals.total_size_bytes, 10, ".strm 指针不计物理体积");
+        assert_eq!(totals.strm_file_count, 1);
+        // 旧代 facts 版本：不能把 0 当成空库，必须让调用方去重建。
+        assert_eq!(store.browse_file_totals(&library.id, 4).unwrap(), None);
     }
 
     /// P3-D：非默认库的候选读走 `ledger_path_idx`，VM steps 不随无关台账增长。

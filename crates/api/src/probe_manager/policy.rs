@@ -58,6 +58,7 @@ pub(super) fn assess_probe_need(
     row: &domain::LedgerRow,
     origin: ProbeRequestOrigin,
     now_ms: i64,
+    source_version: String,
 ) -> ProbeNeed {
     let ledger_id = row.id.to_string();
     let kind = store
@@ -68,7 +69,6 @@ pub(super) fn assess_probe_need(
         .unwrap_or(MediaKind::Movie);
     let path = Path::new(&row.path);
     let fingerprint_enabled = is_fingerprint_enabled_for_path(store, path, kind);
-    let source_version = crate::fingerprint_job::current_source_version(path);
     let sample_duration_secs = store
         .get_scrape_config()
         .ok()

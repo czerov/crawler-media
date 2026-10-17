@@ -144,7 +144,11 @@ impl ProbeManager {
     ) -> Result<policy::ProbeRequestResult, store::StoreError> {
         let now_ms = self.clock.lock().now_ms();
         self.assessments.fetch_add(1, Ordering::SeqCst);
-        let need = policy::assess_probe_need(&self.store.lock(), row, origin, now_ms);
+        let source_version = crate::fingerprint_job::current_source_version(std::path::Path::new(&row.path));
+        let need = {
+            let store = self.store.lock();
+            policy::assess_probe_need(&store, row, origin, now_ms, source_version)
+        };
         if !matches!(need.retry, policy::ProbeRequestResult::Complete) {
             return Ok(need.retry);
         }

@@ -46,6 +46,7 @@ impl Store {
         }
         let store = Self {
             data_dir,
+            root_ledger_scans: std::sync::atomic::AtomicUsize::new(0),
             app_path: app_path.clone(),
             app,
             catalog,

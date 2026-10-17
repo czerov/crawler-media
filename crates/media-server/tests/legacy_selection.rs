@@ -179,11 +179,12 @@ impl MediaServerProvider for SplitRootProvider {
                 false,
             )]);
         }
-        // 根列表：代表行在 root A 的折叠剧 + root B 的另一部折叠剧 + 电影。
+        // Mixed-granularity root: collapsed show first, existing episode second,
+        // then another collapsed show which requires expansion.
         let mut series = self.episode_a.clone();
         series.is_series = true;
         series.row.path = "/media/root-a/Show".into();
-        Ok(vec![series, self.collapsed_b.clone(), self.movie.clone()])
+        Ok(vec![series, self.episode_b.clone(), self.collapsed_b.clone(), self.movie.clone()])
     }
 
     async fn resolve_single_item(
@@ -278,6 +279,31 @@ async fn legacy_folder_keeps_series_whose_representative_is_elsewhere() {
 }
 
 #[tokio::test]
+async fn legacy_folder_series_only_expands_membership_and_rebuilds_aggregates() {
+    let provider = SplitRootProvider::new();
+    let folder = folder_id_for_root(std::path::Path::new("/media/root-b"));
+    let page = legacy_select(
+        &provider,
+        user(),
+        ServerItemQuery {
+            parent_id: Some(folder),
+            include_item_types: Some("Series".into()),
+            limit: 20,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("legacy folder selection");
+    assert_eq!(page.total, 2);
+    let series = page.items.iter().find(|item| item.media.id == provider.show.id).unwrap_or_else(|| panic!("split folder series missing: {:?}", page.items.iter().map(|item| (&item.media.title, item.is_series, &item.row.path)).collect::<Vec<_>>()));
+    assert_eq!(series.row.path, "/media/root-b/Show/S01E02.mkv");
+    assert_eq!(series.metadata.child_count, Some(1));
+    assert_eq!(series.metadata.season_count, Some(1));
+    assert_eq!(series.unplayed_item_count, Some(1));
+    assert!(!series.played);
+}
+
+#[tokio::test]
 async fn legacy_next_up_returns_explicit_movie_and_expands_collapsed_media() {
     let provider = SplitRootProvider::new();
     let movie_id = provider.movie.media.id.to_string();
@@ -291,12 +317,11 @@ async fn legacy_next_up_returns_explicit_movie_and_expands_collapsed_media() {
         .await
         .expect("mixed granularity");
     let titles: Vec<&str> = mixed.items.iter().map(|item| item.media.title.as_str()).collect();
-    assert!(
-        titles.contains(&"Split show"),
-        "已有分集的剧必须留下：{titles:?}"
-    );
-    assert!(
-        titles.contains(&"Collapsed other"),
-        "缺分集的折叠剧必须各自展开，不能因为列表里已有别的分集就跳过：{titles:?}"
-    );
+    assert!(titles.contains(&"Split show"), "已有分集的剧必须留下：{titles:?}");
+    assert!(titles.contains(&"Collapsed other"), "缺分集的折叠剧必须各自展开：{titles:?}");
+    assert_eq!(mixed.total, 2);
+    assert_eq!(mixed.items[0].media.title, "Split show");
+    assert_eq!(mixed.items[1].media.title, "Collapsed other");
+    assert_eq!(mixed.items[0].row.media_id, provider.show.id);
+    assert_eq!(mixed.items[1].row.media_id, provider.collapsed_b.media.id);
 }

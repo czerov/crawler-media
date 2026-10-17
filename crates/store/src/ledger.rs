@@ -376,7 +376,10 @@ impl Store {
             Ok((ledger, mode, source_path))
         })?;
         let collected = rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from);
-        note_root_ledger_scan(stmt.get_status(rusqlite::StatementStatus::FullscanStep) as usize);
+        self.root_ledger_scans.fetch_add(
+            (stmt.get_status(rusqlite::StatementStatus::FullscanStep) as usize).max(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         collected
     }
 
@@ -404,21 +407,6 @@ impl Store {
     }
 }
 
-std::thread_local! {
-    static ROOT_LEDGER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-pub(crate) fn note_root_ledger_scan(vm_steps: usize) {
-    ROOT_LEDGER_SCANS.with(|scans| scans.set(scans.get() + vm_steps.max(1)));
-}
-
-pub(crate) fn root_ledger_scans() -> usize {
-    ROOT_LEDGER_SCANS.with(|scans| scans.get())
-}
-
-pub(crate) fn reset_root_ledger_scans() {
-    ROOT_LEDGER_SCANS.with(|scans| scans.set(0));
-}
 #[cfg(test)]
 mod batch_tests {
     use super::*;

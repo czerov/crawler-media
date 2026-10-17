@@ -184,9 +184,15 @@ pub(crate) async fn list_libraries(
     axum::Extension(user_id): axum::Extension<Option<domain::UserId>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    // 锁内只收集 owned DB 事实（ledger 行 / removal / 封面候选路径）；逐文件
-    // `stat`、root `is_dir`、封面 `is_file` 一律放到锁外、受 http_work 预算约束，
-    // 慢挂载不再阻塞共享 Store 和 Tokio worker。
+    // 统计一次聚合：锁内一次 ownership/role/ledger/media 批量聚合 + 投影 head 的
+    // 刷新状态。不再每个 Library 重跑一遍全局账本读取，也不再逐文件 `stat`。
+    let stats = match crate::library_statistics::collect_statistics(state.clone(), user_id).await {
+        Ok(stats) => stats,
+        Err(error) => return error.into_response(),
+    };
+    // 锁内只收集 owned DB/路径事实（removal / 封面候选路径）；逐 root `is_dir`、
+    // 封面 `is_file` 仍在锁外、受 http_work 预算约束，慢挂载不再阻塞共享 Store
+    // 和 Tokio worker。
     let facts: Vec<assets::LibraryFacts> = {
         let store = state.store.lock();
         let libraries = match store.list_libraries() {
@@ -225,7 +231,13 @@ pub(crate) async fn list_libraries(
         .run(selection::BROWSE_DEADLINE, move || {
             facts
                 .iter()
-                .map(assets::library_json_from_facts)
+                .map(|facts| {
+                    let stats = stats
+                        .get(&facts.library.id)
+                        .copied()
+                        .unwrap_or_default();
+                    assets::library_json_from_facts(facts, stats)
+                })
                 .collect::<Vec<Value>>()
         })
         .await

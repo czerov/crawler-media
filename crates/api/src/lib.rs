@@ -9,6 +9,7 @@ mod check_in;
 mod episode_still;
 pub(crate) mod fanart_artwork;
 pub mod job_loop;
+pub mod library_statistics;
 mod jobs_api;
 mod open_coverage;
 pub(crate) mod scrape_config;

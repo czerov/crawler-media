@@ -559,7 +559,7 @@ pub async fn legacy_select(
     // folder 归属必须先于折叠：代表行在别的根下不能决定整个 series 是否属于
     // 这个 folder。先取未折叠的分集，再用 folder 内的行重建剧快照。
     if let ParentScope::Folder(root) = &scope {
-        if wants_episodes && rows.iter().any(|row| row.is_series) {
+        if rows.iter().any(|row| row.is_series) {
             let mut expanded = Vec::new();
             for item in rows {
                 if item.is_series {
@@ -573,17 +573,32 @@ pub async fn legacy_select(
                         if let Some(representative) = in_folder.first() {
                             let mut series = item;
                             series.row = representative.row.clone();
+                            series.metadata.child_count = Some(in_folder.len());
+                            series.metadata.season_count = Some(
+                                in_folder.iter().filter_map(|episode| episode.row.season).collect::<HashSet<_>>().len(),
+                            );
+                            series.unplayed_item_count = Some(in_folder.iter().filter(|episode| !episode.played).count());
+                            series.played = in_folder.iter().all(|episode| episode.played);
                             expanded.push(series);
                         }
                     }
-                    expanded.extend(in_folder);
-                } else if Path::new(&item.row.path).starts_with(root) {
+                    if wants_episodes {
+                        expanded.extend(in_folder);
+                    }
+                } else if Path::new(&item.row.path).starts_with(root)
+                    && (item.media.kind != MediaKind::Tv
+                        || item.is_series && wants_series
+                        || !item.is_series && wants_episodes)
+                {
                     expanded.push(item);
                 }
             }
             rows = expanded;
         } else {
-            rows.retain(|item| Path::new(&item.row.path).starts_with(root));
+            rows.retain(|item| {
+                Path::new(&item.row.path).starts_with(root)
+                    && (item.is_series && wants_series || !item.is_series && wants_episodes)
+            });
         }
     } else if wants_episodes && rows.iter().any(|row| row.is_series) {
         let mut expanded = Vec::new();
@@ -592,17 +607,17 @@ pub async fn legacy_select(
                 let series_id = item.media.id.to_string().replace('-', "");
                 let episodes = match &scope {
                     ParentScope::Library(library_id) => {
-                        provider
-                            .list_visible_items_in_library(user, Some(&series_id), library_id)
-                            .await?
+                        provider.list_visible_items_in_library(user, Some(&series_id), library_id).await?
                     }
                     _ => provider.list_visible_items(user, Some(&series_id)).await?,
                 };
-                expanded.extend(episodes);
+                if wants_episodes {
+                    expanded.extend(episodes);
+                }
                 if wants_series {
                     expanded.push(item);
                 }
-            } else {
+            } else if item.is_series && wants_series || !item.is_series && wants_episodes {
                 expanded.push(item);
             }
         }
@@ -655,23 +670,24 @@ pub async fn legacy_next_up(
         .await?;
     // 显式 SeriesId 与生产路径一致：不限制种类（电影也能返回）。缺省才只要 TV。
     let restrict_kind = series_id.is_none();
-    let mut episodes: Vec<MediaItemSnapshot> = candidates
-        .iter()
-        .filter(|item| {
-            !item.is_series && (!restrict_kind || item.media.kind == MediaKind::Tv)
-        })
-        .cloned()
-        .collect();
-    let expanded_media: HashSet<domain::MediaId> =
-        episodes.iter().map(|item| item.media.id).collect();
-    // 混合粒度：已有分集的 Media 不再展开，缺分集的折叠剧各自展开。
-    for show in candidates.iter().filter(|item| item.is_series) {
-        if expanded_media.contains(&show.media.id) {
+    let mut episodes = Vec::new();
+    let mut expanded_media = HashSet::new();
+    for item in candidates {
+        if !item.is_series {
+            if !restrict_kind || item.media.kind == MediaKind::Tv {
+                expanded_media.insert(item.media.id);
+                episodes.push(item);
+            }
             continue;
         }
-        let series_id = show.media.id.to_string().replace('-', "");
+        if !expanded_media.insert(item.media.id) {
+            continue;
+        }
+        let series_id = item.media.id.to_string().replace('-', "");
         let expanded = provider.list_visible_items(user, Some(&series_id)).await?;
-        episodes.extend(expanded.into_iter().filter(|item| !item.is_series));
+        episodes.extend(expanded.into_iter().filter(|episode| {
+            !episode.is_series && (!restrict_kind || episode.media.kind == MediaKind::Tv)
+        }));
     }
     Ok(first_unwatched_per_media(episodes, offset, limit))
 }

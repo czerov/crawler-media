@@ -68,7 +68,7 @@ mod users;
 pub mod password;
 pub mod probe_state;
 
-pub use browse_reads::PlaybackUnitSnapshot;
+pub use browse_reads::{BrowseFileTotals, PlaybackUnitSnapshot};
 pub use catalog::CatalogCacheRow;
 pub use downloaders::DownloaderRow;
 pub use fingerprint_attempts::StoredFingerprintAttempt;
@@ -180,6 +180,9 @@ pub enum StoreError {
 
 pub struct Store {
     data_dir: PathBuf,
+    /// Times this store's `list_ledger` executed its unfiltered `FROM ledger`
+    /// statement. Per-instance so concurrent tests never share the diagnostic.
+    pub(crate) root_ledger_scans: std::sync::atomic::AtomicUsize,
     app_path: PathBuf,
     pub(crate) app: Connection,
     pub(crate) catalog: Connection,
@@ -193,10 +196,10 @@ impl Store {
     /// Incremented beside that statement, so filtering the returned rows cannot
     /// hide the scan. `ledger_for_media` does not increment it.
     pub fn root_ledger_scans(&self) -> usize {
-        ledger::root_ledger_scans()
+        self.root_ledger_scans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn reset_root_ledger_scans(&self) {
-        ledger::reset_root_ledger_scans();
+        self.root_ledger_scans.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
