@@ -20,6 +20,8 @@ mod watch_intake;
 mod watch_ledger;
 mod watch_scrape;
 pub mod worker;
+#[doc(hidden)]
+pub use worker::{page_is_full_and_irrelevant, search_keywords_for};
 pub use scrape_store::ScrapeStoreExt;
 mod admit;
 pub mod auto_resolve;
@@ -43,6 +45,9 @@ pub mod maintenance;
 /// symlinks never followed out of scope, `incomplete` reported honestly, and
 /// the result is NOT an authorization decision).
 pub mod library_reconciliation;
+/// Library 统计：一次归属聚合与投影 head 的可见刷新状态（API-03）。
+pub mod library_statistics;
+pub use library_statistics::{LibraryStatistics, read_library_statistics};
 pub mod marker_resolver;
 pub mod media_posters;
 pub mod media_server_provider;

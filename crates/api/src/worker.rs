@@ -6,7 +6,10 @@ use crate::management::ApiState;
 mod finish_search;
 use finish_search::finish_search;
 mod search;
-pub(crate) use search::{report_site_failures, search_torrents_for_media};
+pub(crate) use search::{
+    report_site_failures, search_torrents_for_media, search_torrents_for_subscribe,
+};
+pub use search::{page_is_full_and_irrelevant, search_keywords_for};
 pub(crate) mod transfer;
 pub use transfer::transfer_one;
 
@@ -119,7 +122,7 @@ fn search(state: &ApiState, job: &Job, rss_batch: Option<&RssBatch>) -> Result<(
             // 不能只走关键词搜索（旧行为让「两者」实际只有搜索）。
             (_, FetchMode::Both) => {
                 let (mut merged, keywords, search_succeeded, mut failures) =
-                    search_torrents_for_media(&state, &sites, &media);
+                    search_torrents_for_subscribe(&state, &sites, &media, &subscribe.coverage);
                 let mut seen: std::collections::HashSet<String> =
                     merged.iter().map(|t| t.enclosure.clone()).collect();
                 let (rss_torrents, rss_succeeded, rss_failures) =
@@ -139,7 +142,7 @@ fn search(state: &ApiState, job: &Job, rss_batch: Option<&RssBatch>) -> Result<(
             }
             _ => {
                 let (torrents, keywords, succeeded, failures) =
-                    search_torrents_for_media(state, &sites, &media);
+                    search_torrents_for_subscribe(state, &sites, &media, &subscribe.coverage);
                 (torrents, keywords, succeeded, failures)
             }
         };

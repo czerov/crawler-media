@@ -231,6 +231,8 @@ struct Details {
     first_air_date: Option<String>,
     #[serde(default)]
     translations: Option<TranslationsWrapper>,
+    #[serde(default)]
+    alternative_titles: Option<AlternativeTitles>,
 }
 
 #[derive(Deserialize)]
@@ -249,6 +251,19 @@ struct TranslationItem {
 #[derive(Deserialize, Default)]
 struct TranslationData {
     name: Option<String>,
+    title: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct AlternativeTitles {
+    #[serde(default)]
+    titles: Vec<AlternativeTitle>,
+    #[serde(default)]
+    results: Vec<AlternativeTitle>,
+}
+
+#[derive(Deserialize, Default)]
+struct AlternativeTitle {
     title: Option<String>,
 }
 
@@ -284,7 +299,10 @@ pub fn details(kind: MediaKind, body: &str) -> Result<Media, TmdbError> {
         .or(parsed.first_air_date.as_deref())
         .and_then(|date| date.split('-').next())
         .and_then(|year| year.parse::<u16>().ok());
-    let mut original_title = parsed.original_title.or(parsed.original_name);
+    let mut original_title = parsed
+        .original_title
+        .clone()
+        .or_else(|| parsed.original_name.clone());
     // 如果原名与中文名相同（如国产剧），尝试从英文翻译中提取英文译名作为 alias/original_title
     if let Some(wrapper) = &parsed.translations {
         for tr in &wrapper.translations {
@@ -297,13 +315,44 @@ pub fn details(kind: MediaKind, body: &str) -> Result<Media, TmdbError> {
             }
         }
     }
-    to_media(
-        kind,
-        parsed.id,
-        parsed.title.or(parsed.name),
-        year,
-        original_title,
-    )
+    let title = parsed.title.clone().or_else(|| parsed.name.clone());
+    let mut media = to_media(kind, parsed.id, title, year, original_title)?;
+    media.aliases = aliases_from_details(&parsed, &media);
+    Ok(media)
+}
+
+fn aliases_from_details(parsed: &Details, media: &Media) -> Vec<String> {
+    let mut aliases = Vec::new();
+    let mut push = |title: &Option<String>| {
+        let Some(title) = title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        else {
+            return;
+        };
+        if title == media.title || media.original_title.as_deref() == Some(title) {
+            return;
+        }
+        if aliases.iter().all(|existing| existing != title) {
+            aliases.push(title.to_string());
+        }
+    };
+    if let Some(alternative) = &parsed.alternative_titles {
+        for title in &alternative.titles {
+            push(&title.title);
+        }
+        for title in &alternative.results {
+            push(&title.title);
+        }
+    }
+    if let Some(wrapper) = &parsed.translations {
+        for translation in &wrapper.translations {
+            push(&translation.data.title);
+            push(&translation.data.name);
+        }
+    }
+    aliases
 }
 
 pub fn details_poster_path(body: &str) -> Result<Option<String>, TmdbError> {
@@ -330,6 +379,7 @@ fn to_media(
         title,
         year,
         original_title: orig,
+        aliases: Vec::new(),
         tmdb_id: Some(tmdb_id.to_string()),
         douban_id: None,
         tvdb_id: None,

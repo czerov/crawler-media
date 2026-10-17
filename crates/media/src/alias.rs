@@ -29,6 +29,11 @@ pub fn merge(into: Media, from: Media) -> Media {
     if merged.original_title.is_none() {
         merged.original_title = from.original_title;
     }
+    for alias in from.aliases {
+        if !merged.aliases.iter().any(|existing| existing == &alias) {
+            merged.aliases.push(alias);
+        }
+    }
     if merged.tmdb_id.is_none() {
         merged.tmdb_id = from.tmdb_id;
     }

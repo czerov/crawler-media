@@ -72,6 +72,7 @@ pub fn migrate_app(conn: &Connection) -> Result<(), StoreError> {
     // 永远跑不到它。这里改成每次打开都做一次幂等对账：按定义只删「removal 已成功且
     // Library 行已不存在」的键，重复执行安全，对 v7 老库也不是空操作。
     crate::library_deletion::repair_removed_library_settings(conn)?;
+    ensure_column(conn, "media", "aliases_json", "TEXT NOT NULL DEFAULT '[]'")?;
     ensure_column(conn, "downloaders", "path_maps", "TEXT")?;
     // downloaders.enabled：停用的下载器不参与自动投递（手动提交仍可用）。
     ensure_column(conn, "downloaders", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
@@ -591,4 +592,4 @@ fn seed_libraries(app: &Connection) -> Result<(), StoreError> {
 }
 
 pub const MEDIA_COLS: &str =
-    "id, kind, title, year, original_title, tmdb_id, douban_id, tvdb_id, bangumi_id, anilist_id";
+    "id, kind, title, year, original_title, tmdb_id, douban_id, tvdb_id, bangumi_id, anilist_id, aliases_json";

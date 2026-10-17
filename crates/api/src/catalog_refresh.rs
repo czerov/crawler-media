@@ -48,6 +48,11 @@ fn apply_details(stored: Media, fresh: Media) -> Media {
         },
         year: fresh.year.or(stored.year),
         original_title: fresh.original_title.or(stored.original_title),
+        aliases: if fresh.aliases.is_empty() {
+            stored.aliases
+        } else {
+            fresh.aliases
+        },
         tmdb_id: fresh.tmdb_id.or(stored.tmdb_id),
         douban_id: fresh.douban_id.or(stored.douban_id),
         tvdb_id: fresh.tvdb_id.or(stored.tvdb_id),

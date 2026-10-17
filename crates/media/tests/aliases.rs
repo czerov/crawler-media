@@ -1,5 +1,5 @@
 use domain::{Media, MediaId, MediaKind};
-use media::{Source, attach, merge};
+use media::{Source, attach, details, merge};
 
 fn blank(title: &str) -> Media {
     Media {
@@ -8,6 +8,7 @@ fn blank(title: &str) -> Media {
         title: title.into(),
         year: None,
         original_title: None,
+        aliases: Vec::new(),
         tmdb_id: None,
         douban_id: None,
         tvdb_id: None,
@@ -40,4 +41,31 @@ fn merge_keeps_one_internal_id() {
     assert_eq!(merged.id, id);
     assert_eq!(merged.tmdb_id.as_deref(), Some("603"));
     assert_eq!(merged.douban_id.as_deref(), Some("1291843"));
+}
+
+#[test]
+fn details_keep_alternative_titles_in_source_order() {
+    let body = r#"{
+        "id": 1,
+        "name": "醉梦",
+        "alternative_titles": {"results": [
+            {"title": "Dream"},
+            {"title": "Chinese Dream"},
+            {"title": "醉梦"},
+            {"title": "国庆特别节目"}
+        ]},
+        "translations": {"translations": [
+            {"iso_639_1": "zh", "data": {"name": "Chinese Dream"}}
+        ]}
+    }"#;
+    let media = details(MediaKind::Tv, body).unwrap();
+    assert_eq!(media.title, "醉梦");
+    assert_eq!(
+        media.aliases,
+        vec![
+            "Dream".to_string(),
+            "Chinese Dream".to_string(),
+            "国庆特别节目".to_string(),
+        ]
+    );
 }

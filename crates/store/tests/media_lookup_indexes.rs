@@ -14,12 +14,24 @@ fn media(kind: MediaKind, title: &str, year: Option<u16>, tmdb: Option<&str>) ->
         title: title.into(),
         year,
         original_title: Some(title.into()),
+        aliases: Vec::new(),
         tmdb_id: tmdb.map(str::to_string),
         douban_id: None,
         tvdb_id: None,
         bangumi_id: None,
         anilist_id: None,
     }
+}
+
+#[test]
+fn title_aliases_round_trip_in_source_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let mut row = media(MediaKind::Tv, "醉梦", None, Some("1"));
+    row.aliases = vec!["Chinese Dream".into(), "国庆特别节目".into()];
+    store.insert_media(&row).unwrap();
+    let loaded = store.get_media(row.id).unwrap().expect("stored media");
+    assert_eq!(loaded.aliases, row.aliases);
 }
 
 #[test]
