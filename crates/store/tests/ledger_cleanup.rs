@@ -32,19 +32,6 @@ fn sample_media(id: MediaId) -> Media {
         bangumi_id: None,
         anilist_id: None,
     }
-
-        id,
-        kind: MediaKind::Movie,
-        title: "Test Movie".to_string(),
-        original_title: None,
-        aliases: Vec::new(),
-        year: None,
-        tmdb_id: None,
-        douban_id: None,
-        tvdb_id: None,
-        bangumi_id: None,
-        anilist_id: None,
-    }
 }
 
 #[test]

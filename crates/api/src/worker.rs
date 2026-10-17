@@ -7,7 +7,7 @@ mod finish_search;
 use finish_search::finish_search;
 mod search;
 pub(crate) use search::{
-    report_site_failures, search_torrents_for_media, search_torrents_for_subscribe,
+    report_site_failures, search_torrents_for_subscribe,
 };
 pub use search::{page_is_full_and_irrelevant, search_keywords_for};
 pub(crate) mod transfer;
