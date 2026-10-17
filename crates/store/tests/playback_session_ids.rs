@@ -193,7 +193,7 @@ fn old_schema_migrates_without_resetting_user_facts() {
     let version: i64 = sub_conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7, "subscribe.db schema version must be 7");
+    assert_eq!(version, 8, "subscribe.db schema version must be 8");
 
     // Check session backfilled last_report_at_ms = 1234 * 1000
     let (last_report_at_ms, play_session_id): (i64, Option<String>) = sub_conn

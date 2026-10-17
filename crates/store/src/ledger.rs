@@ -290,6 +290,7 @@ impl Store {
         &self,
         media_id: domain::MediaId,
     ) -> Result<Vec<LedgerRow>, StoreError> {
+        self.media_ledger_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut stmt = self.library.prepare(
             "SELECT id, media_id, path, season, episode, resolution, codec, hdr,
                     quality_source, confidence, filter_score

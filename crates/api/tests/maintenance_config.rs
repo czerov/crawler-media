@@ -4,9 +4,10 @@
 //! 原始 SQL（仓库既有约定：setup 可以用 raw SQL，断言不行）。
 
 use api::maintenance::{
-    DatabaseMaintenancePolicy, DEFAULT_DATABASE_INTERVAL_SECS, DEFAULT_JOBS_INTERVAL_SECS,
-    DEFAULT_RETENTION_DAYS, JobsRetentionPolicy, MaintenancePolicy, MAX_RETENTION_DAYS,
-    PlaybackHistoryRetentionPolicy, POLICY_VERSION, seed_maintenance_defs,
+    DataRetentionPolicy, DatabaseMaintenancePolicy, DEFAULT_DATABASE_INTERVAL_SECS,
+    DEFAULT_DATA_RETENTION_DAYS, DEFAULT_DATA_RETENTION_INTERVAL_SECS,
+    DEFAULT_JOBS_INTERVAL_SECS, DEFAULT_RETENTION_DAYS, JobsRetentionPolicy, MaintenancePolicy,
+    MAX_RETENTION_DAYS, PlaybackHistoryRetentionPolicy, POLICY_VERSION, seed_maintenance_defs,
     validate_maintenance_interval,
 };
 use domain::JobDefId;
@@ -41,13 +42,13 @@ fn retention_days(def: &JobDef) -> u32 {
 }
 
 #[test]
-fn seed_creates_three_maintenance_defs_with_documented_defaults() {
+fn seed_creates_four_maintenance_defs_with_documented_defaults() {
     let tmp = tempfile::tempdir().unwrap();
     let queue = open(&tmp);
     seed_maintenance_defs(&queue).unwrap();
 
     let defs = queue.list_defs().unwrap();
-    assert_eq!(defs.len(), 3, "只应注册三个维护任务");
+    assert_eq!(defs.len(), 4, "只应注册四个维护任务");
 
     let database = maintenance_def(&defs, JobKind::DatabaseMaintenance);
     assert!(database.enabled, "数据库维护默认开启");
@@ -97,6 +98,25 @@ fn seed_creates_three_maintenance_defs_with_documented_defaults() {
             dry_run: false,
         })
     );
+
+    let data = maintenance_def(&defs, JobKind::DataRetention);
+    assert!(!data.enabled, "分类历史保留默认关闭");
+    assert_eq!(
+        data.schedule,
+        Some(Schedule::Interval {
+            secs: DEFAULT_DATA_RETENTION_INTERVAL_SECS
+        })
+    );
+    assert_eq!(
+        MaintenancePolicy::parse(data.kind, &data.payload).unwrap(),
+        MaintenancePolicy::DataRetention(DataRetentionPolicy {
+            version: POLICY_VERSION,
+            dry_run: true,
+            qoe_days: DEFAULT_DATA_RETENTION_DAYS,
+            transient_cache_days: DEFAULT_DATA_RETENTION_DAYS,
+            probe_days: DEFAULT_DATA_RETENTION_DAYS,
+        })
+    );
 }
 
 #[test]
@@ -105,7 +125,7 @@ fn seed_is_idempotent() {
     let queue = open(&tmp);
     seed_maintenance_defs(&queue).unwrap();
     seed_maintenance_defs(&queue).unwrap();
-    assert_eq!(queue.list_defs().unwrap().len(), 3, "重复 seed 不得产生重复 def");
+    assert_eq!(queue.list_defs().unwrap().len(), 4, "重复 seed 不得产生重复 def");
 }
 
 #[test]

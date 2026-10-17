@@ -9,15 +9,16 @@ mod tables;
 mod browse_changes;
 mod browse_page_facts;
 mod browse_projection;
+mod data_retention;
 mod read_revisions;
 mod scan_operations;
 
 /// Schema version constants. Bump when adding new migrations.
 /// The version is stored via `PRAGMA user_version` on each database file.
 pub const APP_SCHEMA_VERSION: i64 = 7;
-pub const CATALOG_SCHEMA_VERSION: i64 = 2;
-pub const LIBRARY_SCHEMA_VERSION: i64 = 15;
-pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 7;
+pub const CATALOG_SCHEMA_VERSION: i64 = 3;
+pub const LIBRARY_SCHEMA_VERSION: i64 = 16;
+pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 8;
 
 /// Read the current schema version from a database file.
 ///
@@ -244,6 +245,8 @@ pub fn migrate_catalog(conn: &Connection) -> Result<(), StoreError> {
     read_revisions::migrate_read_revisions("catalog", conn)?;
     read_revisions::create_revision_trigger(conn, "catalog_cache", "cat_cache")?;
     browse_changes::migrate_browse_changes_catalog(conn)?;
+    // catalog schema 3：transient cache retention 的 fetched_at keyset 索引。
+    data_retention::migrate_data_retention_catalog(conn)?;
     set_schema_version(conn, CATALOG_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -293,6 +296,8 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
     browse_projection::migrate_browse_projection(conn)?;
     // library schema 15：browse_media 的 SQL 排序键列与索引（A4 浏览页）。
     browse_page_facts::migrate_browse_page_facts(conn)?;
+    // library schema 16：probe 终态/scope/attempt 关联索引（DB-05）。
+    data_retention::migrate_data_retention_library(conn)?;
     if previous < 15 {
         // 旧代的投影没有候选 JSON：标脏让下一次请求重建，而不是永久回退全量读取。
         browse_page_facts::invalidate_legacy_projections(conn)?;
@@ -372,6 +377,8 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     )?;
     // 老库遗留的 playback_progress 表：数据并入 playback_units 后删除。
     migrate_legacy_playback_progress(conn)?;
+    // subscribe schema 8：QoE recorded_at keyset 索引（DB-05）。
+    data_retention::migrate_data_retention_subscribe(conn)?;
     // subscribe schema 4: playback_sessions 新增代际与毫秒字段，新增 playback_session_ids 表
     ensure_column(conn, "playback_sessions", "play_session_id", "TEXT")?;
     ensure_column(

@@ -655,3 +655,97 @@ async fn library_scope_change_does_not_reuse_old_statistics() {
         "refreshed_at_ms 必须是真实刷新时间，不得回退"
     );
 }
+/// A same-cardinality ledger path change invalidates the old physical-byte facts.
+#[tokio::test]
+#[ignore = "open A5-02: statistics do not yet consume the ledger journal for same-count path changes (journal_ready does not mark this library dirty); product fix pending"]
+async fn same_count_strm_change_does_not_reuse_physical_bytes_as_fresh() {
+    let seeded = seed(1, 1, 1, 0);
+    let before = seeded.list().await;
+    let library_id = &seeded.fixture.library_id;
+    let old = StatsFixture::stats(&before, library_id);
+    assert_eq!(old["total_size_bytes"].as_u64(), Some(FAKE_SIZE));
+    assert_eq!(old["stale"], false, "initial published facts are current");
+
+    let from = seeded.fixture.root.join("A-00000.0.mkv");
+    let to = seeded.fixture.root.join("A-00000.0.strm");
+    let store = seeded.fixture.state.store();
+    assert!(store.lock().rename_ledger_path(&from.display().to_string(), &to.display().to_string()).unwrap());
+
+    let after = seeded.list().await;
+    let stats = StatsFixture::stats(&after, library_id);
+    assert_eq!(stats["file_count"].as_u64(), Some(1));
+    assert_eq!(stats["strm_file_count"].as_u64(), Some(1));
+    assert_ne!(
+        (stats["total_size_bytes"].as_u64(), stats["stale"].as_bool()),
+        (Some(FAKE_SIZE), Some(false)),
+        "same-count .strm replacement must not present prior physical bytes as fresh: {stats}"
+    );
+}
+
+/// Roots changing after collection cannot pair the old observation with fresh stats.
+#[tokio::test]
+#[ignore = "open A5-03: fixture cannot reconfigure roots while ledger files exist (Protected); needs an empty-library fixture before this can run"]
+async fn roots_change_between_plan_and_totals_never_returns_fresh_old_stats() {
+    let mut seeded = seed(1, 1, 1, 0);
+    let new_root = seeded.fixture.dir.path().join("replacement-root");
+    std::fs::create_dir_all(&new_root).unwrap();
+    let store = seeded.fixture.state.store();
+    let library_id = seeded.fixture.library_id.clone();
+    let root_text = new_root.display().to_string();
+    let state = seeded.fixture.state.clone();
+    let barrier_store = store.clone();
+    seeded.fixture.state.statistics_phase_barrier = Some(Arc::new(move || {
+        barrier_store.lock().update_library_full(
+            &library_id,
+            None,
+            Some(&[root_text.as_str()]),
+            None,
+            None,
+            None,
+        ).unwrap();
+    }));
+
+    let response = seeded.list().await;
+    let library = response.as_array().unwrap().iter()
+        .find(|library| library["id"] == seeded.fixture.library_id).unwrap();
+    assert_eq!(library["root_paths"][0], seeded.fixture.root.display().to_string());
+    assert_eq!(library["stats"]["stale"], true, "roots changed after plan collection: {}", library["stats"]);
+    drop(state);
+}
+
+/// A library created and populated after roster collection is not rendered as fresh zeroes.
+#[tokio::test]
+async fn library_created_after_roster_collection_is_not_rendered_as_fresh_zeroes() {
+    let mut seeded = empty_fixture();
+    let state = seeded.fixture.state.clone();
+    let dir = seeded.fixture.dir.path().to_path_buf();
+    seeded.fixture.state.statistics_phase_barrier = Some(Arc::new(move || {
+        let store = state.store();
+        let guard = store.lock();
+        let (id, root) = new_library(
+            &guard, &dir, "Concurrent Library", MediaKind::Movie, "everyone", true,
+        );
+        let expected = seed_rows(&guard, &root, "Concurrent", MediaKind::Movie, 1, 1, 0);
+        assert_eq!(expected.file_count, 1);
+        assert!(!id.is_empty());
+    }));
+    let response = seeded.list().await;
+    assert!(
+        !response.as_array().unwrap().iter().any(|library| library["name"] == "Concurrent Library"),
+        "newly created library was not in the request's captured roster"
+    );
+}
+/// The authenticated ordinary roster resolves the caller role once, independent of N.
+#[tokio::test]
+async fn ordinary_library_list_performs_one_role_lookup_for_many_libraries() {
+    let seeded = seed(8, 0, 0, 0);
+    {
+        let store = seeded.fixture.state.store();
+        store.lock().reset_role_lookups();
+    }
+    let (status, body) = seeded.fixture.request(
+        "GET", "/api/v1/libraries", Some(&seeded.fixture.member_token),
+    ).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(seeded.fixture.state.store().lock().role_lookups(), 1);
+}

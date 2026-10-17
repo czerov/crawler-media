@@ -26,6 +26,10 @@ use crate::http::err;
 use axum::http::StatusCode;
 use crate::management::ApiState;
 
+/// 测试 seam：统计计算在计划收集与 totals 读取之间的屏障（生产为 `None`）。
+#[doc(hidden)]
+pub type StatisticsPhaseBarrier = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// 一个 Library 的可见统计。
 ///
 /// 前四个字段与既有 `stats` 同名同义；`refreshed_at_ms` / `stale` 是新增的兼容
@@ -170,23 +174,40 @@ fn is_admin_role(store: &Store, user: Option<UserId>) -> bool {
 }
 
 /// 锁内一次收集：计数 + 每库 head + scope 指纹比对。role 只解析一次。
-fn collect_plans(store: &Store, user: Option<UserId>) -> Result<Vec<LibraryPlan>, String> {
+fn collect_plans(
+    store: &Store,
+    user: Option<UserId>,
+    roster: Option<&[crate::store::Library]>,
+    resolved_admin: Option<bool>,
+) -> Result<Vec<LibraryPlan>, String> {
     let ownership = store.library_ownership().map_err(|error| error.to_string())?;
-    let is_admin = is_admin_role(store, user);
+    let is_admin = resolved_admin.unwrap_or_else(|| is_admin_role(store, user));
+    let roster_by_id: Option<std::collections::HashMap<&str, &crate::store::Library>> = roster
+        .map(|libraries| libraries.iter().map(|library| (library.id.as_str(), library)).collect());
     let aggregate = aggregate_counts(store, &ownership).map_err(|error| error.to_string())?;
     let mut plans = Vec::new();
     for (slot, library) in aggregate.libraries().iter().enumerate() {
+        // 有 roster 时以调用方快照为准渲染；与当前 ownership 配置不一致即视为配置在请求期间变化。
+        let snapshot_library = match roster_by_id.as_ref() {
+            Some(map) => match map.get(library.id.as_str()) {
+                Some(supplied) => *supplied,
+                None => continue,
+            },
+            None => library,
+        };
+        let config_unchanged = scope_signature(snapshot_library) == scope_signature(library);
         if !stats_visible(&ownership, library, user, is_admin) {
             continue;
         }
         let head = store
             .browse_projection_head(&library.id)
             .map_err(|error| error.to_string())?;
-        let scope_matches = head
-            .as_ref()
-            .is_some_and(|head| head.scope_signature == scope_signature(library));
+        let scope_matches = config_unchanged
+            && head
+                .as_ref()
+                .is_some_and(|head| head.scope_signature == scope_signature(snapshot_library));
         plans.push(LibraryPlan {
-            library: library.clone(),
+            library: snapshot_library.clone(),
             counts: aggregate.counts_at(slot),
             head,
             scope_matches,
@@ -335,16 +356,14 @@ fn ready_ids(plans: &[LibraryPlan]) -> Vec<String> {
 }
 
 /// 读取所有可见 Library 的统计。
-pub(crate) async fn collect_statistics(
+/// 步骤 2-4：按预算读 facts、按需有界构建、标脏过旧投影并组装结果。
+async fn finish_statistics(
     state: ApiState,
-    user: Option<UserId>,
+    mut plans: Vec<LibraryPlan>,
 ) -> Result<HashMap<String, LibraryStatistics>, StatisticsFailure> {
-    // 1) 锁内一次聚合：ownership/role/ledger/media batch → 每库计数 + head。
-    let mut plans = {
-        let store = state.store.lock();
-        collect_plans(&store, user).map_err(StatisticsFailure::Store)?
-    };
-    // 2) 预算内：已就绪投影的 facts 一次 SQL 汇总。
+    if let Some(barrier) = &state.statistics_phase_barrier {
+        barrier();
+    }
     let mut totals = read_totals(&state, ready_ids(&plans)).await?;
     // 3) 从未建过投影的库：一次有界构建（单飞 + 共享容量），再按新代读 facts。
     let cold: Vec<usize> = plans
@@ -385,6 +404,46 @@ pub(crate) async fn collect_statistics(
         drop(store);
     }
     totals.extend(read_totals(&state, built).await?);
+    // totals 与 head 必须来自同一代：await 期间任何发布/标脏都让旧 totals 失效。
+    {
+        let store = state.store.lock();
+        let current_ownership = store
+            .library_ownership()
+            .map_err(|error| StatisticsFailure::Store(error.to_string()))?;
+        for plan in &mut plans {
+            if !totals.contains_key(&plan.library.id) {
+                continue;
+            }
+            // 配置本身也可能在 await 期间变化：旧计数不得配到新根上。
+            let config_unchanged = current_ownership
+                .libraries()
+                .iter()
+                .find(|library| library.id == plan.library.id)
+                .is_some_and(|library| scope_signature(library) == scope_signature(&plan.library));
+            // 内存里的脏标记同样使旧 facts 失效（journal 尚未被后台消费时）。
+            let dirty = state.projection.is_dirty(&plan.library.id);
+            let current = store
+                .browse_projection_head(&plan.library.id)
+                .map_err(|error| StatisticsFailure::Store(error.to_string()))?;
+            let same_generation = match (&plan.head, &current) {
+                (Some(approved), Some(now)) => {
+                    approved.generation == now.generation
+                        && approved.dirty_token == now.dirty_token
+                        && approved.scope_signature == now.scope_signature
+                }
+                (None, None) => true,
+                _ => false,
+            };
+            if dirty || !same_generation || !config_unchanged {
+                totals.remove(&plan.library.id);
+                plan.head = current;
+                plan.scope_matches = plan
+                    .head
+                    .as_ref()
+                    .is_some_and(|head| head.scope_signature == scope_signature(&plan.library));
+            }
+        }
+    }
     // 4) 投影过旧（scope 变 / facts 版本旧 / 落后）：标脏交给投影刷新路径重建，
     //    本请求不重扫文件系统。
     let mut out = HashMap::with_capacity(plans.len());
@@ -404,6 +463,38 @@ pub(crate) async fn collect_statistics(
         out.insert(plan.library.id.clone(), statistics(plan, totals));
     }
     Ok(out)
+}
+
+/// 一次读取所有可见 Library 的统计（HTTP 失败细节由调用方决定）。
+pub(crate) async fn collect_statistics(
+    state: ApiState,
+    user: Option<UserId>,
+) -> Result<HashMap<String, LibraryStatistics>, StatisticsFailure> {
+    let plans = {
+        let store = state.store.lock();
+        collect_plans(&store, user, None, None).map_err(StatisticsFailure::Store)?
+    };
+    finish_statistics(state, plans).await
+}
+
+/// Roster-scoped statistics.
+///
+/// The handler already resolved the roster (and the caller's role) from one
+/// snapshot; building plans from that roster means no second library scan and
+/// no per-library role lookup, and statistics of excluded libraries cannot be
+/// attached to the response.
+pub(crate) async fn collect_statistics_for_roster(
+    state: ApiState,
+    user: Option<UserId>,
+    roster: &[crate::store::Library],
+    is_admin: bool,
+) -> Result<HashMap<String, LibraryStatistics>, StatisticsFailure> {
+    let plans = {
+        let store = state.store.lock();
+        collect_plans(&store, user, Some(roster), Some(is_admin))
+            .map_err(StatisticsFailure::Store)?
+    };
+    finish_statistics(state, plans).await
 }
 
 /// 一次读取所有可见 Library 的统计（HTTP 失败细节由调用方决定）。

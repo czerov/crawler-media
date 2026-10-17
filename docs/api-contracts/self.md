@@ -87,7 +87,7 @@ HTTP 路径是 `/rule-sets`；表名仍是 `filters`。这是有意的 API 别�
 
 ### 维护任务（DB8）
 
-维护任务是 `kind ∈ {database_maintenance, jobs_retention, playback_history_retention}` 的普通 JobDef；
+维护任务是 `kind ∈ {database_maintenance, jobs_retention, playback_history_retention, data_retention}` 的普通 JobDef；
 调度与开关仍走既有 JobDef 字段，**保留参数只存在该 def 的版本化 payload 里**（不在 settings 另存一份）。
 
 `payload`（`version: 1`；未知版本/未知字段/越界一律 400，绝不回退成更激进的删除策略）：
@@ -95,10 +95,14 @@ HTTP 路径是 `/rule-sets`；表名仍是 `filters`。这是有意的 API 别�
 - `database_maintenance`：`{version: 1, vacuum_enabled: bool}`（默认 `false`）。
 - `jobs_retention` / `playback_history_retention`：`{version: 1, retention_days: 1..=36500, dry_run: bool}`。
   `retention_days=0` **不代表永久保留**；永久保留请关闭该任务。`batch_size=500`、`max_batches=20` 是服务端固定安全预算，不暴露给用户。
+- `data_retention`（DB-05）：`{version: 1, dry_run: bool, qoe_days: 1..=36500, transient_cache_days: 1..=36500, probe_days: 1..=36500}`。
+  首次注册 `enabled=false`、`dry_run=true`、三个窗口默认 90 天；生产启用需要用户显式确认。QoE 只删 `playback_metrics`；
+  catalog 只删 URL path 白名单内的 search/discover/trending 临时缓存（详情与未知 key 保护）；Probe 只删终态 job，
+  每个 scope 至少保留最新 3 条（时间并列全部保留），被 sample 引用或仍有活动 unit 的 job 保护。samples/models/model_members 本轮不删。
 
 维护 def 在 `GET /jobs` / `GET /jobs/{id}` 上**额外**返回（非维护 def 不返回这些键，既有字段不变）：
 
-- `maintenance`：typed 策略摘要，如 `{kind, version, retention_days, dry_run}` 或 `{kind, version, vacuum_enabled}`；payload 损坏时为 `{kind, invalid: true, error}`。
+- `maintenance`：typed 策略摘要，如 `{kind, version, retention_days, dry_run}`、`{kind, version, vacuum_enabled}` 或 `{kind, version, dry_run, qoe_days, transient_cache_days, probe_days}`；payload 损坏时为 `{kind, invalid: true, error}`。
 - `payload_token`：**修改令牌**，等于服务端当前 `payload` 的原始 JSON 字符串。
 - `last_report`：最近一次维护运行报告（`job.progress` 的原始 JSON 字符串，可能为 `null`）。
 
@@ -115,7 +119,7 @@ HTTP 路径是 `/rule-sets`；表名仍是 `filters`。这是有意的 API 别�
 
 - body = `{payload?}`（缺省用该 def 当前已保存的 payload）。
 - **只读、匹配返回行数有限额**：不写def、不创建删除Job、不改数据库内容，也不返回播放明细；真正SQL扫描／时间预算仍是待实现目标，不能将行数限额当硬执行上限。
-- 返回 `{kind, policy_version, retention_days?, cutoff?, scanned, candidates, protected, truncated, note?}`；
+- 返回 `{kind, policy_version, retention_days?, cutoff?, scanned, candidates, protected, truncated, note?}`；`data_retention` 另含 `examined, incomplete, classes[]`（每类 `examined/candidates/protected/incomplete/resume_after`）；
   目标合同中 `truncated=true` 表示固定预算截断了窗口，计数是**下界**而不是精确总量。**当前 Jobs 只按可删候选决定 truncated，保护计数最多501但未标其截断；不能把 `truncated=false` 当全部计数完整**（F03）。数据库维护没有删除候选，计数字段恒为 0。
 - `scanned/candidates` 当前是匹配窗口的行数，不是 SQLite 实际扫描量；LIMIT500 不构成时间或持锁预算，preview 同步 SQL 尚未 offload（F05）。
 

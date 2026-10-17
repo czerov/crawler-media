@@ -95,6 +95,24 @@ pub(crate) fn library_visible(
     library.member_ids.contains(&user_id)
 }
 
+pub(crate) fn library_visible_with_role(
+    store: &crate::Store,
+    library: &Library,
+    user_id: Option<domain::UserId>,
+    is_admin: bool,
+) -> bool {
+    if !store.library_accepts_work(&library.id).unwrap_or(false) {
+        return false;
+    }
+    let Some(user_id) = user_id else {
+        return true;
+    };
+    if is_admin {
+        return library.admin_visible;
+    }
+    library.access_mode == "everyone" || library.member_ids.contains(&user_id)
+}
+
 pub(crate) fn missing_library() -> Response {
     err(StatusCode::NOT_FOUND, "library.missing", "媒体库不存在")
 }
@@ -184,16 +202,11 @@ pub(crate) async fn list_libraries(
     axum::Extension(user_id): axum::Extension<Option<domain::UserId>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    // 统计一次聚合：锁内一次 ownership/role/ledger/media 批量聚合 + 投影 head 的
-    // 刷新状态。不再每个 Library 重跑一遍全局账本读取，也不再逐文件 `stat`。
-    let stats = match crate::library_statistics::collect_statistics(state.clone(), user_id).await {
-        Ok(stats) => stats,
-        Err(error) => return error.into_response(),
-    };
+    // The filtered library roster is captured once and shared by statistics and rendering.
     // 锁内只收集 owned DB/路径事实（removal / 封面候选路径）；逐 root `is_dir`、
     // 封面 `is_file` 仍在锁外、受 http_work 预算约束，慢挂载不再阻塞共享 Store
     // 和 Tokio worker。
-    let facts: Vec<assets::LibraryFacts> = {
+    let (facts, roster, is_admin) = {
         let store = state.store.lock();
         let libraries = match store.list_libraries() {
             Ok(libraries) => libraries,
@@ -213,18 +226,27 @@ pub(crate) async fn list_libraries(
         let manage_scope = query.get("scope").is_some_and(|s| s == "admin")
             || query.get("manage").is_some_and(|s| s == "1" || s == "true");
         let kind = query.get("kind").and_then(|k| MediaKind::from_str(k).ok());
-        libraries
+        let roster: Vec<Library> = libraries
             .into_iter()
             .filter(|library| {
-                if is_admin && manage_scope {
-                    true
-                } else {
-                    library_visible(&store, library, user_id)
-                }
+                (is_admin && manage_scope)
+                    || library_visible_with_role(&store, library, user_id, is_admin)
             })
             .filter(|library| kind.is_none_or(|k| library.kind == k))
-            .map(|library| assets::library_facts(&store, &library))
-            .collect()
+            .collect();
+        let facts: Vec<assets::LibraryFacts> = roster
+            .iter()
+            .map(|library| assets::library_facts(&store, library))
+            .collect();
+        (facts, roster, is_admin)
+    };
+    let stats = match crate::library_statistics::collect_statistics_for_roster(
+        state.clone(), user_id, &roster, is_admin,
+    )
+    .await
+    {
+        Ok(stats) => stats,
+        Err(error) => return error.into_response(),
     };
     match state
         .http_work
@@ -232,10 +254,7 @@ pub(crate) async fn list_libraries(
             facts
                 .iter()
                 .map(|facts| {
-                    let stats = stats
-                        .get(&facts.library.id)
-                        .copied()
-                        .unwrap_or_default();
+                    let stats = stats.get(&facts.library.id).copied();
                     assets::library_json_from_facts(facts, stats)
                 })
                 .collect::<Vec<Value>>()

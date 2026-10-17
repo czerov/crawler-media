@@ -89,6 +89,10 @@ pub struct ApiState {
     /// 测试 seam：投影依赖覆盖读过的轻量行数（列读 + 候选行；重启后的首个小页
     /// 只应产生这一项成本，不应解码整份 facts）。
     pub(crate) browse_page_dependency_rows: Arc<std::sync::atomic::AtomicUsize>,
+    /// 测试 seam：统计计算在计划收集与 totals 读取之间的屏障（生产为 `None`）。
+    pub statistics_phase_barrier: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// 测试 seam：统计路径执行的用户 role 查询次数（生产只读计数）。
+    pub(crate) statistics_role_lookups: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn apply_admin_bootstrap(
@@ -280,6 +284,8 @@ impl ApiState {
             browse_page_decoded_media: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             browse_page_candidate_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             browse_page_dependency_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            statistics_phase_barrier: None,
+            statistics_role_lookups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             crate::library_lifecycle::resume_library_removals(&state)

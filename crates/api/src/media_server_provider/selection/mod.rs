@@ -84,7 +84,13 @@ fn select_items_blocking(
     let browse = state.browse_files.clone();
     let (scope, mut items) = {
         let store = state.store.lock();
-        let scope = read_scope(&store, user_id, &query)?;
+        let scope = match read_scope(&store, user_id, &query) {
+            Ok(scope) => scope,
+            Err(error) => {
+                count_candidates(state, error.rows_read);
+                return Err(error.to_string());
+            }
+        };
         count_candidates(state, scope.rows_read);
         let items = if scope.unresolved {
             Vec::new()
@@ -197,7 +203,13 @@ fn next_up_blocking(
     let query = next_up_query(series_id);
     let (scope, items) = {
         let store = state.store.lock();
-        let scope = read_scope(&store, user_id, &query)?;
+        let scope = match read_scope(&store, user_id, &query) {
+            Ok(scope) => scope,
+            Err(error) => {
+                count_candidates(state, error.rows_read);
+                return Err(error.to_string());
+            }
+        };
         count_candidates(state, scope.rows_read);
         let items = if scope.unresolved {
             Vec::new()

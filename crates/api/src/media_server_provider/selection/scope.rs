@@ -9,6 +9,26 @@ use domain::{LedgerRow, Media, MediaId, MediaKind, UserId};
 use media_server::provider::query::folder_id_for_root;
 use media_server::provider::ServerItemQuery;
 
+/// 作用域读失败时已经完成的台账行数。`rows_read` 原先只活在成功的
+/// [`ScopedRead`] 里，后面的 media/playback 读取用 `?` 失败时计数停在 0。
+#[derive(Debug)]
+pub(super) struct ScopeError {
+    pub(super) rows_read: usize,
+    message: String,
+}
+
+impl std::fmt::Display for ScopeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+impl From<String> for ScopeError {
+    fn from(message: String) -> Self {
+        Self { rows_read: 0, message }
+    }
+}
+
 pub(super) struct ScopedRead {
     pub(super) ownership: store::LibraryOwnership,
     pub(super) is_admin: bool,
@@ -28,7 +48,7 @@ pub(super) fn read_scope(
     store: &crate::Store,
     user_id: UserId,
     query: &ServerItemQuery,
-) -> Result<ScopedRead, String> {
+) -> Result<ScopedRead, ScopeError> {
     let ownership = store.library_ownership().map_err(|error| error.to_string())?;
     let is_admin = store.user_role(user_id).map_err(|error| error.to_string())? == "admin";
     let libraries = visible_libraries(store, &ownership, user_id, is_admin)?;
@@ -61,29 +81,49 @@ pub(super) fn read_scope(
     if media_target.is_some() && media_scope.is_none() {
         return Ok(unresolved_scope(ownership, is_admin, user_id));
     }
-    let (rows, requested_library, folder_root) = if let Some(rows) = classified_rows {
+    // 已完成的台账读取必须立刻入账：后面的 media/playback 读取用 `?` 失败时，
+    // 调用方拿不到 ScopedRead，候选计数会停在 0。分类阶段读过、可见性又拒绝的
+    // 行同样算一次读取，即使结果被丢掉。
+    let mut rows_read = classified_rows.as_ref().map(|rows| rows.len()).unwrap_or(0);
+    let loaded_media = classified_rows.as_ref().and_then(|rows| rows.first().map(|row| row.media_id));
+    let same_media = media_scope.is_some_and(|id| loaded_media == Some(id));
+    // 可见分类沿用已加载的行；不可见时只在显式目标就是这部媒体时复用，避免再读一遍。
+    let reusable = classified_rows.filter(|_| series_parent.is_some() || same_media);
+    let (rows, requested_library, folder_root) = if let Some(rows) = reusable {
         (rows, None, None)
     } else if let Some(media_id) = media_scope {
-        (store.ledger_for_media(media_id).map_err(|error| error.to_string())?, library.map(str::to_owned), folder)
+        let loaded = store.ledger_for_media(media_id).map_err(|error| error.to_string())?;
+        rows_read += loaded.len();
+        (loaded, library.map(str::to_owned), folder)
     } else if let Some(library_id) = library {
-        (store.ledger_candidates_for_library(&ownership, library_id).map_err(|error| error.to_string())?, Some(library_id.to_string()), None)
+        let loaded = store.ledger_candidates_for_library(&ownership, library_id).map_err(|error| error.to_string())?;
+        rows_read += loaded.len();
+        (loaded, Some(library_id.to_string()), None)
     } else if is_folder_id {
         let Some(root) = folder else {
             return Ok(unresolved_scope(ownership, is_admin, user_id));
         };
         let owner = libraries.iter().find(|library| library.root_paths.iter().any(|path| path == &root));
-        let rows = match owner {
+        let loaded = match owner {
             Some(library) => store.ledger_candidates_for_library(&ownership, &library.id).map_err(|error| error.to_string())?,
             None => Vec::new(),
         };
-        (rows, None, Some(root))
+        rows_read += loaded.len();
+        (loaded, None, Some(root))
     } else {
-        (store.jellyfin_ledger_candidates(&ownership, None).map_err(|error| error.to_string())?, None, None)
+        let loaded = store.jellyfin_ledger_candidates(&ownership, None).map_err(|error| error.to_string())?;
+        rows_read += loaded.len();
+        (loaded, None, None)
     };
-    let rows_read = rows.len();
     let ids: Vec<MediaId> = rows.iter().map(|row| row.media_id).collect();
-    let media = store.media_batch(&ids).map_err(|error| error.to_string())?;
-    let units = store.playback_units_for_media(user_id, &ids).map_err(|error| error.to_string())?;
+    let media = store.media_batch(&ids).map_err(|error| {
+        tracing::warn!(rows_read, error = %error, "Jellyfin 作用域台账已读完，媒体批量读取失败");
+        ScopeError { rows_read, message: error.to_string() }
+    })?;
+    let units = store.playback_units_for_media(user_id, &ids).map_err(|error| {
+        tracing::warn!(rows_read, error = %error, "Jellyfin 作用域台账已读完，播放单元读取失败");
+        ScopeError { rows_read, message: error.to_string() }
+    })?;
     let unknown_parent = parent.is_some() && library.is_none() && !is_folder_id && media_target.is_none();
     Ok(ScopedRead { ownership, is_admin, user_id, media, rows, units, requested_library, folder_root, media_scoped: media_scope.is_some(), unresolved: false, unknown_parent, rows_read })
 }
@@ -136,7 +176,8 @@ fn series_media_id(store: &crate::Store, user_id: UserId, id: &str, ownership: &
         let Some(owner) = ownership.owner(Path::new(&row.path), media.kind) else { return false; };
         ownership.accepts_work(&owner.id) && if is_admin { owner.admin_visible } else { owner.access_mode == "everyone" || owner.member_ids.contains(&user_id) }
     });
-    Ok(visible.then_some(media.id).map(|id| (Some(id), Some(rows))).unwrap_or((None, None)))
+    // 可见性拒绝只丢掉分类身份，不丢掉已经读出的行：同一媒体稍后还会当显式目标用。
+    Ok((visible.then_some(media.id), Some(rows)))
 }
 
 pub(super) fn in_scope_folder(scope: &ScopedRead, row: &LedgerRow) -> bool {

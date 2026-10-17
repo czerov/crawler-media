@@ -72,7 +72,8 @@ impl Runner for StateRunner {
             // `maintenance::run` 里。它只在**不持 Queue 锁**的正式 job_loop 路径执行。
             JobKind::DatabaseMaintenance
             | JobKind::JobsRetention
-            | JobKind::PlaybackHistoryRetention => crate::maintenance::run(&self.state, job),
+            | JobKind::PlaybackHistoryRetention
+            | JobKind::DataRetention => crate::maintenance::run(&self.state, job),
         }
     }
 }

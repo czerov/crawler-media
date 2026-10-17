@@ -5,6 +5,7 @@
 
 pub mod policy;
 
+mod data_retention;
 mod database;
 mod report;
 mod runner;
@@ -13,14 +14,17 @@ pub use database::{
     ConfiguredSqliteExecutor, DatabaseExecutor, DatabaseName, DatabaseTarget, MaintenanceContext,
     PER_DATABASE_LIMIT, SqliteExecutor, SqliteLimits, VACUUM_DISK_HEADROOM_BYTES, database_targets,
 };
+pub use data_retention::{DATA_RETENTION_CLASSES, cutoff_ms_for_days, run_data_retention};
+pub(crate) use data_retention::load_cursor;
 pub use policy::{
-    BATCH_SIZE, DEFAULT_DATABASE_INTERVAL_SECS, DEFAULT_JOBS_INTERVAL_SECS,
-    DEFAULT_PLAYBACK_INTERVAL_SECS, DEFAULT_RETENTION_DAYS, DatabaseMaintenancePolicy,
-    JobsRetentionPolicy, MAINTENANCE_TIMEOUT_SECS, MAX_BATCHES, MAX_MAINTENANCE_INTERVAL_SECS,
-    MAX_RETENTION_DAYS, MIN_MAINTENANCE_INTERVAL_SECS, MIN_RETENTION_DAYS, MaintenancePolicy,
-    POLICY_VERSION, PlaybackHistoryRetentionPolicy, VACUUM_MIN_FREE_BYTES,
-    VACUUM_MIN_FREE_RATIO_PERCENT, VACUUM_MIN_INTERVAL_SECS, validate_maintenance_interval,
-    validate_retention_days,
+    BATCH_SIZE, DEFAULT_DATABASE_INTERVAL_SECS, DEFAULT_DATA_RETENTION_DAYS,
+    DEFAULT_DATA_RETENTION_INTERVAL_SECS, DEFAULT_JOBS_INTERVAL_SECS,
+    DEFAULT_PLAYBACK_INTERVAL_SECS, DEFAULT_RETENTION_DAYS, DataRetentionPolicy,
+    DatabaseMaintenancePolicy, JobsRetentionPolicy, MAINTENANCE_TIMEOUT_SECS, MAX_BATCHES,
+    MAX_MAINTENANCE_INTERVAL_SECS, MAX_RETENTION_DAYS, MIN_MAINTENANCE_INTERVAL_SECS,
+    MIN_RETENTION_DAYS, MaintenancePolicy, POLICY_VERSION, PlaybackHistoryRetentionPolicy,
+    VACUUM_MIN_FREE_BYTES, VACUUM_MIN_FREE_RATIO_PERCENT, VACUUM_MIN_INTERVAL_SECS,
+    validate_maintenance_interval, validate_retention_days,
 };
 pub use report::{DatabaseOutcome, DatabaseReport, MaintenanceReport};
 pub use runner::{check_maintenance_stop, run, MaintenanceStop};
@@ -37,7 +41,7 @@ struct DefSpec {
     concurrency_key: &'static str,
 }
 
-const DEFS: [DefSpec; 3] = [
+const DEFS: [DefSpec; 4] = [
     DefSpec {
         kind: JobKind::DatabaseMaintenance,
         name: "数据库维护",
@@ -60,6 +64,14 @@ const DEFS: [DefSpec; 3] = [
         interval_secs: DEFAULT_PLAYBACK_INTERVAL_SECS,
         concurrency_key: "maintenance:playback_history",
     },
+    DefSpec {
+        kind: JobKind::DataRetention,
+        name: "分类历史保留",
+        // DB-05：新类别默认关闭且 dry_run，生产启用必须由用户显式确认。
+        enabled: false,
+        interval_secs: DEFAULT_DATA_RETENTION_INTERVAL_SECS,
+        concurrency_key: "maintenance:data_retention",
+    },
 ];
 
 /// 维护 payload 的默认值。必须能被 [`MaintenancePolicy::parse`] 原样接受。
@@ -74,12 +86,19 @@ pub fn default_payload(kind: JobKind) -> Option<String> {
             "retention_days": DEFAULT_RETENTION_DAYS,
             "dry_run": false,
         }),
+        JobKind::DataRetention => serde_json::json!({
+            "version": POLICY_VERSION,
+            "dry_run": true,
+            "qoe_days": DEFAULT_DATA_RETENTION_DAYS,
+            "transient_cache_days": DEFAULT_DATA_RETENTION_DAYS,
+            "probe_days": DEFAULT_DATA_RETENTION_DAYS,
+        }),
         _ => return None,
     };
     Some(value.to_string())
 }
 
-/// 注册三类维护任务。幂等：已存在的 def（含用户改过的开关/频率/payload）原样保留。
+/// 注册四类维护任务。幂等：已存在的 def（含用户改过的开关/频率/payload）原样保留。
 pub fn seed_maintenance_defs(queue: &Queue) -> Result<(), jobs::JobError> {
     for spec in &DEFS {
         let Some(payload) = default_payload(spec.kind) else {

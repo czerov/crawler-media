@@ -650,7 +650,7 @@ impl ProjectionService {
     ///
     /// A ready projection is usable only after this request has consumed a bounded
     /// amount of pending journal work. Incomplete sources force the build path.
-    async fn journal_ready(
+    pub(crate) async fn journal_ready(
         &self,
         state: &ApiState,
         library_id: &str,

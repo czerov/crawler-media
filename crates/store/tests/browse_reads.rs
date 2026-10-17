@@ -384,3 +384,96 @@ fn playback_units_for_user_is_scoped_to_one_user() {
     assert_eq!(store.playback_units_for_user(owner).unwrap().len(), 1);
     assert!(store.playback_units_for_user(UserId::new()).unwrap().is_empty());
 }
+
+/// Design characterization only: no derived owner index exists yet, so this
+/// checks current candidate/owner parity rather than claiming a regression.
+#[test]
+fn default_candidate_growth_and_ownership_parity() {
+    use domain::{Confidence, LedgerId, LedgerRow, QualitySource};
+    use std::path::Path;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let root = tmp.path().join("root");
+    let nested = root.join("nested");
+    let tied_root = tmp.path().join("tied");
+    let target = store
+        .create_library(MediaKind::Movie, "Target", &[root.to_str().unwrap()], "everyone", true, &[])
+        .unwrap();
+    let nested_library = store
+        .create_library(MediaKind::Movie, "Nested", &[nested.to_str().unwrap()], "everyone", true, &[])
+        .unwrap();
+    let tied = store
+        .create_library(MediaKind::Movie, "Tied", &[tied_root.to_str().unwrap()], "everyone", true, &[])
+        .unwrap();
+    let default = store.default_library(MediaKind::Movie).unwrap().unwrap();
+    let paths = [
+        root.join("owned.mkv").display().to_string(),
+        nested.join("nested.mkv").display().to_string(),
+        tied_root.join("ambiguous.mkv").display().to_string(),
+        format!("{}/./odd.mkv", root.display()),
+        tmp.path().join("unmatched.mkv").display().to_string(),
+    ];
+    for (index, path) in paths.iter().enumerate() {
+        let row = LedgerRow {
+            id: LedgerId::new(), media_id: MediaId::new(), path: path.clone(), season: None,
+            episode: None, resolution: None, codec: None, hdr: None,
+            quality_source: QualitySource::Release, confidence: Confidence::High, filter_score: None,
+        };
+        store.insert_ledger(&row).unwrap();
+        if index == 0 {
+            let tv_row = LedgerRow { id: LedgerId::new(), media_id: row.media_id, path: path.clone(), ..row.clone() };
+            store.insert_ledger(&tv_row).unwrap();
+        }
+    }
+    let ownership = store.library_ownership().unwrap();
+    let frozen = store.begin_library_removal(&target.id).unwrap();
+    assert_eq!(frozen.library_id, target.id);
+    let ownership = store.library_ownership().unwrap();
+    for library_id in [&target.id, &nested_library.id, &tied.id, &default.id] {
+        let current = store.list_ledger().unwrap().into_iter().filter(|row| {
+            ownership.owner(Path::new(&row.path), MediaKind::Movie).is_some_and(|owner| owner.id == *library_id)
+        }).map(|row| row.id).collect::<std::collections::HashSet<_>>();
+        let candidate = store.ledger_candidates_for_library(&ownership, library_id).unwrap().into_iter().filter(|row| {
+            ownership.owner(Path::new(&row.path), MediaKind::Movie).is_some_and(|owner| owner.id == *library_id)
+        }).map(|row| row.id).collect::<std::collections::HashSet<_>>();
+        assert_eq!(candidate, current);
+    }
+    let cold_global_build_is_reported = store.list_ledger().unwrap().len() == 5;
+    assert!(cold_global_build_is_reported, "the existing default candidate build reads globally");
+    // No derived index/interface exists today; stale-index rejection is therefore not applicable.
+    let db = rusqlite::Connection::open(tmp.path().join("data/library.db")).unwrap();
+    let index_exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='browse_ledger_owners')", [], |r| r.get(0)).unwrap();
+    assert!(!index_exists, "documented absence: derived ownership index is unimplemented");
+}
+
+/// Measurement only: current global-scan growth and persisted bytes/write time.
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn default_candidate_scan_size_and_write_cost() {
+    use domain::{Confidence, LedgerId, LedgerRow, QualitySource};
+    use std::time::Instant;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    let default = store.default_library(MediaKind::Movie).unwrap().unwrap();
+    let mut total_rows = 0usize;
+    for count in [1_000usize, 10_000, 50_000] {
+        let started = Instant::now();
+        for i in 0..count {
+            store.insert_ledger(&LedgerRow {
+                id: LedgerId::new(), media_id: MediaId::new(), path: format!("/unrelated/{count}/{i}.mkv"),
+                season: None, episode: None, resolution: None, codec: None, hdr: None,
+                quality_source: QualitySource::Release, confidence: Confidence::High, filter_score: None,
+            }).unwrap();
+        }
+        total_rows += count;
+        let write_ms = started.elapsed().as_millis();
+        let ownership = store.library_ownership().unwrap();
+        let started = Instant::now();
+        let rows = store.ledger_candidates_for_library(&ownership, &default.id).unwrap();
+        let scan_ms = started.elapsed().as_millis();
+        let bytes = std::fs::metadata(tmp.path().join("data/library.db")).unwrap().len();
+        println!("batch_rows={count} cumulative_rows={total_rows} candidates={} scan_ms={scan_ms} batch_insert_ms={write_ms} library_db_bytes={bytes}", rows.len());
+    }
+}

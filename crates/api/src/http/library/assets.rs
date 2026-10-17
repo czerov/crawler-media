@@ -78,8 +78,12 @@ fn cover_path_from_input(cover: &CoverInput) -> Option<PathBuf> {
 /// 投影 facts、刷新状态来自 head）；这里只负责逐 root `is_dir` 与封面 `is_file`。
 pub(crate) fn library_json_from_facts(
     facts: &LibraryFacts,
-    stats: crate::library_statistics::LibraryStatistics,
+    stats: Option<crate::library_statistics::LibraryStatistics>,
 ) -> Value {
+    let stats = stats.unwrap_or(crate::library_statistics::LibraryStatistics {
+        stale: true,
+        ..Default::default()
+    });
     let library = &facts.library;
     // 根目录被删：库不能假装是「空的」，要在 UI 提示并提供恢复/删除。
     let root_missing = library
@@ -122,7 +126,7 @@ pub(crate) fn library_json_from_facts(
 /// [`crate::library_statistics::statistics_for`] 的同一套口径同步算一次，不构建。
 pub(crate) fn library_json(store: &crate::Store, library: &Library) -> Value {
     let stats = crate::library_statistics::statistics_for(store, library);
-    library_json_from_facts(&library_facts(store, library), stats)
+    library_json_from_facts(&library_facts(store, library), Some(stats))
 }
 
 /// Emby-style current cover source: latest TV episode wins; movies use their

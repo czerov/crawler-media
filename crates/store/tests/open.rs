@@ -15,17 +15,17 @@ fn open_creates_four_sqlite_files() {
     );
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "catalog").unwrap().1,
-        2,
-        "catalog schema version should be 2"
+        3,
+        "catalog schema version should be 3"
     );
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "library").unwrap().1,
-        15,
-        "library schema version should be 15"
+        16,
+        "library schema version should be 16"
     );
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "subscribe").unwrap().1,
-        7,
-        "subscribe schema version should be 7"
+        8,
+        "subscribe schema version should be 8"
     );
 }

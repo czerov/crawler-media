@@ -323,34 +323,54 @@ impl Store {
         library_id: &str,
         facts_version: u64,
     ) -> Result<Option<BrowseFileTotals>, StoreError> {
+        // A5-01: TOTAL() 浮点聚合避免 SQLite 整数加法溢出。
+        // 每一行 facts_json 必须通过严格的有效性验证：
+        // - json_valid(facts_json)
+        // - json_extract(facts_json, '$.version') = ?2
+        // - json_type(facts_json, '$.size') IN ('integer', 'real')
+        // - json_extract(facts_json, '$.size') >= 0 且 <= 100_000_000_000_000_000 (100 PB)
+        // 任何损坏/非法/负数/越界 size 的行都记入 foreign 计数，使该库 facts 标记不可用 (None) 等待重建，
+        // 而不是静默吞掉负数或让整个请求 500 崩溃。
+        const MAX_SANE_FILE_SIZE: f64 = 100_000_000_000_000_000.0; // 100 PB
         let mut stmt = self.library.prepare(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE WHEN json_valid(facts_json)
                                        AND json_extract(facts_json, '$.version') = ?2
+                                       AND json_type(facts_json, '$.size') IN ('integer', 'real')
+                                       AND json_extract(facts_json, '$.size') >= 0
+                                       AND json_extract(facts_json, '$.size') <= ?3
                                       THEN 0 ELSE 1 END), 0),
                     COALESCE(SUM(CASE WHEN json_valid(facts_json)
                                        AND json_extract(facts_json, '$.version') = ?2
                                        AND lower(COALESCE(json_extract(facts_json, '$.path'), ''))
                                            LIKE '%.strm'
                                       THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN json_valid(facts_json)
-                                       AND json_extract(facts_json, '$.version') = ?2
-                                       AND lower(COALESCE(json_extract(facts_json, '$.path'), ''))
-                                           NOT LIKE '%.strm'
-                                      THEN COALESCE(json_extract(facts_json, '$.size'), 0)
-                                      ELSE 0 END), 0)
+                    TOTAL(CASE WHEN json_valid(facts_json)
+                                    AND json_extract(facts_json, '$.version') = ?2
+                                    AND lower(COALESCE(json_extract(facts_json, '$.path'), ''))
+                                        NOT LIKE '%.strm'
+                                    AND json_type(facts_json, '$.size') IN ('integer', 'real')
+                                    AND json_extract(facts_json, '$.size') >= 0
+                                    AND json_extract(facts_json, '$.size') <= ?3
+                               THEN json_extract(facts_json, '$.size')
+                               ELSE 0.0 END)
              FROM browse_files WHERE library_id = ?1",
         )?;
-        let (file_count, foreign, strm, size): (i64, i64, i64, i64) = stmt.query_row(
-            params![library_id, facts_version as i64],
+        let (file_count, foreign, strm, size_float): (i64, i64, i64, f64) = stmt.query_row(
+            params![library_id, facts_version as i64, MAX_SANE_FILE_SIZE],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-        if foreign > 0 {
+        if foreign > 0 || !size_float.is_finite() || size_float < 0.0 {
             return Ok(None);
         }
+        let total_size_bytes = if size_float >= (u64::MAX as f64) {
+            u64::MAX
+        } else {
+            size_float.round() as u64
+        };
         Ok(Some(BrowseFileTotals {
             file_count: file_count.max(0) as u64,
-            total_size_bytes: size.max(0) as u64,
+            total_size_bytes,
             strm_file_count: strm.max(0) as u64,
         }))
     }
@@ -549,6 +569,81 @@ mod tests {
         assert_eq!(totals.strm_file_count, 1);
         // 旧代 facts 版本：不能把 0 当成空库，必须让调用方去重建。
         assert_eq!(store.browse_file_totals(&library.id, 4).unwrap(), None);
+    }
+
+    /// A5-01: Invalid sizes make the projection unusable; valid huge values use TOTAL.
+    #[test]
+    fn browse_file_totals_rejects_invalid_sizes_and_saturates_safe_totals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("data")).unwrap();
+        let library = store
+            .default_library(MediaKind::Movie)
+            .unwrap()
+            .expect("seeded default movie library");
+        let media_id = MediaId::new();
+        let scope = format!(
+            "{}|{}",
+            library.kind.as_str(),
+            library
+                .root_paths
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\u{1f}")
+        );
+        let publish = |generation, sizes: &[serde_json::Value]| {
+            let files = sizes
+                .iter()
+                .enumerate()
+                .map(|(index, size)| {
+                    let path = format!("/movies/{generation}-{index}.mkv");
+                    crate::BrowseFileFacts {
+                        ledger_id: LedgerId::new(),
+                        media_id,
+                        path: path.clone(),
+                        facts: serde_json::json!({
+                            "version": 3,
+                            "path": path,
+                            "size": size,
+                            "missing": false,
+                        }),
+                    }
+                })
+                .collect();
+            let build = crate::ProjectionBuild {
+                library_id: library.id.clone(),
+                generation,
+                scope_signature: scope.clone(),
+                revisions: store.read_revisions().unwrap(),
+                expected_dirty_token: None,
+                files,
+                media: Vec::new(),
+                candidates: Vec::new(),
+            };
+            assert!(store.publish_browse_projection(&build).unwrap());
+        };
+
+        publish(1, &[serde_json::json!(100), serde_json::json!(-90)]);
+        assert_eq!(store.browse_file_totals(&library.id, 3).unwrap(), None);
+        publish(2, &[serde_json::json!(100), serde_json::json!("invalid")]);
+        assert_eq!(store.browse_file_totals(&library.id, 3).unwrap(), None);
+        publish(3, &[serde_json::json!(90_000_000_000_000_000u64), serde_json::json!(90_000_000_000_000_000u64)]);
+        let totals = store
+            .browse_file_totals(&library.id, 3)
+            .unwrap()
+            .expect("valid bounded sizes aggregate");
+        assert_eq!(totals.file_count, 2);
+        assert_eq!(totals.total_size_bytes, 180_000_000_000_000_000u64);
+        // A pair of values that overflow SQLite SUM(i64) is rejected as invalid
+        // facts, not surfaced as an aggregate error/HTTP 500.
+        publish(4, &[serde_json::json!(9_000_000_000_000_000_000u64), serde_json::json!(9_000_000_000_000_000_000u64)]);
+        assert_eq!(store.browse_file_totals(&library.id, 3).unwrap(), None);
+        publish(5, &[serde_json::json!(100_000_000_000_000_001u64)]);
+        assert_eq!(
+            store.browse_file_totals(&library.id, 3).unwrap(),
+            None,
+            "sizes above the configured sane bound make facts unusable"
+        );
     }
 
     /// P3-D：非默认库的候选读走 `ledger_path_idx`，VM steps 不随无关台账增长。

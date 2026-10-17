@@ -297,3 +297,89 @@ async fn jellyfin_selection_records_candidate_and_heavy_counts() {
     assert_eq!(heavy.load(Ordering::SeqCst), 2, "第二次请求仍然只 enrich 本页");
 }
 
+/// A3-06-01：播放单元解码失败发生在台账读完之后，已读行仍要计入候选。
+#[tokio::test]
+async fn failed_playback_unit_read_still_counts_loaded_ledger_rows() {
+    let fixture = tv_fixture(1, 2);
+    let show = media_id_for_title(&fixture.state, "Show000");
+    let user_id = {
+        let store = fixture.state.store();
+        let store = store.lock();
+        store
+            .list_users()
+            .unwrap()
+            .into_iter()
+            .find(|user| store.user_role(user.id).unwrap() == "admin")
+            .expect("admin")
+            .id
+    };
+    let stored_media = uuid::Uuid::parse_str(&show).unwrap().to_string();
+    let conn = rusqlite::Connection::open(fixture.dir.path().join("data/subscribe.db")).unwrap();
+    conn.execute(
+        "INSERT INTO playback_units
+            (user_id, media_id, season, episode, position_ms, played, favorite, updated_at)
+         VALUES (?1, ?2, 1, 1, 'bad', 0, 0, 1)",
+        rusqlite::params![user_id.to_string(), stored_media],
+    )
+    .unwrap();
+    drop(conn);
+
+    let candidates = fixture.state.jellyfin_candidates();
+    let app = router(fixture.state.clone());
+    let (status, body) = get(&app, &format!("/Items?ParentId={show}&Limit=1")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(
+        candidates.load(Ordering::SeqCst),
+        2,
+        "两行台账已读完，播放单元失败不得把候选计成 0"
+    );
+}
+
+/// A3-06-02：不可见剧的分类读取仍计入，且同一媒体不得再读一遍只报一次。
+#[tokio::test]
+async fn invisible_series_classification_keeps_its_ledger_read() {
+    let fixture = tv_fixture(1, 2);
+    let hidden_root = fixture.dir.path().join("tv-hidden");
+    std::fs::create_dir_all(&hidden_root).unwrap();
+    let show = {
+        let store = fixture.state.store();
+        let store = store.lock();
+        store
+            .create_library(
+                domain::MediaKind::Tv,
+                "Hidden",
+                &[hidden_root.to_str().unwrap()],
+                "everyone",
+                false,
+                &[],
+            )
+            .unwrap();
+        let media_id = new_media(&store, "HiddenShow");
+        let show_dir = hidden_root.join("HiddenShow");
+        std::fs::create_dir_all(&show_dir).unwrap();
+        for episode in 1..=2 {
+            insert_episode(&store, &show_dir, media_id, 1, episode);
+        }
+        media_id.to_string().replace('-', "")
+    };
+
+    let candidates = fixture.state.jellyfin_candidates();
+    fixture.state.store().lock().reset_media_ledger_reads();
+    let app = router(fixture.state.clone());
+    let (status, body) = get(
+        &app,
+        &format!("/Items?ParentId={show}&SeriesId={show}&Limit=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["TotalRecordCount"], 0, "admin_visible=false 的剧不得列出：{body}");
+    let reads = fixture.state.store().lock().media_ledger_reads();
+    assert_eq!(reads, 1, "分类已经读过这部剧，显式目标不得再读一遍，实际 {reads}");
+    assert_eq!(
+        candidates.load(Ordering::SeqCst),
+        2,
+        "分类读了 2 行并复用，不得丢掉这次读取：实际 {}",
+        candidates.load(Ordering::SeqCst)
+    );
+}
+
