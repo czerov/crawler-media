@@ -159,23 +159,26 @@ fn recording_ffmpeg(dir: &std::path::Path) -> (std::path::PathBuf, std::path::Pa
 /// 不是同步手段（负载下 2s 太紧会把正常的慢完成误判成失败，DB16）。
 const WORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn wait_for_idle(
+fn chapter_service(
+    store: &std::sync::Arc<parking_lot::Mutex<Store>>,
     registry: &std::sync::Arc<crate::library_lifecycle::LibraryWorkRegistry>,
-    library_id: &str,
-) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("test runtime");
-    runtime.block_on(async {
-        tokio::time::timeout(WORK_TIMEOUT, registry.wait_idle(library_id))
-            .await
-            .expect("background chapter frame work did not finish");
-    });
+    ffmpeg: &std::path::Path,
+) -> std::sync::Arc<crate::chapter_frame_service::ChapterFrameService> {
+    std::sync::Arc::new(
+        crate::chapter_frame_service::ChapterFrameService::with_runner(
+            store.clone(),
+            registry.clone(),
+            std::sync::Arc::new(
+                crate::chapter_frame_service::worker::FfmpegChapterFrameRunner::new(
+                    ffmpeg.display().to_string(),
+                ),
+            ),
+        ),
+    )
 }
 
-#[test]
-fn fingerprint_marker_extracts_scene_frames_when_library_enables_them() {
+#[tokio::test]
+async fn fingerprint_marker_extracts_scene_frames_when_library_enables_them() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, media_id, row) = tv_episode(&tmp);
     let root = tmp.path().to_str().unwrap().to_string();
@@ -187,17 +190,27 @@ fn fingerprint_marker_extracts_scene_frames_when_library_enables_them() {
         .unwrap();
 
     let (ffmpeg, args) = recording_ffmpeg(tmp.path());
-    crate::http::library_chapters::set_scene_frame_ffmpeg_for_test(leak_path(ffmpeg));
     let updates =
         persist_marker(&store, &[row.clone()], fingerprint_marker(media_id), false).unwrap();
     let store = std::sync::Arc::new(parking_lot::Mutex::new(store));
     let registry = std::sync::Arc::new(crate::library_lifecycle::LibraryWorkRegistry::default());
-    crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
-        &updates, &store, &registry,
-    );
-    // 必须等抓帧工作**做完**再读参数文件：`args` 由 shell 的 `>>` 重定向先建后写，
-    // 只等"文件出现"会读到还没写入内容的空文件，断言就会假失败（DB16）。
-    wait_for_idle(&registry, &library.id);
+    let service = chapter_service(&store, &registry, &ffmpeg);
+    service.start();
+    crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(&updates, &service);
+    // 必须等抓帧任务**终态**再读参数文件：`args` 由 shell 的 `>>` 重定向先建后写，
+    // 只等"文件出现"或 lease 归还会读到还没写入内容的空文件（DB16）。
+    tokio::time::timeout(WORK_TIMEOUT, async {
+        loop {
+            let terminal = store.lock().chapter_frame_task_counts().unwrap().terminal();
+            if terminal > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background chapter frame work did not finish");
+    let _ = service.shutdown().await;
     let recorded = std::fs::read_to_string(&args).unwrap_or_default();
     assert!(
         recorded.contains("-frames:v"),
@@ -218,15 +231,12 @@ fn fingerprint_marker_skips_scene_frames_when_library_disables_them() {
         .unwrap();
 
     let (ffmpeg, args) = recording_ffmpeg(tmp.path());
-    crate::http::library_chapters::set_scene_frame_ffmpeg_for_test(leak_path(ffmpeg));
     let updates =
         persist_marker(&store, &[row.clone()], fingerprint_marker(media_id), false).unwrap();
     let store = std::sync::Arc::new(parking_lot::Mutex::new(store));
     let registry = std::sync::Arc::new(crate::library_lifecycle::LibraryWorkRegistry::default());
-    crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
-        &updates, &store, &registry,
-    );
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    let service = chapter_service(&store, &registry, &ffmpeg);
+    crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(&updates, &service);
     assert!(
         !args.is_file(),
         "关闭生成章节后，声纹写入片头片尾不得抓场景图"
@@ -265,14 +275,13 @@ async fn cancelling_detached_chapter_frames_reaps_child_and_preserves_sidecars()
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    crate::http::library_chapters::set_scene_frame_ffmpeg_for_test(leak_path(ffmpeg));
     let updates =
         persist_marker(&store, &[row.clone()], fingerprint_marker(media_id), false).unwrap();
     let store = std::sync::Arc::new(parking_lot::Mutex::new(store));
     let registry = std::sync::Arc::new(crate::library_lifecycle::LibraryWorkRegistry::default());
-    crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
-        &updates, &store, &registry,
-    );
+    let service = chapter_service(&store, &registry, &ffmpeg);
+    service.start();
+    crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(&updates, &service);
     // 条件等待（子进程写出 ready 文件）+ 明确超时；不用固定 sleep 当同步手段。
     tokio::time::timeout(WORK_TIMEOUT, async {
         while !started.exists() {
@@ -285,6 +294,7 @@ async fn cancelling_detached_chapter_frames_reaps_child_and_preserves_sidecars()
     tokio::time::timeout(WORK_TIMEOUT, registry.wait_idle(&owner.id))
         .await
         .expect("chapter frame work did not stop after freeze");
+    let _ = service.shutdown().await;
     let image = std::path::Path::new(&row.path).with_file_name("episode-chapter_0.jpg");
     assert!(!image.exists());
     assert_eq!(
@@ -364,8 +374,4 @@ fn marker_publication_skips_frozen_library_but_updates_live_copy() {
     assert_eq!(updates[0].0, live.id.to_string());
     assert!(store.get_cached_chapters(&row.id.to_string()).unwrap().is_none());
     assert!(store.get_cached_chapters(&live.id.to_string()).unwrap().is_some());
-}
-
-fn leak_path(path: std::path::PathBuf) -> &'static str {
-    Box::leak(path.display().to_string().into_boxed_str())
 }

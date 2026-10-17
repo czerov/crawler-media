@@ -60,6 +60,7 @@ pub(crate) enum ProbeEnqueueError {
 pub struct ProbeManager {
     store: Arc<Mutex<Store>>,
     library_work: Mutex<Option<Arc<crate::library_lifecycle::LibraryWorkRegistry>>>,
+    chapter_frames: Mutex<Option<Arc<crate::chapter_frame_service::ChapterFrameService>>>,
     fingerprint_engine: Arc<dyn FingerprintEngine>,
     capture_engine: Arc<dyn FingerprintCaptureEngine>,
     metadata_tx: mpsc::UnboundedSender<ProbeUnit>,
@@ -108,6 +109,7 @@ impl ProbeManager {
         let manager = Self {
             store,
             library_work: Mutex::new(None),
+            chapter_frames: Mutex::new(None),
             fingerprint_engine,
             capture_engine,
             metadata_tx,
@@ -131,6 +133,19 @@ impl ProbeManager {
 
     pub(crate) fn set_library_registry(&self, registry: Arc<crate::library_lifecycle::LibraryWorkRegistry>) {
         *self.library_work.lock() = Some(registry);
+    }
+
+    pub(crate) fn set_chapter_frames(
+        &self,
+        service: Arc<crate::chapter_frame_service::ChapterFrameService>,
+    ) {
+        *self.chapter_frames.lock() = Some(service);
+    }
+
+    pub(crate) fn chapter_frames(
+        &self,
+    ) -> Option<Arc<crate::chapter_frame_service::ChapterFrameService>> {
+        self.chapter_frames.lock().clone()
     }
 
     pub fn priority_gate(&self) -> Arc<dyn crate::fingerprint_job::CaptureGate> {

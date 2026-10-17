@@ -2,6 +2,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::StoreError;
 
+mod chapter_frame_tasks;
 mod fingerprint;
 mod library_deletion;
 mod probe_state;
@@ -293,6 +294,7 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
             ON ledger_probe_obligations(created_at_ms, ledger_id);",
     )?;
     scan_operations::migrate_scan_operations(conn)?;
+    chapter_frame_tasks::migrate_chapter_frame_tasks(conn)?;
     browse_projection::migrate_browse_projection(conn)?;
     // library schema 15：browse_media 的 SQL 排序键列与索引（A4 浏览页）。
     browse_page_facts::migrate_browse_page_facts(conn)?;

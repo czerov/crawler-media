@@ -69,6 +69,8 @@ pub struct ApiState {
     pub obscura: Arc<crate::obscura_manager::ObscuraManager>,
     /// 异步媒体探测队列（streamdetails + 声纹指纹后台采集）。
     pub probe: Arc<crate::probe_manager::ProbeManager>,
+    /// 持久章节帧义务的有界派发服务（2 进程 / 64 ID 窗口）。
+    pub(crate) chapter_frames: Arc<crate::chapter_frame_service::ChapterFrameService>,
     /// 测试 seam：gallery 实际展开图片 JSON 的组数（生产只读计数，无副作用）。
     /// 用来证明「先按图片存在性剔除空组、再分页」后只渲染本页图片集合。
     pub(crate) gallery_expansions: Arc<std::sync::atomic::AtomicUsize>,
@@ -235,6 +237,11 @@ impl ApiState {
         let library_work = Arc::new(crate::library_lifecycle::LibraryWorkRegistry::default());
         let probe = Arc::new(crate::probe_manager::ProbeManager::new(store.clone()));
         probe.set_library_registry(library_work.clone());
+        let chapter_frames = Arc::new(crate::chapter_frame_service::ChapterFrameService::new(
+            store.clone(),
+            library_work.clone(),
+        ));
+        probe.set_chapter_frames(chapter_frames.clone());
         let state = Self {
             store: store.clone(),
             password_login: Arc::new(crate::password_login::PasswordLogin::new(
@@ -277,6 +284,7 @@ impl ApiState {
             log_buffer: LogBuffer::new(DEFAULT_CAPACITY),
             obscura: Arc::new(crate::obscura_manager::ObscuraManager::new(&data_dir)),
             probe,
+            chapter_frames,
             gallery_expansions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             jellyfin_candidates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             jellyfin_heavy_items: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -291,6 +299,7 @@ impl ApiState {
             crate::library_lifecycle::resume_library_removals(&state)
                 .map_err(std::io::Error::other)?;
             state.probe.try_start_workers();
+            state.chapter_frames.start();
             crate::scan_probe_dispatch::start_dispatcher(state.clone());
             // 已访问 Library 的投影周期刷新（外部 NFO/图片修改 ≤60 秒可见）。
             state.projection.clone().start_periodic_refresh(state.clone());
@@ -316,6 +325,25 @@ impl ApiState {
     ) -> Self {
         self.library_files = files;
         self
+    }
+    /// Replace the chapter frame renderer (tests inject a gated fake; no ffmpeg).
+    pub fn with_chapter_frame_runner(
+        mut self,
+        runner: Arc<dyn crate::chapter_frame_service::ChapterFrameRunner>,
+    ) -> Self {
+        let service = Arc::new(crate::chapter_frame_service::ChapterFrameService::with_runner(
+            self.store.clone(),
+            self.library_work.clone(),
+            runner,
+        ));
+        self.chapter_frames.abort();
+        self.probe.set_chapter_frames(service.clone());
+        self.chapter_frames = service;
+        self
+    }
+
+    pub fn chapter_frames(&self) -> Arc<crate::chapter_frame_service::ChapterFrameService> {
+        self.chapter_frames.clone()
     }
     pub fn with_playback_clock(
         mut self,

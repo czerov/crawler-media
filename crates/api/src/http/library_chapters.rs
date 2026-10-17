@@ -46,7 +46,11 @@ pub(crate) fn auto_generate_chapters(state: &ApiState, path: &std::path::Path) {
         .as_ref()
         .map(|lease| lease.control().clone())
         .unwrap_or_default();
-    let _ = generate_chapter_frames(path, &control);
+    if let Some(targets) = probe_chapter_targets(path, &control) {
+        if let Err(error) = state.chapter_frames.enqueue_path(path, targets) {
+            tracing::debug!(%error, path = %path.display(), "章节帧任务入队失败");
+        }
+    }
 }
 
 /// 最长根目录前缀所属媒体库的「生成章节」开关。路径不落在任何库时默认开启，
@@ -72,87 +76,9 @@ pub(crate) fn chapter_images_enabled(store: &crate::Store, path: &std::path::Pat
         .unwrap_or(true)
 }
 
-pub(crate) fn generate_chapter_frames_for_targets(
-    path: &std::path::Path,
-    targets: &[(i64, i64)],
-) -> (usize, usize) {
-    generate_chapter_frames_for_targets_with(
-        &scene_frame_ffmpeg(),
-        path,
-        targets,
-        &library::WorkControl::default(),
-    )
-}
-
-fn generate_chapter_frames_for_targets_with(
-    ffmpeg: &str,
-    path: &std::path::Path,
-    targets: &[(i64, i64)],
-    control: &library::WorkControl,
-) -> (usize, usize) {
-    let mut generated = 0usize;
-    for (index, &(start_ms, end_ms)) in targets.iter().enumerate() {
-        if control.is_cancelled() {
-            break;
-        }
-        let out = chapter_image_path(path, index);
-        if out.is_file() {
-            generated += 1;
-            continue;
-        }
-        let midpoint = if end_ms > start_ms {
-            start_ms + (end_ms - start_ms) / 2
-        } else {
-            start_ms
-        };
-        if extract_chapter_frame(path, midpoint, &out, ffmpeg, control).is_ok() {
-            generated += 1;
-        }
-    }
-    (generated, targets.len())
-}
-
-fn extract_chapter_frame(
-    path: &std::path::Path,
-    midpoint: i64,
-    out: &std::path::Path,
-    ffmpeg: &str,
-    control: &library::WorkControl,
-) -> Result<(), String> {
-    // The child never writes the visible sidecar. Retain staging through reaping
-    // and publish only under the cancellation gate.
-    let staged = out.with_file_name(format!(".chapter-{}.jpg", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut command = std::process::Command::new(ffmpeg);
-        command.args(["-y", "-ss", &format!("{:.3}", midpoint as f64 / 1000.0)]);
-        library::ProbeTarget::from_path(path).apply_ffmpeg_input(&mut command);
-        command.args(["-frames:v", "1", "-vf", "scale=960:-2", "-q:v", "4"]);
-        command.arg(&staged);
-        let output = control
-            .output(&mut command)
-            .map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-        }
-        control
-            .signal()
-            .publish(|| std::fs::rename(&staged, out).map_err(|error| error.to_string()))
-    })();
-    if staged.exists() {
-        if let Err(error) = std::fs::remove_file(&staged) {
-            tracing::warn!(%error, path = %staged.display(), "failed to remove staged chapter frame");
-        }
-    }
-    if let Err(error) = &result {
-        tracing::debug!(%error, path = %path.display(), "chapter frame extraction stopped");
-    }
-    result
-}
-
 pub(crate) fn trigger_scene_frames_for_chapter_updates(
     updates: &[(String, Vec<library::ChapterMarker>)],
-    store: &std::sync::Arc<parking_lot::Mutex<crate::Store>>,
-    registry: &std::sync::Arc<crate::library_lifecycle::LibraryWorkRegistry>,
+    service: &std::sync::Arc<crate::chapter_frame_service::ChapterFrameService>,
 ) {
     for (ledger_id, chapters) in updates {
         if chapters.is_empty() {
@@ -162,97 +88,15 @@ pub(crate) fn trigger_scene_frames_for_chapter_updates(
         if targets.is_empty() {
             continue;
         }
-        let row_path = store
-            .lock()
-            .get_ledger(&ledger_id.replace('-', ""))
-            .ok()
-            .flatten()
-            .map(|r| std::path::PathBuf::from(r.path));
-        if let Some(path) = row_path {
-            if !chapter_images_enabled(&store.lock(), &path) {
-                tracing::debug!(path = %path.display(), "媒体库已关闭章节场景图提取，跳过声纹章节抓帧");
-                continue;
-            }
-            let owner = {
-                let store = store.lock();
-                store
-                    .get_ledger(&ledger_id.replace('-', ""))
-                    .ok()
-                    .flatten()
-                    .and_then(|row| {
-                        store
-                            .get_media(row.media_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|media| {
-                                store
-                                    .library_for_path_strict(&path, media.kind)
-                                    .ok()
-                                    .flatten()
-                            })
-                    })
-            };
-            let Some(owner) = owner else {
-                continue;
-            };
-            let lease = match registry.acquire(store, &owner.id) {
-                Ok(lease) => lease,
-                Err(error) => {
-                    tracing::debug!(%error, "chapter task rejected");
-                    continue;
-                }
-            };
-            let ffmpeg = scene_frame_ffmpeg();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn_blocking(move || {
-                    generate_chapter_frames_for_targets_with(
-                        &ffmpeg,
-                        &path,
-                        &targets,
-                        lease.control(),
-                    );
-                });
-            } else {
-                std::thread::spawn(move || {
-                    generate_chapter_frames_for_targets_with(
-                        &ffmpeg,
-                        &path,
-                        &targets,
-                        lease.control(),
-                    );
-                });
-            }
+        match service.enqueue_ledger(ledger_id, targets) {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                %ledger_id,
+                "章节帧任务已存在或媒体库已关闭，跳过"
+            ),
+            Err(error) => tracing::debug!(%error, %ledger_id, "章节帧任务入队失败"),
         }
     }
-}
-
-thread_local! {
-    static SCENE_FRAME_FFMPEG: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
-}
-
-fn scene_frame_ffmpeg() -> String {
-    SCENE_FRAME_FFMPEG
-        .with(|ffmpeg| ffmpeg.get().map(str::to_string))
-        .unwrap_or_else(|| "ffmpeg".into())
-}
-
-/// 仅测试使用：让当前线程触发的场景图抓帧走指定 ffmpeg，不碰进程环境。
-#[cfg(test)]
-pub(crate) fn set_scene_frame_ffmpeg_for_test(ffmpeg: &'static str) {
-    SCENE_FRAME_FFMPEG.with(|slot| slot.set(Some(ffmpeg)));
-}
-
-fn generate_chapter_frames(
-    path: &std::path::Path,
-    control: &library::WorkControl,
-) -> Option<(usize, usize)> {
-    let targets = probe_chapter_targets(path, control)?;
-    Some(generate_chapter_frames_for_targets_with(
-        &scene_frame_ffmpeg(),
-        path,
-        &targets,
-        control,
-    ))
 }
 
 fn probe_chapter_targets(
@@ -286,11 +130,7 @@ fn probe_chapter_targets(
 }
 
 fn chapter_image_path(video: &std::path::Path, index: usize) -> std::path::PathBuf {
-    let stem = video
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "video".into());
-    video.with_file_name(format!("{stem}-chapter_{index}.jpg"))
+    crate::chapter_frame_service::chapter_frame_path(video, index)
 }
 
 #[cfg(test)]
@@ -651,7 +491,7 @@ pub(crate) async fn generate_chapters(
     Path((id, item_id)): Path<(String, String)>,
     Query(query): Query<ChapterQuery>,
 ) -> Response {
-    let lease = match state.acquire_library_work(&id) {
+    let _lease = match state.acquire_library_work(&id) {
         Ok(lease) => lease,
         Err(error) => return err(StatusCode::CONFLICT, "library.frozen", &error),
     };
@@ -725,14 +565,16 @@ pub(crate) async fn generate_chapters(
         );
     }
 
-    let ffmpeg = scene_frame_ffmpeg();
-    let (generated, total) = tokio::task::spawn_blocking(move || {
-        generate_chapter_frames_for_targets_with(&ffmpeg, &path, &targets, lease.control())
-    })
-    .await
-    .unwrap_or((0, 0));
-
-    ok(json!({ "generated": generated, "total": total })).into_response()
+    let total = targets.len();
+    if let Err(error) = state.chapter_frames.enqueue_path(&path, targets) {
+        tracing::warn!(%error, path = %path.display(), "章节帧任务入队失败");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "chapters.enqueue_failed",
+            "章节帧任务入队失败，请稍后重试",
+        );
+    }
+    ok(json!({ "generated": 0, "total": total, "queued": true })).into_response()
 }
 
 /// GET /chapters/{ledger_id}/{index} — a generated chapter scene frame.

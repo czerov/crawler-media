@@ -63,12 +63,10 @@ pub(super) fn compare_and_store_markers(
             validate_publication_rows(&store, &comparison.samples.season_rows)?;
             store.replace_marker_results_batch_checked(&[replacement])?;
         }
-        let registry = mgr.library_work.lock().clone();
-        if let Some(registry) = registry {
+        if let Some(service) = mgr.chapter_frames() {
             crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
                 &chapter_updates_clone,
-                &mgr.store,
-                &registry,
+                &service,
             );
         }
         tracing::info!(
@@ -93,11 +91,11 @@ pub(super) fn compare_and_store_markers(
             }
             updates
         };
-        // Drop Store before acquiring the registry/lease; frame extraction reads Store again.
-        let registry = mgr.library_work.lock().clone();
-        if let Some(registry) = registry {
+        // Drop Store before enqueueing; the service re-reads it when it runs.
+        if let Some(service) = mgr.chapter_frames() {
             crate::http::library_chapters::trigger_scene_frames_for_chapter_updates(
-                &updates, &mgr.store, &registry,
+                &updates,
+                &service,
             );
         }
     }

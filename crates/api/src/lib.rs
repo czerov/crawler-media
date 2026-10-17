@@ -30,6 +30,7 @@ pub mod bootstrap_credentials;
 pub mod browse_projection;
 pub mod catalog;
 mod catalog_cache;
+pub mod chapter_frame_service;
 mod catalog_fanout;
 mod claim;
 mod delivery;

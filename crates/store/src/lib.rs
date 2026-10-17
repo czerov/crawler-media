@@ -16,6 +16,8 @@ pub use browse_pages::{
 };
 mod browse_reads;
 mod catalog;
+mod chapter_frame_tasks;
+pub use chapter_frame_tasks::{ChapterFrameTask, ChapterFrameTaskCounts};
 mod collections;
 mod data_retention;
 mod downloaders;
