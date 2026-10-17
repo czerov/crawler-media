@@ -52,9 +52,11 @@ fn dispatch_once_sync(state: &ApiState) -> Result<usize, String> {
             .probe
             .request_probe(&row, crate::probe_manager::policy::ProbeRequestOrigin::Detail)
         {
+            Ok(crate::probe_manager::policy::ProbeRequestResult::Queued { .. }) => {
+                state.probe.holds_dispatch_id(&row.id.to_string())
+            }
             Ok(
-                crate::probe_manager::policy::ProbeRequestResult::Queued { .. }
-                | crate::probe_manager::policy::ProbeRequestResult::AlreadyRunning
+                crate::probe_manager::policy::ProbeRequestResult::AlreadyRunning
                 | crate::probe_manager::policy::ProbeRequestResult::Complete,
             ) => true,
             _ => false,

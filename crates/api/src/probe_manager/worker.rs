@@ -1,11 +1,27 @@
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::{ProbeManager, ProbeUnit, probe};
 
+async fn recv_id(
+    slot: &parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<store::ProbeDispatchId>>>,
+) -> Option<store::ProbeDispatchId> {
+    let mut rx = slot.lock().take()?;
+    let id = rx.recv().await;
+    if id.is_some() {
+        *slot.lock() = Some(rx);
+    }
+    id
+}
 pub(super) fn try_start(manager: &Arc<ProbeManager>) -> bool {
     if tokio::runtime::Handle::try_current().is_err() {
         tracing::warn!("【媒体探测】当前不在 Tokio runtime 上下文，探测 worker 未启动");
         return false;
+    }
+    if manager.workers_started.swap(true, Ordering::SeqCst) {
+        tracing::info!("【媒体探测】worker 已在本 runtime 启动，忽略重复启动");
+        manager.wake.notify_waiters();
+        return true;
     }
     let metadata_workers = manager
         .store
@@ -17,10 +33,16 @@ pub(super) fn try_start(manager: &Arc<ProbeManager>) -> bool {
         .filter(|value| *value > 0)
         .unwrap_or(1)
         .min(8);
+    let mut workers = manager.workers.lock();
     for _ in 0..metadata_workers {
-        tokio::spawn(run_metadata_worker(manager.clone()));
+        let manager = manager.clone();
+        workers.push(tokio::spawn(run_metadata_worker(manager)));
     }
-    tokio::spawn(run_fingerprint_worker(manager.clone()));
+    let fingerprint = manager.clone();
+    workers.push(tokio::spawn(run_fingerprint_worker(fingerprint)));
+    drop(workers);
+    manager.fill_dispatch_windows();
+    manager.wake.notify_waiters();
     tracing::info!(
         metadata_workers,
         fingerprint_workers = 1,
@@ -31,11 +53,20 @@ pub(super) fn try_start(manager: &Arc<ProbeManager>) -> bool {
 
 async fn run_metadata_worker(manager: Arc<ProbeManager>) {
     loop {
-        let unit = {
-            let mut rx = manager.metadata_rx.lock().await;
-            rx.recv().await
+        let id = recv_id(&manager.metadata_rx).await;
+
+        let Some(id) = id else { break };
+        if manager.shutting_down.load(Ordering::SeqCst) {
+            manager.seen.lock().remove(&id.ledger_id);
+            manager.metadata_stage_finished();
+            continue;
+        }
+        let Some((unit, _)) = manager.load_dispatch_unit(&id) else {
+            cancel_deleted_dispatch(&manager, &id);
+            manager.metadata_stage_finished();
+            manager.fill_dispatch_windows();
+            continue;
         };
-        let Some(unit) = unit else { break };
         let pending = MetadataStageGuard(manager.clone());
         let _lease = match work_lease(&manager, &unit) {
             Ok(lease) => lease,
@@ -60,6 +91,7 @@ async fn run_metadata_worker(manager: Arc<ProbeManager>) {
         };
         let outcome = probe::probe_metadata(&manager, &unit).await;
         drop(pending);
+        manager.fill_dispatch_windows();
         if !source_ready(&manager, &unit) {
             continue;
         }
@@ -71,6 +103,39 @@ async fn run_metadata_worker(manager: Arc<ProbeManager>) {
             }
         }
     }
+}
+fn cancel_deleted_dispatch(manager: &ProbeManager, id: &store::ProbeDispatchId) {
+    let missing = manager
+        .store
+        .lock()
+        .get_ledger(&id.ledger_id)
+        .ok()
+        .flatten()
+        .is_none();
+    if !missing {
+        return;
+    }
+    if let Err(error) = manager
+        .store
+        .lock()
+        .cancel_probe_unit(&id.job_id, &id.ledger_id, "file_deleted")
+    {
+        tracing::error!(%error, job_id = %id.job_id, ledger_id = %id.ledger_id, "删除文件后取消探测单元失败");
+        return;
+    }
+    let refresh = manager
+        .store
+        .lock()
+        .get_probe_job(&id.job_id)
+        .ok()
+        .flatten()
+        .is_some_and(|job| job.kind == "marker_refresh" && job.is_active());
+    if refresh {
+        if let Err(error) = manager.store.lock().cancel_probe_job(&id.job_id, "file_deleted") {
+            tracing::error!(%error, job_id = %id.job_id, "删除文件后取消刷新任务失败");
+        }
+    }
+    manager.seen.lock().remove(&id.ledger_id);
 }
 
 struct MetadataStageGuard(Arc<ProbeManager>);
@@ -105,19 +170,22 @@ async fn run_fingerprint_worker(manager: Arc<ProbeManager>) {
             continue;
         }
 
-        let work = {
-            let mut rx = manager.fingerprint_rx.lock().await;
-            rx.recv().await
-        };
-        let Some(work) = work else { break };
-        let _lease = match work_lease(&manager, &work.unit) {
-            Ok(lease) => lease,
-            Err(reason) => {
-                manager.cancel_unit(&work.unit, &reason);
-                continue;
+        let message = {
+            let mut rx = manager.fingerprint_rx.lock().take();
+            let message = match rx.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => None,
+            };
+            if message.is_some() {
+                *manager.fingerprint_rx.lock() = rx;
             }
+            message
         };
-        wait_for_metadata_idle(&manager).await;
+        let Some((id, work)) = message else { break };
+        if manager.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            manager.seen.lock().remove(&id.ledger_id);
+            continue;
+        }
 
         if !source_ready(&manager, &work.unit) {
             continue;
@@ -243,14 +311,26 @@ pub(super) fn source_ready(manager: &ProbeManager, unit: &ProbeUnit) -> bool {
 }
 
 pub(super) async fn wait_for_metadata_idle(manager: &ProbeManager) {
+    let generation = manager
+        .metadata_idle_generation
+        .load(std::sync::atomic::Ordering::Acquire);
     loop {
+        if manager.metadata_pending.load(std::sync::atomic::Ordering::Acquire) == 0
+            || manager
+                .metadata_idle_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
+        {
+            return;
+        }
         let notified = manager.metadata_idle.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if manager
-            .metadata_pending
-            .load(std::sync::atomic::Ordering::Acquire)
-            == 0
+        if manager.metadata_pending.load(std::sync::atomic::Ordering::Acquire) == 0
+            || manager
+                .metadata_idle_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
         {
             return;
         }

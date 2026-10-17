@@ -200,6 +200,8 @@ pub(super) const LIBRARY_TABLES: &str = r#"
             overwrite_markers INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
             error TEXT,
+            reuse_media_info_cache INTEGER NOT NULL DEFAULT 0,
+            stage TEXT NOT NULL DEFAULT 'metadata',
             PRIMARY KEY (job_id, ledger_id),
             FOREIGN KEY (job_id) REFERENCES probe_jobs(id) ON DELETE CASCADE
         );

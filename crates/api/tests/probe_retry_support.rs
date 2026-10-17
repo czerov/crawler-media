@@ -228,6 +228,8 @@ impl ProbeScenario {
         self.manager.request_probe(row, origin).unwrap()
     }
 
+
+
     pub async fn drain(&self) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {

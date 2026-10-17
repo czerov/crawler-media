@@ -28,13 +28,12 @@ fn force_probe_during_existing_probe_is_rejected_until_terminal() {
     let id = unit.row.id.to_string();
     assert!(manager.enqueue(unit.clone()));
     assert!(!manager.enqueue_force(unit.clone()));
-    let mut rx = manager.metadata_rx.try_lock().unwrap();
-    let queued = rx.try_recv().unwrap();
+    let queued = manager.take_queued_for_test().unwrap();
     assert_eq!(queued.row.id, unit.row.id);
-    assert!(rx.try_recv().is_err());
+    assert!(manager.take_queued_for_test().is_none());
     manager.finish(&queued, true);
     assert!(
-        rx.try_recv().is_err(),
+        manager.take_queued_for_test().is_none(),
         "duplicate request must not become a hidden rerun"
     );
     assert!(!manager.is_queued(&id));
@@ -47,7 +46,7 @@ fn force_probe_during_existing_probe_is_rejected_until_terminal() {
         manager.enqueue_force(unit),
         "manual retry bypasses cooldown"
     );
-    assert_eq!(rx.try_recv().unwrap().row.id.to_string(), id);
+    assert_eq!(manager.take_queued_for_test().unwrap().row.id.to_string(), id);
 }
 
 #[test]
@@ -152,7 +151,7 @@ fn queued_probe_is_recovered_after_manager_restart() {
     let restarted = ProbeManager::new(store.clone());
     assert!(restarted.is_queued(&ledger_id));
     assert_eq!(
-        restarted.take_queued_for_test().unwrap().row.id,
+        restarted.take_queued_for_test().expect("recovered unit").row.id,
         unit.row.id,
         "a running database unit must be requeued after a process restart"
     );
@@ -311,12 +310,12 @@ fn metadata_job_finishes_before_a_separate_voiceprint_job_is_queued() {
     drop(manager);
     let restarted = ProbeManager::new(store.clone());
     assert!(restarted.is_queued(&ledger_id));
-    let recovered = restarted.take_queued_for_test().unwrap();
+    let recovered = restarted.take_fingerprint_for_test().unwrap();
     assert_eq!(
         recovered.job_id.as_deref(),
         Some(voiceprint_job_id.as_str())
     );
-    assert!(!restarted.has_fingerprint_queued_for_test());
+    assert!(restarted.take_queued_for_test().is_none());
     restarted.finish(&recovered, false);
     assert_eq!(
         store

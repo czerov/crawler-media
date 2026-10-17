@@ -18,7 +18,7 @@ mod scan_operations;
 /// The version is stored via `PRAGMA user_version` on each database file.
 pub const APP_SCHEMA_VERSION: i64 = 7;
 pub const CATALOG_SCHEMA_VERSION: i64 = 3;
-pub const LIBRARY_SCHEMA_VERSION: i64 = 16;
+pub const LIBRARY_SCHEMA_VERSION: i64 = 17;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 8;
 
 /// Read the current schema version from a database file.
@@ -300,6 +300,19 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
     browse_page_facts::migrate_browse_page_facts(conn)?;
     // library schema 16：probe 终态/scope/attempt 关联索引（DB-05）。
     data_retention::migrate_data_retention_library(conn)?;
+    // library schema 17：probe 派发 stage 的有界窗口索引。旧库补列后建索引，
+    // 两者都幂等，重启不会重扫全表以外的工作。
+    ensure_column(
+        conn,
+        "probe_job_units",
+        "stage",
+        "TEXT NOT NULL DEFAULT 'metadata'",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS probe_job_units_dispatch_idx
+             ON probe_job_units(stage, status, job_id)
+             WHERE status = 'queued';",
+    )?;
     if previous < 15 {
         // 旧代的投影没有候选 JSON：标脏让下一次请求重建，而不是永久回退全量读取。
         browse_page_facts::invalidate_legacy_projections(conn)?;

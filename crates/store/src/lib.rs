@@ -53,6 +53,8 @@ mod open;
 mod playback;
 mod playback_devices;
 mod probe_tasks;
+mod probe_dispatch;
+pub use probe_dispatch::{ProbeDispatchId, ProbeDispatchSnapshot, ProbeDispatchStage};
 mod roots;
 mod schema;
 mod scanned_ledger;
