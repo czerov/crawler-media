@@ -52,6 +52,7 @@ pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, Proj
             file_facts.push(BrowseFileFacts {
                 ledger_id: row.id,
                 media_id: row.media_id,
+                path: row.path.clone(),
                 facts: facts.to_json(),
             });
             row_facts_by_media
@@ -81,7 +82,8 @@ pub fn build(state: &ApiState, library_id: &str) -> Result<ProjectionBuild, Proj
     Ok(ProjectionBuild {
         library_id: library_id.to_string(),
         generation: next_generation,
-        scope_signature: scope_signature(&owned.library),
+        // scope 指纹与发布/新鲜度检查共用 store 的实现，避免两处口径分叉。
+        scope_signature: store::library_scope_signature(&owned.library),
         revisions: owned.revisions,
         expected_dirty_token,
         files: file_facts,
@@ -335,6 +337,7 @@ fn candidate_for(
         media_id: media.id,
         kind: media.kind,
         title: media.title.clone(),
+        tmdb_id: media.tmdb_id.clone(),
         year: media.year,
         added_at_ns: row_facts.iter().filter_map(FileFacts::added_at_ns).min(),
         release_date: light.release_date,
@@ -354,15 +357,4 @@ fn candidate_for(
         has_still: row_facts.iter().any(|fact| fact.has_still),
         episode_keys,
     }
-}
-
-/// Scope 身份指纹：kind + 排序后的根路径。读路径据此拒绝跨 scope 的旧代。
-pub(crate) fn scope_signature(library: &Library) -> String {
-    let mut roots: Vec<String> = library
-        .root_paths
-        .iter()
-        .map(|root| root.display().to_string())
-        .collect();
-    roots.sort_unstable();
-    format!("{}|{}", library.kind.as_str(), roots.join("\u{1f}"))
 }

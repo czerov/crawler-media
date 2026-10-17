@@ -71,23 +71,39 @@ fn seed(count: usize, episodes: u32) -> Seeded {
     {
         let store = fixture.state.store();
         let guard = store.lock();
+        let mut previous_title = String::new();
         for index in 0..count {
             let media_id = MediaId::new();
-            let title = format!("Show {index:05}");
+            // 每第四个 Media 与上一个同名：索引分页的并列键（media_id 升序）才被测到。
+            let title = if index % 4 == 3 {
+                previous_title.clone()
+            } else {
+                format!("Show {index:05}")
+            };
+            previous_title = title.clone();
             titles.push(title.clone());
             let tmdb_id = format!("{}", 100_000 + index);
-            // 每第三个 Media 落一张海报：gallery 的「先剔空组再分页」才有可断言内容。
-            if index % 3 == 0 {
-                let dir = fixture.root.join(&title);
+            // 每第二个 Media 落真实文件（有 added_at/大小），其余留空（NULL added_at）；
+            // 每第三个落一张海报（gallery 先剔空组再分页）。
+            let dir = fixture.root.join(format!("{title}-{index:05}"));
+            if index % 2 == 0 || index % 3 == 0 {
                 std::fs::create_dir_all(&dir).unwrap();
+            }
+            if index % 3 == 0 {
                 std::fs::write(dir.join("poster.jpg"), b"poster").unwrap();
             }
+            if index % 2 == 0 {
+                std::fs::write(dir.join("S01E01.mkv"), b"video-bytes").unwrap();
+            }
+            // 年份缺失（index % 7 == 0）→ release_date 物化键为空串；
+            // catalog 有完整发行日期（index % 3 == 0）→ 完整日期优先。
+            let year = (index % 7 != 0).then(|| 2000 + (index % 20) as u16);
             guard
                 .insert_media(&Media {
                     id: media_id,
                     kind: MediaKind::Tv,
                     title: title.clone(),
-                    year: Some(2000 + (index % 20) as u16),
+                    year,
                     original_title: Some(title.clone()),
                     tmdb_id: Some(tmdb_id.clone()),
                     douban_id: None,
@@ -101,9 +117,7 @@ fn seed(count: usize, episodes: u32) -> Seeded {
                     .insert_ledger(&LedgerRow {
                         id: LedgerId::new(),
                         media_id,
-                        path: fixture
-                            .root
-                            .join(&title)
+                        path: dir
                             .join(format!("S01E{episode:02}.mkv"))
                             .display()
                             .to_string(),
@@ -118,14 +132,17 @@ fn seed(count: usize, episodes: u32) -> Seeded {
                     })
                     .unwrap();
             }
+            let release_date = (index % 3 == 0)
+                .then(|| format!(",\"release_date\":\"2015-06-{:02}\"", 1 + (index % 28)));
             guard
                 .put_catalog_cache(
                     "tmdb",
                     &format!("/tv/{tmdb_id}?language=zh-CN"),
                     &format!(
                         "{{\"vote_average\":8.5,\"runtime\":101,\"original_language\":\"en\",\
-                          \"genres\":[{{\"id\":{}}}],\"origin_country\":[\"US\"]}}",
-                        if index % 2 == 0 { 28 } else { 35 }
+                          \"genres\":[{{\"id\":{}}}],\"origin_country\":[\"US\"]{}}}",
+                        if index % 2 == 0 { 28 } else { 35 },
+                        release_date.unwrap_or_default()
                     ),
                     1000,
                     None,
@@ -200,6 +217,20 @@ impl Seeded {
             .browse_page_decoded_media()
             .load(Ordering::SeqCst)
     }
+
+    fn candidate_rows(&self) -> usize {
+        self.fixture
+            .state
+            .browse_page_candidate_rows()
+            .load(Ordering::SeqCst)
+    }
+
+    fn dependency_rows(&self) -> usize {
+        self.fixture
+            .state
+            .browse_page_dependency_rows()
+            .load(Ordering::SeqCst)
+    }
 }
 
 fn reset_counters(seeded: &Seeded) {
@@ -213,6 +244,16 @@ fn reset_counters(seeded: &Seeded) {
         .fixture
         .state
         .browse_page_decoded_media()
+        .store(0, Ordering::SeqCst);
+    seeded
+        .fixture
+        .state
+        .browse_page_candidate_rows()
+        .store(0, Ordering::SeqCst);
+    seeded
+        .fixture
+        .state
+        .browse_page_dependency_rows()
         .store(0, Ordering::SeqCst);
 }
 
@@ -250,15 +291,21 @@ async fn hot_page_decodes_only_selected_file_facts() {
         0,
         "热页不得做任何 NFO/stat/is_file"
     );
-    assert!(
-        seeded.decoded_files() <= 40,
-        "只解码本页 20 个 Media × 2 集的 file facts，实际 {}",
-        seeded.decoded_files()
+    assert_eq!(
+        seeded.decoded_files(),
+        40,
+        "只解码本页 20 个 Media × 2 集的 file facts（计数在读取处，含被丢弃的行）"
     );
-    assert!(
-        seeded.decoded_media() <= 20,
-        "只解码本页 Media 的 facts，实际 {}",
-        seeded.decoded_media()
+    assert_eq!(seeded.decoded_media(), 20, "只解码本页 Media 的 facts");
+    assert_eq!(
+        seeded.candidate_rows(),
+        0,
+        "常用排序走 SQL 索引分页，不读轻候选 JSON"
+    );
+    assert_eq!(
+        seeded.dependency_rows(),
+        0,
+        "依赖覆盖在预热时已完成，本次请求不再读依赖"
     );
     // 页内容与旧全量选择逐字段一致。
     let legacy = seeded
@@ -277,35 +324,51 @@ async fn advanced_filter_selects_before_paging() {
     let seeded = seed(400, 2);
     seeded.warm().await;
     let urls = [
-        "items?g=28&limit=20&offset=0",
-        "items?hdr=true&limit=20&offset=0",
-        "items?stock=unscraped&limit=20&offset=0",
-        "items?stock=missing&limit=20&offset=0",
-        "items?identity=provisional&limit=20&offset=0",
-        "items?rating_gte=8&limit=20&offset=20",
-        "items?sort=size&order=desc&limit=20&offset=0",
-        "items?sort=random&limit=20&offset=0",
-        "items?sort=release_date&order=desc&limit=20&offset=0",
-        "items?w=unwatched&limit=20&offset=0",
-        "items?unwatched_first=true&sort=added_at&limit=20&offset=0",
-        "gallery?limit=20&offset=0",
+        // (查询, 是否常用排序的 SQL 索引分页：是 → 不读轻候选)
+        ("items?g=28&limit=20&offset=0", false),
+        ("items?hdr=true&limit=20&offset=0", false),
+        ("items?stock=unscraped&limit=20&offset=0", false),
+        ("items?stock=missing&limit=20&offset=0", false),
+        ("items?identity=provisional&limit=20&offset=0", false),
+        ("items?rating_gte=8&limit=20&offset=20", false),
+        ("items?sort=size&order=desc&limit=20&offset=0", false),
+        ("items?sort=random&limit=20&offset=0", false),
+        ("items?w=unwatched&limit=20&offset=0", false),
+        ("items?unwatched_first=true&sort=added_at&limit=20&offset=0", false),
+        ("gallery?limit=20&offset=0", false),
+        // 索引列分页与全量选择同序：不同/NULL added_at、完整日期/年份兜底/缺失日期、
+        // 重复标题并列，两个方向且跨页边界。
+        ("items?sort=release_date&order=desc&limit=20&offset=0", true),
+        ("items?sort=added_at&order=asc&limit=20&offset=0", true),
+        ("items?sort=added_at&order=asc&limit=20&offset=20", true),
+        ("items?sort=added_at&order=desc&limit=20&offset=0", true),
+        ("items?sort=release_date&order=desc&limit=20&offset=20", true),
+        ("items?sort=release_date_asc&limit=20&offset=0", true),
+        ("items?limit=20&offset=20", true),
     ];
     let legacy = seeded
         .fixture
         .state
         .clone()
         .with_projection_service(Arc::new(ProjectionService::disabled()));
-    for suffix in urls {
+    for (suffix, indexed) in urls {
         let url = format!("/api/v1/libraries/{}/{suffix}", seeded.library());
         reset_counters(&seeded);
         let page = seeded.get(&url).await;
         let items = page.as_array().expect("must be an array");
         assert_eq!(seeded.files.total(), 0, "{suffix} 不得做浏览文件 IO");
-        assert!(
-            seeded.decoded_files() <= 40,
-            "{suffix} 只解码本页 file facts，实际 {}",
+        assert_eq!(
+            seeded.candidate_rows(),
+            if indexed { 0 } else { 400 },
+            "{suffix} 只有高级查询读整库轻候选（400 条）；索引分页不读候选"
+        );
+        assert_eq!(
+            seeded.decoded_files(),
+            items.len() * 2,
+            "{suffix} 只解码本页 file facts（每 Media 2 集），实际 {}",
             seeded.decoded_files()
         );
+        assert_eq!(seeded.decoded_media(), items.len());
         let (status, live) = get_with(&legacy, &url, &seeded.fixture.admin_token).await;
         assert_eq!(status, 200, "{suffix}: {live}");
         assert_eq!(page, live["data"], "{suffix} 投影页与旧全量选择必须一致");
@@ -567,5 +630,90 @@ async fn playback_unit_write_keeps_the_hot_page_bounded() {
         body["data"].as_array().expect("array").len(),
         1,
         "只有写了观看状态的那一条命中 w=watched"
+    );
+}
+
+/// A4-02：批准与按页读取之间本库被标脏时，必须回退（重建/全量读取），
+/// 不能用仍留在表里的旧 facts 出页。
+#[tokio::test]
+async fn page_read_rejects_a_head_that_changed_after_approval() {
+    let seeded = seed(60, 2);
+    seeded.warm().await;
+    let url = format!("/api/v1/libraries/{}/items?limit=20&offset=0", seeded.library());
+
+    // 测试 seam：head 批准之后、按页读取之前消费一条影响本库的变更（head 标脏、
+    // dirty_token+1），旧 facts 仍留在 browse_files/browse_media 里。
+    let barrier: api::browse_projection::PageApprovalBarrier = Arc::new(
+        |state: &ApiState, library_id: &str| {
+            let store = state.store();
+            let guard = store.lock();
+            guard
+                .apply_browse_changes(
+                    store::BrowseChangeSource::Library,
+                    1,
+                    &[library_id.to_string()],
+                )
+                .unwrap();
+        },
+    );
+    let state = seeded.fixture.state.clone().with_projection_service(Arc::new(
+        ProjectionService::new().with_page_approval_barrier(barrier),
+    ));
+    let seeded = Seeded {
+        fixture: support::library_presence::PresenceFixture {
+            state,
+            ..seeded.fixture
+        },
+        files: seeded.files,
+        titles: seeded.titles,
+    };
+
+    reset_counters(&seeded);
+    let page = seeded.get(&url).await;
+    assert_eq!(page.as_array().expect("array").len(), 20);
+    assert_eq!(
+        seeded.decoded_media(),
+        60,
+        "批准后 head 变了必须回退到全量路径（整库 media facts），不得按页用旧 facts 出页"
+    );
+    assert_eq!(seeded.candidate_rows(), 0, "回退路径不读轻候选");
+}
+
+/// A4-03：服务重启后的首个小页只用轻量读取覆盖依赖，不整库解码 file/media facts。
+#[tokio::test]
+async fn restart_hydrates_dependencies_without_decoding_whole_projections() {
+    let seeded = seed(120, 2);
+    seeded.warm().await;
+    let url = format!("/api/v1/libraries/{}/items?limit=20&offset=0", seeded.library());
+
+    // 重启：全新的 ProjectionService（内存依赖覆盖为空，持久投影仍 ready）。
+    let state = seeded
+        .fixture
+        .state
+        .clone()
+        .with_projection_service(Arc::new(ProjectionService::new()));
+    let seeded = Seeded {
+        fixture: support::library_presence::PresenceFixture {
+            state,
+            ..seeded.fixture
+        },
+        files: seeded.files,
+        titles: seeded.titles,
+    };
+
+    reset_counters(&seeded);
+    let page = seeded.get(&url).await;
+    assert_eq!(page.as_array().expect("array").len(), 20);
+    assert_eq!(seeded.files.total(), 0, "重启后的热页仍零浏览文件 IO");
+    assert_eq!(
+        seeded.decoded_files(),
+        40,
+        "重启后的首个小页只解码本页 file facts，不整库解码"
+    );
+    assert_eq!(seeded.decoded_media(), 20);
+    assert!(
+        seeded.dependency_rows() >= 120 * 3,
+        "依赖覆盖必须走轻量读取（120 个 Media 的 file 依赖列 + 轻候选），实际 {}",
+        seeded.dependency_rows()
     );
 }

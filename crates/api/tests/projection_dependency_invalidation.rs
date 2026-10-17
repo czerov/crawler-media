@@ -224,7 +224,9 @@ fn stale_library_dependencies_are_evicted_before_invalidation() {
     let removed_library_id = "removed-library";
     let deps = Arc::new(Mutex::new(ProjectionDependencies::new()));
     let consumer = ChangeConsumer::new(deps.clone());
-    consumer.hydrate_ready_dependencies(&store).unwrap();
+    consumer
+        .hydrate_ready_dependencies(&store, &api::browse_projection::changes::HydrationCounters::default())
+        .unwrap();
     deps.lock().record_library(
         removed_library_id,
         [MediaId::new()],
@@ -232,7 +234,9 @@ fn stale_library_dependencies_are_evicted_before_invalidation() {
         ["/removed/library/file.mkv".to_string()],
         ["tmdb:/movie/42".to_string()],
     );
-    consumer.hydrate_ready_dependencies(&store).unwrap();
+    consumer
+        .hydrate_ready_dependencies(&store, &api::browse_projection::changes::HydrationCounters::default())
+        .unwrap();
 
     store
         // 台账键与记录的依赖键必须同形（journal key = `source:cache_key`），否则

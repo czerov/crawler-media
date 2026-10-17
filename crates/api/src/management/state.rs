@@ -79,10 +79,16 @@ pub struct ApiState {
     /// 证明只有选中的那一页被 enrich。
     pub(crate) jellyfin_heavy_items: Arc<std::sync::atomic::AtomicUsize>,
     /// 测试 seam：浏览请求真正解码的投影 file facts 行数（生产只读计数，无副作用）。
-    /// 用来证明热页只解码选中 Media 的 facts，而不是整库。
+    /// 计数发生在**读取/解析处**，包含随后被丢弃或解析失败的行，以及依赖覆盖的
+    /// 回退重读；热页只应解码选中 Media 的 facts。
     pub(crate) browse_page_decoded_files: Arc<std::sync::atomic::AtomicUsize>,
-    /// 测试 seam：浏览请求真正解码的投影 media facts 行数。
+    /// 测试 seam：浏览请求真正解码的投影 media facts 行数（同上口径）。
     pub(crate) browse_page_decoded_media: Arc<std::sync::atomic::AtomicUsize>,
+    /// 测试 seam：选页读过的轻候选 JSON 行数（常用排序的 SQL 分页应为 0）。
+    pub(crate) browse_page_candidate_rows: Arc<std::sync::atomic::AtomicUsize>,
+    /// 测试 seam：投影依赖覆盖读过的轻量行数（列读 + 候选行；重启后的首个小页
+    /// 只应产生这一项成本，不应解码整份 facts）。
+    pub(crate) browse_page_dependency_rows: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn apply_admin_bootstrap(
@@ -272,6 +278,8 @@ impl ApiState {
             jellyfin_heavy_items: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             browse_page_decoded_files: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             browse_page_decoded_media: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            browse_page_candidate_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            browse_page_dependency_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             crate::library_lifecycle::resume_library_removals(&state)
@@ -375,9 +383,13 @@ impl ApiState {
         mut self,
         decoded_files: Arc<std::sync::atomic::AtomicUsize>,
         decoded_media: Arc<std::sync::atomic::AtomicUsize>,
+        candidate_rows: Arc<std::sync::atomic::AtomicUsize>,
+        dependency_rows: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         self.browse_page_decoded_files = decoded_files;
         self.browse_page_decoded_media = decoded_media;
+        self.browse_page_candidate_rows = candidate_rows;
+        self.browse_page_dependency_rows = dependency_rows;
         self
     }
 
@@ -389,6 +401,37 @@ impl ApiState {
     /// 浏览请求真正解码的投影 media facts 行数。
     pub fn browse_page_decoded_media(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.browse_page_decoded_media.clone()
+    }
+
+    /// 选页读过的轻候选 JSON 行数。
+    pub fn browse_page_candidate_rows(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.browse_page_candidate_rows.clone()
+    }
+
+    /// 投影依赖覆盖读过的轻量行数。
+    pub fn browse_page_dependency_rows(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.browse_page_dependency_rows.clone()
+    }
+
+    /// 记录本次请求真正解码的投影行数：计数在**读取/解析处**，包含随后被丢弃或
+    /// 解析失败的行（测试 seam；生产只读计数，无副作用）。
+    pub(crate) fn count_decoded(&self, files: usize, media: usize) {
+        self.browse_page_decoded_files
+            .fetch_add(files, std::sync::atomic::Ordering::SeqCst);
+        self.browse_page_decoded_media
+            .fetch_add(media, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 记录选页读过的轻候选 JSON 行数。
+    pub(crate) fn count_candidate_rows(&self, rows: usize) {
+        self.browse_page_candidate_rows
+            .fetch_add(rows, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 记录依赖覆盖读过的轻量行数（file 依赖列 + 候选行）。
+    pub(crate) fn count_dependency_rows(&self, rows: usize) {
+        self.browse_page_dependency_rows
+            .fetch_add(rows, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 替换 notify 发送实现（测试注入阻塞实现以验证预算准入）。

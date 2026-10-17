@@ -48,6 +48,9 @@ const PROJECTION_BUILD_CAPACITY: usize = 2;
 /// 真实终态而不是伪造 `Cancelled`/`Timeout`。
 pub type PublishBarrier = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 测试 seam：head 批准之后、按页读取之前的屏障（生产为 `None`）。
+pub type PageApprovalBarrier = Arc<dyn Fn(&ApiState, &str) + Send + Sync>;
+
 #[derive(Debug)]
 pub enum ProjectionError {
     Busy,
@@ -219,6 +222,8 @@ pub struct ProjectionService {
     disabled: bool,
     /// 测试 seam：终态发布后、条目移除前的屏障（生产为 `None`）。
     publish_barrier: Option<PublishBarrier>,
+    /// 测试 seam：head 批准后、按页读取前的屏障（生产为 `None`）。
+    page_approval_barrier: Option<PageApprovalBarrier>,
     deps: Arc<Mutex<ProjectionDependencies>>,
     consumer: Arc<ChangeConsumer>,
 }
@@ -242,6 +247,7 @@ impl ProjectionService {
             deadline: PROJECTION_DEADLINE,
             disabled: false,
             publish_barrier: None,
+            page_approval_barrier: None,
             deps,
             consumer,
         }
@@ -273,6 +279,20 @@ impl ProjectionService {
     pub fn with_publish_barrier(mut self, barrier: PublishBarrier) -> Self {
         self.publish_barrier = Some(barrier);
         self
+    }
+
+    /// 注入「head 批准后、按页读取前」的屏障（测试 seam）：用来确定性地复现
+    /// 「批准与按页读取之间本库被标脏/换代」的竞态。生产为 `None`。
+    pub fn with_page_approval_barrier(mut self, barrier: PageApprovalBarrier) -> Self {
+        self.page_approval_barrier = Some(barrier);
+        self
+    }
+
+    /// 生产为 `None` → no-op；测试用它插入并发变更。
+    pub fn run_page_approval_barrier(&self, state: &ApiState, library_id: &str) {
+        if let Some(barrier) = &self.page_approval_barrier {
+            barrier(state, library_id);
+        }
     }
 
     /// Mark a library projection as dirty.
@@ -660,6 +680,9 @@ impl ProjectionService {
     }
 
     /// 锁内装载整份投影行（facets/item-index/回退路径仍需要它）。
+    ///
+    /// 与只读 head 同一套 ready/scope 判定：scope 变了就不能把旧投影交给调用方
+    /// （A4-02 恢复的检查），否则回退路径会返回过期 scope 的事实。
     async fn load_snapshot(
         &self,
         state: &ApiState,
@@ -673,9 +696,16 @@ impl ProjectionService {
                 crate::http::library::selection::BROWSE_DEADLINE,
                 move || {
                     let store = state.store.lock();
+                    if store
+                        .fresh_head_locked(&library_id)
+                        .map_err(|error| ProjectionError::Failed(error.to_string()))?
+                        .is_none()
+                    {
+                        return Ok(None);
+                    }
                     store
                         .browse_projection(&library_id)
-                        .map_err(|e| ProjectionError::Failed(e.to_string()))
+                        .map_err(|error| ProjectionError::Failed(error.to_string()))
                 },
             )
             .await
@@ -696,29 +726,16 @@ fn budget_error(error: BlockingError) -> ProjectionError {
 
 /// 锁内只读 head：仅依据 per-library scope 指纹、`state='ready'` 与 dirty_token
 /// 判定普通新鲜度（D3-01 / D3-02），不装载投影行。
+///
+/// 判定与「批准后复核」共用 store 的同一个实现，避免两处口径分叉。
 fn fresh_head_inner(
     state: &ApiState,
     library_id: &str,
 ) -> Result<Option<ProjectionHead>, ProjectionError> {
     let store = state.store.lock();
-    let scope_signature = store
-        .get_library(library_id)
-        .map_err(|e| ProjectionError::Failed(e.to_string()))?
-        .map(|library| builder::scope_signature(&library));
-    let head = store
-        .browse_projection_head(library_id)
-        .map_err(|e| ProjectionError::Failed(e.to_string()))?;
-    Ok(
-        match head {
-            Some(head)
-                if head.ready
-                    && Some(head.scope_signature.as_str()) == scope_signature.as_deref() =>
-            {
-                Some(head)
-            }
-            _ => None,
-        },
-    )
+    store
+        .fresh_head_locked(library_id)
+        .map_err(|error| ProjectionError::Failed(error.to_string()))
 }
 
 fn poll_changes_inner(
@@ -727,7 +744,7 @@ fn poll_changes_inner(
 ) -> Result<bool, ProjectionError> {
     let store = state.store.lock();
     consumer
-        .hydrate_ready_dependencies(&store)
+        .hydrate_ready_dependencies(&store, &changes::HydrationCounters::from_state(state))
         .map_err(|error| ProjectionError::Failed(error.to_string()))?;
     let ownership = store
         .library_ownership()

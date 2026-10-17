@@ -124,11 +124,7 @@ pub(crate) async fn load_browse_snapshot_or_projection(
                     let store = state_clone.store.lock();
                     let loaded = projected::snapshot_from_projection(&store, &snapshot, user)?;
                     // 全量路径解码了整份投影：热页路径只解码本页（计数 seam）。
-                    super::page::count_decoded(
-                        &state_clone,
-                        snapshot.files.len(),
-                        snapshot.media.len(),
-                    );
+                    state_clone.count_decoded(snapshot.files.len(), snapshot.media.len());
                     Ok(loaded)
                 })
                 .await;

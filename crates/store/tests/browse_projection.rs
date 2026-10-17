@@ -94,6 +94,7 @@ fn projection_publication_and_retrieval() {
         files: vec![BrowseFileFacts {
             ledger_id,
             media_id,
+            path: "/movies/m1.mkv".into(),
             facts: serde_json::json!({ "size": 1024, "version": 1 }),
         }],
         media: vec![BrowseMediaFacts {

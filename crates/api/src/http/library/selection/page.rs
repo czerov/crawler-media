@@ -8,7 +8,6 @@
 //! OFFSET 深翻页仍有 SQLite 自身的跳过成本，本模块不承诺恒定代价。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
 
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -19,7 +18,8 @@ use crate::http::err;
 use crate::http::library::page::PageWindow;
 use crate::management::ApiState;
 use crate::store::{
-    BrowseMediaCandidate, BrowseMediaFacts, BrowsePageOrder, BrowsePageRequest, Store, UnitState,
+    BrowseMediaCandidate, BrowseMediaFacts, BrowsePageOrder, BrowsePageRequest, ProjectionHead,
+    Store, UnitState,
 };
 
 use super::metadata::BrowseMetadata;
@@ -67,16 +67,31 @@ async fn load_page(
     let page = PageWindow::parse(query).map_err(|message| invalid(&message))?;
     // 省略 limit 仍是「返回全部」：直接走全量路径，行为不变。
     if page.limit.is_some() {
-        // 只读 head：不装载整份投影行。
+        // 只读 head：不装载整份投影行。批准的那一代在下面按页读取的**同一个**锁内复核。
         match state.projection.fresh_head(state, &library.id).await {
-            Ok(Some(_)) => {
+            Ok(Some(approved)) => {
+                // 测试 seam：批准之后、按页读取之前插入并发变更（生产 no-op）。
+                state.projection.run_page_approval_barrier(state, &library.id);
                 let state_clone = state.clone();
                 let library_id = library.id.clone();
                 let work = state
                     .http_work
                     .run(BROWSE_DEADLINE, move || {
                         let store = state_clone.store.lock();
-                        page_from_projection(&state_clone, &store, &library_id, user, &filter, page, kind)
+                        if !page_head_is_current(&state_clone, &store, &library_id, &approved) {
+                            return Err(
+                                "投影代在批准后发生变化（标脏/换代/scope）".to_string()
+                            );
+                        }
+                        page_from_projection(
+                            &state_clone,
+                            &store,
+                            &library_id,
+                            user,
+                            &filter,
+                            page,
+                            kind,
+                        )
                     })
                     .await;
                 match work {
@@ -100,6 +115,25 @@ async fn load_page(
     full_page(state, library, user, query, page, kind).await
 }
 
+/// 在**同一个** Store 锁内复核被批准的那一代是否仍然可用：内存脏标记、DB
+/// `ready`/scope、`generation` 与 `dirty_token` 都必须未变。
+///
+/// 批准（只读 head）与按页读取是两次加锁；中间若有别的请求消费了影响本库的变更
+/// （把 head 标脏或换代），旧 facts 仍留在表里，这里必须拒绝并回退重建。
+fn page_head_is_current(
+    state: &ApiState,
+    store: &Store,
+    library_id: &str,
+    approved: &ProjectionHead,
+) -> bool {
+    if state.projection.is_dirty(library_id) {
+        return false;
+    }
+    store
+        .browse_page_head_is_current(library_id, approved)
+        .unwrap_or(false)
+}
+
 /// 投影页读取（blocking 预算内）：选页 → 只解码本页 facts。
 fn page_from_projection(
     state: &ApiState,
@@ -113,8 +147,8 @@ fn page_from_projection(
     let Some(limit) = page.limit else {
         return Err("projection page path requires an explicit limit".into());
     };
-    let ids = page_ids(store, library_id, user, filter, page, limit, kind)?;
-    let loaded = hydrate_page(state, store, library_id, user, filter, ids)?;
+    let selection = page_ids(state, store, library_id, user, filter, page, limit, kind)?;
+    let loaded = hydrate_page(state, store, library_id, user, filter, selection)?;
     tracing::debug!(
         library_id,
         page_items = loaded.0.len(),
@@ -124,9 +158,17 @@ fn page_from_projection(
     Ok(loaded)
 }
 
+/// 选页结果：本页 Media id 顺序；常用排序的 SQL 分页顺带取回了 media 行，
+/// 水合直接复用，避免同一页再读一遍。
+struct PageSelection {
+    ids: Vec<MediaId>,
+    media_rows: Option<Vec<BrowseMediaFacts>>,
+}
+
 /// 选页：常用排序走 SQL 索引；其余（过滤/watch/非常用排序/gallery 图片剔除）先取
 /// 整库轻候选完整筛选排序。两条路径都只返回本页 Media id。
 fn page_ids(
+    state: &ApiState,
     store: &Store,
     library_id: &str,
     user: Option<UserId>,
@@ -134,7 +176,7 @@ fn page_ids(
     page: PageWindow,
     limit: usize,
     kind: PageKind,
-) -> Result<Vec<MediaId>, String> {
+) -> Result<PageSelection, String> {
     if kind == PageKind::Items
         && let Some(order) = filter.index_page_order()
     {
@@ -149,14 +191,20 @@ fn page_ids(
             },
             descending: filter.descending(),
         };
-        return store
+        let rows = store
             .browse_media_page(&request)
-            .map(|rows| rows.into_iter().map(|row| row.media_id).collect())
-            .map_err(|error| error.to_string());
+            .map_err(|error| error.to_string())?;
+        // 计数在读取处：这一页的 media facts 行确实被读出并解析。
+        state.count_decoded(0, rows.len());
+        return Ok(PageSelection {
+            ids: rows.iter().map(|row| row.media_id).collect(),
+            media_rows: Some(rows),
+        });
     }
     let candidates = store
         .browse_media_candidates(library_id)
         .map_err(|error| error.to_string())?;
+    state.count_candidate_rows(candidates.len());
     let units = candidate_units(store, user, filter, &candidates)?;
     let needs_watch = filter.needs_watch_state();
     let mut items: Vec<LibrarySelection> = candidates
@@ -176,7 +224,10 @@ fn page_ids(
         "浏览高级查询按轻候选完整筛选排序（残余 O(M+U)）"
     );
     let bounds = page.bounds(items.len());
-    Ok(items[bounds].iter().map(|item| item.media.id).collect())
+    Ok(PageSelection {
+        ids: items[bounds].iter().map(|item| item.media.id).collect(),
+        media_rows: None,
+    })
 }
 
 /// watch 相关查询才需要 unit：`favorite` 只在输出（本页水合）里用，选页前不读。
@@ -267,14 +318,25 @@ fn hydrate_page(
     library_id: &str,
     user: Option<UserId>,
     filter: &LibraryFilter,
-    ids: Vec<MediaId>,
+    selection: PageSelection,
 ) -> Result<(Vec<LibrarySelection>, ProjectedFacts), String> {
-    let media_rows = store
-        .browse_media_facts_for(library_id, &ids)
-        .map_err(|error| error.to_string())?;
+    let PageSelection { ids, media_rows } = selection;
+    let media_rows = match media_rows {
+        Some(rows) => rows,
+        None => {
+            let rows = store
+                .browse_media_facts_for(library_id, &ids)
+                .map_err(|error| error.to_string())?;
+            // 计数在读取处：读到的行都算，即使随后因缺 file 行被跳过。
+            state.count_decoded(0, rows.len());
+            rows
+        }
+    };
     let file_rows = store
         .browse_file_facts_for_media(library_id, &ids)
         .map_err(|error| error.to_string())?;
+    // 计数在读取处：包含随后被丢弃（无对应 media 行/Media 无 file 行）与解析失败的行。
+    state.count_decoded(file_rows.len(), 0);
     let units = match user {
         Some(user) => units_for_media(store, user, &ids)?,
         None => HashMap::new(),
@@ -290,8 +352,6 @@ fn hydrate_page(
         files_by_media.entry(entry.media_id).or_default().push(facts);
     }
 
-    let mut decoded_files = 0usize;
-    let mut decoded_media = 0usize;
     let mut artwork = HashMap::new();
     let mut stills = HashSet::new();
     let mut items = Vec::with_capacity(ids.len());
@@ -301,13 +361,11 @@ fn hydrate_page(
         };
         let media_facts = MediaFacts::from_json(&media_row.facts)
             .ok_or_else(|| format!("media facts unreadable for {media_id}"))?;
-        decoded_media += 1;
         let facts = files_by_media.remove(&media_id).unwrap_or_default();
         if facts.is_empty() {
             // 与全量路径一致：没有 ledger 行的 Media 不出现在浏览结果里。
             continue;
         }
-        decoded_files += facts.len();
         let rows: Vec<LedgerRow> = facts.iter().map(|fact| fact.row.clone()).collect();
         for fact in &facts {
             if fact.has_still {
@@ -347,7 +405,6 @@ fn hydrate_page(
         }
         items.push(item);
     }
-    count_decoded(state, decoded_files, decoded_media);
     Ok((items, ProjectedFacts { artwork, stills }))
 }
 
@@ -443,16 +500,6 @@ fn take_window(
         items.push(item);
     }
     (items, ProjectedFacts { artwork, stills })
-}
-
-/// 记录本次请求真正解码的投影行数（测试 seam；生产只读计数，无副作用）。
-pub(crate) fn count_decoded(state: &ApiState, files: usize, media: usize) {
-    state
-        .browse_page_decoded_files
-        .fetch_add(files, Ordering::SeqCst);
-    state
-        .browse_page_decoded_media
-        .fetch_add(media, Ordering::SeqCst);
 }
 
 fn invalid(message: &str) -> Response {

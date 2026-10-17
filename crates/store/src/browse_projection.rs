@@ -5,6 +5,7 @@ use std::str::FromStr;
 use domain::{LedgerId, MediaId};
 use rusqlite::params;
 
+use super::browse_changes::ProjectionHead;
 use super::browse_pages::BrowseMediaCandidate;
 use super::{CatalogCacheRow, Store, StoreError};
 
@@ -33,6 +34,8 @@ impl ReadRevisions {
 pub struct BrowseFileFacts {
     pub ledger_id: LedgerId,
     pub media_id: MediaId,
+    /// `facts_json` 里的 ledger 路径的同源副本：依赖覆盖按列读，不解码 JSON。
+    pub path: String,
     pub facts: serde_json::Value,
 }
 
@@ -67,6 +70,58 @@ struct ExistingMedia {
     added_at_ns: Option<i64>,
     release_date: String,
     candidate: String,
+}
+
+/// Scope 身份指纹：kind + 排序后的根路径。发布与新鲜度检查都必须用这一份实现。
+pub fn library_scope_signature(library: &crate::Library) -> String {
+    let mut roots: Vec<String> = library
+        .root_paths
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect();
+    roots.sort_unstable();
+    format!("{}|{}", library.kind.as_str(), roots.join("\u{1f}"))
+}
+
+impl Store {
+    /// 只读 head：`ready` 且 scope 与当前 Library 配置一致的投影代。
+    ///
+    /// 只读 `browse_generations` 与当前配置，**不装载**任何投影行；热页据此判定
+    /// 能否按页读 facts。调用方必须在同一个锁内用它做「批准」与「复核」。
+    pub fn fresh_head_locked(&self, library_id: &str) -> Result<Option<ProjectionHead>, StoreError> {
+        let scope_signature = self
+            .get_library(library_id)?
+            .map(|library| library_scope_signature(&library));
+        let head = self.browse_projection_head(library_id)?;
+        Ok(match head {
+            Some(head)
+                if head.ready
+                    && Some(head.scope_signature.as_str()) == scope_signature.as_deref() =>
+            {
+                Some(head)
+            }
+            _ => None,
+        })
+    }
+
+    /// 在**同一个**锁内复核「被批准的那一代」是否仍然可用：head 仍 ready、scope
+    /// 与当前配置一致、`generation` 与 `dirty_token` 都未变。
+    ///
+    /// 热页的批准（只读 head）与按页读取是两次加锁，中间可能有别的请求消费了
+    /// 影响本库的变更（把 head 标脏或换代）。按页读取必须在这里复核，变了就回退，
+    /// 否则会用仍然留在表里的旧 facts 出页。
+    pub fn browse_page_head_is_current(
+        &self,
+        library_id: &str,
+        approved: &ProjectionHead,
+    ) -> Result<bool, StoreError> {
+        let Some(current) = self.fresh_head_locked(library_id)? else {
+            return Ok(false);
+        };
+        Ok(current.generation == approved.generation
+            && current.dirty_token == approved.dirty_token
+            && current.scope_signature == approved.scope_signature)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -153,14 +208,7 @@ impl Store {
 
         // Revalidate against the current authoritative library scope in app.db (D3-05)
         if let Ok(Some(current_lib)) = self.get_library(&build.library_id) {
-            let mut roots: Vec<String> = current_lib
-                .root_paths
-                .iter()
-                .map(|root| root.display().to_string())
-                .collect();
-            roots.sort_unstable();
-            let authoritative_scope = format!("{}|{}", current_lib.kind.as_str(), roots.join("\u{1f}"));
-            if authoritative_scope != build.scope_signature {
+            if library_scope_signature(&current_lib) != build.scope_signature {
                 return Ok(false);
             }
         }
@@ -175,18 +223,21 @@ impl Store {
             .unwrap_or(0);
 
         // Read existing files and media to patch only changed rows
-        let mut existing_files: std::collections::HashMap<String, String> =
+        let mut existing_files: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
         {
             let mut stmt = tx.prepare(
-                "SELECT ledger_id, facts_json FROM browse_files WHERE library_id = ?1",
+                "SELECT ledger_id, path, facts_json FROM browse_files WHERE library_id = ?1",
             )?;
             let rows = stmt.query_map([&build.library_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+                ))
             })?;
             for r in rows {
-                let (lid, facts) = r?;
-                existing_files.insert(lid, facts);
+                let (lid, data) = r?;
+                existing_files.insert(lid, data);
             }
         }
 
@@ -196,33 +247,39 @@ impl Store {
             let facts_str = f.facts.to_string();
             new_file_keys.insert(lid_str.clone());
 
-            if let Some(existing_facts) = existing_files.get(&lid_str) {
-                if existing_facts != &facts_str {
+            match existing_files.get(&lid_str) {
+                Some((existing_path, existing_facts))
+                    if existing_path == &f.path && existing_facts == &facts_str => {}
+                Some(_) => {
                     tx.execute(
                         "UPDATE browse_files
-                         SET media_id = ?1, generation = ?2, facts_json = ?3
-                         WHERE library_id = ?4 AND ledger_id = ?5",
+                         SET media_id = ?1, generation = ?2, path = ?3, facts_json = ?4
+                         WHERE library_id = ?5 AND ledger_id = ?6",
                         params![
                             f.media_id.to_string(),
                             build.generation,
+                            f.path,
                             facts_str,
                             build.library_id,
                             lid_str
                         ],
                     )?;
                 }
-            } else {
-                tx.execute(
-                    "INSERT INTO browse_files (library_id, ledger_id, media_id, generation, facts_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        build.library_id,
-                        lid_str,
-                        f.media_id.to_string(),
-                        build.generation,
-                        facts_str
-                    ],
-                )?;
+                None => {
+                    tx.execute(
+                        "INSERT INTO browse_files
+                            (library_id, ledger_id, media_id, generation, path, facts_json)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            build.library_id,
+                            lid_str,
+                            f.media_id.to_string(),
+                            build.generation,
+                            f.path,
+                            facts_str
+                        ],
+                    )?;
+                }
             }
         }
 
@@ -411,13 +468,14 @@ impl Store {
         };
 
         let mut files_stmt = self.library.prepare(
-            "SELECT ledger_id, media_id, facts_json FROM browse_files WHERE library_id = ?1",
+            "SELECT ledger_id, media_id, path, facts_json FROM browse_files WHERE library_id = ?1",
         )?;
         let files = files_stmt
             .query_map([library_id], |row| {
                 let lid: String = row.get(0)?;
                 let mid: String = row.get(1)?;
-                let facts_str: String = row.get(2)?;
+                let path: String = row.get(2)?;
+                let facts_str: String = row.get(3)?;
                 let ledger_id = LedgerId::from_str(&lid)
                     .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
                 let media_id = MediaId::from_str(&mid)
@@ -426,6 +484,7 @@ impl Store {
                 Ok(BrowseFileFacts {
                     ledger_id,
                     media_id,
+                    path,
                     facts,
                 })
             })?

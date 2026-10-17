@@ -15,6 +15,8 @@ pub fn migrate_browse_page_facts(conn: &Connection) -> Result<(), StoreError> {
     ensure_column(conn, "browse_media", "added_at_ns", "INTEGER")?;
     ensure_column(conn, "browse_media", "release_date", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "browse_media", "candidate_json", "TEXT NOT NULL DEFAULT ''")?;
+    // 依赖覆盖按列读路径，不解码整份 file facts（A4-03）。
+    ensure_column(conn, "browse_files", "path", "TEXT NOT NULL DEFAULT ''")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS browse_media_added_at_idx
              ON browse_media(library_id, added_at_ns, media_id);

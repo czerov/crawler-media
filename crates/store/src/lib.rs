@@ -5,12 +5,14 @@ mod app_write;
 mod browse_projection;
 pub use browse_projection::{
     BrowseFileFacts, BrowseMediaFacts, ProjectionBuild, ProjectionSnapshot, ReadRevisions,
+    library_scope_signature,
 };
 mod browse_changes;
 pub use browse_changes::{BrowseChange, BrowseChangeSource, ProjectionHead};
 mod browse_pages;
 pub use browse_pages::{
-    BROWSE_CANDIDATE_VERSION, BrowseMediaCandidate, BrowsePageOrder, BrowsePageRequest,
+    BROWSE_CANDIDATE_VERSION, BrowseFileDependency, BrowseMediaCandidate, BrowsePageOrder,
+    BrowsePageRequest,
 };
 mod browse_reads;
 mod catalog;
