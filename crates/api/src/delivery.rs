@@ -113,6 +113,17 @@ pub(crate) fn submit_torrent_with_options(
     id: Option<DownloaderId>,
     save_path: Option<&str>,
 ) -> Result<(), DownloaderError> {
+    let client = client_for_id(state, id)?;
+    submit_on(state, client.as_ref(), torrent, save_path)
+}
+
+/// Submit `torrent` on an already resolved client (keeps its in-memory identity).
+fn submit_on(
+    state: &ApiState,
+    client: &dyn Downloader,
+    torrent: &Torrent,
+    save_path: Option<&str>,
+) -> Result<(), DownloaderError> {
     let site = state
         .store
         .lock()
@@ -124,7 +135,6 @@ pub(crate) fn submit_torrent_with_options(
         .transpose()
         .map_err(error)?
         .flatten();
-    let client = client_for_id(state, id)?;
     match resolved_url {
         Some(url) => client.add_with_options(torrent, &url, save_path),
         None => client.add_with_options(torrent, &torrent.enclosure, save_path),
@@ -137,6 +147,10 @@ pub(crate) struct RoutedDownloader<'a> {
     pending: HashMap<String, Option<DownloaderId>>,
     used: Mutex<HashMap<String, Option<DownloaderId>>>,
     clients: Mutex<HashMap<Option<DownloaderId>, Arc<dyn Downloader>>>,
+    /// D-M3: info hash reported by the client right after each submission.
+    hashes: Mutex<HashMap<String, String>>,
+    /// G-M2: torrents whose existing client task turned out broken.
+    broken: Mutex<Vec<Torrent>>,
 }
 
 impl<'a> RoutedDownloader<'a> {
@@ -147,6 +161,8 @@ impl<'a> RoutedDownloader<'a> {
             pending: HashMap::new(),
             used: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
+            hashes: Mutex::new(HashMap::new()),
+            broken: Mutex::new(Vec::new()),
         }
     }
 
@@ -165,7 +181,19 @@ impl<'a> RoutedDownloader<'a> {
             pending: targets,
             used: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
+            hashes: Mutex::new(HashMap::new()),
+            broken: Mutex::new(Vec::new()),
         }
+    }
+
+    /// D-M3: info hash of a torrent submitted through this router, if known.
+    pub(crate) fn submitted_hash(&self, torrent: &Torrent) -> Option<String> {
+        self.hashes.lock().get(&torrent.enclosure).cloned()
+    }
+
+    /// G-M2: torrents rejected because their existing task is broken.
+    pub(crate) fn broken_torrents(&self) -> Vec<Torrent> {
+        self.broken.lock().clone()
     }
 
     pub(crate) fn used_id(&self, torrent: &Torrent) -> Option<DownloaderId> {
@@ -203,7 +231,11 @@ impl<'a> RoutedDownloader<'a> {
             };
             if in_target {
                 if let Some(source) = source {
-                    let mut file_quality = release::parse(path.file_name().and_then(|n| n.to_str()).unwrap_or_default());
+                    let mut file_quality = release::parse(
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or_default(),
+                    );
                     if row.resolution.is_some() {
                         file_quality.resolution = row.resolution.clone();
                     }
@@ -250,13 +282,42 @@ impl<'a> RoutedDownloader<'a> {
 }
 
 impl Downloader for RoutedDownloader<'_> {
+    fn remember_identity(&self, torrent: &Torrent, hash: &str) -> Result<(), DownloaderError> {
+        self.client_for(torrent)?.remember_identity(torrent, hash)
+    }
+
+    fn select_files(
+        &self,
+        torrent: &Torrent,
+        keep: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<usize>, DownloaderError> {
+        self.client_for(torrent)?.select_files(torrent, keep)
+    }
+
     fn add(&self, torrent: &Torrent) -> Result<(), DownloaderError> {
         let id = match self.pending.get(&torrent.enclosure) {
             Some(id) => *id,
             None => target_id(self.state, self.subscribe, torrent)?,
         };
-        submit_torrent(self.state, torrent, id)?;
         self.used.lock().insert(torrent.enclosure.clone(), id);
+        let client = self.client_for(torrent)?;
+        if let Err(error) = submit_on(self.state, client.as_ref(), torrent, None) {
+            if matches!(error, DownloaderError::ExistingTaskBroken(..)) {
+                self.broken.lock().push(torrent.clone());
+            } else {
+                self.used.lock().remove(&torrent.enclosure);
+            }
+            return Err(error);
+        }
+        match client.owned_identity(torrent) {
+            Ok(Some(hash)) => {
+                self.hashes.lock().insert(torrent.enclosure.clone(), hash);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(torrent = %torrent.title, %error, "提交后读取 info hash 失败")
+            }
+        }
         Ok(())
     }
 
@@ -267,6 +328,17 @@ impl Downloader for RoutedDownloader<'_> {
         // Keep source identities visible to collection. Persisted destinations
         // deduplicate video writes there and identify the matching sidecars.
         self.client_for(torrent)?.completed_files(torrent)
+    }
+
+    fn is_claimed(&self, torrent: &Torrent) -> Result<bool, DownloaderError> {
+        self.client_for(torrent)?.is_claimed(torrent)
+    }
+
+    fn collectable_files(
+        &self,
+        torrent: &Torrent,
+    ) -> Result<(Vec<std::path::PathBuf>, bool), DownloaderError> {
+        self.client_for(torrent)?.collectable_files(torrent)
     }
 
     fn remove(&self, torrent: &Torrent, delete_files: bool) -> Result<(), DownloaderError> {

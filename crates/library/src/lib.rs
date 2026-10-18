@@ -24,7 +24,9 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-pub use file_transfer::{transfer_file, transfer_file_controlled};
+pub use file_transfer::{
+    hardlink_fallback_count, set_hardlink_fallback_copy, transfer_file, transfer_file_controlled,
+};
 pub use fingerprint::{CommonSegment, extract_audio_fingerprint, find_common_segment};
 pub use latest::{WatchTier, played_last};
 pub use marker::{

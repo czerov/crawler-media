@@ -3,7 +3,7 @@ use jobs::{Job, JobKind, Runner};
 
 use crate::management::ApiState;
 
-mod finish_search;
+pub(crate) mod finish_search;
 use finish_search::finish_search;
 mod search;
 pub(crate) use search::{
@@ -111,6 +111,16 @@ fn search(state: &ApiState, job: &Job, rss_batch: Option<&RssBatch>) -> Result<(
     if subscribe.tracking_state == "paused" {
         return Ok(());
     }
+    let mut subscribe = subscribe;
+    if crate::completion::skip_search(state, &mut subscribe) {
+        return Ok(());
+    }
+    if job.kind == JobKind::SubscribeSearch
+        && subscribe.fetch_mode != FetchMode::Rss
+        && crate::air_gate::all_wanted_unaired(state, &subscribe, &media)
+    {
+        return Ok(());
+    }
     let (mut torrents, search_keywords, succeeded, failures) =
         match (job.kind, subscribe.fetch_mode) {
             (JobKind::SubscribeRss, _) | (_, FetchMode::Rss) => {
@@ -162,6 +172,7 @@ fn search(state: &ApiState, job: &Job, rss_batch: Option<&RssBatch>) -> Result<(
             "换源搜索已排除卡住的种子"
         );
     }
+    let torrents = crate::season_check::drop_misnumbered(state, &subscribe, &media, torrents);
     finish_search(state, &subscribe, torrents, search_keywords)
 }
 
@@ -228,6 +239,7 @@ pub(crate) fn notify_subscription_complete(
     subscribe: &domain::Subscribe,
     media: &domain::Media,
 ) -> Result<(), String> {
+    crate::completion::mark_if_complete(state, subscribe);
     if matches!(
         subscribe.coverage,
         domain::Coverage::Tv {
@@ -237,19 +249,15 @@ pub(crate) fn notify_subscription_complete(
     ) {
         return Ok(());
     }
+    // L4: a unit only counts while its file is still on disk.
+    let done = crate::completion::units_on_disk(state, subscribe);
     let store = state.store.lock();
-    let facts = store
-        .load_subscribe_facts(subscribe.id)
-        .map_err(|e| e.to_string())?;
-    let done = subscribe
-        .coverage
-        .units()
-        .iter()
-        .all(|(season, episode)| facts.get(*season, *episode).is_some());
+    let key = format!("subscribe.completed:{}", subscribe.id);
     if !done {
+        // L4: no longer complete → the next completion notifies again.
+        let _ = store.delete_setting(&key);
         return Ok(());
     }
-    let key = format!("subscribe.completed:{}", subscribe.id);
     if store.get_setting(&key).ok().flatten().is_some() {
         return Ok(()); // 已通知过
     }
@@ -271,6 +279,8 @@ fn record_wanted_round<D: downloader::Downloader + ?Sized>(
     added: &subscribe::Added<'_, D>,
 ) -> Result<(), String> {
     let now = crate::job_loop::unix_now();
+    let cap = crate::air_gate::aired_cap(state, subscribe, added.input.media);
+    let catalog_max = crate::air_gate::catalog_aired_max(state, subscribe, added.input.media);
     let store = state.store.lock();
     let facts = store
         .load_subscribe_facts(subscribe.id)
@@ -289,13 +299,17 @@ fn record_wanted_round<D: downloader::Downloader + ?Sized>(
             subscribe::candidate_matches_subscribe(subscribe, added.input.media, &candidate.release)
         })
         .filter_map(|candidate| candidate.release.episode_to.or(candidate.release.episode));
-    let tracked: Vec<(Option<u32>, Option<u32>)> = crate::open_coverage::units(
-        subscribe,
-        added.input.media,
-        &facts,
-        &pending,
-        &history,
-        observed,
+    let tracked: Vec<(Option<u32>, Option<u32>)> = crate::air_gate::cap_units(
+        crate::open_coverage::units_bounded(
+            subscribe,
+            added.input.media,
+            &facts,
+            &pending,
+            &history,
+            observed,
+            Some(catalog_max.unwrap_or(0)),
+        ),
+        cap,
     )
     .into_iter()
     .filter(|(season, episode)| facts.get(*season, *episode).is_none())
@@ -416,6 +430,7 @@ mod tests {
             audio_language: None,
             group: None,
             confidence: domain::Confidence::High,
+            season_inferred: false,
         };
         let units = super::covered_units(&release);
         assert_eq!(units.len(), domain::Coverage::MAX_EPISODES as usize);

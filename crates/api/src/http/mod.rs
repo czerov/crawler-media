@@ -90,11 +90,16 @@ pub(crate) fn err(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
-pub(crate) async fn health() -> Response {
+pub(crate) async fn health(
+    axum::extract::State(state): axum::extract::State<ApiState>,
+) -> Response {
+    // Review N-2: `read_only` is true while another instance holds the
+    // data-directory lease (background jobs and write endpoints paused).
     ok(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "commit": env!("GIT_HASH"),
+        "read_only": !state.instance_writable(),
     }))
     .into_response()
 }
@@ -111,7 +116,7 @@ pub(crate) fn router(state: ApiState) -> Router {
 /// instead of mutating the process environment (which would race).
 pub fn router_with_slow_after(state: ApiState, slow_after: std::time::Duration) -> Router {
     let public = public_routes();
-    let member = member_routes();
+    let member = member_routes(&state);
     let admin = admin_routes(&state);
 
     let protected = member
@@ -149,11 +154,40 @@ fn public_routes() -> Router<ApiState> {
         )
 }
 
-fn member_routes() -> Router<ApiState> {
+/// Review L-9: while another instance holds the data-directory lease, data
+/// writing requests answer 409 `instance.read_only`. Reads (and POST
+/// previews, which only compute) stay available.
+async fn write_gate(
+    axum::extract::State(state): axum::extract::State<ApiState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::http::Method;
+    let reads = matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
+    if !reads
+        && !request.uri().path().ends_with("preview")
+        && let Err(response) = state.require_writable()
+    {
+        return response;
+    }
+    next.run(request).await
+}
+
+fn write_gated(state: &ApiState, routes: Router<ApiState>) -> Router<ApiState> {
+    routes.route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        write_gate,
+    ))
+}
+
+fn member_routes(state: &ApiState) -> Router<ApiState> {
     Router::new()
         .merge(member_discovery_routes())
-        .merge(member_subscriptions_routes())
-        .merge(member_library_routes())
+        .merge(write_gated(state, member_subscriptions_routes()))
+        .merge(write_gated(state, member_library_routes()))
         .merge(member_playback_routes())
 }
 
@@ -395,10 +429,10 @@ fn member_playback_routes() -> Router<ApiState> {
 
 fn admin_routes(state: &ApiState) -> Router<ApiState> {
     Router::new()
-        .merge(admin_core_routes())
-        .merge(admin_library_routes())
+        .merge(write_gated(state, admin_core_routes()))
+        .merge(write_gated(state, admin_library_routes()))
         .merge(admin_metadata_routes())
-        .merge(admin_ops_routes())
+        .merge(write_gated(state, admin_ops_routes()))
         .layer(axum::middleware::from_fn_with_state(
             state.store.clone(),
             auth::require_admin,
@@ -473,6 +507,10 @@ fn admin_library_routes() -> Router<ApiState> {
     Router::new()
         // libraries：实体增删改 + 条目/文件删除
         .route("/library-removals/{operation_id}", get(library_deletion::status))
+        .route(
+            "/library/pending-deletions",
+            get(file_delete::pending_deletions),
+        )
         .route("/libraries", post(library_config::create_library))
         .route(
             "/libraries/{id}",

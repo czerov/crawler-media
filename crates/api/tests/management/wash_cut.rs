@@ -23,11 +23,9 @@ async fn wash_cut_deletes_previous_library_file_and_ledger_row() {
     });
     let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("stage")));
     let better = tmp.path().join("better.mkv");
-    std::fs::write(
-        &better,
-        r#"{"resolution":"2160p","codec":"hevc","hdr":"hdr10"}"#,
-    )
-    .unwrap();
+    // S1: replacement needs a successful probe of the new file.
+    install_fake_ffprobe();
+    std::fs::write(&better, probed_video(2160, "hevc", true)).unwrap();
     downloader.map_enclosure("https://pt.example/download.php?id=1&passkey=abc", better);
 
     let app = router(state(tmp.path(), fetcher, downloader));
@@ -121,11 +119,9 @@ async fn wash_cut_drops_ledger_when_previous_file_is_already_gone() {
     });
     let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("stage")));
     let better = tmp.path().join("better.mkv");
-    std::fs::write(
-        &better,
-        r#"{"resolution":"2160p","codec":"hevc","hdr":"hdr10"}"#,
-    )
-    .unwrap();
+    // S1: replacement needs a successful probe of the new file.
+    install_fake_ffprobe();
+    std::fs::write(&better, probed_video(2160, "hevc", true)).unwrap();
     downloader.map_enclosure("https://pt.example/download.php?id=1&passkey=abc", better);
 
     let app = router(state(tmp.path(), fetcher, downloader));

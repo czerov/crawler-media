@@ -195,7 +195,7 @@ fn seed_subscribe_for_pending(store: &Store) -> Subscribe {
             exclude: false,
         }],
         keep_old_versions: false,
-};
+    };
     store.insert_filter(&filter).unwrap();
     let subscribe = Subscribe {
         id: SubscribeId::new(),
@@ -468,6 +468,7 @@ async fn list_tasks_does_not_bind_pending_to_same_size_different_title() {
         download_speed: 1,
         upload_speed: 0,
         info_hash: "bbbb".into(),
+        owned_tags: vec![],
     });
     let app = router(state(
         tmp.path(),
@@ -489,25 +490,18 @@ async fn list_tasks_does_not_bind_pending_to_same_size_different_title() {
 }
 
 #[tokio::test]
-async fn list_tasks_auto_cleans_stale_absent_pending() {
+async fn list_tasks_keeps_stale_http_pending_when_client_list_is_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let enclosure = "https://pt.example/download.php?id=1";
     seed_pending_at(tmp.path(), enclosure, now_secs() - 30 * 60);
     let app = app(&tmp);
 
-    // 提交超过宽限期、客户端可达但种子不在 → 判定任务已消失，自动清理 pending
-    // 行（下一轮搜索会按订阅重新投递），任务中心不再展示。
+    // Review M-2：客户端返回空列表（刚重启、连错实例）不能证明 HTTP 种子已消失，
+    // pending 必须保留；有归属标签可见时的自动清理由 subscription_e2e d_s1 覆盖。
     let listed = list_tasks_json(&app).await;
-    assert!(
-        task_items(&listed).is_empty(),
-        "超过宽限期的缺失任务应被自动清理"
-    );
-
+    assert_eq!(task_items(&listed).len(), 1, "{listed}");
     let store = Store::open(tmp.path().join("data")).unwrap();
-    assert!(
-        store.list_all_pending().unwrap().is_empty(),
-        "超过宽限期的缺失 pending 行应被删除"
-    );
+    assert_eq!(store.list_all_pending().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -720,6 +714,7 @@ async fn untagged_reachable_snapshot_does_not_prune_stale_pending() {
         download_speed: 1,
         upload_speed: 0,
         info_hash: "cccccccccccccccccccccccccccccccccccccccc".into(),
+        owned_tags: vec![],
     });
     let app = router(state(
         tmp.path(),
@@ -738,5 +733,82 @@ async fn untagged_reachable_snapshot_does_not_prune_stale_pending() {
         store.list_all_pending().unwrap().len(),
         1,
         "不能证明归属时绝不能清理超过宽限期的 pending"
+    );
+}
+
+#[tokio::test]
+async fn d_l4_deleting_a_downloader_orphans_its_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app(&tmp);
+    let created = post_dl(
+        &app,
+        json!({
+            "name": "qb-gone",
+            "kind": "qbittorrent",
+            "url": "http://qb-gone:8080",
+            "username": "admin",
+            "password": "a",
+            "is_default": false
+        }),
+    )
+    .await;
+    let dl: domain::DownloaderId = created["id"].as_str().unwrap().parse().unwrap();
+    let subscribe_id = {
+        let store = Store::open(tmp.path().join("data")).unwrap();
+        let subscribe = seed_subscribe_for_pending(&store);
+        let torrent = Torrent {
+            id: None,
+            site_id: SiteId::new(),
+            title: "Movie.2026.1080p".into(),
+            enclosure: "https://pt.example/gone".into(),
+            size_bytes: Some(100),
+            seeders: Some(1),
+            free: false,
+            hr: false,
+            imdb_id: None,
+            leechers: None,
+            snatched: None,
+            upload_time: None,
+            detail_url: None,
+            category: None,
+            poster_url: None,
+        };
+        store
+            .merge_pending(
+                subscribe.id,
+                &[(
+                    80,
+                    api::store::PendingDownload {
+                        submitted_at: Some(1),
+                        torrent,
+                        release_override: None,
+                        downloader_id: Some(dl),
+                    },
+                )],
+            )
+            .unwrap();
+        subscribe.id
+    };
+    let response = app
+        .clone()
+        .oneshot(request(
+            "DELETE",
+            &format!("/api/v1/downloaders/{dl}"),
+            Some("management-secret"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["data"]["orphaned_pending"], 1);
+    let store = Store::open(tmp.path().join("data")).unwrap();
+    assert!(store.load_pending(subscribe_id).unwrap().is_empty());
+    assert_eq!(
+        store
+            .load_pending_state(subscribe_id, "orphan")
+            .unwrap()
+            .len(),
+        1
     );
 }

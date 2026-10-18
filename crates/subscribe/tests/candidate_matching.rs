@@ -61,6 +61,7 @@ fn pending_release_matches_the_short_title_used_to_find_it() {
         audio_language: None,
         group: None,
         confidence: Confidence::High,
+        season_inferred: false,
     };
 
     assert!(subscribe::candidate_matches_subscribe(

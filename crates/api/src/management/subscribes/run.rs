@@ -34,6 +34,13 @@ pub(crate) async fn run_subscribe(
     axum::Extension(user_id): axum::Extension<UserId>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // H-1: manual runs write pending rows and library files.
+    if !state.instance_writable() {
+        return Err(lifecycle_conflict(
+            "instance.read_only",
+            "数据目录由另一个实例占用，本实例为只读模式",
+        ));
+    }
     let state_for_work = state.clone();
     // 整段同步业务 pipeline（搜索 → 准入 → 海报）都在 blocking worker 上跑到
     // 结束：订阅 guard / LibraryLease 在闭包内持有，响应语义不变（不是排队返回）。
@@ -63,6 +70,12 @@ fn run_subscribe_inner(
     let search_context = load_search_context(state, id, user_id)?;
     reject_if_inactive(state, id, &search_context.subscribe)?;
     let (torrents, search_keywords) = fetch_torrents(state, id, &search_context)?;
+    let torrents = crate::season_check::drop_misnumbered(
+        state,
+        &search_context.subscribe,
+        &search_context.media,
+        torrents,
+    );
     let admitted = admit_after_search(state, id, user_id, torrents, search_keywords)?;
     if admitted.scrape {
         for row in &admitted.ledger {
@@ -290,9 +303,16 @@ fn execute(
         },
         plan: &plan,
     };
+    let overlap = crate::worker::finish_search::overlap_policy(state);
+    let absolute = crate::season_check::absolute_map(
+        state,
+        &context.media,
+        torrents.iter().map(|t| t.title.as_str()),
+    );
+    let chooser = crate::pack_fallback::effective(state, &context.subscribe);
     let added = subscribe::admit_and_add(
         RunInput {
-            subscribe: &context.subscribe,
+            subscribe: &chooser,
             media: &context.media,
             filter: &context.filter,
             wash_filter: context.wash_filter.as_ref(),
@@ -306,6 +326,8 @@ fn execute(
             hooks: None,
             naming: Some(&plan.naming),
             preserve_removed: true,
+            overlap,
+            absolute: absolute.as_ref(),
         },
     )?;
     let mut outcome = subscribe::collect_completed_recorded(
@@ -336,37 +358,12 @@ fn load_run_facts(state: &ApiState, id: SubscribeId, context: &RunContext)
     let snapshot = state.store.lock()
         .subscribe_library_snapshot(&context.subscribe, context.media.kind)
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut facts = crate::subscribe_library_read::evaluate_subscribe_facts_out_of_lock_with(
+    let facts = crate::subscribe_library_read::evaluate_subscribe_facts_out_of_lock_with(
         &snapshot, state.browse_files.as_ref(),
     ).map_err(|e| ApiError::internal(e.to_string()))?;
-    for (_, pending) in &existing {
-        let release = pending
-            .release_override
-            .clone()
-            .unwrap_or_else(|| release::parse(&pending.torrent.title));
-        if !subscribe::candidate_matches_subscribe(&context.subscribe, &context.media, &release) {
-            continue;
-        }
-        let units = if release.season.is_none() {
-            vec![(None, None)]
-        } else {
-            let eps = release.covered_episodes();
-            if eps.is_empty() {
-                vec![(release.season, None)]
-            } else {
-                eps.into_iter().map(|(s, e)| (Some(s), Some(e))).collect()
-            }
-        };
-        for (season, episode) in units {
-            if facts.get(season, episode).is_none() {
-                facts.upsert(
-                    season,
-                    episode,
-                    subscribe::QualityFact { score: 0, path: None },
-                );
-            }
-        }
-    }
+    // H4: same placeholder rule as the scheduled path (shared in subscribe).
+    let releases = crate::worker::finish_search::pending_releases(&existing);
+    let facts = subscribe::facts_with_pending(facts, &releases, &context.subscribe, &context.media);
     Ok(RunFactsObservation {
         facts,
         saved: snapshot.saved,
@@ -470,9 +467,11 @@ fn exclude_pending(
     torrents: &mut Vec<domain::Torrent>,
 ) -> Result<(), ApiError> {
     let existing = state.store.lock().load_pending(id)?;
+    let rejected = state.store.lock().load_rejected_enclosures(id)?;
     let enclosures: std::collections::HashSet<&str> = existing
         .iter()
         .map(|(_, pending)| pending.torrent.enclosure.as_str())
+        .chain(rejected.iter().map(String::as_str))
         .collect();
     let before = torrents.len();
     torrents.retain(|torrent| !enclosures.contains(torrent.enclosure.as_str()));
@@ -497,6 +496,11 @@ fn persist(
     };
     let modes =
         crate::worker::transfer::observe_transfer_modes(&outcome.ledger, &default_transfer_mode);
+    // Review N-1: capped wait for a source probe (outside the Store lock).
+    let mut outcome = outcome;
+    let exhausted =
+        crate::probe_wait::exhausted_probe_waits(state, id, &outcome.awaiting_probe_enclosures);
+    outcome.rejected_enclosures.extend(exhausted);
 
     let store = state.store.lock();
     lease
@@ -528,6 +532,7 @@ fn persist(
     }
     let now = crate::job_loop::unix_now();
     let transferred = outcome.transferred_enclosures;
+    let rejected = outcome.rejected_enclosures;
     let pending_items: Vec<_> = outcome
         .torrents_added
         .into_iter()
@@ -545,38 +550,38 @@ fn persist(
         })
         .collect();
     store.record_pending_submissions(id, &pending_items)?;
+    // G-M2: a broken existing task becomes a rejected source here too.
+    let broken: Vec<_> = routed
+        .broken_torrents()
+        .into_iter()
+        .map(|torrent| {
+            let downloader_id = routed.used_id(&torrent);
+            (
+                0,
+                crate::store::PendingDownload {
+                    torrent,
+                    release_override: None,
+                    downloader_id,
+                    submitted_at: Some(now),
+                },
+            )
+        })
+        .collect();
+    let broken_enclosures: Vec<String> = broken
+        .iter()
+        .map(|(_, p)| p.torrent.enclosure.clone())
+        .collect();
+    store.record_pending_submissions(id, &broken)?;
     store.mark_pending_imported(id, &transferred)?;
+    store.mark_pending_rejected(id, &rejected)?;
+    store.mark_pending_rejected(id, &broken_enclosures)?;
     store.save_subscribe_facts(id, &outcome.facts)?;
-    drop(store);
-
-    // Physical deletion of replaced files OUTSIDE the Store lock (after the database
-    // commit is durable), then remove their ledger rows in one short critical section.
-    let removed_paths = outcome.removed_paths.clone();
-    if !removed_paths.is_empty() {
-        let mut removed = Vec::with_capacity(removed_paths.len());
-        let mut errors = Vec::new();
-        for path in &removed_paths {
-            match std::fs::remove_file(path) {
-                Ok(()) => removed.push(path),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => removed.push(path),
-                Err(error) => {
-                    tracing::error!(path, %error, "物理删除旧文件失败，保留台账行");
-                    errors.push(format!("{path}: {error}"));
-                }
-            }
-        }
-        let store = state.store.lock();
-        for path in removed {
-            if let Err(error) = store.delete_ledger_path(path) {
-                tracing::error!(path, %error, "删除已替换文件的台账行失败");
-                errors.push(format!("{path}: {error}"));
-            }
-        }
-        if !errors.is_empty() {
-            return Err(ApiError::internal(format!("Transfer replacement cleanup failed: {}", errors.join("; "))));
-        }
+    // M6: same queue as the Transfer job; deletion failures are retried later.
+    for path in &outcome.removed_paths {
+        store.enqueue_file_deletion(path, "wash_replaced")?;
     }
-
+    drop(store);
+    crate::http::file_delete::retry_queued_deletions(&state.store);
     crate::http::library::enqueue_probes_for_rows(state, &outcome.ledger);
     Ok(())
 }

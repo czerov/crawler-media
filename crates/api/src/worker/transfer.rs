@@ -110,40 +110,32 @@ fn commit_transfer_outcome(
         }
     }
 
-    cleanup_replaced_files(state, outcome)?;
-    let library_id = lease.library_id().to_string();
-    state.projection.mark_dirty(&library_id);
-    Ok(())
-}
-
-fn cleanup_replaced_files(state: &ApiState, outcome: &RunOutcome) -> Result<(), String> {
-    // Only retire old rows after their files are gone. The new rows/source
-    // mappings remain durable on cleanup failure, so retries reuse them.
-    let mut removed = Vec::with_capacity(outcome.removed_paths.len());
-    let mut errors = Vec::new();
-    for path in &outcome.removed_paths {
-        match std::fs::remove_file(path) {
-            Ok(()) => removed.push(path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => removed.push(path),
-            Err(error) => {
-                tracing::error!(path, %error, "物理删除旧文件失败，保留台账行");
-                errors.push(format!("{path}: {error}"));
-            }
-        }
-    }
-    if !removed.is_empty() {
+    // Review N-1: capped wait for a source probe; exhausted waits are rejected.
+    let exhausted = crate::probe_wait::exhausted_probe_waits(
+        state,
+        subscribe.id,
+        &outcome.awaiting_probe_enclosures,
+    );
+    // M6: queue replaced files instead of deleting inline; a failed delete
+    // must not abort the commit and is retried later (outside the Store lock).
+    {
         let store = state.store.lock();
-        for path in removed {
-            if let Err(error) = store.delete_ledger_path(path) {
-                tracing::error!(path, %error, "删除已替换文件的台账行失败");
-                errors.push(format!("{path}: {error}"));
-            }
+        for path in &outcome.removed_paths {
+            store
+                .enqueue_file_deletion(path, "wash_replaced")
+                .map_err(|e| e.to_string())?;
         }
+        store
+            .mark_pending_rejected(subscribe.id, &outcome.rejected_enclosures)
+            .map_err(|e| e.to_string())?;
+        store
+            .mark_pending_rejected(subscribe.id, &exhausted)
+            .map_err(|e| e.to_string())?;
     }
-
-    if !errors.is_empty() {
-        return Err(format!("Transfer replacement cleanup failed: {}", errors.join("; ")));
-    }
+    crate::http::file_delete::retry_queued_deletions(&state.store);
+    let library_id = lease.library_id().to_string();
+    // Transfer 写入新 ledger 行并可能删除旧文件：该 Library 的投影必须重建。
+    state.projection.mark_dirty(&library_id);
     Ok(())
 }
 
@@ -198,10 +190,36 @@ pub(crate) struct TransferPlan {
     pub(crate) nfo: bool,
 }
 
+/// D-M3: hand persisted info hashes back to the (possibly fresh) clients so
+/// label-less Transmission tasks stay collectable across restarts.
+fn restore_identities(
+    state: &ApiState,
+    subscribe: &Subscribe,
+    routed: &crate::delivery::RoutedDownloader<'_>,
+    pending: &[(i32, crate::store::PendingDownload)],
+) {
+    let hashes = match state.store.lock().load_pending_info_hashes(subscribe.id) {
+        Ok(hashes) => hashes,
+        Err(error) => {
+            tracing::warn!(subscribe_id = %subscribe.id, %error, "读取 pending info hash 失败");
+            return;
+        }
+    };
+    for (_, item) in pending {
+        if let Some(hash) = hashes.get(&item.torrent.enclosure) {
+            use downloader::Downloader as _;
+            if let Err(error) = routed.remember_identity(&item.torrent, hash) {
+                tracing::warn!(torrent = %item.torrent.title, %error, "恢复下载器任务身份失败");
+            }
+        }
+    }
+}
+
 fn filter_matched_pending(
     subscribe: &Subscribe,
     media: &Media,
     pending: Vec<(i32, crate::store::PendingDownload)>,
+    absolute: Option<&subscribe::AbsoluteEpisodes>,
 ) -> Vec<ScoredTorrent> {
     pending
         .into_iter()
@@ -209,6 +227,8 @@ fn filter_matched_pending(
             let release = pending
                 .release_override
                 .unwrap_or_else(|| release::parse(&pending.torrent.title));
+            // G-H2b: absolute episode numbers → catalog season + episode.
+            let release = absolute.map_or_else(|| release.clone(), |map| map.apply(&release));
             if !subscribe::candidate_matches_subscribe(subscribe, media, &release) {
                 tracing::error!(subscribe_id = %subscribe.id, media = %media.title,
                     torrent = %pending.torrent.title, "拒绝转存与订阅不匹配的待处理种子");
@@ -239,10 +259,13 @@ fn build_added_input<'a>(
             removed_paths: Vec::new(),
             completed: false,
             transferred_enclosures: Vec::new(),
+            rejected_enclosures: Vec::new(),
+            awaiting_probe_enclosures: Vec::new(),
             collection_errors: Vec::new(),
             submission_errors: Vec::new(),
             torrents_added: Vec::new(),
         },
+        broken: Vec::new(),
     }
 }
 
@@ -413,6 +436,7 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
         tracing::info!(subscribe_id = %subscribe_id, "订阅正在删除中，跳过 Transfer");
         return Ok(());
     }
+    crate::http::file_delete::retry_queued_deletions(&state.store);
 
     let subscribe = match state.store.lock().get_subscribe(subscribe_id) {
         Ok(Some(s)) => s,
@@ -428,6 +452,10 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
         .lock()
         .load_pending(subscribe.id)
         .map_err(|e| e.to_string())?;
+    // H3: release rows whose task provably vanished from the client, so a
+    // slot never stays blocked just because nobody opened the task center.
+    let pending = crate::pending_reconcile::reconcile_subscribe(state, subscribe.id, pending);
+    crate::selective_files::retry_deferred(state, subscribe.id, &pending);
 
     if pending.is_empty() {
         return Ok(());
@@ -441,7 +469,13 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
     }
     let (media, filter, facts, wash_filter, observation_revisions) = load_transfer_context(state, &subscribe)?;
     let routed = crate::delivery::RoutedDownloader::with_pending(state, &subscribe, &pending);
-    let chosen = filter_matched_pending(&subscribe, &media, pending);
+    restore_identities(state, &subscribe, &routed, &pending);
+    let absolute = crate::season_check::absolute_map(
+        state,
+        &media,
+        pending.iter().map(|(_, p)| p.torrent.title.as_str()),
+    );
+    let chosen = filter_matched_pending(&subscribe, &media, pending, absolute.as_ref());
 
     let library_lease = state.acquire_library_work(&plan.library_id)?;
     library_lease.control().check().map_err(|e| e.to_string())?;
@@ -463,11 +497,32 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
             hooks: None,
             naming: Some(&plan.naming),
             preserve_removed: true,
+            overlap: Default::default(),
+            absolute: absolute.as_ref(),
         },
         chosen,
     );
 
     let destinations = routed.imported_destinations().map_err(|e| e.to_string())?;
+    // M7: do not start writing library files for a subscription being deleted.
+    if state.subscribe_is_deleting(subscribe_id) {
+        tracing::warn!(subscribe_id = %subscribe_id, "订阅已被预留删除，跳过 Transfer");
+        return Ok(());
+    }
+    let known: std::collections::HashSet<std::path::PathBuf> = destinations
+        .iter()
+        .map(|m| m.destination_path.clone())
+        .collect();
+    // D-M2: hardlink fallback policy and fallback counting for this round.
+    let fallback_copy = state
+        .store
+        .lock()
+        .get_setting(crate::settings_keys::LIBRARY_HARDLINK_FALLBACK)
+        .ok()
+        .flatten()
+        .is_none_or(|value| value.trim() != "fail");
+    library::set_hardlink_fallback_copy(fallback_copy);
+    let fallbacks_before = library::hardlink_fallback_count();
     let recorder = PlannedPublicationRecorder {
         recorder: PublicationRecorder { state, subscribe: &subscribe,
             lease: &library_lease, revisions: observation_revisions },
@@ -482,11 +537,15 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
     )
     .map_err(|e| e.to_string())?;
     if state.subscribe_is_deleting(subscribe_id) {
-        tracing::warn!(subscribe_id = %subscribe_id, "Transfer 完成但订阅已被预留删除，取消提交");
+        tracing::warn!(subscribe_id = %subscribe_id, "Transfer 完成但订阅已被预留删除，取消提交并回滚本轮新文件");
+        rollback_new_files(state, &outcome, plan.mode, &known);
         return Ok(());
     }
 
-    library_lease.control().check().map_err(|e| e.to_string())?;
+    if let Err(error) = library_lease.control().check() {
+        rollback_new_files(state, &outcome, plan.mode, &known);
+        return Err(error.to_string());
+    }
     if plan.scrape {
         attach_metadata_and_chapters(state, &media, &outcome.ledger);
     }
@@ -496,6 +555,18 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
     commit_transfer_outcome(state, &subscribe, &outcome, &library_lease, &observation_revisions, &plan)?;
 
     crate::http::library::enqueue_probes_for_rows(state, &outcome.ledger);
+    let fallbacks = library::hardlink_fallback_count().saturating_sub(fallbacks_before);
+    if fallbacks > 0 {
+        tracing::warn!(%subscribe_id, fallbacks, "硬链接失败，已回退为复制");
+        super::notify(
+            state,
+            "硬链接回退为复制",
+            &format!(
+                "「{}」有 {fallbacks} 个文件无法硬链接（下载目录与媒体库可能不在同一设备），已改为复制",
+                media.title
+            ),
+        );
+    }
     if ledger_count > 0 {
         super::notify(
             state,
@@ -520,6 +591,55 @@ pub fn transfer_one(state: &ApiState, subscribe_id: SubscribeId) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// M7: undo library files this abandoned round created. Only paths that were
+/// not already known destinations before the round are touched. Hardlink /
+/// Copy: delete the new file (the download keeps its data). Move: move the
+/// file back to its download source; if that fails it is left in place.
+fn rollback_new_files(
+    state: &ApiState,
+    outcome: &subscribe::RunOutcome,
+    mode: Option<library::TransferMode>,
+    known: &std::collections::HashSet<std::path::PathBuf>,
+) {
+    for row in &outcome.ledger {
+        let path = std::path::PathBuf::from(&row.path);
+        if known.contains(&path) || !path.exists() {
+            continue;
+        }
+        let source = outcome
+            .ledger_sources
+            .iter()
+            .find(|s| s.ledger_path == row.path)
+            .map(|s| std::path::PathBuf::from(&s.source_path));
+        let result = match (mode, source) {
+            (Some(library::TransferMode::Move), Some(source)) => {
+                if source.exists() {
+                    tracing::warn!(path = %path.display(), "回滚：Move 源路径已存在，保留库文件");
+                    continue;
+                }
+                std::fs::rename(&path, &source)
+            }
+            (Some(library::TransferMode::Move), None) => {
+                tracing::warn!(path = %path.display(), "回滚：Move 模式缺少源路径，保留库文件");
+                continue;
+            }
+            _ => std::fs::remove_file(&path),
+        };
+        match result {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "回滚放弃提交的 Transfer 新文件");
+                // The ledger row was reserved before publishing: drop it too.
+                if let Err(error) = state.store.lock().delete_ledger_path(&row.path) {
+                    tracing::warn!(path = %row.path, %error, "回滚时删除预留台账行失败");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "回滚 Transfer 新文件失败")
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -334,6 +334,7 @@ fn preview_entry_dir(
         audio_language: None,
         group: None,
         confidence: domain::Confidence::High,
+        season_inferred: false,
     };
     library::render_path(
         root,

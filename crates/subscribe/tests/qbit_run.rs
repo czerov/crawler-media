@@ -175,6 +175,8 @@ fn finished_qbittorrent_task_transfers_into_library_ledger() {
         hooks: None,
         naming: None,
         preserve_removed: false,
+        overlap: Default::default(),
+        absolute: None,
     })
     .unwrap();
 

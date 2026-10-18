@@ -31,12 +31,20 @@ pub(crate) async fn patch_subscription(
             "订阅正在删除，无法修改",
         );
     }
+    let auto_next_season = body.auto_next_season;
+    let pack_fallback_after_days = body.pack_fallback_after_days;
     let (previous, subscribe, media) = match load_and_patch(&state, sid, user_id, body) {
         Ok(result) => result,
         Err(response) => return response,
     };
     if let Err(response) = persist_subscription(&state, &previous, &subscribe) {
         return response;
+    }
+    if let Some(days) = pack_fallback_after_days {
+        crate::pack_fallback::set_after_days(&state, subscribe.id, (days > 0).then_some(days));
+    }
+    if let Some(auto) = auto_next_season {
+        crate::completion::set_auto_next_season(&state, subscribe.id, auto);
     }
     let store = state.store.lock();
     let facts = store.load_subscribe_facts(subscribe.id).unwrap_or_default();
@@ -88,6 +96,18 @@ fn persist_subscription(
     previous: &Subscribe,
     subscribe: &Subscribe,
 ) -> Result<(), Response> {
+    // G-M1: a coverage / library change must not overlap a sibling subscription.
+    if previous.coverage != subscribe.coverage || previous.library_id != subscribe.library_id {
+        let overlap =
+            crate::subscribe_create::overlapping_subscription(&state.store.lock(), subscribe);
+        if let Ok(Some(other)) = overlap {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "subscription.overlap",
+                &format!("同一媒体库中已有覆盖重叠的订阅（{other}），请合并或调整集数范围"),
+            ));
+        }
+    }
     if let Err(error) = state.store.lock().update_subscribe(subscribe) {
         return Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,

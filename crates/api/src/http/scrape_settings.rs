@@ -252,6 +252,7 @@ fn sample_release(kind: MediaKind) -> Release {
         audio_language: None,
         group: Some("OurTV".into()),
         confidence: domain::Confidence::High,
+        season_inferred: false,
     }
 }
 

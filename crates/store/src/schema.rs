@@ -208,25 +208,25 @@ fn migrate_app_library_columns(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn ensure_column(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    decl: &str,
-) -> Result<(), StoreError> {
-    if !column_exists(conn, table, column)? {
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
-    }
-    Ok(())
-}
-
-fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
     Ok(conn
         .prepare(&format!("PRAGMA table_info({table})"))?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?
         .iter()
         .any(|name| name == column))
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<(), StoreError> {
+    if !has_column(conn, table, column)? {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
+    }
+    Ok(())
 }
 
 pub fn migrate_catalog(conn: &Connection) -> Result<(), StoreError> {
@@ -258,6 +258,10 @@ pub fn migrate_library(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(tables::LIBRARY_TABLES)?;
     // ledger.missing_at：文件核验标记（老库补列，幂等）。
     ensure_column(conn, "ledger", "missing_at", "INTEGER")?;
+    // Review M-3: identity of a queued deletion (additive).
+    ensure_column(conn, "pending_file_deletions", "ledger_id", "TEXT")?;
+    ensure_column(conn, "pending_file_deletions", "file_size", "INTEGER")?;
+    ensure_column(conn, "pending_file_deletions", "file_inode", "INTEGER")?;
     ensure_column(conn, "ledger", "transfer_mode", "TEXT")?;
     ensure_column(conn, "ledger", "source_path", "TEXT")?;
     ensure_column(conn, "ledger", "transfer_pending", "INTEGER NOT NULL DEFAULT 0")?;
@@ -385,6 +389,24 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
         "state",
         "TEXT NOT NULL DEFAULT 'active'",
     )?;
+    // H3 stalled: last observed progress and when it last increased.
+    ensure_column(conn, "pending_downloads", "last_progress", "REAL")?;
+    // Review L-3: rows that predate the column start their stall clock now
+    // (one-time, only when the column is added), not at old submitted_at.
+    let had_progress_at = has_column(conn, "pending_downloads", "last_progress_at")?;
+    ensure_column(conn, "pending_downloads", "last_progress_at", "INTEGER")?;
+    if !had_progress_at {
+        conn.execute_batch(
+            "UPDATE pending_downloads SET last_progress_at = CAST(strftime('%s','now') AS INTEGER)
+             WHERE last_progress_at IS NULL;",
+        )?;
+    }
+    // D-M3: torrent info hash recorded at submit time (when known).
+    ensure_column(conn, "pending_downloads", "info_hash", "TEXT")?;
+    ensure_column(conn, "pending_downloads", "selective_missing", "TEXT")?;
+    // Review N-1: capped wait for a source probe (additive, nullable).
+    ensure_column(conn, "pending_downloads", "probe_wait_attempts", "INTEGER")?;
+    ensure_column(conn, "pending_downloads", "probe_wait_since", "INTEGER")?;
     // Index on (subscribe_id, state) — must come after the state column exists.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS pending_downloads_sub_state_idx \
@@ -426,7 +448,7 @@ pub fn migrate_subscribe(conn: &Connection) -> Result<(), StoreError> {
     // Only a database that predates the column, or is receiving it now, gets
     // the one-time backfill from the playback clock.
     let previous = read_schema_version(conn)?;
-    let favorite_at_existed = column_exists(conn, "playback_units", "favorite_at")?;
+    let favorite_at_existed = has_column(conn, "playback_units", "favorite_at")?;
     ensure_column(
         conn,
         "playback_units",

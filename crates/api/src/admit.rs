@@ -52,6 +52,7 @@ fn apply_admit_release_override(
         audio_language: base.audio_language,
         group: base.group,
         confidence: domain::Confidence::High,
+        season_inferred: false,
     }
 }
 
@@ -120,7 +121,7 @@ pub async fn admit_torrent(
         .map_err(|err| ApiError::invalid("subscribe.invalid", err.to_string()))?;
     crate::delivery::submit_torrent(&state, &scored.torrent, downloader_id)
         .map_err(|err| ApiError::invalid("subscribe.invalid", err.to_string()))?;
-    state.store.lock().record_pending_submissions(
+    state.store.lock().record_manual_pending_submissions(
         subscribe.id,
         &[(
             scored.score,

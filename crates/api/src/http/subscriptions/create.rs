@@ -159,6 +159,8 @@ fn persist_subscription(
     coverage: Coverage,
     body: CreateSubscriptionInput,
 ) -> Response {
+    let auto_next_season = body.auto_next_season;
+    let pack_fallback_after_days = body.pack_fallback_after_days;
     let incoming = incoming_media(media_kind, media_input);
     let subscribe =
         match subscribe_from_input(&state, user_id, incoming.id, fetch_mode, coverage, &body) {
@@ -168,6 +170,13 @@ fn persist_subscription(
     let (media, subscribe) =
         match crate::subscribe_create::create(&state, incoming, subscribe, None) {
             Ok(result) => result,
+            Err(crate::subscribe_create::CreateError::Overlap(other)) => {
+                return err(
+                    StatusCode::CONFLICT,
+                    "subscription.overlap",
+                    &format!("同一媒体库中已有覆盖重叠的订阅（{other}），请合并或调整集数范围"),
+                );
+            }
             Err(error) => {
                 return err(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -176,6 +185,12 @@ fn persist_subscription(
                 );
             }
         };
+    if let Some(days) = pack_fallback_after_days {
+        crate::pack_fallback::set_after_days(&state, subscribe.id, Some(days));
+    }
+    if auto_next_season {
+        crate::completion::set_auto_next_season(&state, subscribe.id, true);
+    }
     let facts = {
         let store = state.store.lock();
         store.load_subscribe_facts(subscribe.id).unwrap_or_default()

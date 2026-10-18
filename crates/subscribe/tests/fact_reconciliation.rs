@@ -118,6 +118,8 @@ fn season_pack_retry_only_reconciles_mapped_slots_without_forging_facts() {
         hooks: None,
         naming: Some(&naming),
         preserve_removed: true,
+        overlap: Default::default(),
+        absolute: None,
     };
 
     let added = Added {
@@ -136,10 +138,13 @@ fn season_pack_retry_only_reconciles_mapped_slots_without_forging_facts() {
             removed_paths: vec![],
             collection_errors: vec![],
             transferred_enclosures: vec![],
+            rejected_enclosures: Vec::new(),
+            awaiting_probe_enclosures: Vec::new(),
             completed: false,
             submission_errors: vec![],
             torrents_added: vec![],
         },
+        broken: Vec::new(),
     };
 
     let outcome = collect_completed_with_destinations(added, &library::Ffprobe::default(), &existing_mappings).unwrap();
@@ -203,6 +208,8 @@ fn stale_facts_pointing_at_missing_file_are_reconciled_to_new_destination() {
         hooks: None,
         naming: Some(&naming),
         preserve_removed: true,
+        overlap: Default::default(),
+        absolute: None,
     };
 
     let added = Added {
@@ -221,10 +228,13 @@ fn stale_facts_pointing_at_missing_file_are_reconciled_to_new_destination() {
             removed_paths: vec![],
             collection_errors: vec![],
             transferred_enclosures: vec![],
+            rejected_enclosures: Vec::new(),
+            awaiting_probe_enclosures: Vec::new(),
             completed: false,
             submission_errors: vec![],
             torrents_added: vec![],
         },
+        broken: Vec::new(),
     };
 
     let outcome = collect_completed_with_destinations(added, &library::Ffprobe::default(), &existing_mappings).unwrap();

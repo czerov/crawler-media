@@ -165,11 +165,12 @@ fn record_submitted_pending(
     torrent: &Torrent,
     downloader_id: Option<DownloaderId>,
     parsed: &Release,
+    score: i32,
 ) -> Result<(), Response> {
     let store = state.store.lock();
     if let Err(error) = store.record_pending_submission(
         subscribe.id,
-        0i32,
+        score,
         &crate::store::PendingDownload {
             torrent: torrent.clone(),
             release_override: None,
@@ -205,6 +206,43 @@ fn record_submitted_pending(
         }
     }
     Ok(())
+}
+
+enum SubmitFailure {
+    Conflict,
+    Downloader(downloader::DownloaderError),
+    Response(Response),
+}
+
+/// D-M5: any slot of `parsed` already owned or in flight for `subscribe`.
+fn slot_taken(state: &ApiState, subscribe: &domain::Subscribe, parsed: &Release) -> bool {
+    let store = state.store.lock();
+    let Ok(Some(media)) = store.get_media(subscribe.media_id) else {
+        return false;
+    };
+    let (Ok(facts), Ok(pending)) = (
+        store.load_library_subscribe_facts(subscribe, media.kind),
+        store.load_pending(subscribe.id),
+    ) else {
+        return false;
+    };
+    drop(store);
+    let releases = crate::worker::finish_search::pending_releases(&pending);
+    let facts = subscribe::facts_with_pending(facts, &releases, subscribe, &media);
+    subscribe::pending_slots(subscribe, parsed)
+        .iter()
+        .any(|(s, e)| facts.get(*s, *e).is_some())
+}
+
+/// D-M5: score the manual torrent with the subscription's filter (0 if rejected).
+fn filter_score(state: &ApiState, subscribe: &domain::Subscribe, torrent: &Torrent) -> i32 {
+    let Ok(Some(filter)) = state.store.lock().get_filter(subscribe.filter_id) else {
+        return 0;
+    };
+    filter::admit(vec![torrent.clone()], &filter)
+        .admitted
+        .first()
+        .map_or(0, |scored| scored.score)
 }
 
 fn build_submit_torrent(body: &SubmitInput) -> (Torrent, Release, Vec<Value>) {
@@ -248,6 +286,17 @@ pub(crate) async fn submit(
     axum::Extension(user_id): axum::Extension<Option<UserId>>,
     Json(body): Json<SubmitInput>,
 ) -> Response {
+    // H-1: manual submission writes pending rows.
+    if let Err(response) = state.require_writable() {
+        return response;
+    }
+    if body
+        .site_id
+        .as_deref()
+        .is_some_and(|id| domain::SiteId::from_str(id).is_err())
+    {
+        return err(StatusCode::BAD_REQUEST, "site.invalid", "站点 id 无效");
+    }
     let (torrent, parsed, units) = build_submit_torrent(&body);
     let explicit_id = match body
         .downloader_id
@@ -287,26 +336,72 @@ pub(crate) async fn submit(
     };
     let delivery_state = state.clone();
     let delivery_torrent = torrent.clone();
-    let add_result = tokio::task::spawn_blocking(move || {
+    let delivery_subscribe = subscribe.clone();
+    let delivery_parsed = parsed.clone();
+    let force = body.force;
+    let add_result = tokio::task::spawn_blocking(move || -> Result<(), SubmitFailure> {
+        let state = &delivery_state;
+        let torrent = &delivery_torrent;
+        // D-M5: serialize with the subscription's own search/Transfer.
+        let guard = delivery_subscribe
+            .as_ref()
+            .map(|sub| state.subscribe_guard(sub.id));
+        let _held = guard.as_ref().map(|g| g.lock());
+        let score = match &delivery_subscribe {
+            Some(sub) => {
+                if !force && slot_taken(state, sub, &delivery_parsed) {
+                    return Err(SubmitFailure::Conflict);
+                }
+                filter_score(state, sub, torrent)
+            }
+            None => 0,
+        };
         crate::delivery::submit_torrent_with_options(
-            &delivery_state,
-            &delivery_torrent,
+            state,
+            torrent,
             downloader_id,
             save_path.as_deref(),
         )
+        .map_err(SubmitFailure::Downloader)?;
+        if let Some(sub) = &delivery_subscribe {
+            if let Err(response) = record_submitted_pending(
+                state,
+                sub,
+                torrent,
+                downloader_id,
+                &delivery_parsed,
+                score,
+            ) {
+                // D-M5: undo the submission so no untracked task lingers.
+                if let Ok(client) = crate::delivery::client_for_id(state, downloader_id) {
+                    let _ = client.remove_owned(torrent, false);
+                }
+                return Err(SubmitFailure::Response(response));
+            }
+        }
+        Ok(())
     })
     .await
-    .unwrap_or_else(|e| Err(downloader::DownloaderError::Message(e.to_string())));
+    .unwrap_or_else(|e| {
+        Err(SubmitFailure::Downloader(
+            downloader::DownloaderError::Message(e.to_string()),
+        ))
+    });
 
+    let add_result = match add_result {
+        Err(SubmitFailure::Conflict) => {
+            return err(
+                StatusCode::CONFLICT,
+                "subscribe.slot_taken",
+                "该集已在库或正在下载；确认后可用 force=true 强制投递",
+            );
+        }
+        Err(SubmitFailure::Response(response)) => return response,
+        Err(SubmitFailure::Downloader(e)) => Err(e),
+        Ok(()) => Ok(()),
+    };
     match add_result {
         Ok(_) => {
-            if let Some(sub) = &subscribe {
-                if let Err(r) =
-                    record_submitted_pending(&state, sub, &torrent, downloader_id, &parsed)
-                {
-                    return r;
-                }
-            }
             if let Some(cat) = body.category.as_deref().filter(|c| !c.trim().is_empty()) {
                 let pref = json!({
                     "kind": if body.auto_route { "smart" } else if response_save_path.is_some() { "dir" } else { "default" },

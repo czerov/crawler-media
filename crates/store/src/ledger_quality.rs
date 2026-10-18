@@ -49,6 +49,7 @@ impl Store {
                     episode_to: None, resolution: stored.resolution, source: stored.source,
                     codec: stored.codec, hdr: stored.hdr, subtitle_language: None,
                     audio_language: None, group: None, confidence: row.confidence,
+                    season_inferred: false,
                 }
             },
             None => Release {
@@ -56,6 +57,7 @@ impl Store {
                 episode_to: None, resolution: None, source: None, codec: None, hdr: None,
                 subtitle_language: None, audio_language: None, group: None,
                 confidence: Confidence::High,
+                season_inferred: false,
             },
         };
         quality.season = row.season;

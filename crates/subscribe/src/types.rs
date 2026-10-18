@@ -40,6 +40,10 @@ pub struct RunInput<'a, D: Downloader + ?Sized> {
     pub naming: Option<&'a str>,
     /// 洗版替换时保留被替换文件（不删除），交由调用方决定去处（回收站）。
     pub preserve_removed: bool,
+    /// M1: how overlapping range packs and single episodes are resolved.
+    pub overlap: crate::choose::OverlapPolicy,
+    /// G-H2b: catalog season lengths for mapping absolute episode numbers.
+    pub absolute: Option<&'a crate::AbsoluteEpisodes>,
 }
 
 pub struct RunOutcome {
@@ -53,6 +57,12 @@ pub struct RunOutcome {
     pub completed: bool,
     /// Enclosures whose completed files were transferred into the Library.
     pub transferred_enclosures: Vec<String>,
+    /// Wash-cut arrivals whose actual (probed) quality vetoed the replacement
+    /// (H2). Persisted as `rejected` so automatic rounds never pick them again.
+    pub rejected_enclosures: Vec<String>,
+    /// Review N-1: wash-cut arrivals whose source could not be probed yet;
+    /// nothing was published. The API caps how long they may wait.
+    pub awaiting_probe_enclosures: Vec<String>,
     /// Failures that occurred while collecting a multi-file download. Successful
     /// files remain in the outcome so callers can persist them before retrying.
     pub collection_errors: Vec<String>,

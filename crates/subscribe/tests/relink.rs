@@ -103,6 +103,8 @@ fn transfer_once(
         hooks: None,
         naming: None,
         preserve_removed: false,
+        overlap: Default::default(),
+        absolute: None,
     };
     let added = Added {
         input,
@@ -120,10 +122,13 @@ fn transfer_once(
             removed_paths: vec![],
             completed: false,
             transferred_enclosures: vec![],
+            rejected_enclosures: Vec::new(),
+            awaiting_probe_enclosures: Vec::new(),
             collection_errors: vec![],
             submission_errors: vec![],
             torrents_added: vec![],
         },
+        broken: Vec::new(),
     };
     collect_completed(added, &Ffprobe::default()).unwrap()
 }

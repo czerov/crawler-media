@@ -81,6 +81,10 @@ pub fn core_titles_compatible(left: &Release, right: &Release) -> bool {
 /// 综合判定目标 Torrent 与下载器任务快照是否指向同一个种子：
 /// 1. 标题必须安全匹配（季集无冲突、年份无冲突、非 Sample 错配、电影核心片名无冲突）；
 /// 2. 体积若已知且大于 0，必须精确匹配。
+///
+/// # Warning (D-L3)
+/// Inferred match for display only; destructive operations must not rely on
+/// it (see `names_match`).
 pub fn torrent_matches_snapshot(
     title: &str,
     size_bytes: Option<u64>,

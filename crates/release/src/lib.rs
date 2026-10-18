@@ -93,6 +93,7 @@ pub fn parse(raw: &str) -> Release {
         audio_language,
         group,
         confidence,
+        season_inferred: season.is_some() && !has_explicit_season(clean_raw),
     };
     tracing::debug!(
         raw = %raw,
@@ -106,6 +107,21 @@ pub fn parse(raw: &str) -> Release {
         "解析发布名"
     );
     release
+}
+
+/// True when `raw` names a season itself (`S01`, `S1E02`, `Season 2`, `第二季`).
+pub fn has_explicit_season(raw: &str) -> bool {
+    if raw.contains('季') {
+        return true;
+    }
+    let upper = raw.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    (0..bytes.len()).any(|i| {
+        let at_word = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        at_word
+            && bytes[i] == b'S'
+            && (bytes.get(i + 1).is_some_and(u8::is_ascii_digit) || upper[i..].starts_with("SEASON"))
+    })
 }
 
 fn tokenize(raw: &str) -> Vec<String> {
@@ -299,5 +315,19 @@ fn parse_ep_numbers(ep_part: &str) -> (Option<u32>, Option<u32>) {
             )
         }
         _ => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod season_inferred_tests {
+    #[test]
+    fn missing_season_marker_is_flagged_as_inferred() {
+        let r = super::parse("Show Episode 13 1080p WEB-DL");
+        assert_eq!((r.season, r.episode, r.season_inferred), (Some(1), Some(13), true));
+        assert!(super::parse("Show E05 1080p").season_inferred);
+        assert!(!super::parse("Show.S01E05.1080p").season_inferred);
+        assert!(!super::parse("Show Season 2 Episode 3").season_inferred);
+        assert!(!super::parse("剧名 第二季 第03集").season_inferred);
+        assert!(!super::parse("Movie.2020.1080p").season_inferred);
     }
 }

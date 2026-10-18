@@ -59,7 +59,10 @@ mod debug_tests {
             password: None,
             path_maps: Vec::new(),
         };
-        assert!(format!("{anonymous:?}").contains("None"), "未配置口令应可诊断");
+        assert!(
+            format!("{anonymous:?}").contains("None"),
+            "未配置口令应可诊断"
+        );
     }
 }
 
@@ -71,6 +74,49 @@ pub struct TransmissionDownloader {
 }
 
 impl TransmissionDownloader {
+    fn claim_duplicate(&self, hash: &str, torrent: &Torrent) -> Result<(), DownloaderError> {
+        let got = self.rpc(
+            "torrent-get",
+            json!({ "ids": [hash], "fields": ["labels"] }),
+        )?;
+        let mut labels: Vec<String> = got["torrents"][0]["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        for wanted in [
+            crate::TASK_TAG.to_string(),
+            crate::ownership_tag(&torrent.enclosure),
+            crate::CLAIMED_TAG.to_string(),
+        ] {
+            if !labels.contains(&wanted) {
+                labels.push(wanted);
+            }
+        }
+        self.rpc("torrent-set", json!({ "ids": [hash], "labels": labels }))?;
+        tracing::info!(torrent = %torrent.title, %hash, "Transmission 已有同 hash 任务，补打标签认领");
+        Ok(())
+    }
+
+    /// Review H-3: the task carries `CLAIMED_TAG` (unknown counts as claimed).
+    fn hash_claimed(&self, hash: &str) -> bool {
+        match self.rpc(
+            "torrent-get",
+            json!({ "ids": [hash], "fields": ["labels"] }),
+        ) {
+            Ok(got) => got["torrents"][0]["labels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|v| v.as_str() == Some(crate::CLAIMED_TAG)),
+            Err(error) => {
+                tracing::warn!(%hash, %error, "无法确认任务是否为认领的用户任务，按认领处理（不删文件）");
+                true
+            }
+        }
+    }
+
     pub fn connect(config: TransmissionConfig) -> Result<Self, DownloaderError> {
         tracing::debug!(url = %config.url, "正在连接 Transmission RPC");
         let mut dl = Self {
@@ -219,6 +265,16 @@ impl TransmissionDownloader {
 }
 
 impl Downloader for TransmissionDownloader {
+    fn remember_identity(&self, torrent: &Torrent, hash: &str) -> Result<(), DownloaderError> {
+        if let Some(hash) = crate::owned::normalize_hash(hash) {
+            self.identities
+                .lock()
+                .entry(torrent.enclosure.clone())
+                .or_insert(hash);
+        }
+        Ok(())
+    }
+
     fn add(&self, torrent: &Torrent) -> Result<(), DownloaderError> {
         self.add_resolved(torrent, &torrent.enclosure)
     }
@@ -246,6 +302,13 @@ impl Downloader for TransmissionDownloader {
             tracing::error!(torrent = %torrent.title, error = %e, "添加种子到 Transmission 失败");
             e
         })?;
+        // D-H2: a duplicate (e.g. added by hand) keeps its old labels; add ours
+        // so ownership survives restarts. Existing labels are preserved.
+        if self.labels_supported {
+            if let Some(hash) = added["torrent-duplicate"]["hashString"].as_str() {
+                self.claim_duplicate(hash, torrent)?;
+            }
+        }
         for field in ["torrent-added", "torrent-duplicate"] {
             if let Some(hash) = added[field]["hashString"]
                 .as_str()
@@ -273,11 +336,81 @@ impl Downloader for TransmissionDownloader {
         self.labeled_hash(torrent)
     }
 
+    fn select_files(
+        &self,
+        torrent: &Torrent,
+        keep: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<usize>, DownloaderError> {
+        let Some(hash) = self.owned_identity(torrent)? else {
+            return Ok(None);
+        };
+        let arguments = self.rpc(
+            "torrent-get",
+            json!({ "ids": [hash.clone()], "fields": ["id", "hashString", "files"] }),
+        )?;
+        let Some(item) = arguments
+            .get("torrents")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("hashString")
+                        .and_then(Value::as_str)
+                        .is_some_and(|h| h.eq_ignore_ascii_case(&hash))
+                })
+            })
+        else {
+            return Ok(None);
+        };
+        let Some(listed) = item
+            .get("files")
+            .and_then(Value::as_array)
+            .filter(|files| !files.is_empty())
+        else {
+            return Ok(None); // metadata not received yet
+        };
+        let names = listed
+            .iter()
+            .map(|file| file.get("name").and_then(Value::as_str).unwrap_or(""));
+        if crate::selection_drops_all_videos(names, keep) {
+            tracing::warn!(hash = %hash, "选择性下载会跳过全部视频文件，放弃筛选、整包下载");
+            return Ok(Some(0));
+        }
+        let skipped: Vec<usize> = Some(listed)
+            .map(|files| {
+                files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, file)| {
+                        !keep(file.get("name").and_then(Value::as_str).unwrap_or(""))
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if skipped.is_empty() {
+            return Ok(Some(0));
+        }
+        let id = item.get("id").cloned().unwrap_or(Value::Null);
+        tracing::info!(hash = %hash, count = skipped.len(), "Transmission 跳过不需要的文件");
+        self.rpc(
+            "torrent-set",
+            json!({ "ids": [id], "files-unwanted": skipped }),
+        )?;
+        Ok(Some(skipped.len()))
+    }
+
     fn endpoint(&self) -> Option<String> {
         Some(format!(
             "transmission|{}",
             self.config.url.trim_end_matches('/')
         ))
+    }
+
+    fn is_claimed(&self, torrent: &Torrent) -> Result<bool, DownloaderError> {
+        Ok(match self.owned_identity(torrent)? {
+            Some(hash) => self.hash_claimed(&hash),
+            None => false,
+        })
     }
 
     fn remove_owned(&self, torrent: &Torrent, delete_files: bool) -> Result<(), DownloaderError> {
@@ -290,6 +423,7 @@ impl Downloader for TransmissionDownloader {
         else {
             return Ok(());
         };
+        let delete_files = delete_files && !self.hash_claimed(&hash);
         tracing::info!(torrent = %torrent.title, hash = %hash, delete_files, "从 Transmission 移除已证实归属的种子");
         self.rpc(
             "torrent-remove",
@@ -299,6 +433,7 @@ impl Downloader for TransmissionDownloader {
     }
 
     fn delete_task(&self, info_hash: &str, delete_files: bool) -> Result<(), DownloaderError> {
+        let delete_files = delete_files && !self.hash_claimed(info_hash);
         tracing::info!(hash = %info_hash, delete_files, "从 Transmission 按已证实哈希删除任务");
         self.rpc(
             "torrent-remove",
@@ -320,6 +455,14 @@ impl Downloader for TransmissionDownloader {
     }
 
     fn completed_files(&self, torrent: &Torrent) -> Result<Vec<PathBuf>, DownloaderError> {
+        let (files, done) = self.collectable_files(torrent)?;
+        Ok(if done { files } else { Vec::new() })
+    }
+
+    fn collectable_files(
+        &self,
+        torrent: &Torrent,
+    ) -> Result<(Vec<PathBuf>, bool), DownloaderError> {
         let arguments = self.rpc(
             "torrent-get",
             json!({
@@ -332,7 +475,7 @@ impl Downloader for TransmissionDownloader {
             .and_then(Value::as_array)
             .unwrap_or(&empty);
         let Some(owned_hash) = self.owned_identity(torrent)? else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         };
         let matched: Vec<&Value> = torrents
             .iter()
@@ -343,7 +486,7 @@ impl Downloader for TransmissionDownloader {
             })
             .collect();
         if matched.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         if matched.len() > 1 {
             tracing::error!(torrent = %torrent.title, matched_count = matched.len(), "匹配到多个任务存在歧义，拒绝收集文件");
@@ -352,17 +495,15 @@ impl Downloader for TransmissionDownloader {
             ));
         }
         let target_item = matched[0];
-        if target_item
+        // percentDone covers the wanted files only.
+        let done = target_item
             .get("percentDone")
             .and_then(Value::as_f64)
             .unwrap_or(0.0)
-            < 1.0
-        {
-            return Ok(Vec::new());
-        }
+            >= 1.0;
         let mut files = Vec::new();
         extract_item_files(target_item, &self.config.path_maps, &mut files);
-        Ok(files)
+        Ok((files, done))
     }
 
     fn task_snapshots(&self) -> Result<Vec<crate::TaskSnapshot>, DownloaderError> {
@@ -411,6 +552,13 @@ impl Downloader for TransmissionDownloader {
                 .find(|label| *label == crate::TASK_TAG || label.starts_with("crawler-media-"))
                 .unwrap_or("")
                 .to_string();
+            let owned_tags = crate::owned_tags_from(
+                item["labels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            );
             let progress = item
                 .get("percentDone")
                 .and_then(Value::as_f64)
@@ -449,6 +597,7 @@ impl Downloader for TransmissionDownloader {
                 uploaded_bytes,
                 state,
                 tag,
+                owned_tags,
             });
         }
         Ok(snapshots)

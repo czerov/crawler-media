@@ -14,6 +14,7 @@ struct Capture {
     methods: Mutex<Vec<String>>,
     requests: Mutex<Vec<String>>,
     injected_torrents: Mutex<Option<String>>,
+    injected_add: Mutex<Option<String>>,
 }
 
 impl Capture {
@@ -22,6 +23,7 @@ impl Capture {
             methods: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
             injected_torrents: Mutex::new(None),
+            injected_add: Mutex::new(None),
         })
     }
 }
@@ -90,18 +92,25 @@ fn serve(capture: Arc<Capture>, save_path: String) -> String {
                 "torrent-get"
             } else if req.contains("torrent-remove") {
                 "torrent-remove"
+            } else if req.contains("torrent-set") {
+                "torrent-set"
             } else {
                 "unknown"
             };
             capture.methods.lock().push(method.into());
-            if method == "torrent-add" || method == "torrent-remove" {
+            if method == "torrent-add" || method == "torrent-remove" || method == "torrent-set" {
                 capture.requests.lock().push(req.clone());
             }
             let body = match method {
                 "session-get" => {
                     r#"{"result":"success","arguments":{"rpc-version":16}}"#.to_string()
                 }
-                "torrent-add" => r#"{"result":"success","arguments":{}}"#.to_string(),
+                "torrent-add" => capture
+                    .injected_add
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| r#"{"result":"success","arguments":{}}"#.to_string()),
+                "torrent-set" => r#"{"result":"success","arguments":{}}"#.to_string(),
                 "torrent-get" => {
                     let injected = capture.injected_torrents.lock().clone();
                     if let Some(custom) = injected {
@@ -167,6 +176,34 @@ fn transmission_snapshots_preserve_metrics_and_only_mark_owned_tasks() {
     assert_eq!(rows[1].state, "pausedUP");
     assert_eq!(rows[2].tag, "crawler-media-old");
     assert_eq!(rows[2].state, "uploading");
+}
+
+#[test]
+fn transmission_snapshots_expose_per_torrent_ownership_labels() {
+    let owned = downloader::ownership_tag("https://pt.example/download.php?id=7");
+    let capture = Capture::new();
+    *capture.injected_torrents.lock() = Some(
+        serde_json::json!({
+            "result": "success", "arguments": {"torrents": [
+                {"name": "owned", "hashString": "abc", "status": 4,
+                 "labels": [downloader::TASK_TAG, owned]},
+                {"name": "generic-only", "hashString": "def", "status": 4,
+                 "labels": [downloader::TASK_TAG]}
+            ]}
+        })
+        .to_string(),
+    );
+    let dl = TransmissionDownloader::connect(TransmissionConfig {
+        url: serve(capture, "/downloads".into()),
+        username: None,
+        password: None,
+        path_maps: vec![],
+    })
+    .unwrap();
+    let rows = dl.task_snapshots().unwrap();
+    assert_eq!(rows[0].tag, downloader::TASK_TAG);
+    assert_eq!(rows[0].owned_tags, vec![owned]);
+    assert!(rows[1].owned_tags.is_empty());
 }
 
 #[test]
@@ -601,4 +638,28 @@ fn transmission_completed_files_skips_deselected_or_incomplete_files() {
     let completed = dl.completed_files(&t).unwrap();
     assert_eq!(completed.len(), 1, "只应返回已完成且勾选的文件");
     assert_eq!(completed[0].to_str().unwrap(), "/downloads/Episode1.mkv");
+}
+
+/// D-H2: a duplicate task (added by hand) is claimed by merging our labels.
+#[test]
+fn transmission_duplicate_is_claimed_with_merged_labels() {
+    let capture = Capture::new();
+    *capture.injected_add.lock() = Some(
+        r#"{"result":"success","arguments":{"torrent-duplicate":{"hashString":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7}}}"#.into(),
+    );
+    *capture.injected_torrents.lock() = Some(
+        r#"{"result":"success","arguments":{"torrents":[{"id":7,"hashString":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","labels":["mine"]}]}}"#.into(),
+    );
+    let dl = TransmissionDownloader::connect(TransmissionConfig {
+        url: serve(capture.clone(), "/downloads".into()),
+        username: None,
+        password: None,
+        path_maps: vec![],
+    })
+    .unwrap();
+    dl.add(&torrent()).unwrap();
+    let requests = capture.requests.lock();
+    let set = requests.iter().find(|r| r.contains("torrent-set")).expect("torrent-set sent");
+    let owned = downloader::ownership_tag(&torrent().enclosure);
+    assert!(set.contains("mine") && set.contains(downloader::TASK_TAG) && set.contains(&owned), "{set}");
 }

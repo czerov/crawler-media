@@ -6,7 +6,9 @@ mod memory;
 mod path_map;
 mod pool;
 mod qbit;
+mod torrent_file;
 mod transmission;
+pub use torrent_file::torrent_info_hash;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,10 +31,19 @@ pub enum DownloaderError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Message(String),
+    /// G-M2: an owned task for this enclosure exists but is unusable
+    /// (`error` / `missingFiles`); callers must switch source.
+    #[error("existing downloader task {0} is broken")]
+    ExistingTaskBroken(String),
 }
 
 pub trait Downloader: Send + Sync {
     fn add(&self, torrent: &Torrent) -> Result<(), DownloaderError>;
+    /// D-M3: re-teach a client the info hash persisted for `torrent` (e.g.
+    /// after a restart). Clients that identify tasks by tags ignore it.
+    fn remember_identity(&self, _torrent: &Torrent, _hash: &str) -> Result<(), DownloaderError> {
+        Ok(())
+    }
     /// Add a torrent to an explicit downloader-side directory. Existing
     /// implementations remain source-compatible; unsupported clients reject
     /// an explicit directory instead of silently ignoring the user's choice.
@@ -62,6 +73,23 @@ pub trait Downloader: Send + Sync {
     }
     fn completed_files(&self, torrent: &Torrent) -> Result<Vec<PathBuf>, DownloaderError>;
 
+    /// Review H-3: whether the task for `torrent` is a claimed user task.
+    fn is_claimed(&self, _torrent: &Torrent) -> Result<bool, DownloaderError> {
+        Ok(false)
+    }
+
+    /// D-L1: files finished so far (even while other files of the task are
+    /// still downloading) and whether the task's wanted files are all done.
+    /// The default keeps the whole-task behaviour of `completed_files`.
+    fn collectable_files(
+        &self,
+        torrent: &Torrent,
+    ) -> Result<(Vec<PathBuf>, bool), DownloaderError> {
+        let files = self.completed_files(torrent)?;
+        let done = !files.is_empty();
+        Ok((files, done))
+    }
+
     /// Uploaded bytes for torrents in a category (boost/刷流 stats).
     /// Downloaders without upload telemetry return 0.
     fn uploaded_by_category(&self, _category: &str) -> Result<u64, DownloaderError> {
@@ -82,6 +110,18 @@ pub trait Downloader: Send + Sync {
         Err(DownloaderError::Message(
             "exact owned removal unsupported; refusing unsafe cleanup".into(),
         ))
+    }
+
+    /// F-1: mark files for which `keep(name)` is false as not-to-download.
+    /// Returns how many files were skipped, or `None` when the task or its
+    /// file list (magnet metadata) is not known yet, or the client cannot
+    /// select files.
+    fn select_files(
+        &self,
+        _torrent: &Torrent,
+        _keep: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<usize>, DownloaderError> {
+        Ok(None)
     }
 
     /// Canonical actual task identity, not a title-derived snapshot match.
@@ -171,7 +211,23 @@ pub struct TaskSnapshot {
     pub download_speed: u64,
     pub upload_speed: u64,
     pub info_hash: String,
+    /// Every per-torrent ownership tag (`crawler-media-owned-<sha256>`) the
+    /// client reports for this task. `tag` only carries the generic marker, so
+    /// HTTP-enclosure identity must be proven through this list.
+    pub owned_tags: Vec<String>,
 }
+
+/// Collect `crawler-media-owned-*` ownership tags from client tag/label values.
+pub fn owned_tags_from<'a>(tags: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    tags.into_iter()
+        .map(str::trim)
+        .filter(|tag| tag.starts_with(OWNED_TAG_PREFIX))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Prefix of [`ownership_tag`] values.
+pub const OWNED_TAG_PREFIX: &str = "crawler-media-owned-";
 
 /// The one tag every crawler-media delivery carries inside a download client.
 ///
@@ -181,6 +237,11 @@ pub struct TaskSnapshot {
 /// our Torrent and a client-side task is established by exact normalized title
 /// + size ([`normalize_name`] / [`names_match`] / [`size_matches`]).
 pub const TASK_TAG: &str = "crawler-media";
+
+/// Review H-3: extra tag/label on a user's existing task that we claimed
+/// (same info hash). Its data belongs to the user: never delete its files
+/// and never Move them out of the download directory.
+pub const CLAIMED_TAG: &str = "crawler-media-claimed";
 
 /// 归一化标题（保留字母数字及中文字符、小写），用于跨客户端匹配任务。
 pub fn normalize_name(value: &str) -> String {
@@ -192,6 +253,12 @@ pub fn normalize_name(value: &str) -> String {
 }
 
 /// 标题宽松匹配（双向包含，或分词显著重合）。
+///
+/// # Warning (D-L3)
+/// This is a loose, display-only heuristic: unrelated tasks with similar
+/// titles match. Never use it to choose a task to remove, pause, claim or
+/// delete files of; destructive paths must use ownership tags / info hash.
+/// `api/tests/subscription_e2e/d_l3_loose_match_audit.rs` audits call sites.
 pub fn names_match(client_name: &str, want: &str) -> bool {
     let got = normalize_name(client_name);
     let want_norm = normalize_name(want);
@@ -271,6 +338,17 @@ pub(crate) fn size_matches(got: u64, want: Option<u64>) -> bool {
 }
 
 #[cfg(test)]
+mod owned_tag_tests {
+    #[test]
+    fn owned_tags_are_collected_and_generic_tags_ignored() {
+        let owned = super::ownership_tag("https://pt.example/a");
+        let raw = format!("other, crawler-media ,{owned}, crawler-media-legacy");
+        assert_eq!(super::owned_tags_from(raw.split(',')), vec![owned]);
+        assert!(super::owned_tags_from(["crawler-media", ""]).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod match_tests {
     use super::torrent_matches_snapshot;
 
@@ -318,4 +396,20 @@ pub fn parse_path_maps(raw: &str) -> Vec<PathMap> {
             Some(PathMap::new(from, to))
         })
         .collect()
+}
+
+/// Review H-2: selection must never deselect every video of a task. Returns
+/// true when `names` has video files but `keep` would keep none of them.
+pub(crate) fn selection_drops_all_videos<'a>(
+    mut names: impl Iterator<Item = &'a str> + Clone,
+    keep: &dyn Fn(&str) -> bool,
+) -> bool {
+    const VIDEO: [&str; 10] = [
+        "mkv", "mp4", "avi", "ts", "m2ts", "wmv", "mov", "rmvb", "flv", "webm",
+    ];
+    let is_video = |name: &str| {
+        name.rsplit_once('.')
+            .is_some_and(|(_, ext)| VIDEO.contains(&ext.to_ascii_lowercase().as_str()))
+    };
+    names.clone().any(is_video) && !names.any(|name| is_video(name) && keep(name))
 }

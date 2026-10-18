@@ -161,13 +161,40 @@ fn load_catalog_sources(
     sources
 }
 
-fn spawn_background_services(state: &ApiState, address: SocketAddr) {
+fn spawn_background_services(
+    state: &ApiState,
+    address: SocketAddr,
+) -> api::job_loop::JobLoopHandle {
     tokio::spawn(api::ssdp::run(
         address.port(),
         state.jellyfin_server_id().to_string(),
     ));
-    let _jobs = spawn_job_loop(state.clone());
+    let jobs = spawn_job_loop(state.clone());
     api::spawn_fs_watcher(state.clone());
+    jobs
+}
+
+/// Review N-2: resolve on SIGTERM (docker stop/restart) or SIGINT (Ctrl-C).
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = interrupt => {}
+        _ = terminate => {}
+    }
+    tracing::info!("收到退出信号，停止后台任务并释放实例锁");
 }
 
 fn create_api_state(
@@ -256,9 +283,31 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     println!("crawler-media 已监听 http://{address}");
 
-    spawn_background_services(&state, address);
+    let jobs = spawn_background_services(&state, address);
 
     let app = api::ui::attach_ui(router(state), config.ui_dir.clone());
-    axum::serve(listener, app).await?;
+    // Graceful shutdown waits for open connections (SSE streams can stay
+    // open); give them 10 s after the signal, then stop anyway.
+    let (signalled_tx, signalled_rx) = tokio::sync::watch::channel(false);
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = signalled_tx.send(true);
+    });
+    let grace = async move {
+        let mut rx = signalled_rx;
+        let _ = rx.wait_for(|signalled| *signalled).await;
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    };
+    tokio::select! {
+        result = serve => result?,
+        _ = grace => tracing::warn!("连接未在 10 秒内关闭，强制退出"),
+    }
+    // Review N-2: stopping the job loop drops its instance lease, which
+    // deletes the lock row, so an immediate restart is writable.
+    if let Err(error) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), jobs.shutdown()).await
+    {
+        tracing::warn!(%error, "停止后台任务超时");
+    }
     Ok(())
 }

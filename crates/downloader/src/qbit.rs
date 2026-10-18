@@ -57,11 +57,24 @@ mod debug_tests {
 
 pub struct QbitDownloader {
     config: QbitConfig,
-    cookie: String,
+    /// Session cookie; refreshed by [`Self::relogin`] when the SID expires (D-H1).
+    cookie: parking_lot::Mutex<String>,
+    /// Serialises re-logins so concurrent 403s trigger a single login.
+    login_lock: parking_lot::Mutex<()>,
 }
 
 impl QbitDownloader {
     pub fn connect(config: QbitConfig) -> Result<Self, DownloaderError> {
+        let cookie = Self::login(&config)?;
+        tracing::info!(url = %config.url, user = %config.username, "qBittorrent 连接成功");
+        Ok(Self {
+            config,
+            cookie: parking_lot::Mutex::new(cookie),
+            login_lock: parking_lot::Mutex::new(()),
+        })
+    }
+
+    fn login(config: &QbitConfig) -> Result<String, DownloaderError> {
         let body = format!(
             "username={}&password={}",
             form_enc(&config.username),
@@ -92,8 +105,45 @@ impl QbitDownloader {
                 "qBittorrent login produced no cookie".into(),
             ));
         }
-        tracing::info!(url = %config.url, user = %config.username, "qBittorrent 连接成功");
-        Ok(Self { config, cookie })
+        Ok(cookie)
+    }
+
+    fn cookie(&self) -> String {
+        self.cookie.lock().clone()
+    }
+
+    /// Log in again unless another thread already refreshed the cookie
+    /// since `stale` was used.
+    fn relogin(&self, stale: &str) -> Result<(), DownloaderError> {
+        let _serial = self.login_lock.lock();
+        if *self.cookie.lock() != stale {
+            return Ok(());
+        }
+        tracing::warn!(url = %self.config.url, "qBittorrent 会话失效（403），重新登录");
+        let fresh = Self::login(&self.config)?;
+        *self.cookie.lock() = fresh;
+        Ok(())
+    }
+
+    /// Run an authenticated request; on 403 re-login once and retry (D-H1).
+    /// A second 403 is reported as an authentication error, never retried again.
+    fn authed<T>(&self, op: impl Fn(&str) -> Result<T, ureq::Error>) -> Result<T, DownloaderError> {
+        let cookie = self.cookie();
+        match op(&cookie) {
+            Err(ureq::Error::StatusCode(403)) => {
+                self.relogin(&cookie)?;
+                match op(&self.cookie()) {
+                    Err(ureq::Error::StatusCode(403)) => {
+                        tracing::error!(url = %self.config.url, "qBittorrent 重新登录后仍返回 403，认证失败");
+                        Err(DownloaderError::Message(
+                            "qBittorrent authentication failed (403 after re-login)".into(),
+                        ))
+                    }
+                    other => other.map_err(http_err),
+                }
+            }
+            other => other.map_err(http_err),
+        }
     }
 }
 
@@ -112,8 +162,12 @@ impl Downloader for QbitDownloader {
         download_url: &str,
         save_path: Option<&str>,
     ) -> Result<(), DownloaderError> {
-        if self.exact_existing_hash(torrent)?.is_some() {
-            return Ok(());
+        if let Some(info) = self.owned_info(torrent)? {
+            return match existing_task_health(&info.state, info.progress) {
+                ExistingHealth::Broken => Err(DownloaderError::ExistingTaskBroken(info.hash)),
+                ExistingHealth::Paused => self.resume_task(&info.hash),
+                ExistingHealth::Usable => Ok(()),
+            };
         }
         let tag = format!(
             "{},{}",
@@ -121,18 +175,17 @@ impl Downloader for QbitDownloader {
             crate::ownership_tag(&torrent.enclosure)
         );
         const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-        let mut form = ureq::unversioned::multipart::Form::new()
-            .text("paused", "false")
-            .text("stopped", "false")
-            .text("tags", tag.as_str());
-        if let Some(save_path) = save_path.filter(|path| !path.trim().is_empty()) {
-            form = form.text("savepath", save_path);
-        }
         let mut temp_path = None;
         let mut fallback_url = true;
         if download_url.starts_with("http://") || download_url.starts_with("https://") {
             if let Ok(bytes) = self.download_torrent_bytes(download_url, UA) {
-                if bytes.len() >= 8 {
+                // D-M4: only a bencoded dictionary with an `info` key is a
+                // torrent; an HTML login page / error body is not uploaded.
+                let valid = crate::torrent_info_hash(&bytes).is_some();
+                if !valid {
+                    tracing::warn!(torrent = %torrent.title, bytes = bytes.len(), "种子链接返回的不是 .torrent（可能站点 Cookie 失效），不上传");
+                }
+                if valid {
                     static NONCE: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -141,6 +194,14 @@ impl Downloader for QbitDownloader {
                         std::process::id(),
                         tag
                     ));
+                    // D-H2: a task with the same info hash may already exist
+                    // without our tags (added by hand). Claim it instead of
+                    // failing every round with qBittorrent's `Fails.`.
+                    if let Some(hash) = crate::torrent_info_hash(&bytes) {
+                        if self.claim_existing(&hash, &tag, &torrent.title)? {
+                            return Ok(());
+                        }
+                    }
                     if std::fs::write(&temp, &bytes).is_ok() {
                         temp_path = Some(temp);
                         fallback_url = false;
@@ -148,22 +209,39 @@ impl Downloader for QbitDownloader {
                 }
             }
         }
-        if let Some(ref path) = temp_path {
-            if let Ok(part) = ureq::unversioned::multipart::Part::file(path) {
-                form = form.part("torrents", part.file_name("download.torrent"));
-            }
-        } else if fallback_url {
-            if download_url != torrent.enclosure {
-                return Err(DownloaderError::Message(
-                    "failed to fetch resolved Torrent before the signed URL expired".into(),
-                ));
-            }
-            form = form.text("urls", download_url);
+        if temp_path.is_none() && fallback_url && download_url != torrent.enclosure {
+            return Err(DownloaderError::Message(
+                "failed to fetch resolved Torrent before the signed URL expired (站点 Cookie 失效或链接未返回 .torrent)".into(),
+            ));
         }
-        if let Some(category) = &self.config.category {
-            form = form.text("category", category);
+        // The multipart form is consumed per request, so rebuild it for a
+        // retry after re-login.
+        let build_form = || {
+            let mut form = ureq::unversioned::multipart::Form::new()
+                .text("paused", "false")
+                .text("stopped", "false")
+                .text("tags", tag.as_str());
+            if let Some(save_path) = save_path.filter(|path| !path.trim().is_empty()) {
+                form = form.text("savepath", save_path);
+            }
+            if let Some(ref path) = temp_path {
+                if let Ok(part) = ureq::unversioned::multipart::Part::file(path) {
+                    form = form.part("torrents", part.file_name("download.torrent"));
+                }
+            } else if fallback_url {
+                form = form.text("urls", download_url);
+            }
+            if let Some(category) = &self.config.category {
+                form = form.text("category", category);
+            }
+            form
+        };
+        let result = self.post_add_form(&build_form, &torrent.title, &tag);
+        // D-M4: never leave the staged .torrent behind.
+        if let Some(path) = &temp_path {
+            let _ = std::fs::remove_file(path);
         }
-        self.post_add_form(form, &torrent.title, &tag)
+        result
     }
 
     fn uploaded_by_category(&self, category: &str) -> Result<u64, DownloaderError> {
@@ -180,6 +258,13 @@ impl Downloader for QbitDownloader {
 
     fn remove(&self, torrent: &Torrent, delete_files: bool) -> Result<(), DownloaderError> {
         self.remove_owned(torrent, delete_files)
+    }
+
+    fn is_claimed(&self, torrent: &Torrent) -> Result<bool, DownloaderError> {
+        Ok(match self.exact_existing_hash(torrent)? {
+            Some(hash) => self.hash_claimed(&hash),
+            None => false,
+        })
     }
 
     fn owned_identity(&self, torrent: &Torrent) -> Result<Option<String>, DownloaderError> {
@@ -202,6 +287,7 @@ impl Downloader for QbitDownloader {
         else {
             return Ok(());
         };
+        let delete_files = delete_files && !self.hash_claimed(&hash);
         tracing::info!(torrent = %torrent.title, hash = %hash, delete_files = %delete_files, "从 qBittorrent 移除已证实归属的种子");
         let url = join(&self.config.url, "/api/v2/torrents/delete");
         let body = format!("hashes={}&deleteFiles={}", form_enc(&hash), delete_files);
@@ -213,26 +299,86 @@ impl Downloader for QbitDownloader {
         let Some(info) = self.owned_info(torrent)? else {
             return Ok(Vec::new());
         };
-        if info.progress < 1.0 {
+        let listed = self.torrent_files(&info.hash)?;
+        // F-1: skipped (priority 0) files never complete; the task is done once
+        // every wanted file is.
+        let wanted_done = listed.iter().any(|file| file.priority > 0)
+            && listed
+                .iter()
+                .filter(|file| file.priority > 0)
+                .all(|file| file.progress >= 1.0);
+        if info.progress < 1.0 && !wanted_done {
             return Ok(Vec::new());
         }
-        let files_url = format!(
-            "{}?hash={}",
-            join(&self.config.url, "/api/v2/torrents/files"),
-            form_enc(&info.hash)
-        );
-        let file_body = self.get(&files_url)?;
-        let listed: Vec<TorrentFile> = serde_json::from_str(&file_body)
-            .map_err(|err| DownloaderError::Message(err.to_string()))?;
         Ok(listed
             .into_iter()
-            .filter(|file| file.progress >= 1.0)
+            .filter(|file| file.priority > 0 && file.progress >= 1.0)
             .map(|file| Path::new(&info.save_path).join(file.name))
             .map(|path| apply_maps(&path, &self.config.path_maps))
             .collect())
     }
 
+    fn collectable_files(
+        &self,
+        torrent: &Torrent,
+    ) -> Result<(Vec<PathBuf>, bool), DownloaderError> {
+        let Some(info) = self.owned_info(torrent)? else {
+            return Ok((Vec::new(), false));
+        };
+        let listed = self.torrent_files(&info.hash)?;
+        let wanted_done = listed.iter().any(|file| file.priority > 0)
+            && listed
+                .iter()
+                .filter(|file| file.priority > 0)
+                .all(|file| file.progress >= 1.0);
+        let done = info.progress >= 1.0 || wanted_done;
+        let files = listed
+            .into_iter()
+            .filter(|file| file.priority > 0 && file.progress >= 1.0)
+            .map(|file| Path::new(&info.save_path).join(file.name))
+            .map(|path| apply_maps(&path, &self.config.path_maps))
+            .collect();
+        Ok((files, done))
+    }
+
+    fn select_files(
+        &self,
+        torrent: &Torrent,
+        keep: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<usize>, DownloaderError> {
+        let Some(hash) = self.exact_existing_hash(torrent)? else {
+            return Ok(None);
+        };
+        let files = self.torrent_files(&hash)?;
+        if files.is_empty() {
+            return Ok(None); // metadata not received yet
+        }
+        if crate::selection_drops_all_videos(files.iter().map(|f| f.name.as_str()), keep) {
+            tracing::warn!(hash = %hash, "选择性下载会跳过全部视频文件，放弃筛选、整包下载");
+            return Ok(Some(0));
+        }
+        let skipped: Vec<String> = files
+            .into_iter()
+            .enumerate()
+            .filter(|(_, file)| !keep(&file.name))
+            .map(|(i, file)| file.index.unwrap_or(i).to_string())
+            .collect();
+        if skipped.is_empty() {
+            return Ok(Some(0));
+        }
+        tracing::info!(hash = %hash, count = skipped.len(), "qBittorrent 跳过不需要的文件");
+        let url = join(&self.config.url, "/api/v2/torrents/filePrio");
+        let body = format!(
+            "hash={}&id={}&priority=0",
+            form_enc(&hash),
+            form_enc(&skipped.join("|"))
+        );
+        let _ = self.post_form(&url, &body)?;
+        Ok(Some(skipped.len()))
+    }
+
     fn delete_task(&self, info_hash: &str, delete_files: bool) -> Result<(), DownloaderError> {
+        let delete_files = delete_files && !self.hash_claimed(info_hash);
         tracing::info!(hash = %info_hash, delete_files, "从 qBittorrent 删除任务");
         let url = join(&self.config.url, "/api/v2/torrents/delete");
         let body = format!(
@@ -288,14 +434,15 @@ impl Downloader for QbitDownloader {
                 download_limit, upload_limit
             ))
         );
-        let response = agent_for_url(&self.config.url, true)
-            .post(&url)
-            .header("Referer", &self.config.url)
-            .header("Origin", self.config.url.trim_end_matches('/'))
-            .header("Cookie", &self.cookie)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send(&payload)
-            .map_err(http_err)?;
+        let response = self.authed(|cookie| {
+            agent_for_url(&self.config.url, true)
+                .post(&url)
+                .header("Referer", &self.config.url)
+                .header("Origin", self.config.url.trim_end_matches('/'))
+                .header("Cookie", cookie)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .send(&payload)
+        })?;
         let _ = read_body(response)?;
         Ok(())
     }
@@ -314,7 +461,9 @@ impl Downloader for QbitDownloader {
             .into_iter()
             .map(|info| {
                 let tag = our_tag(&info.tags);
+                let owned_tags = crate::owned_tags_from(info.tags.split(','));
                 crate::TaskSnapshot {
+                    owned_tags,
                     tag,
                     name: info.name,
                     progress: info.progress,
@@ -332,13 +481,73 @@ impl Downloader for QbitDownloader {
 }
 
 impl QbitDownloader {
-    fn exact_existing_hash(&self, torrent: &Torrent) -> Result<Option<String>, DownloaderError> {
-        let body = self.get(&join(&self.config.url, "/api/v2/torrents/info"))?;
-        let infos: Vec<TorrentInfo> =
-            serde_json::from_str(&body).map_err(|e| DownloaderError::Message(e.to_string()))?;
+    /// Review H-3: the task carries `CLAIMED_TAG`. Unknown (lookup failed)
+    /// counts as claimed so user data is never deleted on doubt.
+    fn hash_claimed(&self, hash: &str) -> bool {
+        let url = format!(
+            "{}?hashes={}",
+            join(&self.config.url, "/api/v2/torrents/info"),
+            form_enc(hash)
+        );
+        let infos: Result<Vec<TorrentInfo>, _> = self.get(&url).and_then(|body| {
+            serde_json::from_str(&body).map_err(|e| DownloaderError::Message(e.to_string()))
+        });
+        match infos {
+            Ok(infos) => infos.iter().any(|info| {
+                info.hash.eq_ignore_ascii_case(hash)
+                    && info.tags.split(',').any(|t| t.trim() == crate::CLAIMED_TAG)
+            }),
+            Err(error) => {
+                tracing::warn!(%hash, %error, "无法确认任务是否为认领的用户任务，按认领处理（不删文件）");
+                true
+            }
+        }
+    }
+
+    /// Tag an existing task with `hash` as ours. Only tags are added; nothing
+    /// destructive happens to a task the user created. Returns whether found.
+    fn claim_existing(&self, hash: &str, tags: &str, title: &str) -> Result<bool, DownloaderError> {
+        let url = format!(
+            "{}?hashes={hash}",
+            join(&self.config.url, "/api/v2/torrents/info")
+        );
+        let infos: Vec<TorrentInfo> = serde_json::from_str(&self.get(&url)?)
+            .map_err(|e| DownloaderError::Message(e.to_string()))?;
+        if !infos
+            .iter()
+            .any(|info| info.hash.eq_ignore_ascii_case(hash))
+        {
+            return Ok(false);
+        }
+        self.post_form(
+            &join(&self.config.url, "/api/v2/torrents/addTags"),
+            &format!(
+                "hashes={hash}&tags={}",
+                form_enc(&format!("{tags},{}", crate::CLAIMED_TAG))
+            ),
+        )?;
+        tracing::info!(torrent = %title, %hash, "qBittorrent 已有同 info hash 任务，补打标签认领");
+        Ok(true)
+    }
+
+    /// D-L2: tasks that may belong to `torrent`, asked for with a `hashes=`
+    /// (magnet) or `tag=` filter so the client does not list every task.
+    /// Results are still checked here, so a client ignoring the filter
+    /// stays correct.
+    fn candidate_infos(&self, torrent: &Torrent) -> Result<Vec<TorrentInfo>, DownloaderError> {
         let magnet = crate::magnet_info_hash(&torrent.enclosure);
         let tag = crate::ownership_tag(&torrent.enclosure);
-        let hashes = infos
+        let filter = match &magnet {
+            Some(hash) => format!("hashes={}", form_enc(hash)),
+            None => format!("tag={}", form_enc(&tag)),
+        };
+        let url = format!(
+            "{}?{filter}",
+            join(&self.config.url, "/api/v2/torrents/info")
+        );
+        let infos: Vec<TorrentInfo> = serde_json::from_str(&self.get(&url)?)
+            .map_err(|e| DownloaderError::Message(e.to_string()))?;
+        Ok(infos
             .into_iter()
             .filter(|info| {
                 if let Some(hash) = &magnet {
@@ -347,19 +556,35 @@ impl QbitDownloader {
                     info.tags.split(',').any(|item| item.trim() == tag)
                 }
             })
+            .collect())
+    }
+
+    fn exact_existing_hash(&self, torrent: &Torrent) -> Result<Option<String>, DownloaderError> {
+        let hashes = self
+            .candidate_infos(torrent)?
+            .into_iter()
             .map(|info| info.hash)
             .collect();
         crate::owned::proven_hashes(hashes)
     }
 
+    fn torrent_files(&self, hash: &str) -> Result<Vec<TorrentFile>, DownloaderError> {
+        let files_url = format!(
+            "{}?hash={}",
+            join(&self.config.url, "/api/v2/torrents/files"),
+            form_enc(hash)
+        );
+        let file_body = self.get(&files_url)?;
+        serde_json::from_str(&file_body).map_err(|err| DownloaderError::Message(err.to_string()))
+    }
+
     fn owned_info(&self, torrent: &Torrent) -> Result<Option<TorrentInfo>, DownloaderError> {
-        let Some(hash) = self.exact_existing_hash(torrent)? else {
+        // D-L2: one filtered request instead of two full listings.
+        let infos = self.candidate_infos(torrent)?;
+        let hashes = infos.iter().map(|info| info.hash.clone()).collect();
+        let Some(hash) = crate::owned::proven_hashes(hashes)? else {
             return Ok(None);
         };
-        let url = join(&self.config.url, "/api/v2/torrents/info");
-        let body = self.get(&url)?;
-        let infos: Vec<TorrentInfo> =
-            serde_json::from_str(&body).map_err(|err| DownloaderError::Message(err.to_string()))?;
         Ok(infos
             .into_iter()
             .find(|info| info.hash.eq_ignore_ascii_case(&hash)))
@@ -384,44 +609,48 @@ impl QbitDownloader {
     }
 
     fn get(&self, url: &str) -> Result<String, DownloaderError> {
-        let response = agent_for_url(&self.config.url, true)
-            .get(url)
-            .header("Referer", &self.config.url)
-            .header("Origin", self.config.url.trim_end_matches('/'))
-            .header("Cookie", &self.cookie)
-            .call()
-            .map_err(http_err)?;
+        let response = self.authed(|cookie| {
+            agent_for_url(&self.config.url, true)
+                .get(url)
+                .header("Referer", &self.config.url)
+                .header("Origin", self.config.url.trim_end_matches('/'))
+                .header("Cookie", cookie)
+                .call()
+        })?;
         read_body(response)
     }
 
     fn post_form(&self, url: &str, body: &str) -> Result<String, DownloaderError> {
-        let response = agent_for_url(&self.config.url, true)
-            .post(url)
-            .header("Referer", &self.config.url)
-            .header("Origin", self.config.url.trim_end_matches('/'))
-            .header("Cookie", &self.cookie)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send(body)
-            .map_err(http_err)?;
+        let response = self.authed(|cookie| {
+            agent_for_url(&self.config.url, true)
+                .post(url)
+                .header("Referer", &self.config.url)
+                .header("Origin", self.config.url.trim_end_matches('/'))
+                .header("Cookie", cookie)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .send(body)
+        })?;
         read_body(response)
     }
 
-    fn post_add_form(
+    fn post_add_form<'f>(
         &self,
-        form: ureq::unversioned::multipart::Form<'_>,
+        form: &dyn Fn() -> ureq::unversioned::multipart::Form<'f>,
         title: &str,
         tag: &str,
     ) -> Result<(), DownloaderError> {
         let url = join(&self.config.url, "/api/v2/torrents/add");
-        let response = agent_for_url(&self.config.url, true)
-            .post(&url)
-            .header("Referer", &self.config.url)
-            .header("Origin", self.config.url.trim_end_matches('/'))
-            .header("Cookie", &self.cookie)
-            .send(form)
-            .map_err(|e| {
+        let response = self
+            .authed(|cookie| {
+                agent_for_url(&self.config.url, true)
+                    .post(&url)
+                    .header("Referer", &self.config.url)
+                    .header("Origin", self.config.url.trim_end_matches('/'))
+                    .header("Cookie", cookie)
+                    .send(form())
+            })
+            .inspect_err(|e| {
                 tracing::error!(torrent = %title, error = %e, "提交种子到 qBittorrent 失败");
-                http_err(e)
             })?;
         let body = read_body(response)?;
         if body.trim().eq_ignore_ascii_case("fails.") {
@@ -437,7 +666,7 @@ impl QbitDownloader {
 
 fn http_agent() -> ureq::Agent {
     let config = ureq::config::Config::builder()
-        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
         .build();
     ureq::Agent::new_with_config(config)
 }
@@ -496,10 +725,65 @@ struct TorrentInfo {
     upspeed: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ExistingHealth {
+    Usable,
+    Paused,
+    Broken,
+}
+
+/// G-M2: classify an existing task's qBittorrent state (v4 `paused*`, v5 `stopped*`).
+fn existing_task_health(state: &str, progress: f64) -> ExistingHealth {
+    match state {
+        "error" | "missingFiles" => ExistingHealth::Broken,
+        "pausedDL" | "stoppedDL" if progress < 1.0 => ExistingHealth::Paused,
+        _ => ExistingHealth::Usable,
+    }
+}
+
+#[cfg(test)]
+mod existing_health_tests {
+    use super::{ExistingHealth, existing_task_health};
+
+    #[test]
+    fn maps_qbit_states() {
+        assert_eq!(existing_task_health("error", 0.2), ExistingHealth::Broken);
+        assert_eq!(
+            existing_task_health("missingFiles", 1.0),
+            ExistingHealth::Broken
+        );
+        assert_eq!(
+            existing_task_health("pausedDL", 0.5),
+            ExistingHealth::Paused
+        );
+        assert_eq!(
+            existing_task_health("stoppedDL", 0.5),
+            ExistingHealth::Paused
+        );
+        assert_eq!(
+            existing_task_health("pausedUP", 1.0),
+            ExistingHealth::Usable
+        );
+        assert_eq!(
+            existing_task_health("downloading", 0.1),
+            ExistingHealth::Usable
+        );
+    }
+}
+
 #[derive(Deserialize)]
 struct TorrentFile {
+    #[serde(default)]
+    index: Option<usize>,
     name: String,
     progress: f64,
+    /// 0 = do not download (F-1 selective files).
+    #[serde(default = "default_priority")]
+    priority: i64,
+}
+
+fn default_priority() -> i64 {
+    1
 }
 
 /// Pick our marker out of a client's comma-separated tag list.

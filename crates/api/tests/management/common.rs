@@ -244,3 +244,54 @@ pub(crate) async fn scan_and_wait(app: &axum::Router, lib_id: &str) -> Value {
     }
     panic!("scan operation timed out");
 }
+
+/// Install a deterministic fake `ffprobe` first on PATH (once per test binary).
+/// A file whose content starts with `PROBE:` yields the JSON after the prefix;
+/// anything else fails like ffprobe on invalid data (the probe-failure branch).
+pub(crate) fn install_fake_ffprobe() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("crawler-media-e2e-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("ffprobe");
+        // Write under a temp name and rename into place so a concurrent
+        // fork/exec never sees the file open for writing (ETXTBSY).
+        let staging = dir.join("ffprobe.tmp");
+        std::fs::write(
+            &staging,
+            "#!/bin/sh\nfor last; do :; done\nif grep -q SLOWPROBE \"$last\" 2>/dev/null; then sleep 2; fi\nif [ \"$(head -c 6 \"$last\" 2>/dev/null)\" = \"PROBE:\" ]; then tail -c +7 \"$last\"; exit 0; fi\necho 'Invalid data found when processing input' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::rename(&staging, &script).unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: test-only, executed once before the harness spawns workers.
+        unsafe { std::env::set_var("PATH", format!("{}:{path}", dir.display())) };
+    });
+}
+
+/// Synthetic media bytes that the fake ffprobe reports with this quality.
+pub(crate) fn probed_video(height: u32, codec: &str, hdr: bool) -> Vec<u8> {
+    let width = match height {
+        2160 => 3840,
+        1080 => 1920,
+        720 => 1280,
+        _ => 640,
+    };
+    let transfer = if hdr {
+        r#","color_transfer":"smpte2084""#
+    } else {
+        ""
+    };
+    format!(r#"PROBE:{{"streams":[{{"codec_name":"{codec}","width":{width},"height":{height}{transfer}}}]}}"#)
+        .into_bytes()
+}
+
+/// Bytes the fake ffprobe cannot read (probe failure).
+pub(crate) fn unprobeable_video() -> Vec<u8> {
+    b"not-a-real-video".to_vec()
+}

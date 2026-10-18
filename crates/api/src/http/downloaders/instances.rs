@@ -303,7 +303,25 @@ pub(crate) async fn delete_downloader(
     let _ = store.delete_setting(&format!("downloader.{id}.verified"));
     let _ = store.delete_setting(&format!("downloader.{id}.last_error"));
     match store.delete_downloader(id) {
-        Ok(true) => ok(json!({ "deleted": true })).into_response(),
+        Ok(true) => {
+            // D-L4: its in-flight pending rows can no longer be tracked.
+            let orphaned = store.mark_pending_orphaned(id).unwrap_or_else(|error| {
+                tracing::warn!(%id, %error, "标记已删除下载器的 pending 失败");
+                0
+            });
+            drop(store);
+            if orphaned > 0 {
+                tracing::warn!(%id, orphaned, "下载器已删除，其在途任务标记为 orphan");
+                crate::worker::notify(
+                    &state,
+                    "下载器已删除",
+                    &format!(
+                        "{orphaned} 个在途订阅任务失去下载器，已停止跟踪，可重新搜索提交到其它下载器"
+                    ),
+                );
+            }
+            ok(json!({ "deleted": true, "orphaned_pending": orphaned })).into_response()
+        }
         _ => err(StatusCode::NOT_FOUND, "downloader.missing", "下载器不存在"),
     }
 }

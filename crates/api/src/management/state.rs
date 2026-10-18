@@ -47,6 +47,9 @@ pub struct ApiState {
     pub jobs: Arc<Mutex<jobs::Queue>>,
     /// 后台 job_loop 控制（停止意图与正在运行的 blocking worker 跟踪）。
     pub(crate) job_loop_control: Arc<crate::job_loop::JobLoopControl>,
+    /// H-1: false while another instance holds the data-directory lease.
+    /// Background writers stop and manual write endpoints answer 409.
+    pub(crate) instance_writable: Arc<std::sync::atomic::AtomicBool>,
     /// 数据库维护执行器（生产为真实 SQLite；测试可注入阻塞/报错的假实现）。
     pub(crate) maintenance_executor: Arc<dyn crate::maintenance::DatabaseExecutor>,
     /// 进程内维护互斥：`concurrency_key` 只防同一 def 重叠，这里覆盖不同维护 def。
@@ -266,6 +269,7 @@ impl ApiState {
             library_work,
             jobs: Arc::new(Mutex::new(jobs)),
             job_loop_control: Arc::new(crate::job_loop::JobLoopControl::new()),
+            instance_writable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             maintenance_executor: Arc::new(crate::maintenance::SqliteExecutor),
             maintenance_lock: Arc::new(Mutex::new(())),
             active_job_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -522,6 +526,24 @@ impl ApiState {
 
     pub fn jobs(&self) -> Arc<Mutex<jobs::Queue>> {
         self.jobs.clone()
+    }
+
+    /// H-1: whether this instance currently owns the data directory.
+    pub fn instance_writable(&self) -> bool {
+        self.instance_writable
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// H-1: 409 for write endpoints while another instance holds the lease.
+    pub(crate) fn require_writable(&self) -> Result<(), axum::response::Response> {
+        if self.instance_writable() {
+            return Ok(());
+        }
+        Err(crate::http::err(
+            axum::http::StatusCode::CONFLICT,
+            "instance.read_only",
+            "数据目录由另一个实例占用，本实例为只读模式",
+        ))
     }
 
     pub fn job_loop_control(&self) -> Arc<crate::job_loop::JobLoopControl> {

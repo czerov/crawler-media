@@ -91,6 +91,7 @@ impl Downloader for OwnedDownloads {
             download_speed: 0,
             upload_speed: 0,
             info_hash: "unrelated".into(),
+            owned_tags: vec![],
         }])
     }
 }

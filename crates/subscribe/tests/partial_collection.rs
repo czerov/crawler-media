@@ -116,6 +116,8 @@ fn one_failed_file_does_not_discard_successful_files_from_same_torrent() {
             hooks: None,
             naming: None,
             preserve_removed: false,
+            overlap: Default::default(),
+            absolute: None,
         },
         chosen: vec![ScoredTorrent {
             release: domain::Release {
@@ -132,6 +134,7 @@ fn one_failed_file_does_not_discard_successful_files_from_same_torrent() {
                 audio_language: None,
                 group: None,
                 confidence: Confidence::High,
+                season_inferred: false,
             },
             torrent,
             score: 80,
@@ -145,10 +148,13 @@ fn one_failed_file_does_not_discard_successful_files_from_same_torrent() {
             removed_paths: vec![],
             completed: false,
             transferred_enclosures: vec![],
+            rejected_enclosures: Vec::new(),
+            awaiting_probe_enclosures: Vec::new(),
             collection_errors: vec![],
             submission_errors: vec![],
             torrents_added: vec![],
         },
+        broken: Vec::new(),
     };
 
     let outcome = collect_completed(added, &Probe)

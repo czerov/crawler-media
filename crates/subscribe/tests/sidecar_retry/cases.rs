@@ -23,6 +23,8 @@ impl RetryFixture {
             torrents: vec![], facts, search_keywords: vec![], downloader: &dl,
             library_root: &self.root, transfer_mode: Some(library::TransferMode::Copy),
             scrape: false, hooks: None, naming: Some(&self.naming), preserve_removed: true,
+            overlap: Default::default(),
+            absolute: None,
         };
         let added = make_added(input, self.torrent.clone(), release::parse(&self.torrent.title));
         collect_completed_with_destinations(added, &library::Ffprobe::default(), mappings).unwrap()

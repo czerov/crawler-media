@@ -112,6 +112,8 @@ fn collect_transfers_subtitle_sidecar_beside_video() {
         hooks: None,
         naming: None,
         preserve_removed: false,
+        overlap: Default::default(),
+        absolute: None,
     })
     .unwrap();
 
@@ -152,6 +154,8 @@ fn subtitle_only_torrent_does_not_enter_library() {
         hooks: None,
         naming: None,
         preserve_removed: false,
+        overlap: Default::default(),
+        absolute: None,
     })
     .unwrap();
 
@@ -275,6 +279,8 @@ fn multi_episode_subtitles_match_respective_episodes_without_overwriting() {
         hooks: None,
         naming: None,
         preserve_removed: false,
+        overlap: Default::default(),
+        absolute: None,
     })
     .unwrap();
 

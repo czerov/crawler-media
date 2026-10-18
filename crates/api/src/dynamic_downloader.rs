@@ -76,6 +76,18 @@ macro_rules! delegate {
 }
 
 impl Downloader for DynamicDownloader {
+    fn remember_identity(&self, torrent: &Torrent, hash: &str) -> Result<(), DownloaderError> {
+        delegate!(self, remember_identity(torrent, hash))
+    }
+
+    fn select_files(
+        &self,
+        torrent: &Torrent,
+        keep: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<usize>, DownloaderError> {
+        delegate!(self, select_files(torrent, keep))
+    }
+
     fn add(&self, torrent: &Torrent) -> Result<(), DownloaderError> {
         delegate!(self, add(torrent))
     }
@@ -98,6 +110,17 @@ impl Downloader for DynamicDownloader {
         torrent: &Torrent,
     ) -> Result<Vec<std::path::PathBuf>, DownloaderError> {
         delegate!(self, completed_files(torrent))
+    }
+
+    fn is_claimed(&self, torrent: &Torrent) -> Result<bool, DownloaderError> {
+        delegate!(self, is_claimed(torrent))
+    }
+
+    fn collectable_files(
+        &self,
+        torrent: &Torrent,
+    ) -> Result<(Vec<std::path::PathBuf>, bool), DownloaderError> {
+        delegate!(self, collectable_files(torrent))
     }
 
     fn uploaded_by_category(&self, category: &str) -> Result<u64, DownloaderError> {

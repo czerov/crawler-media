@@ -5,20 +5,10 @@ use axum::response::{IntoResponse, Response};
 use domain::DownloaderId;
 use serde_json::{Value, json};
 
-use super::tasks::{ABSENT_CLEANUP_GRACE_SECS, task_state};
+use super::tasks::task_state;
 use crate::http::ok;
 use crate::management::ApiState;
-
-fn snapshot_matches_pending(
-    torrent: &domain::Torrent,
-    snapshot: &downloader::TaskSnapshot,
-) -> bool {
-    if let Some(hash) = downloader::magnet_info_hash(&torrent.enclosure) {
-        return !snapshot.info_hash.is_empty() && snapshot.info_hash.eq_ignore_ascii_case(&hash);
-    }
-    let owned = downloader::ownership_tag(&torrent.enclosure);
-    snapshot.tag == owned || snapshot.tag.split(',').any(|item| item.trim() == owned)
-}
+use crate::pending_reconcile::{absence_is_provable, snapshot_matches_pending};
 
 fn prune_orphan_pending(
     state: &ApiState,
@@ -86,35 +76,81 @@ fn prune_absent_pending(
     snapshots_by_downloader: &HashMap<Option<DownloaderId>, Vec<downloader::TaskSnapshot>>,
     reachable: &HashSet<Option<DownloaderId>>,
 ) -> Vec<(domain::SubscribeId, i32, store::PendingDownload)> {
-    let store = state.store.lock();
     let now = crate::job_loop::unix_now();
+    let mut hashes: HashMap<domain::SubscribeId, HashMap<String, String>> = HashMap::new();
     let mut kept = Vec::with_capacity(pending.len());
     for (subscribe_id, score, item) in pending {
         let snapshots = snapshots_by_downloader
             .get(&item.downloader_id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let matched = snapshots
-            .iter()
-            .find(|s| snapshot_matches_pending(&item.torrent, s));
-        let identity_visible = snapshots.is_empty() || snapshots.iter().any(|s| !s.tag.is_empty());
-        let absent =
-            reachable.contains(&item.downloader_id) && identity_visible && matched.is_none();
-        let stale = item
-            .submitted_at
-            .is_some_and(|ts| now - ts >= ABSENT_CLEANUP_GRACE_SECS);
-        if absent && stale {
-            let enclosure = item.torrent.enclosure.clone();
-            if let Err(error) = store.delete_pending(subscribe_id, &enclosure) {
-                tracing::error!(%subscribe_id, %error, "自动清理缺失任务失败");
-            } else {
-                tracing::info!(%subscribe_id, torrent = %item.torrent.title, "自动清理：种子已不在下载器且超过宽限期");
-            }
+        // Review M-1: same rule as the background reconcile, including the
+        // persisted info hash (D-M3).
+        let sub_hashes = hashes.entry(subscribe_id).or_insert_with(|| {
+            state
+                .store
+                .lock()
+                .load_pending_info_hashes(subscribe_id)
+                .unwrap_or_default()
+        });
+        let hash = sub_hashes.get(&item.torrent.enclosure).map(String::as_str);
+        let reachable_list = reachable.contains(&item.downloader_id).then_some(snapshots);
+        let matched = snapshots.iter().any(|s| {
+            crate::pending_reconcile::snapshot_matches_pending_with_hash(&item.torrent, hash, s)
+        });
+        if !matched && reachable_list.is_some() && !absence_is_provable(&item.torrent, snapshots) {
+            tracing::error!(%subscribe_id, torrent = %item.torrent.title,
+                "下载器未暴露归属标签，无法证明任务已消失，拒绝自动清理 pending");
+        }
+        let absent = crate::pending_reconcile::is_absent_and_stale_with_hash(
+            &item,
+            hash,
+            reachable_list,
+            now,
+        );
+        if absent && delete_absent_pending(state, subscribe_id, &item) {
             continue;
         }
         kept.push((subscribe_id, score, item));
     }
     kept
+}
+
+/// Delete one absent pending row under its Subscribe guard (lock order:
+/// guard → store, same as search/Transfer). A busy guard means a search or
+/// Transfer is working on this Subscribe right now: skip this round.
+fn delete_absent_pending(
+    state: &ApiState,
+    subscribe_id: domain::SubscribeId,
+    item: &store::PendingDownload,
+) -> bool {
+    let guard = state.subscribe_guard(subscribe_id);
+    let Some(_held) = guard.try_lock() else {
+        tracing::debug!(%subscribe_id, "订阅正在搜索/转存，本轮跳过缺失任务清理");
+        return false;
+    };
+    let store = state.store.lock();
+    // Re-check under the guard: Transfer may have imported it meanwhile.
+    let still_active = store
+        .load_pending(subscribe_id)
+        .map(|rows| {
+            rows.iter()
+                .any(|(_, p)| p.torrent.enclosure == item.torrent.enclosure)
+        })
+        .unwrap_or(false);
+    if !still_active {
+        return true;
+    }
+    match store.delete_pending(subscribe_id, &item.torrent.enclosure) {
+        Ok(()) => {
+            tracing::info!(%subscribe_id, torrent = %item.torrent.title, "自动清理：种子已不在下载器且超过宽限期");
+            true
+        }
+        Err(error) => {
+            tracing::error!(%subscribe_id, %error, "自动清理缺失任务失败");
+            false
+        }
+    }
 }
 
 fn subscribe_media_index(
@@ -225,4 +261,63 @@ pub(crate) async fn list_tasks(State(state): State<ApiState>) -> Response {
     let kept = prune_absent_pending(&state, pending, &snapshots_by_downloader, &reachable);
     let items = map_task_rows(&state, &kept, &snapshots_by_downloader, &reachable);
     ok(json!({ "items": items, "sources": [] })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::pending_reconcile::{absence_is_provable, snapshot_matches_pending};
+
+    fn torrent(enclosure: &str) -> domain::Torrent {
+        domain::Torrent {
+            site_id: domain::SiteId::new(),
+            title: "The.Matrix.1999.2160p".into(),
+            enclosure: enclosure.into(),
+            size_bytes: None,
+            seeders: None,
+            free: false,
+            hr: false,
+            imdb_id: None,
+            id: None,
+            leechers: None,
+            snatched: None,
+            upload_time: None,
+            detail_url: None,
+            category: None,
+            poster_url: None,
+        }
+    }
+
+    fn snapshot(owned: &[String]) -> downloader::TaskSnapshot {
+        downloader::TaskSnapshot {
+            tag: downloader::TASK_TAG.into(),
+            owned_tags: owned.to_vec(),
+            info_hash: "aaaa".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn http_pending_matches_real_client_snapshot_by_owned_tag() {
+        let t = torrent("https://pt.example/download.php?id=1");
+        let owned = downloader::ownership_tag(&t.enclosure);
+        assert!(snapshot_matches_pending(&t, &snapshot(&[owned])));
+        let other = downloader::ownership_tag("https://pt.example/download.php?id=2");
+        assert!(!snapshot_matches_pending(&t, &snapshot(&[other])));
+        assert!(!snapshot_matches_pending(&t, &snapshot(&[])));
+    }
+
+    #[test]
+    fn absence_needs_visible_ownership_for_http_but_not_magnets() {
+        let http = torrent("https://pt.example/download.php?id=1");
+        let magnet = torrent("magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let generic_only = vec![snapshot(&[])];
+        assert!(!absence_is_provable(&http, &generic_only));
+        assert!(absence_is_provable(&magnet, &generic_only));
+        // Review M-2: an empty list is no evidence for HTTP torrents.
+        assert!(!absence_is_provable(&http, &[]));
+        // Review L-8: nor for magnets (client may still be loading torrents).
+        assert!(!absence_is_provable(&magnet, &[]));
+        let visible = vec![snapshot(&[downloader::ownership_tag("https://x/other")])];
+        assert!(absence_is_provable(&http, &visible));
+    }
 }

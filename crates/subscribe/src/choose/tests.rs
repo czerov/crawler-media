@@ -32,6 +32,7 @@ fn release(title: &str) -> Release {
         audio_language: None,
         group: None,
         confidence: domain::Confidence::High,
+        season_inferred: false,
     }
 }
 
@@ -195,6 +196,7 @@ fn scored(title: &str, from: u32, to: u32, score: i32) -> ScoredTorrent {
             audio_language: None,
             group: None,
             confidence: domain::Confidence::High,
+            season_inferred: false,
         },
         score,
     }
@@ -242,21 +244,26 @@ fn huge_release_range_does_not_allocate_unbounded_choose_slots() {
     let subscribe = tv_subscribe(media_id);
     let huge = scored("Show.S01E01-E4294967295", 1, u32::MAX, 10);
     let precise = scored("Show.S01E02", 2, 2, 20);
+    // M1: overlapping candidates never download together; with PreferEpisode
+    // the higher-scoring single still wins its slot.
+    let chosen = super::choose_with_policy(
+        &subscribe,
+        None,
+        &[huge.clone(), precise.clone()],
+        &SubscribeFacts::default(),
+        super::OverlapPolicy::PreferEpisode,
+    );
+    assert!(
+        chosen.iter().any(|c| c.torrent.title.contains("S01E02")),
+        "higher-scoring single episode must still win its slot: {chosen:?}"
+    );
     let chosen = choose(
         &subscribe,
         None,
         &[huge, precise],
         &SubscribeFacts::default(),
     );
-    assert!(
-        chosen.iter().any(|c| c.torrent.title.contains("S01E02")),
-        "higher-scoring single episode must still win its slot: {chosen:?}"
-    );
-    assert!(
-        chosen.len() <= 2,
-        "capped range must not explode chosen set: {}",
-        chosen.len()
-    );
+    assert_eq!(chosen.len(), 1, "capped range must not explode chosen set");
 }
 
 #[test]
@@ -562,4 +569,159 @@ fn wash_target_cutoff_prevents_further_upgrades_when_target_reached() {
         chosen.is_empty(),
         "达到 WashTarget 截止线后必须停止继续升级"
     );
+}
+
+#[test]
+fn inferred_season_never_matches_a_later_season_subscribe() {
+    let mut m = media("The Long Watch", None);
+    m.kind = MediaKind::Tv;
+    let mut subscribe = tv_subscribe(m.id);
+    subscribe.coverage = Coverage::Tv {
+        season: 2,
+        episode_from: 1,
+        episode_to: Some(2),
+    };
+    let mut guessed = release("The Long Watch Episode 1");
+    guessed.season = Some(2);
+    guessed.episode = Some(1);
+    guessed.season_inferred = true;
+    assert!(!candidate_matches_subscribe(&subscribe, &m, &guessed));
+    guessed.season_inferred = false;
+    assert!(candidate_matches_subscribe(&subscribe, &m, &guessed));
+}
+
+fn ten_episode_subscribe() -> (Media, Subscribe) {
+    let mut m = media("Show", None);
+    m.kind = MediaKind::Tv;
+    let mut subscribe = tv_subscribe(m.id);
+    subscribe.coverage = Coverage::Tv {
+        season: 1,
+        episode_from: 1,
+        episode_to: Some(10),
+    };
+    (m, subscribe)
+}
+
+#[test]
+fn overlapping_pack_and_single_choose_exactly_one_per_policy() {
+    let (_, subscribe) = ten_episode_subscribe();
+    let pack = scored("pack", 1, 10, 90);
+    let single = scored("e06", 6, 6, 95);
+    let facts = SubscribeFacts::default();
+    let both = [pack.clone(), single.clone()];
+    let pick = |policy| {
+        super::choose_with_policy(&subscribe, None, &both, &facts, policy)
+            .into_iter()
+            .map(|c| c.torrent.title)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        pick(super::OverlapPolicy::PreferPack),
+        vec!["pack".to_string()]
+    );
+    assert_eq!(
+        pick(super::OverlapPolicy::PreferEpisode),
+        vec!["e06".to_string()]
+    );
+}
+
+#[test]
+fn non_overlapping_singles_are_each_chosen_and_best_score_wins_a_slot() {
+    let (_, subscribe) = ten_episode_subscribe();
+    let picks = choose(
+        &subscribe,
+        None,
+        &[
+            scored("e01", 1, 1, 50),
+            scored("e02", 2, 2, 50),
+            scored("e01-better", 1, 1, 70),
+        ],
+        &SubscribeFacts::default(),
+    );
+    let mut titles: Vec<_> = picks.into_iter().map(|c| c.torrent.title).collect();
+    titles.sort();
+    assert_eq!(titles, vec!["e01-better".to_string(), "e02".to_string()]);
+}
+
+#[test]
+fn m9_scanned_2160p_is_not_replaced_by_high_scoring_1080p_without_ladder() {
+    let mut subscribe = tv_subscribe(domain::MediaId::new());
+    subscribe.wash_cut = true;
+    let mut facts = SubscribeFacts::default();
+    let path = "/library/Show.S01E01.mkv";
+    facts.replace(
+        Some(1),
+        Some(1),
+        crate::QualityFact {
+            score: 0, // scanned into the library: no filter score
+            path: Some(path.into()),
+        },
+    );
+    let mut old = release("Show");
+    old.resolution = Some("2160p".into());
+    facts.set_quality(path.into(), old);
+    let mut candidate = scored("Show.S01E01.1080p", 1, 1, 90);
+    candidate.release.resolution = Some("1080p".into());
+    assert!(choose(&subscribe, None, &[candidate], &facts).is_empty());
+}
+
+#[test]
+fn m9_same_quality_falls_back_to_score_tie_break() {
+    let mut subscribe = tv_subscribe(domain::MediaId::new());
+    subscribe.wash_cut = true;
+    let mut facts = SubscribeFacts::default();
+    let path = "/library/Show.S01E01.mkv";
+    facts.replace(
+        Some(1),
+        Some(1),
+        crate::QualityFact {
+            score: 10,
+            path: Some(path.into()),
+        },
+    );
+    let mut old = release("Show");
+    old.resolution = Some("1080p".into());
+    facts.set_quality(path.into(), old);
+    let mut better = scored("Show.S01E01.1080p.A", 1, 1, 20);
+    better.release.resolution = Some("1080p".into());
+    assert_eq!(choose(&subscribe, None, &[better.clone()], &facts).len(), 1);
+    better.score = 5;
+    assert!(choose(&subscribe, None, &[better], &facts).is_empty());
+}
+
+fn bare_pack(size: u64) -> ScoredTorrent {
+    let mut pack = scored("Show.S01.SP", 1, 1, 50);
+    pack.release.episode = None;
+    pack.release.episode_to = None;
+    pack.torrent.size_bytes = Some(size);
+    pack
+}
+
+#[test]
+fn l1_small_bare_season_is_not_a_pack() {
+    let mut subscribe = tv_subscribe(domain::MediaId::new());
+    subscribe.full_season_pack = true;
+    let mut single = scored("Show.S01E01", 1, 1, 10);
+    single.torrent.size_bytes = Some(2_000_000_000);
+    let facts = SubscribeFacts::default();
+    let small = bare_pack(300_000_000);
+    assert!(choose(&subscribe, None, &[small, single.clone()], &facts).is_empty());
+    let big = bare_pack(3_500_000_000);
+    assert_eq!(choose(&subscribe, None, &[big, single], &facts).len(), 1);
+}
+
+#[test]
+fn l2_wider_range_pack_is_accepted() {
+    let mut subscribe = tv_subscribe(domain::MediaId::new());
+    subscribe.full_season_pack = true;
+    subscribe.coverage = Coverage::Tv {
+        season: 1,
+        episode_from: 1,
+        episode_to: Some(12),
+    };
+    let facts = SubscribeFacts::default();
+    let wide = scored("Show.S01E01-E13", 1, 13, 50);
+    assert_eq!(choose(&subscribe, None, &[wide], &facts).len(), 1);
+    let narrow = scored("Show.S01E01-E11", 1, 11, 50);
+    assert!(choose(&subscribe, None, &[narrow], &facts).is_empty());
 }

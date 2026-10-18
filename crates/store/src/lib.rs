@@ -2,6 +2,9 @@
 //! Backed by 4 SQLite files in the data directory.
 
 mod app_write;
+mod instance_lock;
+mod pending_file_deletions;
+mod pending_progress;
 mod browse_projection;
 pub use browse_projection::{
     BrowseFileFacts, BrowseMediaFacts, ProjectionBuild, ProjectionSnapshot, ReadRevisions,
@@ -45,6 +48,7 @@ mod library_scope;
 pub use library_scope::{LibraryPathResolver, LibraryPathScope, StrictOwner};
 mod subscribe_library_snapshot;
 pub use subscribe_library_snapshot::SubscribeLibrarySnapshot;
+pub use pending_file_deletions::{MAX_FILE_DELETION_ATTEMPTS, QueuedFileDeletion, file_identity};
 mod subscribe_library;
 pub use subscribe_library::evaluate_subscribe_facts_pure;
 mod maps;

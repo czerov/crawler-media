@@ -52,11 +52,22 @@ impl JobLoopControl {
 pub struct JobLoopHandle {
     loop_task: JoinHandle<()>,
     control: Arc<JobLoopControl>,
+    writable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl JobLoopHandle {
     pub fn new(loop_task: JoinHandle<()>, control: Arc<JobLoopControl>) -> Self {
-        Self { loop_task, control }
+        Self {
+            loop_task,
+            control,
+            writable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    /// G-M5: true when another live instance owns the data directory, so this
+    /// instance runs no background jobs (HTTP stays available, read-only).
+    pub fn is_read_only(&self) -> bool {
+        !self.writable.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn abort(&self) {
@@ -93,13 +104,51 @@ pub fn spawn_job_loop_with_control(
     clock: impl Fn() -> i64 + Send + 'static,
     control: Arc<JobLoopControl>,
 ) -> JobLoopHandle {
+    // G-M5 / H-1: only the instance holding the data-directory lease runs
+    // background jobs. A read-only instance retries the lease every TTL/2
+    // (a crashed holder's lease expires), and an instance whose lease was
+    // taken over stops its jobs and goes back to retrying.
+    let writable = state.instance_writable.clone();
+    let first = crate::instance_lease::acquire(&state.store);
+    writable.store(first.is_ok(), std::sync::atomic::Ordering::SeqCst);
+    if let Err(error) = &first {
+        tracing::error!(%error, "实例锁冲突：本实例暂不运行后台任务（只读模式），将定期重试");
+    }
     let clock: Arc<Mutex<Box<dyn Fn() -> i64 + Send>>> = Arc::new(Mutex::new(Box::new(clock)));
     let loop_control = control.clone();
+    let loop_writable = writable.clone();
     let loop_task = tokio::spawn(async move {
-        loop {
-            if loop_control.is_stopping() {
-                break;
+        let mut next = Some(first);
+        'lease: loop {
+            let attempt = match next.take() {
+                Some(attempt) => attempt,
+                None => crate::instance_lease::acquire(&state.store),
+            };
+            let lease = match attempt {
+                Ok(lease) => lease,
+                Err(_) => {
+                    loop_writable.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if loop_control.is_stopping() {
+                        return;
+                    }
+                    tokio::time::sleep(crate::instance_lease::retry_interval()).await;
+                    continue 'lease;
+                }
+            };
+            if !loop_writable.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                tracing::info!("已获取实例锁，恢复后台任务");
             }
+            loop {
+                if loop_control.is_stopping() {
+                    return;
+                }
+                if lease.as_ref().is_some_and(|lease| lease.is_lost()) {
+                    loop_writable.store(false, std::sync::atomic::Ordering::SeqCst);
+                    loop_control.drain().await;
+                    drop(lease);
+                    tokio::time::sleep(crate::instance_lease::retry_interval()).await;
+                    continue 'lease;
+                }
             let now = read_clock(&clock);
             if let Err(error) = state.probe.dispatch_due(now.saturating_mul(1000), 32) {
                 tracing::error!(%error, now, "【媒体探测】派发到期阶段失败");
@@ -130,10 +179,13 @@ pub fn spawn_job_loop_with_control(
             });
             loop_control.track_worker(worker_handle);
             tokio::time::sleep(interval).await;
+            }
         }
     });
 
-    JobLoopHandle::new(loop_task, control)
+    let mut handle = JobLoopHandle::new(loop_task, control);
+    handle.writable = writable;
+    handle
 }
 
 /// 一轮 tick 的来源：决定维护任务是否参与本轮调度。

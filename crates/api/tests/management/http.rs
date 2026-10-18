@@ -47,9 +47,11 @@ async fn subscribe_with_same_tmdb_id_reuses_media_row() {
         ))
         .await
         .unwrap();
-    assert_eq!(second.status(), StatusCode::CREATED);
-    let second = json_data(second).await;
-    assert_eq!(first["media"]["id"], second["media"]["id"]);
+    // G-M1: the same media in the same library cannot be subscribed twice
+    // with overlapping coverage; the second request resolves to the same
+    // media row and is refused instead of duplicating it.
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    assert!(first["media"]["id"].is_string());
 }
 
 #[tokio::test]

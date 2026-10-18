@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use domain::{Coverage, Media, MediaKind, Release, Subscribe};
 use filter::ScoredTorrent;
 
@@ -11,11 +9,94 @@ pub fn choose(
     admitted: &[ScoredTorrent],
     facts: &SubscribeFacts,
 ) -> Vec<ScoredTorrent> {
+    choose_with_policy(
+        subscribe,
+        wash_filter,
+        admitted,
+        facts,
+        OverlapPolicy::default(),
+    )
+}
+
+/// How overlapping TV candidates (range pack vs single episodes) are resolved (M1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlapPolicy {
+    /// Larger packs claim their slots first.
+    #[default]
+    PreferPack,
+    /// Single episodes claim their slots first; packs only fill untouched slots.
+    PreferEpisode,
+}
+
+impl OverlapPolicy {
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "prefer_episode" => Self::PreferEpisode,
+            _ => Self::PreferPack,
+        }
+    }
+}
+
+/// M1 greedy coverage: candidates are ordered by policy (slot count) then
+/// score, and one is chosen only when none of its window slots is already
+/// claimed, so overlapping packs and singles are never downloaded together.
+fn choose_tv_greedy(
+    subscribe: &Subscribe,
+    wash_filter: Option<&domain::Filter>,
+    admitted: &[ScoredTorrent],
+    facts: &SubscribeFacts,
+    policy: OverlapPolicy,
+) -> Vec<ScoredTorrent> {
+    let mut ranked: Vec<(&ScoredTorrent, Vec<(u32, u32)>)> = admitted
+        .iter()
+        .filter(|c| should_take(subscribe, wash_filter, facts, c))
+        .map(|c| {
+            // 只竞争订阅窗口里这个候选真正能填的槽。
+            let slots = covered_slots(subscribe, &c.release)
+                .into_iter()
+                .filter_map(|(s, e)| Some((s?, e?)))
+                .collect::<Vec<_>>();
+            (c, slots)
+        })
+        .filter(|(_, slots)| !slots.is_empty())
+        .collect();
+    ranked.sort_by(|(a, a_slots), (b, b_slots)| {
+        let by_size = match policy {
+            OverlapPolicy::PreferPack => b_slots.len().cmp(&a_slots.len()),
+            OverlapPolicy::PreferEpisode => a_slots.len().cmp(&b_slots.len()),
+        };
+        by_size.then(b.score.cmp(&a.score))
+    });
+    let mut claimed: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    let mut chosen: Vec<ScoredTorrent> = Vec::new();
+    for (candidate, slots) in ranked {
+        if slots.iter().any(|slot| claimed.contains(slot))
+            || chosen
+                .iter()
+                .any(|c| c.torrent.enclosure == candidate.torrent.enclosure)
+        {
+            continue;
+        }
+        claimed.extend(slots);
+        chosen.push(candidate.clone());
+    }
+    chosen
+}
+
+pub fn choose_with_policy(
+    subscribe: &Subscribe,
+    wash_filter: Option<&domain::Filter>,
+    admitted: &[ScoredTorrent],
+    facts: &SubscribeFacts,
+    policy: OverlapPolicy,
+) -> Vec<ScoredTorrent> {
     let mut chosen = Vec::new();
     if subscribe.full_season_pack {
+        let average = single_episode_average_size(admitted);
         if let Some(pack) = admitted
             .iter()
             .filter(|c| is_pack(&c.release, subscribe))
+            .filter(|c| pack_size_plausible(c, subscribe, average))
             .filter(|c| should_take(subscribe, wash_filter, facts, c))
             .max_by_key(|c| c.score)
         {
@@ -35,38 +116,7 @@ pub fn choose(
             }
         }
         Coverage::Tv { .. } => {
-            let mut best_by_ep: HashMap<(u32, u32), &ScoredTorrent> = HashMap::new();
-            for candidate in admitted
-                .iter()
-                .filter(|c| should_take(subscribe, wash_filter, facts, c))
-            {
-                // 只竞争订阅窗口里这个候选真正能填的槽。范围包在窗口外的集数
-                // 不能让它和窗口内的更高分单集一起被下载。
-                for (season, ep) in covered_slots(subscribe, &candidate.release) {
-                    let (Some(season), Some(ep)) = (season, ep) else {
-                        continue;
-                    };
-                    best_by_ep
-                        .entry((season, ep))
-                        .and_modify(|current| {
-                            if candidate.score > current.score {
-                                *current = candidate;
-                            }
-                        })
-                        .or_insert(candidate);
-                }
-            }
-            let mut seen = Vec::new();
-            for candidate in best_by_ep.into_values() {
-                if seen
-                    .iter()
-                    .any(|c: &&ScoredTorrent| c.torrent.enclosure == candidate.torrent.enclosure)
-                {
-                    continue;
-                }
-                seen.push(candidate);
-                chosen.push(candidate.clone());
-            }
+            chosen = choose_tv_greedy(subscribe, wash_filter, admitted, facts, policy);
         }
     }
     chosen
@@ -79,7 +129,22 @@ fn should_take(
     candidate: &ScoredTorrent,
 ) -> bool {
     let slots = covered_slots(subscribe, &candidate.release);
-    should_replace_slots(subscribe, wash_filter, facts, candidate, &slots)
+    // H1: at most one upgrade per owned slot in flight. A candidate is only
+    // worth taking for slots that are neither owned-with-upgrade-pending nor
+    // otherwise blocked; if every slot it touches already has an in-flight
+    // upgrade, skip it (the in-flight download decides once it lands).
+    if subscribe.wash_cut
+        && !slots.is_empty()
+        && slots.iter().all(|(s, e)| facts.is_in_flight(*s, *e))
+    {
+        return false;
+    }
+    let open: Vec<_> = slots
+        .iter()
+        .copied()
+        .filter(|(s, e)| !facts.is_in_flight(*s, *e))
+        .collect();
+    should_replace_slots(subscribe, wash_filter, facts, candidate, &open)
 }
 
 /// 逐槽位判定候选是否应替换已有事实。choose() 用它做选择；collect.rs 用它
@@ -133,11 +198,17 @@ pub(crate) fn should_replace_slots(
                         })
                     }
                     None => {
-                        if !old_quality.as_ref().is_some_and(quality_known) {
+                        let Some(old) = old_quality.as_ref().filter(|q| quality_known(q)) else {
                             tracing::warn!(path = ?existing.path, "已有质量未知，拒绝按分数批准 Wash-cut");
                             return false;
+                        };
+                        // M9: built-in default ladder; score only breaks ties
+                        // between equal (comparable) quality.
+                        match default_ladder_compare(&candidate.release, old) {
+                            std::cmp::Ordering::Greater => true,
+                            std::cmp::Ordering::Equal => candidate.score > existing.score,
+                            std::cmp::Ordering::Less => false,
                         }
-                        candidate.score > existing.score
                     }
                 }
             }
@@ -214,6 +285,18 @@ pub fn target_reached(owned: &Release, target: &Release) -> bool {
 }
 
 /// Ordered Wash-cut comparison dimensions configured on the Filter.
+/// L3: dimensions an `UpgradeLadder` may name.
+pub const LADDER_DIMENSIONS: [&str; 4] = ["resolution", "source", "codec", "hdr"];
+
+/// L3: the first ladder dimension that is not in `LADDER_DIMENSIONS`.
+pub fn unknown_ladder_dimension(raw: &str) -> Option<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|dim| !dim.is_empty())
+        .find(|dim| !LADDER_DIMENSIONS.contains(dim))
+        .map(str::to_string)
+}
+
 fn ladder_for(wash_filter: Option<&domain::Filter>) -> Option<Vec<String>> {
     let filter = wash_filter?;
     filter.atoms.iter().find_map(|atom| match &atom.rule {
@@ -262,7 +345,15 @@ fn ladder_compare(new: &Release, old: &Release, ladder: &[String]) -> Option<std
             "source" => (&new.source, &old.source, source_level),
             "codec" => (&new.codec, &old.codec, codec_level),
             "hdr" => (&new.hdr, &old.hdr, hdr_level),
-            _ => continue,
+            other => {
+                // L3: saved ladders are validated; an old row may still hold a
+                // bad name. Report it once instead of silently ignoring it.
+                static REPORTED: std::sync::Once = std::sync::Once::new();
+                REPORTED.call_once(|| {
+                    tracing::error!(dimension = %other, "UpgradeLadder 含未知维度，已忽略");
+                });
+                continue;
+            }
         };
         match (new_value.as_deref(), old_value.as_deref()) {
             (Some(new_value), Some(old_value)) => {
@@ -278,6 +369,35 @@ fn ladder_compare(new: &Release, old: &Release, ladder: &[String]) -> Option<std
         }
     }
     Some(result)
+}
+
+/// M9: default `resolution,hdr,codec,source` ordering used when no
+/// UpgradeLadder is configured. Dimensions unknown on either side are skipped;
+/// any known downgrade makes the candidate worse.
+fn default_ladder_compare(new: &Release, old: &Release) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let dims: [(Option<&str>, Option<&str>, fn(&str) -> i32); 4] = [
+        (
+            new.resolution.as_deref(),
+            old.resolution.as_deref(),
+            resolution_level,
+        ),
+        (new.hdr.as_deref(), old.hdr.as_deref(), hdr_level),
+        (new.codec.as_deref(), old.codec.as_deref(), codec_level),
+        (new.source.as_deref(), old.source.as_deref(), source_level),
+    ];
+    let mut result = Ordering::Equal;
+    for (new_value, old_value, level) in dims {
+        let (Some(new_value), Some(old_value)) = (new_value, old_value) else {
+            continue;
+        };
+        match level(new_value).cmp(&level(old_value)) {
+            Ordering::Less => return Ordering::Less,
+            Ordering::Greater if result == Ordering::Equal => result = Ordering::Greater,
+            _ => {}
+        }
+    }
+    result
 }
 
 fn resolution_level(value: &str) -> i32 {
@@ -435,6 +555,28 @@ pub(crate) fn candidate_matches_subscribe_with_keywords(
     release_matches_subscribe(subscribe, media, release)
 }
 
+/// Identity check for an in-flight pending release (H4): like
+/// `candidate_matches_subscribe`, but a pure season pack of the subscribed
+/// season counts even when the chooser would not pick packs itself (a pack
+/// admitted by hand still occupies the season).
+pub(crate) fn pending_matches_subscribe(
+    subscribe: &Subscribe,
+    media: &Media,
+    release: &Release,
+) -> bool {
+    if candidate_matches_subscribe(subscribe, media, release) {
+        return true;
+    }
+    let Coverage::Tv { season, .. } = subscribe.coverage else {
+        return false;
+    };
+    let keywords = short_title_keyword(media);
+    subscribe.media_id == media.id
+        && matches_media(media, release, &keywords)
+        && release.season == Some(season)
+        && release.covered_episodes().is_empty()
+}
+
 fn release_matches_subscribe(subscribe: &Subscribe, media: &Media, release: &Release) -> bool {
     if let (Some(want), Some(got)) = (media.year, release.year) {
         if want != got {
@@ -445,9 +587,53 @@ fn release_matches_subscribe(subscribe: &Subscribe, media: &Media, release: &Rel
         (Coverage::Movie, MediaKind::Movie) => {
             release.season.is_none() && release.episode.is_none() && release.episode_to.is_none()
         }
+        // G-H2: a defaulted S01 never stands in for another season.
+        (Coverage::Tv { season, .. }, MediaKind::Tv) if release.season_inferred && *season != 1 => {
+            false
+        }
         (Coverage::Tv { .. }, MediaKind::Tv) => !covered_slots(subscribe, release).is_empty(),
         _ => false,
     }
+}
+
+/// L1: average size of admitted single-episode candidates, when known.
+fn single_episode_average_size(admitted: &[ScoredTorrent]) -> Option<u64> {
+    let sizes: Vec<u64> = admitted
+        .iter()
+        .filter(|c| matches!(c.release.episode_span(), Some((from, to)) if from == to))
+        .filter_map(|c| c.torrent.size_bytes)
+        .collect();
+    (!sizes.is_empty()).then(|| sizes.iter().sum::<u64>() / sizes.len() as u64)
+}
+
+/// L1: a bare `S01` (no episode numbers) only counts as a season pack when
+/// its size is at least half of `average single × episodes`. Without a size
+/// or without single-episode references the old behaviour is kept.
+fn pack_size_plausible(
+    candidate: &ScoredTorrent,
+    subscribe: &Subscribe,
+    average: Option<u64>,
+) -> bool {
+    if candidate.release.episode.is_some() {
+        return true;
+    }
+    let (Some(size), Some(average)) = (candidate.torrent.size_bytes, average) else {
+        return true;
+    };
+    let Coverage::Tv {
+        episode_from,
+        episode_to: Some(episode_to),
+        ..
+    } = subscribe.coverage
+    else {
+        return true;
+    };
+    let episodes = u64::from(episode_to.saturating_sub(episode_from) + 1);
+    let plausible = size.saturating_mul(2) >= average.saturating_mul(episodes);
+    if !plausible {
+        tracing::debug!(torrent = %candidate.torrent.title, size, average, episodes, "纯季包体积过小，不视为整季包");
+    }
+    plausible
 }
 
 fn is_pack(release: &Release, subscribe: &Subscribe) -> bool {
@@ -466,10 +652,18 @@ fn is_pack(release: &Release, subscribe: &Subscribe) -> bool {
         return false;
     }
     // 明确标注了范围 E01-E10 的整季包，或者省略集号的 S01 纯季包
-    (release.episode == Some(episode_from) && release.episode_to == Some(episode_to))
+    // L2: an explicit range pack is accepted when it covers the whole window
+    // (E01-E13 for E01-E12); episodes outside the window are not imported.
+    matches!((release.episode, release.episode_to), (Some(from), Some(to)) if from <= episode_from && to >= episode_to)
         || (release.episode.is_none() && release.episode_to.is_none())
 }
 
+/// Whether a bounded, non-wash subscription owns every unit.
+///
+/// M4b: wash-cut and open-window subscriptions are never "complete" here by
+/// design: they keep tracking upgrades / future episodes. The persisted
+/// `completed` tracking state (M4a, `api::completion`) applies only to
+/// bounded, non-wash coverage.
 pub fn is_complete(subscribe: &Subscribe, facts: &SubscribeFacts) -> bool {
     if subscribe.wash_cut {
         return false;

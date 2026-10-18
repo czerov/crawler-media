@@ -70,6 +70,15 @@ pub(super) fn finish_search(
         "评估候选种子"
     );
     remove_pending_candidates(&mut torrents, &context.existing, subscribe.id);
+    // H2: never auto-pick an enclosure whose probed quality already vetoed it.
+    let rejected = state
+        .store
+        .lock()
+        .load_rejected_enclosures(subscribe.id)
+        .map_err(|e| e.to_string())?;
+    if !rejected.is_empty() {
+        torrents.retain(|torrent| !rejected.contains(&torrent.enclosure));
+    }
 
     let add_errors = admit_candidates(
         state,
@@ -123,12 +132,16 @@ fn load_search_context(
             .and_then(|id| store.get_filter(id).ok().flatten())
             .or_else(|| store.get_filter(subscribe.filter_id).ok().flatten())
     };
-    let (library_root, transfer_mode, scrape) =
-        crate::directory::transfer_plan_for_library(
-            &state.store.lock(), media.kind,
-            subscribe.library_id.as_ref().map(|id| id.to_string()).as_deref(),
-        )
-            .map_err(|error| error.to_string())?;
+    let (library_root, transfer_mode, scrape) = crate::directory::transfer_plan_for_library(
+        &state.store.lock(),
+        media.kind,
+        subscribe
+            .library_id
+            .as_ref()
+            .map(|id| id.to_string())
+            .as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
     let naming = state
         .store
         .lock()
@@ -189,8 +202,13 @@ fn admit_candidates(
     let routed =
         crate::delivery::RoutedDownloader::with_pending(state, subscribe, &context.existing);
     let facts = facts_with_pending(context.facts.clone(), &context.existing, subscribe, media);
+    let overlap = overlap_policy(state);
+    let absolute =
+        crate::season_check::absolute_map(state, media, torrents.iter().map(|t| t.title.as_str()));
+    let selective = crate::selective_files::enabled(state).then(|| facts.clone());
+    let chooser = crate::pack_fallback::effective(state, subscribe);
     let added = admit_and_add(RunInput {
-        subscribe,
+        subscribe: &chooser,
         media,
         filter,
         wash_filter: context.wash_filter.as_ref(),
@@ -204,13 +222,26 @@ fn admit_candidates(
         hooks: None,
         naming: Some(&context.naming),
         preserve_removed: false,
+        overlap,
+        absolute: absolute.as_ref(),
     })
     .map_err(|e| {
         tracing::error!(subscribe_id = %subscribe.id, media = %media.title, error = %e, "收录并添加种子失败");
         e.to_string()
     })?;
+    let deferred = selective
+        .as_ref()
+        .map(|before| crate::selective_files::apply(&routed, subscribe, &added.chosen, before, absolute.as_ref()))
+        .unwrap_or_default();
     notify_search_additions(state, subscribe, media, &added);
     merge_added_pending(state, subscribe, &added, &routed)?;
+    for (enclosure, missing) in &deferred {
+        state
+            .store
+            .lock()
+            .set_pending_selective(subscribe.id, enclosure, Some(missing))
+            .map_err(|error| error.to_string())?;
+    }
     record_wanted_round(state, subscribe, &added)?;
     notify_subscription_complete(state, subscribe, media)?;
     Ok(added.add_errors)
@@ -268,73 +299,100 @@ fn merge_added_pending<D: downloader::Downloader + ?Sized>(
             )
         })
         .collect();
-    state
-        .store
-        .lock()
+    let store = state.store.lock();
+    // D-M3: the same torrent reached through another enclosure (other site /
+    // link) is one download: keep a single pending row per info hash.
+    let known = store
+        .load_pending_info_hashes(subscribe.id)
+        .map_err(|error| error.to_string())?;
+    let pending: Vec<_> = pending
+        .into_iter()
+        .filter(|(_, item)| {
+            let Some(hash) = routed.submitted_hash(&item.torrent) else { return true };
+            let duplicate = known
+                .iter()
+                .any(|(enclosure, known)| *enclosure != item.torrent.enclosure && known.eq_ignore_ascii_case(&hash));
+            if duplicate {
+                tracing::info!(torrent = %item.torrent.title, %hash, "同 info hash 的任务已在途，不重复登记 pending");
+            }
+            !duplicate
+        })
+        .collect();
+    store
         .record_pending_submissions(subscribe.id, &pending)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    for (_, item) in &pending {
+        if let Some(hash) = routed.submitted_hash(&item.torrent) {
+            store
+                .set_pending_info_hash(subscribe.id, &item.torrent.enclosure, &hash)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    // G-M2: a broken existing task is recorded as a rejected source so the
+    // next round never picks it again and switches to another release.
+    if !added.broken.is_empty() {
+        let broken: Vec<(i32, crate::store::PendingDownload)> = added
+            .broken
+            .iter()
+            .map(|scored| {
+                (
+                    scored.score,
+                    crate::store::PendingDownload {
+                        submitted_at: None,
+                        torrent: scored.torrent.clone(),
+                        release_override: None,
+                        downloader_id: routed.used_id(&scored.torrent),
+                    },
+                )
+            })
+            .collect();
+        let enclosures: Vec<String> = added
+            .broken
+            .iter()
+            .map(|s| s.torrent.enclosure.clone())
+            .collect();
+        store
+            .record_pending_submissions(subscribe.id, &broken)
+            .map_err(|error| error.to_string())?;
+        store
+            .mark_pending_rejected(subscribe.id, &enclosures)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn facts_with_pending(
-    mut facts: subscribe::SubscribeFacts,
+    facts: subscribe::SubscribeFacts,
     existing: &[(i32, crate::store::PendingDownload)],
     subscribe: &domain::Subscribe,
     media: &domain::Media,
 ) -> subscribe::SubscribeFacts {
-    for (_, pending) in existing {
-        let release = pending
-            .release_override
-            .clone()
-            .unwrap_or_else(|| release::parse(&pending.torrent.title));
-        if !subscribe::candidate_matches_subscribe(subscribe, media, &release) {
-            continue;
-        }
-        for (season, episode) in covered_units(&release, subscribe) {
-            if facts.get(season, episode).is_none() {
-                facts.upsert(
-                    season,
-                    episode,
-                    subscribe::QualityFact {
-                        score: 0,
-                        path: None,
-                    },
-                );
-            }
-        }
-    }
-    facts
+    let releases = pending_releases(existing);
+    subscribe::facts_with_pending(facts, &releases, subscribe, media)
 }
 
-fn covered_units(
-    release: &domain::Release,
-    subscribe: &domain::Subscribe,
-) -> Vec<(Option<u32>, Option<u32>)> {
-    if release.season.is_none() {
-        return vec![(None, None)];
-    }
-    let units = release.covered_episodes();
-    if units.is_empty() {
-        // D04: 若订阅开启了整季包模式，将无具体集号的季包展开为具体的 (season, episode) 槽位，
-        // 与 chooser 保持一致，防止下一轮重复下载相同季的其他种子。
-        if let domain::Coverage::Tv {
-            season,
-            episode_from,
-            episode_to,
-        } = subscribe.coverage
-        {
-            if release.season == Some(season) && subscribe.full_season_pack {
-                let pack_to = episode_to.unwrap_or(episode_from);
-                let capped = episode_from
-                    .saturating_add(domain::Coverage::MAX_EPISODES.saturating_sub(1));
-                return (episode_from..=pack_to.min(capped))
-                    .map(|ep| (Some(season), Some(ep)))
-                    .collect();
-            }
-        }
-        return vec![(release.season, None)];
-    }
-    units
-        .into_iter()
-        .map(|(season, episode)| (Some(season), Some(episode)))
+pub(crate) fn pending_releases(
+    existing: &[(i32, crate::store::PendingDownload)],
+) -> Vec<domain::Release> {
+    existing
+        .iter()
+        .map(|(_, pending)| {
+            pending
+                .release_override
+                .clone()
+                .unwrap_or_else(|| release::parse(&pending.torrent.title))
+        })
         .collect()
+}
+
+/// M1: overlap policy from settings (`prefer_pack` default). Takes the store lock briefly.
+pub(crate) fn overlap_policy(state: &ApiState) -> subscribe::OverlapPolicy {
+    state
+        .store
+        .lock()
+        .get_setting(crate::settings_keys::SUBSCRIBE_OVERLAP_POLICY)
+        .ok()
+        .flatten()
+        .map(|value| subscribe::OverlapPolicy::parse(&value))
+        .unwrap_or_default()
 }

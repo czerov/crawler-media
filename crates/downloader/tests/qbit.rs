@@ -71,7 +71,12 @@ fn match_fake_qbit_route(
         capture.adds.lock().push(req.to_string());
         ("200 OK", "Ok.".into(), "")
     } else if req.starts_with("GET /signed.torrent") {
-        ("200 OK", "d8:announce12:https://pt/e".into(), "")
+        // D-M4: must be a real bencoded torrent (dictionary with `info`).
+        (
+            "200 OK",
+            "d8:announce10:https://pt4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".into(),
+            "",
+        )
     } else if req.contains("/api/v2/torrents/info") {
         let injected = capture.injected_infos.lock().clone();
         let body = if let Some(custom) = injected {
@@ -391,6 +396,11 @@ fn task_snapshots_extract_our_tag_and_live_state() {
     assert_eq!(
         snapshot.tag, "crawler-media",
         "应从 tags 里挑出 crawler-media 标记，忽略 ownership 派生标签"
+    );
+    assert_eq!(
+        snapshot.owned_tags,
+        vec![downloader::ownership_tag("https://pt.example/download.php?id=1")],
+        "D-S1: per-torrent ownership tag must be exposed for HTTP identity"
     );
     assert_eq!(snapshot.state, "stalledDL");
     assert_eq!(snapshot.progress, 1.0);

@@ -20,7 +20,7 @@ use crate::management::ApiState;
 /// 提交后的短窗口内种子可能尚未在客户端可见（URL/磁力投递需要时间入库），
 /// 宽限期内缺失只如实上报 missing 不删行；超过宽限期且客户端可达仍找不到，
 /// 判定为「任务已消失」，自动清理 pending 行（下一轮搜索会按订阅重新投递）。
-pub(super) const ABSENT_CLEANUP_GRACE_SECS: i64 = 15 * 60;
+pub(super) use crate::pending_reconcile::ABSENT_CLEANUP_GRACE_SECS;
 
 #[derive(Deserialize)]
 pub(crate) struct SubmitInput {
@@ -47,6 +47,9 @@ pub(crate) struct SubmitInput {
     pub(super) save_path: Option<String>,
     #[serde(default)]
     pub(super) auto_route: bool,
+    /// D-M5: submit even when the subscription already owns / downloads the slot.
+    #[serde(default)]
+    pub(super) force: bool,
 }
 
 /// 下载器工作失败的两层结果：解析失败 vs 调用失败 vs 预算失败。
