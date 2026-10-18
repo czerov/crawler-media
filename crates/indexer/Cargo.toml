@@ -16,6 +16,8 @@ roxmltree = "0.21"
 tracing.workspace = true
 tungstenite.workspace = true
 ureq.workspace = true
+psl = "2"
+idna = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

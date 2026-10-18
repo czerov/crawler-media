@@ -18,7 +18,6 @@ pub struct FetchRequest {
     pub cookie: Option<String>,
     pub api_key: Option<String>,
     pub proxy: Option<String>,
-    pub render: bool,
     pub cdp_url: Option<String>,
 }
 
@@ -120,7 +119,6 @@ pub fn search_request_page_categories(
         cookie: site.cookie.clone(),
         api_key: site.api_key.clone(),
         proxy: site.proxy.clone(),
-        render: profile.render,
         cdp_url: site.cdp_url.clone(),
     }
 }
@@ -134,7 +132,6 @@ pub fn rss_request(site: &Site, profile: &Profile) -> FetchRequest {
         cookie: site.cookie.clone(),
         api_key: site.api_key.clone(),
         proxy: site.proxy.clone(),
-        render: profile.render,
         cdp_url: site.cdp_url.clone(),
     }
 }
@@ -166,7 +163,6 @@ pub fn download_token_request(site: &Site, profile: &Profile, id: &str) -> Optio
         cookie: site.cookie.clone(),
         api_key: site.api_key.clone(),
         proxy: site.proxy.clone(),
-        render: false,
         cdp_url: None,
     })
 }
@@ -180,7 +176,6 @@ pub fn mteam_download_request(site: &Site, id: &str) -> FetchRequest {
         cookie: None,
         api_key: site.api_key.clone(),
         proxy: site.proxy.clone(),
-        render: false,
         cdp_url: None,
     }
 }

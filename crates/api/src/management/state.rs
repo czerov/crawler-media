@@ -70,6 +70,7 @@ pub struct ApiState {
     pub(crate) media_posters: Arc<dyn crate::media_posters::MediaPosterSource>,
     pub log_buffer: LogBuffer,
     pub obscura: Arc<crate::obscura_manager::ObscuraManager>,
+    pub browser: Arc<indexer::Browser>,
     /// 异步媒体探测队列（streamdetails + 声纹指纹后台采集）。
     pub probe: Arc<crate::probe_manager::ProbeManager>,
     /// 持久章节帧义务的有界派发服务（2 进程 / 64 ID 窗口）。
@@ -240,6 +241,7 @@ impl ApiState {
         let library_work = Arc::new(crate::library_lifecycle::LibraryWorkRegistry::default());
         let probe = Arc::new(crate::probe_manager::ProbeManager::new(store.clone()));
         probe.set_library_registry(library_work.clone());
+        let startup_browser = crate::runtime_browser::startup_browser(store.clone());
         let chapter_frames = Arc::new(crate::chapter_frame_service::ChapterFrameService::new(
             store.clone(),
             library_work.clone(),
@@ -287,6 +289,7 @@ impl ApiState {
             )),
             log_buffer: LogBuffer::new(DEFAULT_CAPACITY),
             obscura: Arc::new(crate::obscura_manager::ObscuraManager::new(&data_dir)),
+            browser: Arc::new(startup_browser.0),
             probe,
             chapter_frames,
             gallery_expansions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -299,7 +302,11 @@ impl ApiState {
             statistics_phase_barrier: None,
             statistics_role_lookups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
+        if let Some(error) = startup_browser.1 {
+            state.obscura.set_last_error(Some(error));
+        }
         if tokio::runtime::Handle::try_current().is_ok() {
+            crate::http::browser_settings::spawn_reconcile(&state);
             crate::library_lifecycle::resume_library_removals(&state)
                 .map_err(std::io::Error::other)?;
             state.probe.try_start_workers();
@@ -369,6 +376,11 @@ impl ApiState {
     /// 替换 blocking 预算（测试注入小并发以观察准入/超时行为）。
     pub fn with_http_work(mut self, budget: Arc<crate::blocking_budget::BlockingBudget>) -> Self {
         self.http_work = budget;
+        self
+    }
+
+    pub fn with_browser(mut self, browser: Arc<indexer::Browser>) -> Self {
+        self.browser = browser;
         self
     }
 

@@ -17,7 +17,7 @@ A configured PT tracker the system is allowed to search. Runtime credentials (co
 _Avoid_: tracker (except when quoting BT protocol), 爬虫配置
 
 **Indexer**:
-The parsing/search adapter for one **Site**: a framework (NexusPHP HTML or API) plus a per-site YAML overlay for selectors, categories, and RSS. Fetching a search/RSS page uses HTTP by default, or a **Browser** when the profile sets `render`. Built-in profiles ship with the app; a user overlay directory can replace a profile without a rebuild. An **Indexer** does not own login credentials. M-Team is a first-class API exception behind the same **Torrent** output; other API sites follow that pattern. Search across enabled **Sites** is concurrent; one **Site** failing does not fail the others.
+The parsing/search adapter for one **Site**: a framework (NexusPHP HTML or API) plus a per-site YAML overlay for selectors, categories, and RSS. Fetching a search/RSS page always uses HTTP; a profile `render` flag is ignored. Built-in profiles ship with the app; a user overlay directory can replace a profile without a rebuild. An **Indexer** does not own login credentials. M-Team is a first-class API exception behind the same **Torrent** output; other API sites follow that pattern. Search across enabled **Sites** is concurrent; one **Site** failing does not fail the others.
 _Avoid_: spider, crawler, scraper (as the configured object)
 
 **Torrent**:
@@ -97,7 +97,7 @@ Serving **Library** files to clients. External apps (Infuse, Fileball, and simil
 _Avoid_: 媒体服务器 (too broad), 转码服务 (a later, separate capability)
 
 **Browser**:
-A CDP session used to fetch JS-rendered pages and to drive login / **Check-in**. Default is: no Chromium in the image. Current runtime is **external-CDP-only**: connect to an already-running HTTP(S) CDP discovery endpoint, with explicit **Site** `cdp_url` taking precedence over enabled Obscura and then enabled global CDP. Managed Chromium/Obscura download and launch are not supported; enabling legacy managed Chromium is rejected rather than creating a placeholder directory. Saving an enabled endpoint config is not proof of running/usable rendering. This is a fetch/automation channel, not a Windows remote desktop.
+A CDP session used only to drive login / **Check-in** for **Sites** that opt in (`maintenance_via = browser`); search and RSS always use HTTP and never a **Browser**. One instance-level switch decides whether CDP is used at all: off means login / **Check-in** use HTTP, and no browser process is probed, downloaded, or started. When on, the endpoint (`http` discovery URLs only) resolves explicit **Site** `cdp_url` → instance `cdp.url` → a managed Obscura daemon; a failure before navigation falls back to HTTP with a warning, a failure after navigation is reported without retrying over HTTP. Each session runs in its own isolated browser context (created and disposed per session), so cookies never leak between Sites or accounts and no cookie is ever deleted from other contexts; endpoints without browser-context support are marked incompatible. Cookies are injected host-only and read back only for the Site URL. Same registrable-domain sessions are serialized to avoid cookie races. The Site proxy is not used. Existing data directories are upgraded in place; existing Sites default to HTTP maintenance. The managed daemon starts only when no instance endpoint is set and at least one enabled **Site** opts into the **Browser** without its own endpoint; it binds loopback on a random port. The default image ships neither Chromium nor Obscura; by default only a preinstalled, hash-verified release archive is used, and downloading requires an explicit admin choice. Saving an endpoint config is not proof of a usable browser. This is an automation channel, not a Windows remote desktop.
 _Avoid_: RDP, 无头模块, Playwright (implementation)
 
 **Check-in**:
@@ -113,7 +113,7 @@ _Avoid_: scheduler (the loop, not the record), APScheduler, cron (the schedule s
 - A **Subscribe** is owned by one **User** and targets exactly one **Media**
 - A **Subscribe** has a **Fetch mode** and a **Filter**
 - A **Media** has one internal id and optional aliases from **Metadata sources**
-- A **Site** is searched through its **Indexer** (HTTP or **Browser**, then the same selectors)
+- A **Site** is searched through its **Indexer** over HTTP
 - Search and RSS both produce **Torrents**
 - A **Filter** admits and scores a **Torrent** (via its **Release**) for a **Subscribe**
 - A **Downloader** receives a **Torrent** and later yields files that are **Transferred** into the **Library**

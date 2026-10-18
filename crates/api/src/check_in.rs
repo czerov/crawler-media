@@ -30,11 +30,7 @@ pub fn run(state: &ApiState) -> Result<(), String> {
         }
 
         tracing::info!(site = %site.name, site_id = %site.id, "【站点签到】正在执行站点签到/保活请求");
-        let result = site_policy(state, &site).and_then(|policy| {
-            CheckInPlugin::http(&bus, &creds, &http)
-                .with_policy(&policy)
-                .check_in(site.id)
-        });
+        let result = crate::site_maintenance::perform_check_in(state, &site, &bus, &creds);
         match result {
             Ok(_) => {
                 tracing::info!(site = %site.name, site_id = %site.id, "【站点签到】签到/保活成功");

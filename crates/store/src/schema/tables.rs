@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS instance_lock (
             rate_limit_per_minute INTEGER,
             cdp_url TEXT,
             downloader_id TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1
+            enabled INTEGER NOT NULL DEFAULT 1,
+            maintenance_via TEXT NOT NULL DEFAULT 'http' CHECK (maintenance_via IN ('http','browser'))
         );
         CREATE TABLE IF NOT EXISTS filters (
             id TEXT PRIMARY KEY,

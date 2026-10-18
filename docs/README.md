@@ -1,6 +1,6 @@
 # 文档入口与权威层级
 
-更新：2026-10-15。本次盘点按“已完成计划不再留在工作树”的原则清理了 `docs/`：删除 51 份已实施／已替代的逐轮计划、设计与复现附件（详见文末）。**旧文档的日期、unchecked 框或历史绿测都不表示当前功能未实现或已验收。**
+更新：2026-10-16。ADR-0007 的 Browser 能力边界随 2026-10-16 决策更新（单一 CDP 开关、受管 Obscura、失败回退 HTTP），下表 0007 行与 [deploy](<deploy.md>)、[CONTEXT](<../CONTEXT.md>) 同步；其余内容与清理记录仍为 2026-10-15。本次盘点按“已完成计划不再留在工作树”的原则清理了 `docs/`：删除 51 份已实施／已替代的逐轮计划、设计与复现附件（详见文末）。**旧文档的日期、unchecked 框或历史绿测都不表示当前功能未实现或已验收。**
 
 ## 当前先读
 
@@ -30,7 +30,7 @@
 | [0003 Site credentials](<adr/0003-plaintext-site-credentials.md>) | 有意的 SQLite 明文凭证边界，不等于可日志输出／进 Git |
 | [0005 Jellyfin](<adr/0005-jellyfin-compatible-playback.md>) | 实际客户端协议子集；未实现 UserConfiguration 明确保留 |
 | [0006 Indexer](<adr/0006-indexer-in-first-slice.md>) | 架构 rationale，不是当前外网验收结果 |
-| [0007 Browser](<adr/0007-cdp-browser-opt-in.md>) | external-CDP-only；端点配置≠可用性验证 |
+| [0007 Browser](<adr/0007-cdp-browser-opt-in.md>) | Browser 仅用于登录/签到；导航前回退 HTTP；受管 Obscura；每会话独立 BrowserContext；存量库增量升级（r9） |
 | [0008 SQLite](<adr/0008-sqlite-system-of-record.md>) | 四 Store 生命周期分区＋jobs/fanart；root_id／路径与历史背景已更正 |
 | [0009 Job](<adr/0009-job-queue.md>) | Interval／queued-running 约束／状态事实；不宣称专用单写线程或全局 2 runner 上限 |
 | [0010 Password](<adr/0010-password-hashing.md>) | Argon2id；其他独立 credential 生命周期历史计划不得机械重跑 |

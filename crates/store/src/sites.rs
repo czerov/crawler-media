@@ -9,8 +9,8 @@ impl Store {
         self.app.execute(
             "INSERT INTO sites (
                 id, name, url, profile_id, cookie, api_key, rss_url, proxy,
-                rate_limit_per_minute, cdp_url, downloader_id, enabled
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rate_limit_per_minute, cdp_url, downloader_id, enabled, maintenance_via
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 site.id.to_string(),
                 site.name,
@@ -24,6 +24,7 @@ impl Store {
                 site.cdp_url,
                 site.downloader_id.map(|id| id.to_string()),
                 site.enabled as i64,
+                site.maintenance_via.as_str(),
             ],
         )?;
         Ok(())
@@ -33,7 +34,7 @@ impl Store {
         self.app
             .query_row(
                 "SELECT id, name, url, profile_id, cookie, api_key, rss_url, proxy,
-                        rate_limit_per_minute, cdp_url, downloader_id, enabled
+                        rate_limit_per_minute, cdp_url, downloader_id, enabled, maintenance_via
                  FROM sites WHERE id = ?1",
                 params![id.to_string()],
                 map_site,
@@ -45,7 +46,7 @@ impl Store {
     pub fn list_enabled_sites(&self) -> Result<Vec<Site>, StoreError> {
         let mut stmt = self.app.prepare(
             "SELECT id, name, url, profile_id, cookie, api_key, rss_url, proxy,
-                    rate_limit_per_minute, cdp_url, downloader_id, enabled
+                    rate_limit_per_minute, cdp_url, downloader_id, enabled, maintenance_via
              FROM sites WHERE enabled = 1",
         )?;
         let rows = stmt.query_map([], map_site)?;
@@ -55,7 +56,7 @@ impl Store {
     pub fn list_sites(&self) -> Result<Vec<Site>, StoreError> {
         let mut stmt = self.app.prepare(
             "SELECT id, name, url, profile_id, cookie, api_key, rss_url, proxy,
-                    rate_limit_per_minute, cdp_url, downloader_id, enabled
+                    rate_limit_per_minute, cdp_url, downloader_id, enabled, maintenance_via
              FROM sites",
         )?;
         let rows = stmt.query_map([], map_site)?;
@@ -81,7 +82,7 @@ impl Store {
         let n = self.app.execute(
             "UPDATE sites SET name = ?2, url = ?3, profile_id = ?4, cookie = ?5, api_key = ?6,
                     rss_url = ?7, proxy = ?8, rate_limit_per_minute = ?9, cdp_url = ?10,
-                    downloader_id = ?11, enabled = ?12
+                    downloader_id = ?11, enabled = ?12, maintenance_via = ?13
              WHERE id = ?1",
             params![
                 site.id.to_string(),
@@ -96,6 +97,7 @@ impl Store {
                 site.cdp_url,
                 site.downloader_id.map(|id| id.to_string()),
                 site.enabled as i64,
+                site.maintenance_via.as_str(),
             ],
         )?;
         Ok(n > 0)

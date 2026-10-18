@@ -233,7 +233,7 @@ fn reopen_at_current_app_schema_cleans_settings_of_already_removed_library() {
         .find(|(name, _)| *name == "app")
         .unwrap()
         .1;
-    assert_eq!(app_version, 7, "本测试钉住真实边界：app schema 7");
+    assert_eq!(app_version, 8, "本测试钉住真实边界：app schema 8");
     drop(store);
 
     let reopened = Store::open(&data).unwrap();

@@ -130,6 +130,7 @@ impl SearchAdmissionFixture {
                     cdp_url: None,
                     downloader_id: None,
                     enabled: true,
+                    maintenance_via: domain::MaintenanceVia::Http,
                 };
                 site_ids.push(site.id.to_string());
                 guard.insert_site(&site).unwrap();

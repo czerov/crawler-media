@@ -132,6 +132,34 @@ pub struct User {
     pub role: UserRole,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MaintenanceVia {
+    #[default]
+    Http,
+    Browser,
+}
+
+impl MaintenanceVia {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Browser => "browser",
+        }
+    }
+}
+
+impl std::str::FromStr for MaintenanceVia {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "http" => Ok(Self::Http),
+            "browser" => Ok(Self::Browser),
+            other => Err(format!("unknown maintenance_via '{other}'")),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Site {
     pub id: SiteId,
@@ -146,6 +174,7 @@ pub struct Site {
     pub cdp_url: Option<String>,
     pub downloader_id: Option<DownloaderId>,
     pub enabled: bool,
+    pub maintenance_via: MaintenanceVia,
 }
 
 /// 手写 `Debug`：`cookie` 是站点会话凭证、`api_key` 是站点 API 凭证，
@@ -170,6 +199,7 @@ impl std::fmt::Debug for Site {
             .field("cdp_url", &self.cdp_url)
             .field("downloader_id", &self.downloader_id)
             .field("enabled", &self.enabled)
+            .field("maintenance_via", &self.maintenance_via)
             .finish()
     }
 }
@@ -227,6 +257,7 @@ mod debug_tests {
             cdp_url: None,
             downloader_id: None,
             enabled: true,
+            maintenance_via: super::MaintenanceVia::Http,
         }
     }
 
@@ -245,6 +276,7 @@ mod debug_tests {
             cdp_url: None,
             downloader_id: None,
             enabled: true,
+            maintenance_via: super::MaintenanceVia::Http,
         };
         let rendered = format!("{site:?}");
         assert!(

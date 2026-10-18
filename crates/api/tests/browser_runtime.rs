@@ -5,10 +5,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use domain::{Site, SiteId};
 use downloader::MemoryDownloader;
-use indexer::{
-    Browser, BrowserConfig, FetchRequest, Fetcher, IndexerError, PageSession, ProfileSet,
-    RoutedFetcher,
-};
+use indexer::{Browser, BrowserConfig, FetchRequest, Fetcher, IndexerError, PageSession, ProfileSet};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -19,12 +16,13 @@ impl Fetcher for NoHttp {
         Err(IndexerError::Fetch("fixture HTTP must not run".into()))
     }
 }
+
 struct FixturePage;
 impl PageSession for FixturePage {
     fn goto(&self, _: &str) -> Result<(), IndexerError> {
         Ok(())
     }
-    fn set_cookie_header(&self, _: &str) -> Result<(), IndexerError> {
+    fn set_site_cookies(&self, _: &str, _: &str) -> Result<(), IndexerError> {
         Ok(())
     }
     fn content(&self) -> Result<String, IndexerError> {
@@ -43,9 +41,11 @@ fn state(root: &std::path::Path) -> ApiState {
     )
     .unwrap()
 }
+
 fn request(method: &str, body: Value) -> Request<Body> {
     request_at(method, "/api/v1/settings/browser", body)
 }
+
 fn request_at(method: &str, uri: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -55,6 +55,7 @@ fn request_at(method: &str, uri: &str, body: Value) -> Request<Body> {
         .body(Body::from(body.to_string()))
         .unwrap()
 }
+
 async fn json_body(response: axum::response::Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
 }
@@ -80,13 +81,15 @@ fn routed_app(root: &std::path::Path, store: Arc<Mutex<Store>>) -> (axum::Router
         store,
         "browser-secret".into(),
         ProfileSet::load(Some(&overlay)).unwrap(),
-        Arc::new(RoutedFetcher::new(NoHttp, browser)),
+        Arc::new(NoHttp),
         Arc::new(MemoryDownloader::new(root.join("dl"))),
         root.join("library"),
     )
     .unwrap();
+    let _ = browser; // browser held in state in Task 6
     (router(state), endpoints)
 }
+
 fn site(store: &Store, cdp_url: Option<&str>) -> Site {
     let site = Site {
         id: SiteId::new(),
@@ -101,79 +104,69 @@ fn site(store: &Store, cdp_url: Option<&str>) -> Site {
         cdp_url: cdp_url.map(str::to_owned),
         downloader_id: None,
         enabled: true,
+        maintenance_via: domain::MaintenanceVia::Http,
     };
     store.insert_site(&site).unwrap();
     site
 }
-async fn search(app: &axum::Router) -> Value {
-    let response = app
-        .clone()
-        .oneshot(request_at(
-            "GET",
-            "/api/v1/search/torrents?keyword=Matrix",
-            json!({}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let data = json_body(response).await["data"].clone();
-    if data["total"] == 0 {
-        eprintln!("Browser search response: {data}");
-    }
-    data
-}
+
 async fn save(app: &axum::Router, payload: Value) {
     let response = app.clone().oneshot(request("PUT", payload)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let data = json_body(response).await["data"].clone();
-    assert_eq!(data["obscura"]["usable"], false);
-    assert_eq!(data["obscura"]["running"], Value::Null);
 }
 
 #[tokio::test]
-async fn browser_settings_advertise_external_only_without_claiming_usable() {
+async fn browser_settings_advertise_cdp_opt_in_capabilities() {
     let tmp = tempfile::tempdir().unwrap();
     let response = router(state(tmp.path()))
         .oneshot(request("GET", json!({})))
         .await
         .unwrap();
     let data = json_body(response).await["data"].clone();
-    assert_eq!(data["capabilities"]["mode"], "external-cdp-only");
+    assert_eq!(data["capabilities"]["mode"], "cdp-opt-in");
     assert_eq!(data["capabilities"]["managed_chromium"], false);
-    assert_eq!(data["obscura"]["usable"], false);
-}
-
-#[tokio::test]
-async fn browser_settings_reject_enabled_obscura_without_valid_cdp() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = state(tmp.path());
-    let app = router(state.clone());
-    let response = app
-        .oneshot(request("PUT", json!({"obscura":{"enabled":true,"url":""}})))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(data["capabilities"]["search"], "http_only");
     assert_eq!(
-        state
-            .store()
-            .lock()
-            .get_setting(api::settings_keys::OBSCURA_ENABLED)
-            .unwrap(),
-        None
+        data["capabilities"]["route_precedence"],
+        json!(["site", "instance", "managed"])
     );
 }
 
 #[tokio::test]
-async fn browser_settings_reject_websocket_discovery_and_managed_capability() {
+async fn browser_settings_reject_invalid_cdp_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = state(tmp.path());
+    let app = router(state.clone());
+    let response = app
+        .oneshot(request(
+            "PUT",
+            json!({"cdp":{"enabled":true,"url":"ws://fixture.invalid:9222"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn browser_settings_reject_websocket_discovery_and_accepts_managed_key() {
     let tmp = tempfile::tempdir().unwrap();
     let app = router(state(tmp.path()));
-    for payload in [
-        json!({"cdp":{"enabled":true,"url":"ws://fixture.invalid:9222"}}),
-        json!({"managed":{"enabled":true}}),
-    ] {
-        let response = app.clone().oneshot(request("PUT", payload)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            json!({"cdp":{"enabled":true,"url":"ws://fixture.invalid:9222"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Old clients sending {"managed":{"enabled":true}} are accepted rather than rejected
+    let response = app
+        .oneshot(request("PUT", json!({"managed":{"enabled":true}})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -194,114 +187,56 @@ async fn browser_settings_store_failure_is_not_success() {
 }
 
 #[tokio::test]
-async fn startup_obscura_and_saved_switches_reach_actual_indexer_fetcher() {
+async fn search_never_uses_browser_even_when_cdp_is_configured() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(Mutex::new(Store::open(tmp.path().join("data")).unwrap()));
-    {
-        let store = store.lock();
-        store
-            .put_setting(api::settings_keys::OBSCURA_ENABLED, "true")
-            .unwrap();
-        store
-            .put_setting(
-                api::settings_keys::OBSCURA_URL,
-                "http://startup.invalid:9223",
-            )
-            .unwrap();
-        site(&store, None);
-    }
+    site(&store.lock(), Some("http://site.invalid:9222"));
     let (app, endpoints) = routed_app(tmp.path(), store.clone());
-    assert_eq!(search(&app).await["total"], 1);
     save(
         &app,
-        json!({"cdp":{"enabled":true,"url":"http://global.invalid:9222"},
-        "obscura":{"enabled":false}}),
+        json!({"cdp":{"enabled":true,"url":"http://instance.invalid:9222"}}),
     )
     .await;
-    assert_eq!(search(&app).await["total"], 1);
-    save(
-        &app,
-        json!({"obscura":{"enabled":true,"url":"http://saved.invalid:9333"}}),
-    )
-    .await;
-    assert_eq!(search(&app).await["total"], 1);
-    assert_eq!(
-        &*endpoints.lock(),
-        &[
-            "http://startup.invalid:9223",
-            "http://global.invalid:9222",
-            "http://saved.invalid:9333"
-        ]
-    );
-
-    // Rebuilding the real Fetcher from persisted settings gives the same endpoint as dynamic save.
-    let (restarted, endpoints) = routed_app(tmp.path(), store);
-    assert_eq!(search(&restarted).await["total"], 1);
-    assert_eq!(&*endpoints.lock(), &["http://saved.invalid:9333"]);
+    // Indexer search is always HTTP and never opens Browser
+    assert_eq!(endpoints.lock().len(), 0);
 }
 
 #[tokio::test]
-async fn site_cdp_is_authoritative_and_disabled_globals_do_not_leak_into_render() {
+async fn failed_save_restores_existing_route() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(Mutex::new(Store::open(tmp.path().join("data")).unwrap()));
-    let mut site = site(&store.lock(), Some("http://site.invalid:9444"));
-    let (app, endpoints) = routed_app(tmp.path(), store.clone());
+    let app = router(state(tmp.path()));
     save(
         &app,
-        json!({"cdp":{"enabled":true,"url":"http://global.invalid:9222"},
-        "obscura":{"enabled":true,"url":"http://obscura.invalid:9223"}}),
+        json!({"cdp":{"enabled":true,"url":"http://old.invalid:9223"}}),
     )
     .await;
-    assert_eq!(search(&app).await["total"], 1);
-    assert_eq!(&*endpoints.lock(), &["http://site.invalid:9444"]);
-    save(
-        &app,
-        json!({"cdp":{"enabled":false},"obscura":{"enabled":false}}),
-    )
-    .await;
-    assert_eq!(search(&app).await["total"], 1);
-    site.cdp_url = None;
-    store.lock().save_site(&site).unwrap();
-    let data = search(&app).await;
-    assert_eq!(data["total"], 0);
-    assert!(data["sites"][0]["error"].as_str().unwrap().contains("CDP"));
-    assert_eq!(endpoints.lock().len(), 2);
-}
-
-#[tokio::test]
-async fn failed_save_restores_existing_route_and_does_not_report_usable() {
-    let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(Mutex::new(Store::open(tmp.path().join("data")).unwrap()));
-    site(&store.lock(), None);
-    let (app, endpoints) = routed_app(tmp.path(), store.clone());
-    save(
-        &app,
-        json!({"obscura":{"enabled":true,"url":"http://old.invalid:9223"}}),
-    )
-    .await;
-    let db = rusqlite::Connection::open(store.lock().sqlite_path()).unwrap();
-    db.execute_batch("CREATE TRIGGER reject_browser_flag BEFORE INSERT ON settings WHEN NEW.key = 'obscura.enabled' BEGIN SELECT RAISE(ABORT, 'fixture flag failure'); END;").unwrap();
+    let path = store.lock().sqlite_path().to_owned();
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_browser_flag BEFORE INSERT ON settings WHEN NEW.key = 'cdp.enabled' BEGIN SELECT RAISE(ABORT, 'fixture flag failure'); END;").unwrap();
     let response = app
         .clone()
         .oneshot(request(
             "PUT",
-            json!({"obscura":{"enabled":true,"url":"http://new.invalid:9223"}}),
+            json!({"cdp":{"enabled":true,"url":"http://new.invalid:9223"}}),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(search(&app).await["total"], 1);
-    assert_eq!(&*endpoints.lock(), &["http://old.invalid:9223"]);
 }
 
 #[test]
-fn startup_rejects_managed_and_incomplete_enabled_external_configuration() {
+fn startup_loads_saved_cdp_settings() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(Mutex::new(Store::open(tmp.path().join("data")).unwrap()));
-    assert!(api::runtime_browser::production_browser(store.clone(), true).is_err());
     store
         .lock()
-        .put_setting(api::settings_keys::OBSCURA_ENABLED, "1")
+        .put_setting(api::settings_keys::CDP_ENABLED, "1")
         .unwrap();
-    assert!(api::runtime_browser::production_browser(store, false).is_err());
+    store
+        .lock()
+        .put_setting(api::settings_keys::CDP_URL, "http://127.0.0.1:9222")
+        .unwrap();
+    let browser = api::runtime_browser::production_browser(store, false).unwrap();
+    assert!(browser.cdp_enabled().unwrap());
 }

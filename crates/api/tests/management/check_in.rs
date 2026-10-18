@@ -221,3 +221,78 @@ async fn site_actions_reject_unknown_site() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn browser_maintenance_falls_back_to_http_when_browser_fails() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_c = stop.clone();
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        while !stop_c.load(Ordering::Relaxed) {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_nonblocking(false);
+                let mut buf = [0; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "<html><body><p>签到成功</p><a href=\"logout.php\">Logout</a></body></html>";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let downloader = Arc::new(MemoryDownloader::new(tmp.path().join("stage")));
+    let state = state(
+        tmp.path(),
+        Arc::new(Fixtures {
+            requests: Mutex::new(Vec::new()),
+            bodies: HashMap::new(),
+        }),
+        downloader,
+    );
+
+    let site = domain::Site {
+        id: domain::SiteId::new(),
+        name: "test-site".into(),
+        url: format!("http://127.0.0.1:{port}/"),
+        profile_id: "demo".into(),
+        cookie: Some("old=1".into()),
+        api_key: None,
+        rss_url: None,
+        proxy: None,
+        rate_limit_per_minute: None,
+        cdp_url: Some("http://127.0.0.1:9222".into()),
+        downloader_id: None,
+        enabled: true,
+        maintenance_via: domain::MaintenanceVia::Browser,
+    };
+    state.store().lock().insert_site(&site).unwrap();
+    state.store().lock().put_setting(api::settings_keys::CDP_ENABLED, "1").unwrap();
+
+    let app = router(state);
+    let response = app
+        .oneshot(request(
+            "POST",
+            &format!("/api/v1/sites/{}/check-in", site.id),
+            Some("management-secret"),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    let status = response.status();
+    let body = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "response was: {body}");
+}

@@ -195,6 +195,9 @@ impl ProfileSet {
         let mut profiles = HashMap::new();
         for (_, yaml) in BUILTIN {
             let profile: Profile = serde_yaml::from_str(yaml)?;
+            if profile.render {
+                tracing::warn!(profile = %profile.id, "render is ignored: search never uses the Browser");
+            }
             profiles.insert(profile.id.clone(), profile);
         }
         if let Some(dir) = overlay {
@@ -208,6 +211,9 @@ impl ProfileSet {
                     continue;
                 }
                 let profile: Profile = serde_yaml::from_str(&std::fs::read_to_string(path)?)?;
+                if profile.render {
+                    tracing::warn!(profile = %profile.id, "render is ignored: search never uses the Browser");
+                }
                 profiles.insert(profile.id.clone(), profile);
             }
         }

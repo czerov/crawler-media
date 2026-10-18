@@ -29,6 +29,7 @@ fn credentials(cookie: Option<&str>) -> Credentials {
         cdp_url: Some("http://fixture.invalid".into()),
         downloader_id: None,
         enabled: true,
+        maintenance_via: domain::MaintenanceVia::Http,
     }))
 }
 
@@ -212,7 +213,7 @@ fn browser_login_never_fabricates_cookie_from_an_unverified_page() {
     for &body in BAD_PAGES {
         let store = credentials(Some("uid=valid; pass=secret"));
         let before = store.0.lock().unwrap().clone();
-        let browser = Browser::with_opener(BrowserConfig::disabled(), move |_| {
+        let browser = Browser::with_opener(BrowserConfig::enabled_for_test(), move |_| {
             Ok(Arc::new(Page(body)) as Arc<dyn PageSession>)
         });
         assert!(

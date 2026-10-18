@@ -12,6 +12,17 @@ pub enum PluginError {
     Veto(String),
     #[error("{0}")]
     Fetch(String),
+    /// Browser failed before the target page was navigated (busy, endpoint,
+    /// target creation, cookie injection). Nothing reached the site, so the
+    /// caller may safely fall back to HTTP.
+    #[error("browser pre-navigation: {0}")]
+    BrowserPreNavigation(String),
+}
+
+impl PluginError {
+    pub fn is_browser_pre_navigation(&self) -> bool {
+        matches!(self, Self::BrowserPreNavigation(_))
+    }
 }
 
 pub trait SiteCredentials {
@@ -43,6 +54,7 @@ pub struct LoginPlugin<'a> {
     store: &'a dyn SiteCredentials,
     via: LoginVia<'a>,
     policy: &'a dyn SiteResponsePolicy,
+    emit_hook: bool,
 }
 
 enum LoginVia<'a> {
@@ -57,6 +69,7 @@ impl<'a> LoginPlugin<'a> {
             store,
             via: LoginVia::Http(http),
             policy: &DEFAULT_POLICY,
+            emit_hook: true,
         }
     }
 
@@ -66,11 +79,19 @@ impl<'a> LoginPlugin<'a> {
             store,
             via: LoginVia::Browser(browser),
             policy: &DEFAULT_POLICY,
+            emit_hook: true,
         }
     }
 
     pub fn with_policy(mut self, policy: &'a dyn SiteResponsePolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Skip the Bus hook event: used when a browser attempt already emitted it
+    /// and failed before navigation, so an HTTP fallback must not emit twice.
+    pub fn without_hook_event(mut self) -> Self {
+        self.emit_hook = false;
         self
     }
 
@@ -91,44 +112,58 @@ impl<'a> LoginPlugin<'a> {
     }
 
     fn login_inner(&self, id: SiteId) -> Result<(), PluginError> {
-        self.bus.emit(&HookEvent { step: Step::Login })?;
+        if self.emit_hook {
+            self.bus.emit(&HookEvent { step: Step::Login })?;
+        }
         let mut site = self.store.load(id)?;
         require_cookie(&site)?;
         // No credentials can be submitted: verify the supplied session, not an empty login form.
         let url = format!("{}index.php", site_base(&site));
-        let response = match self.via {
+        let (body, cookie_update) = match self.via {
             LoginVia::Http(http) => {
-                http.get(&url, site.cookie.as_deref(), site.proxy.as_deref())?
+                let response = http.get(&url, site.cookie.as_deref(), site.proxy.as_deref())?;
+                let body = response_body(&response).to_string();
+                let cookie = cookies_from_response(&response);
+                (body, cookie)
             }
-            LoginVia::Browser(browser) => browser_page(browser, &site, &url)?,
+            LoginVia::Browser(browser) => {
+                let page = browser_render(browser, &site, &url)?;
+                (page.html, page.cookie_header)
+            }
         };
-        let body = response_body(&response);
-        reject_challenge(body)?;
-        self.policy.authenticated(&site, body)?;
-        if let Some(cookie) = cookies_from_response(&response) {
-            site.cookie = Some(merge_cookie_string(site.cookie.as_deref(), &cookie));
+        reject_challenge(&body)?;
+        self.policy.authenticated(&site, &body)?;
+        if let Some(cookie) = cookie_update.as_deref() {
+            site.cookie = Some(merge_cookie_string(site.cookie.as_deref(), cookie));
             self.store.save(&site)?;
         }
         Ok(())
     }
 }
 
-fn browser_page(browser: &Browser, site: &Site, url: &str) -> Result<String, PluginError> {
+fn browser_render(
+    browser: &Browser,
+    site: &Site,
+    url: &str,
+) -> Result<indexer::RenderedPage, PluginError> {
     let request = indexer::FetchRequest {
-        key: format!("login:{}", site.id),
+        key: format!("maintenance:{}", site.id),
         url: url.to_string(),
         method: indexer::FetchMethod::Get,
         body: None,
         cookie: site.cookie.clone(),
         api_key: None,
         proxy: site.proxy.clone(),
-        render: true,
         cdp_url: site.cdp_url.clone(),
     };
-    // Fetching HTML does not expose Browser cookies; never synthesize a session credential.
     browser
-        .fetch_html(&request)
-        .map_err(|err| PluginError::Fetch(err.to_string()))
+        .render(&request)
+        .map_err(|err| match err {
+            indexer::IndexerError::BrowserSetup(_) | indexer::IndexerError::BrowserBusy => {
+                PluginError::BrowserPreNavigation(err.to_string())
+            }
+            other => PluginError::Fetch(other.to_string()),
+        })
 }
 
 fn require_cookie(site: &Site) -> Result<(), PluginError> {
@@ -196,11 +231,17 @@ fn merge_cookie_string(old_cookie: Option<&str>, new_cookie: &str) -> String {
         .join("; ")
 }
 
+enum CheckInVia<'a> {
+    Http(&'a dyn HttpPost),
+    Browser(&'a Browser),
+}
+
 pub struct CheckInPlugin<'a> {
     bus: &'a Bus,
     store: &'a dyn SiteCredentials,
-    http: Option<&'a dyn HttpPost>,
+    via: Option<CheckInVia<'a>>,
     policy: &'a dyn SiteResponsePolicy,
+    emit_hook: bool,
 }
 
 impl<'a> CheckInPlugin<'a> {
@@ -208,8 +249,9 @@ impl<'a> CheckInPlugin<'a> {
         Self {
             bus,
             store,
-            http: None,
+            via: None,
             policy: &DEFAULT_POLICY,
+            emit_hook: true,
         }
     }
 
@@ -217,13 +259,31 @@ impl<'a> CheckInPlugin<'a> {
         Self {
             bus,
             store,
-            http: Some(http),
+            via: Some(CheckInVia::Http(http)),
             policy: &DEFAULT_POLICY,
+            emit_hook: true,
+        }
+    }
+
+    pub fn browser(bus: &'a Bus, store: &'a dyn SiteCredentials, browser: &'a Browser) -> Self {
+        Self {
+            bus,
+            store,
+            via: Some(CheckInVia::Browser(browser)),
+            policy: &DEFAULT_POLICY,
+            emit_hook: true,
         }
     }
 
     pub fn with_policy(mut self, policy: &'a dyn SiteResponsePolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Skip the Bus hook event: used when a browser attempt already emitted it
+    /// and failed before navigation, so an HTTP fallback must not emit twice.
+    pub fn without_hook_event(mut self) -> Self {
+        self.emit_hook = false;
         self
     }
 
@@ -239,21 +299,33 @@ impl<'a> CheckInPlugin<'a> {
 
     fn check_in_inner(&self, id: SiteId) -> Result<(), PluginError> {
         let mut site = self.store.load(id)?;
-        self.bus.emit(&HookEvent {
-            step: Step::CheckIn,
-        })?;
-        let http = self.http.ok_or_else(|| {
-            PluginError::Fetch("Check-in 不支持仅分发 Hook；请配置 HTTP transport".into())
+        if self.emit_hook {
+            self.bus.emit(&HookEvent {
+                step: Step::CheckIn,
+            })?;
+        }
+        let via = self.via.as_ref().ok_or_else(|| {
+            PluginError::Fetch("Check-in 不支持仅分发 Hook；请配置 transport".into())
         })?;
         require_cookie(&site)?;
         let url = format!("{}attendance.php", site_base(&site));
-        let response = http.post(&url, "", site.cookie.as_deref(), site.proxy.as_deref())?;
-        let body = response_body(&response);
-        reject_challenge(body)?;
-        let outcome = self.policy.check_in(&site, body)?;
+        let (body, cookie_update) = match via {
+            CheckInVia::Http(http) => {
+                let response = http.post(&url, "", site.cookie.as_deref(), site.proxy.as_deref())?;
+                let body = response_body(&response).to_string();
+                let cookie = cookies_from_response(&response);
+                (body, cookie)
+            }
+            CheckInVia::Browser(browser) => {
+                let page = browser_render(browser, &site, &url)?;
+                (page.html, page.cookie_header)
+            }
+        };
+        reject_challenge(&body)?;
+        let outcome = self.policy.check_in(&site, &body)?;
         tracing::debug!(site_id = %id, ?outcome, "Site attendance business outcome verified");
-        if let Some(cookie) = cookies_from_response(&response) {
-            site.cookie = Some(merge_cookie_string(site.cookie.as_deref(), &cookie));
+        if let Some(cookie) = cookie_update.as_deref() {
+            site.cookie = Some(merge_cookie_string(site.cookie.as_deref(), cookie));
             self.store.save(&site)?;
         }
         Ok(())

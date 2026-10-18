@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use downloader::MemoryDownloader;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use tempfile::tempdir;
 use tower::ServiceExt;
 
 use super::common::{Fixtures, create_member, json_data, request, state};
@@ -28,7 +29,7 @@ fn payload() -> Value {
         "url": "https://base-user:base-password@pt.example/base-path-secret?key=base-query-secret#base-fragment-secret",
         "rss_url": "https://pt.example/rss/rss-path-secret?passkey=rss-passkey-secret#rss-fragment-secret",
         "proxy": "http://proxy-user:proxy-password@proxy.example:8080/proxy-path-secret?token=proxy-query-secret",
-        "cdp_url": "wss://cdp-user:cdp-password@browser.example/cdp-path-secret?token=cdp-query-secret",
+        "cdp_url": "http://browser.example:9222/cdp-path-secret",
         "cookie": "cookie-secret", "api_key": "api-key-secret"
     })
 }
@@ -202,7 +203,7 @@ async fn explicit_url_replacements_and_empty_credential_clears_are_persisted() {
     let uri = format!("/api/v1/sites/{id}");
     let replacements = json!({
         "url": "https://replacement.example/", "rss_url": "https://replacement.example/rss?key=new",
-        "proxy": "http://new:secret@proxy.example/", "cdp_url": "ws://browser.example/new?token=new"
+        "proxy": "http://new:secret@proxy.example/", "cdp_url": "http://browser.example:9222/new"
     });
     call(
         &app,
@@ -234,4 +235,73 @@ async fn explicit_url_replacements_and_empty_credential_clears_are_persisted() {
     let store = api::Store::open(tmp.path().join("data")).unwrap();
     let site = store.get_site(id.parse().unwrap()).unwrap().unwrap();
     assert!(site.cookie.is_none() && site.api_key.is_none());
+}
+
+#[tokio::test]
+async fn site_maintenance_via_round_trips_and_rejects_unknown_values() {
+    let tmp = tempdir().unwrap();
+    let app = app(&tmp);
+    let mut p = payload();
+    p["maintenance_via"] = json!("browser");
+    p["proxy"] = json!(""); // browser cannot have proxy
+    let res = call(&app, "POST", "/api/v1/sites", "management-secret", p.clone()).await;
+    assert_eq!(res["maintenance_via"], "browser");
+
+    p["maintenance_via"] = json!("invalid_via");
+    let resp = app.clone().oneshot(request("POST", "/api/v1/sites", Some("management-secret"), p)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn site_with_proxy_cannot_choose_browser_maintenance() {
+    let tmp = tempdir().unwrap();
+    let app = app(&tmp);
+    let mut p = payload();
+    p["maintenance_via"] = json!("browser");
+    p["proxy"] = json!("http://proxy.example:8080");
+    let resp = app.clone().oneshot(request("POST", "/api/v1/sites", Some("management-secret"), p)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn browser_site_cannot_add_a_proxy() {
+    let tmp = tempdir().unwrap();
+    let app = app(&tmp);
+    let mut p = payload();
+    p["maintenance_via"] = json!("browser");
+    p["proxy"] = json!("");
+    let site = call(&app, "POST", "/api/v1/sites", "management-secret", p).await;
+    let site_id = site["id"].as_str().unwrap();
+
+    let patch_resp = app.clone().oneshot(request("PATCH", &format!("/api/v1/sites/{site_id}"), Some("management-secret"), json!({"proxy": "http://proxy.example:8080"}))).await.unwrap();
+    assert_eq!(patch_resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn switching_back_to_http_and_adding_a_proxy_in_one_patch_is_allowed() {
+    let tmp = tempdir().unwrap();
+    let app = app(&tmp);
+    let mut p = payload();
+    p["maintenance_via"] = json!("browser");
+    p["proxy"] = json!("");
+    let site = call(&app, "POST", "/api/v1/sites", "management-secret", p).await;
+    let site_id = site["id"].as_str().unwrap();
+
+    let patch_resp = app.clone().oneshot(request("PATCH", &format!("/api/v1/sites/{site_id}"), Some("management-secret"), json!({
+        "maintenance_via": "http",
+        "proxy": "http://proxy.example:8080"
+    }))).await.unwrap();
+    assert_eq!(patch_resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn site_write_rejects_invalid_cdp_url() {
+    let tmp = tempdir().unwrap();
+    let app = app(&tmp);
+    let mut p = payload();
+    p["cdp_url"] = json!("wss://cdp-user:cdp-password@browser.example/cdp?token=x");
+    let resp = app.clone().oneshot(request("POST", "/api/v1/sites", Some("management-secret"), p)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = crate::common::json_body(resp).await;
+    assert_eq!(body["error"]["code"], "site.invalid_endpoint");
 }

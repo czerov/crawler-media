@@ -53,6 +53,8 @@ pub(crate) struct SiteInput {
     cdp_url: Option<String>,
     #[serde(default)]
     downloader_id: Option<String>,
+    #[serde(default)]
+    maintenance_via: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -82,6 +84,8 @@ pub(crate) struct PatchSiteInput {
     #[serde(default)]
     downloader_id: Option<String>,
     #[serde(default)]
+    maintenance_via: Option<String>,
+    #[serde(default)]
     enabled: Option<bool>,
 }
 
@@ -110,6 +114,7 @@ fn site_json(site: &Site) -> Value {
         "cdp_url": site.cdp_url,
         "downloader_id": site.downloader_id.map(|id| id.to_string()),
         "enabled": site.enabled,
+        "maintenance_via": site.maintenance_via.as_str(),
     })
 }
 
@@ -136,7 +141,7 @@ fn auth_type(site: &Site) -> &'static str {
     }
 }
 
-pub(crate) async fn create_site(
+async fn create_site_inner(
     State(state): State<ApiState>,
     Json(body): Json<SiteInput>,
 ) -> Response {
@@ -167,6 +172,37 @@ pub(crate) async fn create_site(
         .as_deref()
         .filter(|id| !id.is_empty())
         .and_then(|id| domain::DownloaderId::from_str(id).ok());
+    let maintenance_via = match body.maintenance_via.as_deref() {
+        Some(s) => match s.parse::<domain::MaintenanceVia>() {
+            Ok(v) => v,
+            Err(_) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "site.invalid_maintenance_via",
+                    "无效的 maintenance_via",
+                );
+            }
+        },
+        None => domain::MaintenanceVia::Http,
+    };
+    if maintenance_via == domain::MaintenanceVia::Browser
+        && body.proxy.as_deref().is_some_and(|p| !p.trim().is_empty())
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "site.browser_proxy_unsupported",
+            "浏览器维护方式不支持配置代理",
+        );
+    }
+    if let Some(cdp_url) = body.cdp_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        if let Err(e) = indexer::BrowserConfig::validate_endpoint(cdp_url.trim()) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "site.invalid_endpoint",
+                &e.to_string(),
+            );
+        }
+    }
     let site = Site {
         id: SiteId::new(),
         name: body.name,
@@ -180,6 +216,7 @@ pub(crate) async fn create_site(
         cdp_url: body.cdp_url,
         downloader_id,
         enabled: body.enabled,
+        maintenance_via,
     };
     let store = state.store.lock();
     if let Err(error) = store.insert_site(&site) {
@@ -228,7 +265,7 @@ pub(crate) async fn list_sites(
     .into_response()
 }
 
-pub(crate) async fn put_site(
+async fn put_site_inner(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(body): Json<SiteInput>,
@@ -260,7 +297,10 @@ pub(crate) async fn put_site(
         Ok(None) => return err(StatusCode::NOT_FOUND, "site.missing", "站点不存在"),
         Err(error) => return site_store_error(&error),
     };
-    let site = replacement_site(current, body, downloader_id);
+    let site = match replacement_site(current, body, downloader_id) {
+        Ok(site) => site,
+        Err((status, code, msg)) => return err(status, code, msg),
+    };
     let updated = match store.save_site(&site) {
         Ok(updated) => updated,
         Err(error) => {
@@ -282,8 +322,41 @@ fn replacement_site(
     current: Site,
     body: SiteInput,
     downloader_id: Option<domain::DownloaderId>,
-) -> Site {
-    Site {
+) -> Result<Site, (StatusCode, &'static str, &'static str)> {
+    let maintenance_via = match body.maintenance_via.as_deref() {
+        Some(s) => match s.parse::<domain::MaintenanceVia>() {
+            Ok(v) => v,
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "site.invalid_maintenance_via",
+                    "无效的 maintenance_via",
+                ));
+            }
+        },
+        None => current.maintenance_via,
+    };
+    let proxy = replacement_credential(body.proxy, current.proxy);
+    if maintenance_via == domain::MaintenanceVia::Browser
+        && proxy.as_deref().is_some_and(|p| !p.trim().is_empty())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "site.browser_proxy_unsupported",
+            "浏览器维护方式不支持配置代理",
+        ));
+    }
+    let cdp_url = replacement_credential(body.cdp_url, current.cdp_url);
+    if let Some(endpoint) = cdp_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        if let Err(_) = indexer::BrowserConfig::validate_endpoint(endpoint.trim()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "site.invalid_endpoint",
+                "无效的 CDP discovery 端点",
+            ));
+        }
+    }
+    Ok(Site {
         id: current.id,
         name: body.name,
         url: body.url,
@@ -291,12 +364,13 @@ fn replacement_site(
         cookie: replacement_credential(body.cookie, current.cookie),
         api_key: replacement_credential(body.api_key, current.api_key),
         rss_url: replacement_credential(body.rss_url, current.rss_url),
-        proxy: replacement_credential(body.proxy, current.proxy),
+        proxy,
         rate_limit_per_minute: body.rate_limit_per_minute,
-        cdp_url: replacement_credential(body.cdp_url, current.cdp_url),
+        cdp_url,
         downloader_id,
         enabled: body.enabled,
-    }
+        maintenance_via,
+    })
 }
 
 fn replacement_credential(input: Option<String>, current: Option<String>) -> Option<String> {
@@ -346,7 +420,7 @@ pub(crate) async fn get_site(
     .into_response()
 }
 
-pub(crate) async fn patch_site(
+async fn patch_site_inner(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(body): Json<PatchSiteInput>,
@@ -381,6 +455,16 @@ pub(crate) async fn patch_site(
         site.rate_limit_per_minute = (rate > 0).then_some(rate);
     }
     if let Some(cdp_url) = body.cdp_url {
+        let trimmed = cdp_url.trim();
+        if !trimmed.is_empty() {
+            if let Err(_) = indexer::BrowserConfig::validate_endpoint(trimmed) {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "site.invalid_endpoint",
+                    "无效的 CDP discovery 端点",
+                );
+            }
+        }
         site.cdp_url = (!cdp_url.is_empty()).then_some(cdp_url);
     }
     if let Some(downloader_id) = body.downloader_id {
@@ -388,8 +472,29 @@ pub(crate) async fn patch_site(
             .then(|| domain::DownloaderId::from_str(&downloader_id).ok())
             .flatten();
     }
+    if let Some(mv_str) = body.maintenance_via {
+        match mv_str.parse::<domain::MaintenanceVia>() {
+            Ok(v) => site.maintenance_via = v,
+            Err(_) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "site.invalid_maintenance_via",
+                    "无效的 maintenance_via",
+                );
+            }
+        }
+    }
     if let Some(enabled) = body.enabled {
         site.enabled = enabled;
+    }
+    if site.maintenance_via == domain::MaintenanceVia::Browser
+        && site.proxy.as_deref().is_some_and(|p| !p.trim().is_empty())
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "site.browser_proxy_unsupported",
+            "浏览器维护方式不支持配置代理",
+        );
     }
     if let Err(error) = store.save_site(&site) {
         return err(
@@ -401,7 +506,7 @@ pub(crate) async fn patch_site(
     ok(site_public(&site, auth_type(&site), true)).into_response()
 }
 
-pub(crate) async fn delete_site(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+async fn delete_site_inner(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let id = match SiteId::from_str(&id) {
         Ok(id) => id,
         Err(_) => return err(StatusCode::BAD_REQUEST, "site.invalid", "站点 id 无效"),
@@ -480,10 +585,7 @@ pub(crate) async fn site_login(State(state): State<ApiState>, Path(id): Path<Str
             })?;
             let bus = hooks::Bus::new();
             let creds = crate::check_in::store_sites(&state_for_work.store);
-            let http = crate::check_in::attendance_http();
-            hooks::LoginPlugin::http(&bus, &creds, &http)
-                .with_policy(&policy)
-                .login(site_id)
+            crate::site_maintenance::perform_login(&state_for_work, &site, &bus, &creds)
                 .map_err(|error| {
                     (
                         StatusCode::BAD_REQUEST,
@@ -524,10 +626,7 @@ pub(crate) async fn site_check_in(
             })?;
             let bus = hooks::Bus::new();
             let creds = crate::check_in::store_sites(&state_for_work.store);
-            let http = crate::check_in::attendance_http();
-            hooks::CheckInPlugin::http(&bus, &creds, &http)
-                .with_policy(&policy)
-                .check_in(site_id)
+            crate::site_maintenance::perform_check_in(&state_for_work, &site, &bus, &creds)
                 .map_err(|error| {
                     (
                         StatusCode::BAD_REQUEST,
@@ -658,8 +757,6 @@ pub(crate) async fn boost_stats(State(state): State<ApiState>) -> Response {
 }
 
 pub(crate) async fn site_catalog(State(state): State<ApiState>) -> Response {
-    let store = state.store.lock();
-    let _ = store;
     // Profiles are compile-time + overlay; expose id/name only.
     // demo 是测试桩，不列进站点配置。
     let items: Vec<Value> = state
@@ -675,4 +772,42 @@ pub(crate) async fn site_catalog(State(state): State<ApiState>) -> Response {
         })
         .collect();
     ok(Value::Array(items)).into_response()
+}
+
+pub(crate) async fn create_site(
+    State(state): State<ApiState>,
+    Json(body): Json<SiteInput>,
+) -> Response {
+    after_site_write(&state, create_site_inner(State(state.clone()), Json(body)).await)
+}
+
+pub(crate) async fn put_site(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<SiteInput>,
+) -> Response {
+    after_site_write(&state, put_site_inner(State(state.clone()), Path(id), Json(body)).await)
+}
+
+pub(crate) async fn patch_site(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchSiteInput>,
+) -> Response {
+    after_site_write(&state, patch_site_inner(State(state.clone()), Path(id), Json(body)).await)
+}
+
+pub(crate) async fn delete_site(
+    State(state): State<ApiState>, Path(id): Path<String>
+) -> Response {
+    after_site_write(&state, delete_site_inner(State(state.clone()), Path(id)).await)
+}
+
+/// Site writes can change `managed_browser_sites`; re-run the managed-daemon
+/// decision in the background after any successful write.
+fn after_site_write(state: &ApiState, response: Response) -> Response {
+    if response.status().is_success() {
+        crate::http::browser_settings::spawn_reconcile(state);
+    }
+    response
 }

@@ -74,6 +74,10 @@ impl Runner for StateRunner {
             | JobKind::JobsRetention
             | JobKind::PlaybackHistoryRetention
             | JobKind::DataRetention => crate::maintenance::run(&self.state, job),
+            JobKind::BrowserReconcile => {
+                crate::http::browser_settings::reconcile_obscura(&self.state);
+                Ok(())
+            }
         }
     }
 }
@@ -465,6 +469,7 @@ mod tests {
             cdp_url: None,
             downloader_id: None,
             enabled: true,
+            maintenance_via: domain::MaintenanceVia::Http,
         }
     }
 

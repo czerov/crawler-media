@@ -6,7 +6,7 @@ fn fake_ffmpeg(dir: &std::path::Path) -> std::path::PathBuf {
     let program = dir.join("ffmpeg");
     fs::write(
         &program,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv.txt\"\n: > \"${@: -1}\"\nexit 0\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv.txt\"\nfor last; do :; done\n: > \"$last\"\nexit 0\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&program).unwrap().permissions();

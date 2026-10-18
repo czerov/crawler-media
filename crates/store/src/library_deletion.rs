@@ -722,14 +722,12 @@ mod tests {
             .execute("DELETE FROM library_removal_roots", [])
             .unwrap();
         store.app.pragma_update(None, "user_version", 6).unwrap();
-        drop(store);
-
-        let reopened = Store::open(&data).unwrap();
-        assert!(reopened
+        crate::schema::migrate_app(&store.app).unwrap();
+        assert!(store
             .path_in_removal_scope(&roots[0].join("E01.strm"))
             .unwrap());
         assert_eq!(
-            reopened.removal_roots(&removal.operation_id).unwrap(),
+            store.removal_roots(&removal.operation_id).unwrap(),
             roots
         );
     }
@@ -759,12 +757,11 @@ mod tests {
         store.put_setting(&removed_key, "checked-v2").unwrap();
         store.put_setting(&kept_key, "checked-v2").unwrap();
         store.app.pragma_update(None, "user_version", 6).unwrap();
-        drop(store);
+        crate::schema::migrate_app(&store.app).unwrap();
 
-        let reopened = Store::open(&data).unwrap();
-        assert!(reopened.get_setting(&removed_key).unwrap().is_none());
+        assert!(store.get_setting(&removed_key).unwrap().is_none());
         assert_eq!(
-            reopened.get_setting(&kept_key).unwrap().as_deref(),
+            store.get_setting(&kept_key).unwrap().as_deref(),
             Some("checked-v2")
         );
     }

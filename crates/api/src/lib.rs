@@ -65,6 +65,7 @@ mod runtime_downloader;
 pub mod scan_operations;
 pub mod scan_probe_dispatch;
 pub mod settings_keys;
+pub mod site_maintenance;
 pub mod store;
 pub mod theintrodb;
 pub mod ui;

@@ -19,6 +19,7 @@ fn site() -> Site {
         cdp_url: Some("http://127.0.0.1:9222".into()),
         downloader_id: None,
         enabled: true,
+        maintenance_via: domain::MaintenanceVia::Http,
     }
 }
 
@@ -44,6 +45,7 @@ impl SiteCredentials for MemoryStore {
 
 struct FakePage {
     navigated: Mutex<Vec<String>>,
+    read_cookies: Option<String>,
 }
 
 impl PageSession for FakePage {
@@ -52,12 +54,16 @@ impl PageSession for FakePage {
         Ok(())
     }
 
+    fn cookie_header(&self, _url: &str) -> Result<String, IndexerError> {
+        Ok(self.read_cookies.clone().unwrap_or_default())
+    }
+
     fn set_cookie_header(&self, _header: &str) -> Result<(), IndexerError> {
         Ok(())
     }
 
     fn content(&self) -> Result<String, IndexerError> {
-        Ok(r#"<html><body><a href="logout.php">Logout</a></body></html>"#.into())
+        Ok(r#"<html><body><p>签到成功</p><a href="logout.php">Logout</a></body></html>"#.into())
     }
 }
 
@@ -116,9 +122,10 @@ fn login_plugin_can_use_browser_session() {
     };
     let page = Arc::new(FakePage {
         navigated: Mutex::new(Vec::new()),
+        read_cookies: Some("uid=fresh_browser; pass=xyz".into()),
     });
     let page_for_open = page.clone();
-    let browser = Browser::with_opener(BrowserConfig::disabled(), move |_| {
+    let browser = Browser::with_opener(BrowserConfig::enabled_for_test(), move |_| {
         Ok(page_for_open.clone() as Arc<dyn PageSession>)
     });
     let bus = Bus::new();
@@ -133,7 +140,36 @@ fn login_plugin_can_use_browser_session() {
     );
     assert_eq!(
         store.site.lock().unwrap().cookie.as_deref(),
-        Some("expired=1")
+        Some("expired=1; pass=xyz; uid=fresh_browser")
+    );
+}
+
+#[test]
+fn check_in_plugin_can_use_browser_session() {
+    let store = MemoryStore {
+        site: Mutex::new(site()),
+    };
+    let page = Arc::new(FakePage {
+        navigated: Mutex::new(Vec::new()),
+        read_cookies: Some("attendance=checked_in".into()),
+    });
+    let page_for_open = page.clone();
+    let browser = Browser::with_opener(BrowserConfig::enabled_for_test(), move |_| {
+        Ok(page_for_open.clone() as Arc<dyn PageSession>)
+    });
+    let bus = Bus::new();
+    let plugin = CheckInPlugin::browser(&bus, &store, &browser);
+    let id = store.site.lock().unwrap().id;
+
+    plugin.check_in(id).unwrap();
+
+    assert_eq!(
+        *page.navigated.lock().unwrap(),
+        vec!["https://pt.example/attendance.php".to_string()]
+    );
+    assert_eq!(
+        store.site.lock().unwrap().cookie.as_deref(),
+        Some("attendance=checked_in; expired=1")
     );
 }
 

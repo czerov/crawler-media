@@ -10,8 +10,8 @@ fn open_creates_four_sqlite_files() {
     let versions = store.schema_versions();
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "app").unwrap().1,
-        7,
-        "app schema version should be 7"
+        8,
+        "app schema version should be 8"
     );
     assert_eq!(
         versions.iter().find(|(n, _)| *n == "catalog").unwrap().1,

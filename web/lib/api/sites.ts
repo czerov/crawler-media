@@ -35,6 +35,7 @@ export interface Site {
   downloader_id: string | null;
   enabled: boolean;
   auth_type: SiteAuthType;
+  maintenance_via: "http" | "browser";
 }
 
 /** 兼容别名：历史组件以 ConfiguredSite 引用站点视图。 */
@@ -71,6 +72,7 @@ export interface SiteConfigPayload {
   cdp_url?: string | null;
   downloader_id?: string | null;
   enabled?: boolean;
+  maintenance_via?: "http" | "browser";
   /** 仅供前端展示提示；后端忽略（auth_type 由 api_key/cookie 派生）。 */
   auth_type?: SiteAuthType;
 }

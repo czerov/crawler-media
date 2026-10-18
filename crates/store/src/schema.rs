@@ -16,7 +16,7 @@ mod scan_operations;
 
 /// Schema version constants. Bump when adding new migrations.
 /// The version is stored via `PRAGMA user_version` on each database file.
-pub const APP_SCHEMA_VERSION: i64 = 7;
+pub const APP_SCHEMA_VERSION: i64 = 8;
 pub const CATALOG_SCHEMA_VERSION: i64 = 3;
 pub const LIBRARY_SCHEMA_VERSION: i64 = 17;
 pub const SUBSCRIBE_SCHEMA_VERSION: i64 = 8;
@@ -76,6 +76,14 @@ pub fn migrate_app(conn: &Connection) -> Result<(), StoreError> {
     crate::library_deletion::repair_removed_library_settings(conn)?;
     ensure_column(conn, "media", "aliases_json", "TEXT NOT NULL DEFAULT '[]'")?;
     ensure_column(conn, "downloaders", "path_maps", "TEXT")?;
+    // app schema 8：Site 维护方式。存量 Site（v7 及更早）一律补成 `http`，
+    // 与旧版本只走 HTTP 登录/签到的行为一致；不会自动切到 Browser。
+    ensure_column(
+        conn,
+        "sites",
+        "maintenance_via",
+        "TEXT NOT NULL DEFAULT 'http' CHECK (maintenance_via IN ('http','browser'))",
+    )?;
     // downloaders.enabled：停用的下载器不参与自动投递（手动提交仍可用）。
     ensure_column(conn, "downloaders", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(conn, "users", "role", "TEXT NOT NULL DEFAULT 'member'")?;

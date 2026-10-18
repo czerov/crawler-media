@@ -275,6 +275,7 @@ mod tests {
             cdp_url: None,
             downloader_id: None,
             enabled: true,
+            maintenance_via: domain::MaintenanceVia::Http,
         };
         let media = Media {
             id: MediaId::new(),

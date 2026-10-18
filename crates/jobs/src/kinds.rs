@@ -15,6 +15,8 @@ pub enum JobKind {
     JobsRetention,
     /// 播放历史清理。
     PlaybackHistoryRetention,
+    /// 浏览器生命周期对账。
+    BrowserReconcile,
     /// 分类历史保留：QoE、transient catalog cache、probe 终态。
     DataRetention,
 }
@@ -27,6 +29,7 @@ impl JobKind {
             Self::DatabaseMaintenance
                 | Self::JobsRetention
                 | Self::PlaybackHistoryRetention
+                | Self::BrowserReconcile
                 | Self::DataRetention
         )
     }
@@ -45,6 +48,7 @@ impl JobKind {
             Self::DatabaseMaintenance => "database_maintenance",
             Self::JobsRetention => "jobs_retention",
             Self::PlaybackHistoryRetention => "playback_history_retention",
+            Self::BrowserReconcile => "browser_reconcile",
             Self::DataRetention => "data_retention",
         }
     }
@@ -65,6 +69,7 @@ impl FromStr for JobKind {
             "database_maintenance" => Ok(Self::DatabaseMaintenance),
             "jobs_retention" => Ok(Self::JobsRetention),
             "playback_history_retention" => Ok(Self::PlaybackHistoryRetention),
+            "browser_reconcile" => Ok(Self::BrowserReconcile),
             "data_retention" => Ok(Self::DataRetention),
             other => Err(other.to_string()),
         }

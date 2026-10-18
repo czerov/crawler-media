@@ -14,7 +14,7 @@ use api::{
     cli, router, spawn_job_loop,
 };
 use downloader::Downloader;
-use indexer::{ProfileSet, RoutedFetcher};
+use indexer::ProfileSet;
 
 #[tokio::main]
 async fn main() {
@@ -109,6 +109,18 @@ fn seed_store_settings(store: &parking_lot::Mutex<Store>, config: &ServerConfig)
         let _ = store
             .lock()
             .put_setting(api::settings_keys::PROXY_PASSWORD, pass);
+    }
+    if store
+        .lock()
+        .get_setting(api::settings_keys::CDP_ENABLED)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        let val = if config.browser_enabled { "1" } else { "0" };
+        let _ = store
+            .lock()
+            .put_setting(api::settings_keys::CDP_ENABLED, val);
     }
     api::http_agent::sync_from_store(&store.lock());
     api::user_agent::sync_user_agent(&store.lock());
@@ -214,12 +226,13 @@ fn create_api_state(
     let mut state = ApiState::new_arc_with_admin_bootstrap(
         store.clone(),
         ProfileSet::load(Some(overlay_dir))?,
-        Arc::new(RoutedFetcher::new(HttpFetcher, browser)),
+        Arc::new(HttpFetcher),
         downloader,
         data_dir.join("library"),
         action,
     )?
-    .with_log_buffer(log_buffer);
+    .with_log_buffer(log_buffer)
+    .with_browser(Arc::new(browser));
 
     let sources = load_catalog_sources(
         &store,

@@ -216,36 +216,39 @@ pub(crate) async fn test_metadata(State(state): State<ApiState>) -> Response {
 
 pub(crate) use super::proxy_settings::{diagnose_proxy, get_proxy, put_proxy, test_proxy};
 
-#[path = "browser_settings.rs"]
-mod browser_settings;
-pub(crate) use browser_settings::{get_browser_settings, put_browser_settings};
+pub(crate) use super::browser_settings::{
+    get_browser_settings, get_obscura_status, post_obscura_start, post_obscura_stop,
+    put_browser_settings,
+};
 
 /// Trigger CDP Cookie Sync across all supported PT sites.
 /// Discovers cookies from Chrome, updates existing sites, and returns discovered candidate sites.
 pub(crate) async fn sync_cdp_cookies(State(state): State<ApiState>) -> Response {
-    let (cdp_enabled, cdp_url) = {
-        let store = state.store.lock();
-        let enabled = store
-            .get_setting(settings_keys::CDP_SYNC_ENABLED)
-            .ok()
-            .flatten()
-            .and_then(|v| crate::config::parse_bool(&v))
-            .unwrap_or(false);
-        let url = store
-            .get_setting(settings_keys::CDP_URL)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "http://127.0.0.1:9222".into());
-        (enabled, url)
+    let resolved_endpoint = {
+        let config = state.browser.effective_config()
+            .map_err(|e| (StatusCode::BAD_REQUEST, "cdp.disabled", e.to_string()));
+        match config {
+            Ok(c) => match c.resolve(None) {
+                Ok(Some((endpoint, _))) => Ok(endpoint),
+                Ok(None) => Err((
+                    StatusCode::BAD_REQUEST,
+                    "cdp.disabled",
+                    "CDP 同步未开启，请先在系统设置中启用 CDP 开关".to_string(),
+                )),
+                Err(_) => Err((
+                    StatusCode::BAD_REQUEST,
+                    "cdp.no_endpoint",
+                    "CDP 已开启但没有可用端点（未配置外部端点且受管浏览器未运行）".to_string(),
+                )),
+            },
+            Err(e) => Err(e),
+        }
     };
 
-    if !cdp_enabled {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "cdp.disabled",
-            "CDP 同步未开启，请先在系统设置中启用 CDP 开关",
-        );
-    }
+    let cdp_url = match resolved_endpoint {
+        Ok(url) => url,
+        Err((status, code, msg)) => return err(status, code, &msg),
+    };
 
     // 1. Fetch raw cookies from Chrome CDP in a blocking thread
     let cookies_res =

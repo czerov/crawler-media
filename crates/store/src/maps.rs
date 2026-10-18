@@ -141,6 +141,11 @@ pub(super) fn map_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
             .map(|s| parse_id(s, 10))
             .transpose()?,
         enabled: row.get::<_, i64>(11)? != 0,
+        maintenance_via: row
+            .get::<_, Option<String>>(12)?
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default(),
     })
 }
 
